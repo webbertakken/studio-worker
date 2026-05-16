@@ -46,6 +46,11 @@ pub struct Config {
     /// Whether to upgrade to pre-release versions.
     #[serde(default)]
     pub auto_update_prerelease: bool,
+    /// Root directory for downloaded model files (per-engine
+    /// subdirectories: `llm/`, `stt/`, `tts/`, `image/`, `video/`).
+    /// Defaults to the OS cache dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_root: Option<std::path::PathBuf>,
 }
 
 fn default_auto_update_enabled() -> bool {
@@ -75,6 +80,7 @@ impl Default for Config {
             auto_update_interval_secs: default_auto_update_interval(),
             auto_update_feed: default_auto_update_feed(),
             auto_update_prerelease: false,
+            models_root: None,
         }
     }
 }

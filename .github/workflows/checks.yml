@@ -11,8 +11,18 @@ permissions:
 
 jobs:
   checks:
-    name: Format, lint, check, test
+    name: Format, lint, check, test (${{ matrix.features }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: ""
+            label: default
+          - features: "all-engines-llm"
+            label: llm-bundle
+          - features: "all-engines-stt"
+            label: stt-bundle
     steps:
       - uses: actions/checkout@v4
 
@@ -21,15 +31,18 @@ jobs:
           components: clippy, rustfmt
 
       - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
 
       - name: Check formatting
+        if: matrix.features == ''
         run: cargo fmt --check
 
       - name: Run clippy (tests too)
-        run: cargo clippy --tests -- -D warnings
+        run: cargo clippy --tests ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }} -- -D warnings
 
       - name: Compile check
-        run: cargo check
+        run: cargo check ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
 
       - name: Run tests
-        run: cargo test
+        run: cargo test ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}

@@ -39,6 +39,36 @@ hound = "3.5.1"
 mp4 = "0.14.0"
 semver = "1.0.28"
 tempfile = "3"
+# Real-engine deps; each behind its own cargo feature so the default
+# build stays small and CI stays fast.
+llama-cpp-2 = { version = "0.1.124", optional = true, default-features = false }
+whisper-rs = { version = "0.14", optional = true, default-features = false }
+encoding_rs = { version = "0.8", optional = true }
+candle-core = { version = "0.10.2", optional = true }
+candle-nn = { version = "0.10.2", optional = true }
+candle-transformers = { version = "0.10.2", optional = true }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
+hf-hub = { version = "0.4", optional = true }
+gif = { version = "0.13", optional = true }
+
+[features]
+default = []
+llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
+whisper = ["dep:whisper-rs"]
+image-candle = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+video = ["dep:gif"]
+tts = []
+# Convenience bundles.  llama and whisper both statically link ggml.cpp,
+# which currently can't coexist in the same binary on Linux (duplicate
+# symbols).  Pick one bundle per build.
+all-engines-llm = ["llama", "image-candle", "video", "tts"]
+all-engines-stt = ["whisper", "image-candle", "video", "tts"]
 
 [dev-dependencies]
 wiremock = "0.6"

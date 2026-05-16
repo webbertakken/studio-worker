@@ -43,6 +43,17 @@ impl EngineCapabilities {
     }
 }
 
+#[cfg(feature = "image-candle")]
+pub mod candle_image;
+#[cfg(feature = "llama")]
+pub mod llama;
+#[cfg(feature = "tts")]
+pub mod tts;
+#[cfg(feature = "video")]
+pub mod video;
+#[cfg(feature = "whisper")]
+pub mod whisper;
+
 pub trait Engine: Send + Sync {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> EngineCapabilities;
@@ -64,8 +75,32 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
                 cfg.supported_models_override.clone(),
             )))
         }
+        #[cfg(feature = "llama")]
+        "llama" => {
+            let root = cfg.models_root.clone().unwrap_or_else(default_models_root);
+            Ok(Box::new(llama::LlamaEngine::new(root)?))
+        }
+        #[cfg(feature = "whisper")]
+        "whisper" => {
+            let root = cfg.models_root.clone().unwrap_or_else(default_models_root);
+            Ok(Box::new(whisper::WhisperEngine::new(root)))
+        }
+        #[cfg(feature = "image-candle")]
+        "image-candle" => Ok(Box::new(candle_image::CandleImageEngine::new())),
+        #[cfg(feature = "video")]
+        "video" => Ok(Box::new(video::VideoEngine::new())),
+        #[cfg(feature = "tts")]
+        "tts" => Ok(Box::new(tts::TtsEngine::new())),
         other => bail!("unknown engine: {other}"),
     }
+}
+
+/// Default cache dir for downloaded model files.
+pub fn default_models_root() -> std::path::PathBuf {
+    if let Some(dir) = directories::ProjectDirs::from("gg", "minis", "minis-studio-worker") {
+        return dir.cache_dir().to_path_buf();
+    }
+    std::env::temp_dir().join("studio-worker-models")
 }
 
 // ---------------------------------------------------------------------------
