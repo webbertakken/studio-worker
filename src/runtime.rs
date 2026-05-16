@@ -86,6 +86,7 @@ pub async fn register(
     }
     let engine = engine::build(&cfg)?;
     let cap = build_capabilities(&cfg, &*engine);
+    let api_for_diag = cfg.api_base_url.clone();
     let response = tokio::task::spawn_blocking({
         let api_base_url = cfg.api_base_url.clone();
         let bootstrap = cfg.bootstrap_token.clone();
@@ -96,7 +97,8 @@ pub async fn register(
             api.register(&bootstrap, cap, worker_id)
         }
     })
-    .await??;
+    .await?
+    .map_err(|e| friendly_register_error(e, &api_for_diag))?;
     cfg.worker_id = Some(response.worker_id.clone());
     cfg.auth_token = Some(response.auth_token);
     config::save(&cfg, &path)?;
@@ -106,6 +108,39 @@ pub async fn register(
         "registered with studio API"
     );
     Ok(())
+}
+
+/// Wrap network/HTTP errors from register() with a hint that points the
+/// operator at `--api-base-url` and the right secret.  Saves people from
+/// hitting the default `http://localhost:9790` and wondering what happened.
+fn friendly_register_error(err: anyhow::Error, api_base_url: &str) -> anyhow::Error {
+    // Walk the full error chain so we catch the cause inside
+    // reqwest/hyper, not just the top-level wrap.
+    let message = format!("{:#}", err);
+    let is_connection_refused =
+        message.contains("Connection refused") || message.contains("ConnectionRefused");
+    if is_connection_refused {
+        anyhow!(
+            "could not reach the studio API at {api_base_url}: {message}\n\
+             \n\
+             Hint: pass --api-base-url <URL> on the register command, e.g.\n\
+               studio-worker register \\\n\
+                 --bootstrap-token <TOKEN> \\\n\
+                 --api-base-url https://studio.example.com\n\
+             \n\
+             The bootstrap token is the WORKER_BOOTSTRAP_TOKEN wrangler secret\n\
+             on the studio side (for local dev the default is `dev-bootstrap-token`)."
+        )
+    } else if message.contains("401") || message.contains("403") {
+        anyhow!(
+            "the studio API rejected our bootstrap token: {message}\n\
+             \n\
+             Check that --bootstrap-token matches the WORKER_BOOTSTRAP_TOKEN\n\
+             secret on the studio side."
+        )
+    } else {
+        err
+    }
 }
 
 pub async fn status(config_path: Option<&str>) -> Result<()> {
