@@ -2780,6 +2780,7 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
+ "dirs",
  "encoding_rs",
  "gif",
  "hex",

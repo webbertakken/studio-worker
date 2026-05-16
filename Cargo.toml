@@ -73,6 +73,7 @@ all-engines-stt = ["whisper", "image-candle", "video", "tts"]
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+dirs = "6.0.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
