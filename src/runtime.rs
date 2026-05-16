@@ -755,11 +755,14 @@ pub fn build_capabilities(cfg: &Config, engine: &dyn Engine) -> WorkerCapabiliti
     let caps = engine.capabilities();
     let supported_models_per_kind = caps.supported_models_per_kind.clone();
     let task_kinds = caps.kinds();
-    let supported_models = if let Some(image) = caps.supported_models_per_kind.get(&TaskKind::Image)
-    {
-        image.clone()
-    } else {
-        caps.flat_models()
+    // Legacy `supported_models` is a flat list across all kinds so the
+    // studio API's claim filter (which only knows about this field) can
+    // match jobs of any modality this worker can serve.
+    let supported_models = {
+        let mut all = caps.flat_models();
+        all.sort();
+        all.dedup();
+        all
     };
     let supported_models = if cfg.supported_models_override.is_empty() {
         supported_models

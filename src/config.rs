@@ -24,8 +24,14 @@ pub struct Config {
     pub auto_start: bool,
     /// Whether the worker should claim new jobs.
     pub auto_enabled: bool,
-    /// Engine identifier (`synthetic` or `gradio`).
+    /// Engine identifier: `synthetic`, `gradio`, `multi`, or — when
+    /// built with the matching cargo feature — `llama`, `whisper`,
+    /// `image-candle`, `video`, `tts`.
     pub engine: String,
+    /// When `engine = "multi"`, the per-modality engines to combine.
+    /// First engine that claims support for a job's kind+model wins.
+    #[serde(default)]
+    pub engines: Vec<String>,
     /// Local Gradio endpoint URL when `engine = "gradio"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gradio_endpoint_url: Option<String>,
@@ -74,6 +80,7 @@ impl Default for Config {
             auto_start: true,
             auto_enabled: true,
             engine: "synthetic".into(),
+            engines: Vec::new(),
             gradio_endpoint_url: None,
             supported_models_override: Vec::new(),
             auto_update_enabled: default_auto_update_enabled(),

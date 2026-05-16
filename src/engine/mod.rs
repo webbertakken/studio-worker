@@ -47,6 +47,7 @@ impl EngineCapabilities {
 pub mod candle_image;
 #[cfg(feature = "llama")]
 pub mod llama;
+pub mod multi;
 #[cfg(feature = "tts")]
 pub mod tts;
 #[cfg(feature = "video")]
@@ -61,7 +62,26 @@ pub trait Engine: Send + Sync {
 }
 
 pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
-    match cfg.engine.as_str() {
+    if cfg.engine == "multi" {
+        return build_multi(cfg);
+    }
+    build_single(cfg, cfg.engine.as_str())
+}
+
+fn build_multi(cfg: &Config) -> Result<Box<dyn Engine>> {
+    let names = &cfg.engines;
+    if names.is_empty() {
+        bail!("multi engine requires a non-empty `engines` list in the config");
+    }
+    let mut built: Vec<Box<dyn Engine>> = Vec::with_capacity(names.len());
+    for name in names {
+        built.push(build_single(cfg, name)?);
+    }
+    Ok(Box::new(multi::MultiEngine::new(built)))
+}
+
+fn build_single(cfg: &Config, name: &str) -> Result<Box<dyn Engine>> {
+    match name {
         "synthetic" => Ok(Box::new(SyntheticEngine::new(
             cfg.supported_models_override.clone(),
         ))),
@@ -91,6 +111,7 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
         "video" => Ok(Box::new(video::VideoEngine::new())),
         #[cfg(feature = "tts")]
         "tts" => Ok(Box::new(tts::TtsEngine::new())),
+        "multi" => bail!("nested `multi` engines are not allowed"),
         other => bail!("unknown engine: {other}"),
     }
 }
