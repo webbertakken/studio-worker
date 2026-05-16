@@ -1,0 +1,67 @@
+[package]
+name = "studio-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Pull-based image-generation worker for the minis.gg studio."
+authors = ["Webber Takken"]
+license = "MIT"
+repository = "https://github.com/webbertakken/studio-worker"
+homepage = "https://github.com/webbertakken/studio-worker"
+readme = "README.md"
+keywords = ["studio", "image-generation", "worker", "gradio"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "studio-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+hostname = "0.4"
+whoami = "1.5"
+sha2 = "0.10"
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+directories = "5.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+url = "2.5"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+
+# cargo-dist build profile
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# cargo-dist configuration — drives the release pipeline.
+[workspace.metadata.dist]
+cargo-dist-version = "0.30.4"
+ci = "github"
+installers = ["shell", "powershell"]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+# PR checks run plan-only to catch issues early
+pr-run-mode = "plan"

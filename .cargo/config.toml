@@ -1,0 +1,5 @@
+# Cap parallelism by default so a `cargo build` doesn't saturate every core
+# on shared developer machines. Override with `cargo build --jobs N` or
+# `CARGO_BUILD_JOBS=N`.
+[build]
+jobs = 2
