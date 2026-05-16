@@ -24,7 +24,7 @@ jobs:
           - features: "all-engines-stt"
             label: stt-bundle
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
