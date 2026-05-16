@@ -35,11 +35,17 @@ parking_lot = "0.12"
 url = "2.5"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
+hound = "3.5.1"
+mp4 = "0.14.0"
+semver = "1.0.28"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 wiremock = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [profile.release]
 strip = "symbols"

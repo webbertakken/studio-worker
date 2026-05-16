@@ -33,6 +33,29 @@ pub struct Config {
     /// reports its native list.
     #[serde(default)]
     pub supported_models_override: Vec<String>,
+    /// Periodically check the release feed and auto-install newer
+    /// versions when no job is running.
+    #[serde(default = "default_auto_update_enabled")]
+    pub auto_update_enabled: bool,
+    /// How often (seconds) to check the release feed.
+    #[serde(default = "default_auto_update_interval")]
+    pub auto_update_interval_secs: u64,
+    /// GitHub Releases feed for this binary.
+    #[serde(default = "default_auto_update_feed")]
+    pub auto_update_feed: String,
+    /// Whether to upgrade to pre-release versions.
+    #[serde(default)]
+    pub auto_update_prerelease: bool,
+}
+
+fn default_auto_update_enabled() -> bool {
+    true
+}
+fn default_auto_update_interval() -> u64 {
+    1800
+}
+fn default_auto_update_feed() -> String {
+    "https://api.github.com/repos/webbertakken/studio-worker/releases".into()
 }
 
 impl Default for Config {
@@ -48,6 +71,10 @@ impl Default for Config {
             engine: "synthetic".into(),
             gradio_endpoint_url: None,
             supported_models_override: Vec::new(),
+            auto_update_enabled: default_auto_update_enabled(),
+            auto_update_interval_secs: default_auto_update_interval(),
+            auto_update_feed: default_auto_update_feed(),
+            auto_update_prerelease: false,
         }
     }
 }
@@ -94,4 +121,102 @@ pub type SharedConfig = std::sync::Arc<Mutex<Config>>;
 
 pub fn shared(cfg: Config) -> SharedConfig {
     std::sync::Arc::new(Mutex::new(cfg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn default_values_are_sensible() {
+        let cfg = Config::default();
+        assert_eq!(cfg.engine, "synthetic");
+        assert!(cfg.auto_enabled);
+        assert!(cfg.auto_start);
+        assert!(cfg.auto_update_enabled);
+        assert_eq!(cfg.auto_update_interval_secs, 1800);
+        assert!(!cfg.auto_update_prerelease);
+        assert!(cfg.auto_update_feed.contains("webbertakken/studio-worker"));
+        assert_eq!(cfg.vram_threshold_gb, 12.0);
+        assert!(cfg.worker_id.is_none());
+        assert!(cfg.auth_token.is_none());
+    }
+
+    #[test]
+    fn resolve_path_uses_override_when_provided() {
+        let path = resolve_path(Some("/tmp/test-config.toml")).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/test-config.toml"));
+    }
+
+    #[test]
+    fn resolve_path_defaults_when_no_override() {
+        let path = resolve_path(None).unwrap();
+        let s = path.to_string_lossy();
+        assert!(
+            s.contains("minis-studio-worker") || s.contains("minis.gg.minis-studio-worker"),
+            "unexpected default path: {s}"
+        );
+        assert!(s.ends_with("config.toml"));
+    }
+
+    #[test]
+    fn load_creates_default_when_file_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sub").join("config.toml");
+        let path_str = path.to_string_lossy().to_string();
+        let (cfg, returned_path) = load(Some(&path_str)).unwrap();
+        assert_eq!(returned_path, path);
+        assert_eq!(cfg.engine, "synthetic");
+        // File should have been written.
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn round_trip_via_save_and_load_preserves_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            engine: "gradio".into(),
+            gradio_endpoint_url: Some("http://example.invalid".into()),
+            worker_id: Some("w-123".into()),
+            auth_token: Some("tok-xyz".into()),
+            vram_threshold_gb: 24.0,
+            auto_update_prerelease: true,
+            supported_models_override: vec!["foo".into(), "bar".into()],
+            ..Config::default()
+        };
+        save(&cfg, &path).unwrap();
+
+        let path_str = path.to_string_lossy().to_string();
+        let (loaded, _) = load(Some(&path_str)).unwrap();
+        assert_eq!(loaded.engine, cfg.engine);
+        assert_eq!(loaded.gradio_endpoint_url, cfg.gradio_endpoint_url);
+        assert_eq!(loaded.worker_id, cfg.worker_id);
+        assert_eq!(loaded.auth_token, cfg.auth_token);
+        assert_eq!(loaded.vram_threshold_gb, cfg.vram_threshold_gb);
+        assert_eq!(loaded.auto_update_prerelease, cfg.auto_update_prerelease);
+        assert_eq!(
+            loaded.supported_models_override,
+            cfg.supported_models_override
+        );
+    }
+
+    #[test]
+    fn shared_wraps_in_arc_mutex() {
+        let cfg = Config::default();
+        let shared = shared(cfg.clone());
+        let guard = shared.lock();
+        assert_eq!(guard.engine, cfg.engine);
+    }
+
+    #[test]
+    fn load_returns_error_on_malformed_toml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this :: is = not = toml = :").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        let err = load(Some(&path_str)).unwrap_err();
+        assert!(err.to_string().contains("parsing config.toml"));
+    }
 }

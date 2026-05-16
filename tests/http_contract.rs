@@ -20,6 +20,10 @@ fn caps() -> WorkerCapabilities {
         auto_enabled: true,
         auto_start: false,
         supported_models: vec!["synthetic".into()],
+        task_kinds: vec![TaskKind::Image],
+        supported_models_per_kind: [(TaskKind::Image, vec!["synthetic".into()])]
+            .into_iter()
+            .collect(),
     }
 }
 

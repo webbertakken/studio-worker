@@ -1,0 +1,10 @@
+# cargo-llvm-cov configuration.
+#
+# Files excluded from coverage by --ignore-filename-regex:
+# - `src/main.rs` — bootstrap entry; all logic is in lib.rs.
+#
+# Functions excluded via `#[cfg_attr(coverage_nightly, coverage(off))]`:
+# - `update::restart_self` (calls execvp, never returns).
+# - `update::RealRunner::{download, run_installer}` (real network/exec).
+# - `service::default_unit_dir` cross-platform variants only one of
+#   which compiles per host.

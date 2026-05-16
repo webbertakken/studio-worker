@@ -1,10 +1,5 @@
-//! End-to-end test of one full claim→generate→complete cycle against a
-//! mock studio API + mock Gradio.  No GPU.
-//!
-//! This is the "cheap models" e2e the operator asked for: it exercises the
-//! gradio engine code path on every PR without spending a single GB of
-//! VRAM, and proves the worker can claim a job, run inference, and post
-//! the result back.
+//! End-to-end test of one full claim → dispatch → complete cycle against
+//! a mock studio API + mock Gradio.  Image task path.  No GPU.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -28,10 +23,13 @@ fn caps() -> WorkerCapabilities {
         auto_enabled: true,
         auto_start: false,
         supported_models: vec!["tiny-test".into()],
+        task_kinds: vec![TaskKind::Image],
+        supported_models_per_kind: [(TaskKind::Image, vec!["tiny-test".into()])]
+            .into_iter()
+            .collect(),
     }
 }
 
-/// Mock that returns the claim payload once, then 204 forever.
 struct OneShotClaim {
     payload: serde_json::Value,
     served: Arc<Mutex<bool>>,
@@ -53,13 +51,10 @@ async fn full_loop_claims_generates_completes() {
     let api_server = MockServer::start().await;
     let gradio_server = MockServer::start().await;
 
-    // Pre-render the expected output so the mock returns a deterministic image.
-    let expected = render_procedural("a tiny test creature", "webp").unwrap();
     let png = render_procedural("a tiny test creature", "png").unwrap();
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
     let data_url = format!("data:image/png;base64,{b64}");
 
-    // Mock Gradio: returns the test image.
     Mock::given(method("POST"))
         .and(path("/run/predict"))
         .respond_with(
@@ -68,7 +63,6 @@ async fn full_loop_claims_generates_completes() {
         .mount(&gradio_server)
         .await;
 
-    // Mock studio API.
     Mock::given(method("POST"))
         .and(path("/graphics/api/workers/register"))
         .respond_with(
@@ -102,9 +96,6 @@ async fn full_loop_claims_generates_completes() {
     Mock::given(method("POST"))
         .and(path("/graphics/api/workers/w-test/jobs/job-1/complete"))
         .respond_with(move |req: &Request| {
-            // Record the request body (multipart) so we can assert the image was
-            // forwarded.  We don't parse multipart — just check it's non-empty
-            // and includes our marker bytes.
             completed_clone.lock().unwrap().push(req.body.clone());
             ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true }))
         })
@@ -123,19 +114,15 @@ async fn full_loop_claims_generates_completes() {
         .mount(&api_server)
         .await;
 
-    // Now run a single iteration of the contract by hand (the run loop is
-    // long-lived; we just verify the building blocks compose).
     let api_uri = api_server.uri();
     let gradio_uri = gradio_server.uri();
 
     let result = std::thread::spawn(move || -> anyhow::Result<()> {
         let api = ApiClient::new(api_uri)?;
 
-        // 1) register
         let registration = api.register("dev-bootstrap-token", caps(), None)?;
         assert_eq!(registration.worker_id, "w-test");
 
-        // 2) heartbeat once
         api.heartbeat(
             &registration.worker_id,
             &registration.auth_token,
@@ -143,14 +130,14 @@ async fn full_loop_claims_generates_completes() {
             None,
         )?;
 
-        // 3) claim
         let job = api
             .claim(&registration.worker_id, &registration.auth_token)?
             .expect("expected a job");
         assert_eq!(job.job_id, "job-1");
         assert_eq!(job.model, "tiny-test");
+        let task = job.resolved_task();
+        assert!(matches!(task, Task::Image(_)));
 
-        // 4) generate via gradio engine
         let cfg = Config {
             engine: "gradio".into(),
             gradio_endpoint_url: Some(gradio_uri),
@@ -158,20 +145,22 @@ async fn full_loop_claims_generates_completes() {
             ..Config::default()
         };
         let eng = engine::build(&cfg)?;
-        let image = eng.generate(&job.prompt, &job.model, &job.ext)?;
-        assert!(!image.is_empty(), "engine should have produced image bytes");
+        let result = eng.dispatch(&job.model, task)?;
+        let (bytes, ext) = match result {
+            TaskResult::Image { bytes, ext } => (bytes, ext),
+            other => panic!("expected image, got {:?}", other.kind()),
+        };
+        assert!(!bytes.is_empty());
 
-        // 5) complete
         api.complete(
             &registration.worker_id,
             &registration.auth_token,
             &job.job_id,
-            &job.ext,
-            &job.prompt,
-            image.clone(),
+            &ext,
+            "a tiny test creature",
+            bytes,
         )?;
 
-        // 6) ship logs
         api.ship_logs(
             &registration.worker_id,
             &registration.auth_token,
@@ -192,13 +181,7 @@ async fn full_loop_claims_generates_completes() {
     .expect("worker thread panicked");
     result.expect("full loop should succeed");
 
-    // The mock recorded at least one completed multipart body.
     let bodies = completed.lock().unwrap();
     assert!(!bodies.is_empty(), "complete endpoint should have been hit");
     assert!(!bodies[0].is_empty(), "multipart body should be non-empty");
-
-    // Sanity: ensure the synthetic engine would have produced something different.
-    // (We're not asserting the gradio output exactly matches the synthetic one;
-    // we only check both engines yield non-empty bytes of plausible size.)
-    assert!(expected.len() > 100);
 }

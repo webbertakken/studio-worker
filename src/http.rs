@@ -102,6 +102,7 @@ impl ApiClient {
         Ok(Some(response.json()?))
     }
 
+    /// Complete a job with binary output (image / audio / video).
     pub fn complete(
         &self,
         worker_id: &str,
@@ -114,6 +115,9 @@ impl ApiClient {
         let mime = match ext {
             "png" => "image/png",
             "webp" => "image/webp",
+            "wav" => "audio/wav",
+            "mp3" => "audio/mpeg",
+            "mp4" => "video/mp4",
             _ => "application/octet-stream",
         };
         let part = reqwest::blocking::multipart::Part::bytes(image)
@@ -121,6 +125,7 @@ impl ApiClient {
             .mime_str(mime)?;
         let form = reqwest::blocking::multipart::Form::new()
             .text("prompt", prompt.to_string())
+            .text("ext", ext.to_string())
             .part("image", part);
         let response = self
             .client
@@ -131,6 +136,37 @@ impl ApiClient {
         if !response.status().is_success() {
             return Err(anyhow!(
                 "complete failed: {} — {}",
+                response.status(),
+                response.text().unwrap_or_default()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Complete a job with structured JSON output (LLM / STT).
+    pub fn complete_json(
+        &self,
+        worker_id: &str,
+        token: &str,
+        job_id: &str,
+        prompt: &str,
+        result: &serde_json::Value,
+    ) -> Result<()> {
+        let body = serde_json::json!({
+            "jobId": job_id,
+            "prompt": prompt,
+            "result": result,
+            "resultKind": "json",
+        });
+        let response = self
+            .client
+            .post(self.url(&format!("/workers/{worker_id}/jobs/{job_id}/complete-json")))
+            .bearer_auth(token)
+            .json(&body)
+            .send()?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "complete-json failed: {} — {}",
                 response.status(),
                 response.text().unwrap_or_default()
             ));
