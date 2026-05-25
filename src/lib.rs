@@ -14,6 +14,8 @@ pub mod telemetry;
 #[doc(hidden)]
 pub mod test_support;
 pub mod types;
+#[cfg(feature = "ui")]
+pub mod ui;
 pub mod update;
 pub mod ws;
 
@@ -42,5 +44,20 @@ pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {
         cli::Command::SetThreshold { gb } => runtime::set_threshold(args.config.as_deref(), gb),
         cli::Command::Config => runtime::show_config(args.config.as_deref()),
         cli::Command::CheckUpdate => runtime::check_update(args.config.as_deref()).await,
+        cli::Command::Ui => run_ui(args.config.as_deref()).await,
     }
+}
+
+#[cfg(feature = "ui")]
+async fn run_ui(config_path: Option<&str>) -> anyhow::Result<()> {
+    ui::run(config_path)
+}
+
+#[cfg(not(feature = "ui"))]
+async fn run_ui(_config_path: Option<&str>) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "this build of studio-worker was compiled without the `ui` cargo feature.\n\
+         Reinstall with `cargo install studio-worker --features ui` (or use the \
+         desktop installer from the releases page) to enable the native UI."
+    )
 }

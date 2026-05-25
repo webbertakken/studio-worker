@@ -14,9 +14,10 @@ use crate::{
     update, AGENT_VERSION,
 };
 use anyhow::{anyhow, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use parking_lot::Mutex;
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -28,6 +29,107 @@ use tracing::info;
 /// Tracing target for runtime-level events (startup, state mutations).
 /// Stable so operators can filter with `RUST_LOG=studio_worker::runtime=debug`.
 const TRACE_TARGET: &str = "studio_worker::runtime";
+
+/// Maximum number of finished jobs kept in `WorkerObservers::recent_jobs`.
+/// Older entries fall off the back of the ring.
+pub const RECENT_JOBS_CAP: usize = 50;
+
+/// Prompt previews stored in `CurrentJob` / `RecentJob` are clipped to
+/// this many chars so the in-memory state stays bounded even when LLM
+/// prompts are huge.
+pub const PROMPT_PREVIEW_CHARS: usize = 200;
+
+/// Job in flight right now.  Populated by the WS session before
+/// dispatch, cleared once the job finishes (success or failure).
+#[derive(Debug, Clone)]
+pub struct CurrentJob {
+    pub job_id: String,
+    pub kind: TaskKind,
+    pub model: String,
+    pub prompt: String,
+    pub started_at: DateTime<Utc>,
+}
+
+/// Outcome a finished job ended with.  Failures carry the human
+/// reason (already surfaced to logs + Sentry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobOutcome {
+    Completed,
+    Failed { reason: String },
+}
+
+/// One finished job, retained in the recent-jobs ring for the UI.
+#[derive(Debug, Clone)]
+pub struct RecentJob {
+    pub job_id: String,
+    pub kind: TaskKind,
+    pub model: String,
+    pub prompt: String,
+    pub outcome: JobOutcome,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+}
+
+/// Result of the most recent heartbeat the WS session sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartbeatOutcome {
+    Ok,
+    Err { reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct HeartbeatStatus {
+    pub last_attempt_at: DateTime<Utc>,
+    pub outcome: HeartbeatOutcome,
+}
+
+/// Bundle of in-process observation slots the WS session writes to and
+/// the optional native UI reads from.  `Default` gives empty slots so
+/// existing (headless) call sites stay one-liners.  Cheap to clone —
+/// every field is an `Arc`.
+#[derive(Clone, Default)]
+pub struct WorkerObservers {
+    pub current_job: Arc<Mutex<Option<CurrentJob>>>,
+    pub recent_jobs: Arc<Mutex<VecDeque<RecentJob>>>,
+    pub last_heartbeat: Arc<Mutex<Option<HeartbeatStatus>>>,
+}
+
+pub fn truncate_prompt(s: &str) -> String {
+    if s.chars().count() <= PROMPT_PREVIEW_CHARS {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(PROMPT_PREVIEW_CHARS).collect();
+    out.push('…');
+    out
+}
+
+pub fn record_recent_job(observers: &WorkerObservers, entry: RecentJob) {
+    let mut ring = observers.recent_jobs.lock();
+    ring.push_front(entry);
+    while ring.len() > RECENT_JOBS_CAP {
+        ring.pop_back();
+    }
+}
+
+/// Test-only helper to populate the recent-jobs ring without driving a
+/// full claim cycle.  Lives in the library surface so integration
+/// tests can pin the ring-capacity contract cheaply.
+#[doc(hidden)]
+pub fn push_recent_job_for_tests(observers: &WorkerObservers, job_id: &str) {
+    let now = Utc::now();
+    record_recent_job(
+        observers,
+        RecentJob {
+            job_id: job_id.to_string(),
+            kind: TaskKind::Image,
+            model: "synthetic".into(),
+            prompt: String::new(),
+            outcome: JobOutcome::Completed,
+            started_at: now,
+            finished_at: now,
+        },
+    );
+}
 
 pub const AUTO_UPDATE_TICK: Duration = Duration::from_secs(60);
 
@@ -274,6 +376,7 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let observers = WorkerObservers::default();
 
     let stop_clone = stop.clone();
     tokio::spawn(async move {
@@ -281,7 +384,7 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
         stop_clone.store(true, Ordering::SeqCst);
     });
 
-    run_loops(cfg, stop, logs, busy, LoopSchedule::default()).await
+    run_loops(cfg, stop, logs, busy, observers, LoopSchedule::default()).await
 }
 
 /// Spawn the WS session + auto-updater, wait for them.  Pulled out of
@@ -291,6 +394,7 @@ pub async fn run_loops(
     stop: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
+    observers: WorkerObservers,
     schedule: LoopSchedule,
 ) -> Result<()> {
     let session_schedule = crate::ws::session::SessionSchedule::default();
@@ -299,6 +403,7 @@ pub async fn run_loops(
         stop.clone(),
         logs.clone(),
         busy.clone(),
+        observers.clone(),
         session_schedule,
     );
     let auto_updater = spawn_auto_updater(

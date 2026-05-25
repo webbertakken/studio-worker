@@ -28,6 +28,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
 use studio_worker::config::{self, Config};
+use studio_worker::runtime::WorkerObservers;
 use studio_worker::types::LogEntry;
 use studio_worker::ws::session::{spawn_ws_session, SessionSchedule};
 use tokio::net::{TcpListener, TcpStream};
@@ -178,7 +179,15 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
         let logs = logs.clone();
         let busy = busy.clone();
         async move {
-            spawn_ws_session(shared, stop, logs, busy, SessionSchedule::fast_for_tests()).await
+            spawn_ws_session(
+                shared,
+                stop,
+                logs,
+                busy,
+                WorkerObservers::default(),
+                SessionSchedule::fast_for_tests(),
+            )
+            .await
         }
     });
 

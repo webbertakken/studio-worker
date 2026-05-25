@@ -293,6 +293,7 @@ pub struct FailRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ui", derive(PartialEq, Eq))]
 pub struct LogEntry {
     pub ts: String,
     pub level: String,

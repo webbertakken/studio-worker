@@ -19,12 +19,24 @@ jobs:
         include:
           - features: ""
             label: default
+            apt: ""
           - features: "all-engines-llm"
             label: llm-bundle
+            apt: ""
           - features: "all-engines-stt"
             label: stt-bundle
+            apt: ""
+          - features: "ui"
+            label: ui
+            apt: "libgtk-3-dev libdbus-1-dev libxdo-dev libayatana-appindicator3-dev"
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install Linux UI build deps
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:

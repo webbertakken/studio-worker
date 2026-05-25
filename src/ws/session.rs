@@ -23,7 +23,9 @@ use tracing::{info, warn};
 use crate::config::SharedConfig;
 use crate::engine::Engine;
 use crate::http::ApiClient;
-use crate::runtime::{build_capabilities, is_unsupported_kind, prompt_for, push_log};
+use crate::runtime::{
+    build_capabilities, is_unsupported_kind, prompt_for, push_log, WorkerObservers,
+};
 use crate::types::{LogEntry, TaskResult, WorkerCapabilities};
 use crate::ws::client::{connect, WsClientError, WsSender};
 use crate::ws::types::{HelloFrame, JobOfferClaim, WorkerInbound, WorkerOutbound};
@@ -93,8 +95,14 @@ pub async fn spawn_ws_session(
     stop: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
+    _observers: WorkerObservers,
     schedule: SessionSchedule,
 ) -> Result<()> {
+    // `observers` is threaded through so the optional native UI gets a
+    // live view of the worker.  Wired into the dispatch path in a
+    // follow-up commit; for now the slots stay empty (Default::default
+    // on the WorkerObservers).  The headless build doesn't care.
+    let _ = &_observers;
     let max_attempts = {
         let guard = cfg.lock();
         guard
