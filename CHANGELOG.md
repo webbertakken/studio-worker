@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.1.2...studio-worker-v0.2.0) (2026-05-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* `bootstrap_token` and the `POST /workers/register` HTTP route are gone.  Existing configs round-trip (the field is ignored on load and dropped on next save).
+
+### Features
+
+* auto-register with operator approval ([#11](https://github.com/webbertakken/studio-worker/issues/11)) ([b5f2155](https://github.com/webbertakken/studio-worker/commit/b5f2155f77a0ebe4e55d6a862dae0333fba97785))
+* **ws:** worker channel, replace HTTP polling ([#8](https://github.com/webbertakken/studio-worker/issues/8)) ([ba43424](https://github.com/webbertakken/studio-worker/commit/ba43424658091a479124fdf33e738b48c7cf6fcf))
+
 ## [0.1.2](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.1.1...studio-worker-v0.1.2) (2026-05-25)
 
 
