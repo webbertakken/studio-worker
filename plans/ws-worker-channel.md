@@ -205,13 +205,35 @@ defined there. Both sides land together as a hard cutover.
 
 ## Phase 6 — Service unit + docs
 
-- [ ] `src/service.rs`: confirm the systemd template sets `Restart=on-failure` and
-      `RestartSec=5s`. Same for the launchd plist and the scheduled task.
-- [ ] Update `README.md` quickstart: replace the "polls every 2 s" line with the WS
-      diagram. Add a short troubleshooting section for "worker exits with auth error".
-- [ ] Update `AGENTS.md`: list `tokio-tungstenite` under tech stack, drop the
-      "(blocking)" qualifier on `reqwest`.
-- [ ] `cargo fmt`, `cargo clippy --tests -- -D warnings`, `cargo test` all green.
+- [x] Confirmed the auto-restart policy is already in place across
+      every OS template:
+      systemd — `Restart=on-failure` + `RestartSec=5`;
+      launchd — `KeepAlive=true`;
+      Windows Task Scheduler — `<RestartOnFailure><Interval>PT1M</Interval><Count>10</Count>`.
+- [x] `README.md` rewritten:
+  - Replaced the pull-based blurb + intermediate "polls every 2 s"
+    line with a WS pipeline description + ASCII diagram.
+  - Added a `## Troubleshooting` section explaining
+    `ws auth failed: ...` and `ws reconnect cap reached` exits.
+  - Added the `ws_reconnect_attempts` config field with its semantics.
+  - Replaced the `run` subcommand description with "Hold the WS session
+    + auto-update loop".
+  - Refreshed the integration-test list with `ws_wire.rs`,
+    `ws_client_contract.rs`, `ws_session_full_loop.rs`, slimmed
+    `http_contract.rs`, etc.
+  - Updated the observability section to describe the WS `logBatch`
+    frame ingest instead of the deleted `POST /workers/<id>/logs`
+    route.
+- [x] `AGENTS.md` refreshed:
+  - Added `tokio-tungstenite`, `futures-util`, and `thiserror` to the
+    Tech stack.
+  - Re-tagged `reqwest` (blocking) as "surviving `/register` +
+    multipart `/complete` routes".
+  - Replaced the runtime-loops description in Project layout with the
+    new `ws/{client,session,types}.rs` modules and the WS-driven
+    integration tests.
+- [x] `cargo fmt --check`, `cargo clippy --tests -- -D warnings`, and
+      `cargo test` (245 tests across 21 suites) all green.
 
 ## Open questions surfaced for the user
 

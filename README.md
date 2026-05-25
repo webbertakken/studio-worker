@@ -8,10 +8,25 @@ A single self-contained Rust binary that pulls **image**, **LLM**,
 **audio (STT/TTS)**, and **video** jobs from the minis.gg studio API,
 runs them locally, and posts the results back.
 
+Install the worker on any PC, register once, and it will hold a
+hibernatable **WebSocket session** to the studio API's
+`WorkerConnections` Durable Object.  The studio pushes job offers over
+the socket as soon as they're queued; the worker accepts, runs the
+engine, and posts the result back the same way (or via a single HTTP
+multipart route for image / audio / video bytes).  The worker also
+**auto-updates itself** between jobs.
+
+```
+  studio-worker binary <----- WebSocket -----> WorkerConnections DO <-> D1
+         ^                                          ^
+         |     HTTP multipart /complete             |
+         +------------------------------------------+ (binary outputs only)
+```
+
 Replaces the previous push-based studio-proxy + cloudflared topology
-with a pull-based pipeline: install the worker on any PC, register
-once, and it will claim queued jobs whose VRAM estimate fits its
-threshold.  The worker also **auto-updates itself** between jobs.
+and the intermediate pull-based polling pipeline.  All five legacy
+worker HTTP routes (`heartbeat`, `claim`, `complete-json`, `fail`,
+`logs`) are now WS frame types.
 
 ## Tasks supported
 
@@ -76,7 +91,7 @@ studio-worker install-service
 
 | Subcommand           | Purpose                                                         |
 | -------------------- | --------------------------------------------------------------- |
-| `run`                | Start the heartbeat + claim + log + auto-update loops.          |
+| `run`                | Hold the WS session + auto-update loop.                         |
 | `register`           | One-shot register with the API.  Idempotent.                    |
 | `status`             | Print the local config + heartbeat info.                        |
 | `install-service`    | Install the auto-start OS service.                              |
@@ -116,7 +131,26 @@ auto_update_enabled       = true
 auto_update_interval_secs = 1800
 auto_update_feed          = "https://api.github.com/repos/webbertakken/studio-worker/releases"
 auto_update_prerelease    = false
+
+# WebSocket reconnect cap.  When the session drops the worker tries
+# to reconnect with exponential backoff up to this many times before
+# exiting non-zero (and letting systemd/launchd/Task-Scheduler
+# restart it).  `0` = infinite.  Omit to use the default of 5.
+ws_reconnect_attempts     = 5
 ```
+
+## Troubleshooting
+
+- **Worker exits with `ws auth failed: ...`** — the studio API rejected
+  the auth token on the upgrade (HTTP 401) or via a close-code 4001
+  after a successful upgrade.  The token was either revoked, the
+  worker was deleted from the studio admin UI, or `config.toml`
+  carries a stale token.  Re-register: `studio-worker register
+  --bootstrap-token <TOKEN> --api-base-url <URL>`.
+- **Worker exits with `ws reconnect cap reached`** — every reconnect
+  attempt failed (DNS, TLS, or the API is down).  Service manager will
+  restart us; if it keeps happening, check the API is reachable from
+  the worker host.
 
 ## Engines
 
@@ -173,8 +207,9 @@ Set `auto_update_enabled = false` to opt out.  Set
 
 ## Observability
 
-Each tick of the worker pushes a batch of log entries to
-`POST /workers/<id>/logs`.  The studio surfaces these in its LogViewer.
+The worker batches log entries every second and pushes them as a
+`logBatch` frame over the WS session.  The DO ingests them into the
+`workerLogs` D1 table; the studio LogViewer reads them from there.
 
 ### Sentry (opt-in)
 
@@ -221,19 +256,27 @@ Truly-untestable bits excluded from the gate:
 
 Integration tests live under `tests/`:
 
-- `tests/http_contract.rs` — exercises every API endpoint against a
-  wiremock-based fake studio.
-- `tests/http_errors.rs` — error-status paths for every endpoint.
+- `tests/ws_wire.rs` — round-trip tests for every `WorkerInbound` /
+  `WorkerOutbound` frame against the TS contract.
+- `tests/ws_client_contract.rs` — the WS client against a live
+  tokio-tungstenite server (upgrade headers, hello roundtrip, 401 →
+  AuthFailed, close 4001 → AuthFailed, binary-frame rejection, close
+  idempotency).
+- `tests/ws_session_full_loop.rs` — end-to-end walk: hello → welcome
+  → LLM offer → accept + completeJson → STT offer → accept +
+  completeJson → clean close.
+- `tests/http_contract.rs` — register + multipart `complete` (image
+  + audio) against wiremock.
+- `tests/http_errors.rs` — error-status paths for register +
+  multipart `complete` plus the tracing-emission contract.
 - `tests/gradio_engine.rs` — GradioEngine code paths against a fake
   Gradio (incl. data-URL / relative-URL / object-with-url responses).
 - `tests/multi_modal.rs` — every TaskKind round-trips through the
   synthetic engine + decoders.
 - `tests/auto_update.rs` — release feed parsing + apply_with full flow.
 - `tests/runtime_helpers.rs` — one-shot CLI helpers via wiremock.
-- `tests/runtime_ticks.rs` — per-tick coverage of the background loops.
-- `tests/runtime_loops.rs` — spawn_* wrappers driven with millisecond
-  intervals to exercise the wrapper bodies.
-- `tests/full_loop.rs` — one full claim → generate → complete cycle.
+- `tests/runtime_ticks.rs` — auto-update ticks + `run_returns_when_aborted`
+  smoke test that exercises the AuthFailed exit path.
 
 ## Release process
 
