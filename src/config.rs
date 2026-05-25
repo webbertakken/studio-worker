@@ -1,10 +1,22 @@
 //! Persistent config in `~/.config/minis-studio-worker/config.toml` (Linux/macOS)
 //! or `%APPDATA%\minis-studio-worker\config.toml` (Windows).
+//!
+//! Every load/save emits a structured tracing breadcrumb so operators
+//! can tell from `journalctl` which file the worker actually consulted
+//! (and whether the file existed or was freshly bootstrapped with
+//! defaults).  The events deliberately omit the two secret fields
+//! — `bootstrap_token` and `auth_token` — so logs can be shipped
+//! off-box without leaking credentials.  See `tests/config_tracing.rs`
+//! for the regression contract.
 use anyhow::{anyhow, Context, Result};
 use directories::ProjectDirs;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Tracing target for config persistence events.  Stable so operators
+/// can filter with `RUST_LOG=studio_worker::config=debug`.
+const TRACE_TARGET: &str = "studio_worker::config";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -111,11 +123,35 @@ pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
     if !path.exists() {
         let cfg = Config::default();
         save(&cfg, &path)?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            op = "load",
+            source = "default_created",
+            config_path = %path.display(),
+            engine = %cfg.engine,
+            api_base_url = %cfg.api_base_url,
+            vram_threshold_gb = cfg.vram_threshold_gb,
+            auto_enabled = cfg.auto_enabled,
+            "config file missing — bootstrapped defaults"
+        );
         return Ok((cfg, path));
     }
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let cfg: Config = toml::from_str(&text).with_context(|| "parsing config.toml")?;
+    tracing::debug!(
+        target: TRACE_TARGET,
+        op = "load",
+        source = "existing_file",
+        config_path = %path.display(),
+        engine = %cfg.engine,
+        api_base_url = %cfg.api_base_url,
+        vram_threshold_gb = cfg.vram_threshold_gb,
+        auto_enabled = cfg.auto_enabled,
+        worker_id = cfg.worker_id.as_deref().unwrap_or("(unregistered)"),
+        has_auth_token = cfg.auth_token.is_some(),
+        "loaded config from disk"
+    );
     Ok((cfg, path))
 }
 
@@ -125,7 +161,18 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(cfg).with_context(|| "serialising config")?;
+    let bytes = text.len();
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    tracing::debug!(
+        target: TRACE_TARGET,
+        op = "save",
+        config_path = %path.display(),
+        engine = %cfg.engine,
+        vram_threshold_gb = cfg.vram_threshold_gb,
+        auto_enabled = cfg.auto_enabled,
+        bytes = bytes,
+        "persisted config to disk"
+    );
     Ok(())
 }
 
