@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.2](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.1.1...studio-worker-v0.1.2) (2026-05-25)
+
+
+### Features
+
+* friendly hint when register can't reach the api ([#3](https://github.com/webbertakken/studio-worker/issues/3)) ([6ab122e](https://github.com/webbertakken/studio-worker/commit/6ab122ea18ec1979c91c1c407ecae9724a5b017f))
+* opt-in sentry + structured tracing pass ([#5](https://github.com/webbertakken/studio-worker/issues/5)) ([cd08513](https://github.com/webbertakken/studio-worker/commit/cd0851393c3bc10fa36a296f67fffb168527928b))
+* **ui:** native egui desktop UI + tray + autostart ([#7](https://github.com/webbertakken/studio-worker/issues/7)) ([4ae6c08](https://github.com/webbertakken/studio-worker/commit/4ae6c08af37c2d83bda10b9fe8f23f7423269105))
+
 ## [0.1.1](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.1.0...studio-worker-v0.1.1) (2026-05-16)
 
 
