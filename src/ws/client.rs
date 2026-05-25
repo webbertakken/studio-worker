@@ -30,7 +30,10 @@ use url::Url;
 use crate::ws::types::{WorkerInbound, WorkerOutbound};
 
 pub const SUBPROTOCOL: &str = "studio-worker-v1";
-const CONNECT_PATH: &str = "/workers";
+/// Mirrors the same prefix the HTTP `ApiClient` mounts under.  Stays
+/// single-sourced with the API's Hono `basePath('/api')` + outer
+/// `/graphics` mount.
+const API_PREFIX: &str = "/graphics/api";
 
 /// Result wrapper for WS-client operations.
 pub type WsResult<T> = Result<T, WsClientError>;
@@ -90,7 +93,15 @@ fn build_connect_url(base_url: &str, worker_id: &str) -> WsResult<Url> {
             .map_err(|_| WsClientError::Transport("set_scheme failed".to_string()))?;
     }
     let trimmed_path = url.path().trim_end_matches('/');
-    let new_path = format!("{trimmed_path}{CONNECT_PATH}/{worker_id}/connect");
+    // Append the studio's `/graphics/api` prefix unless the caller has
+    // already baked it into `base_url` (matches what `ApiClient::url`
+    // does on the HTTP side).
+    let prefixed = if trimmed_path.ends_with(API_PREFIX) {
+        trimmed_path.to_string()
+    } else {
+        format!("{trimmed_path}{API_PREFIX}")
+    };
+    let new_path = format!("{prefixed}/workers/{worker_id}/connect");
     url.set_path(&new_path);
     Ok(url)
 }
@@ -326,6 +337,13 @@ mod tests {
         let url = build_connect_url("https://api.example/graphics/api/", "w-2").unwrap();
         assert_eq!(url.scheme(), "wss");
         assert_eq!(url.path(), "/graphics/api/workers/w-2/connect");
+    }
+
+    #[test]
+    fn build_connect_url_appends_graphics_api_prefix_when_missing() {
+        let url = build_connect_url("http://localhost:9790", "w-3").unwrap();
+        assert_eq!(url.scheme(), "ws");
+        assert_eq!(url.path(), "/graphics/api/workers/w-3/connect");
     }
 
     #[test]
