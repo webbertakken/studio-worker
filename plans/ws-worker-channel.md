@@ -107,27 +107,45 @@ defined there. Both sides land together as a hard cutover.
 
 ## Phase 3 — Runtime rewrite
 
-- [ ] Delete `spawn_heartbeat`, `spawn_claim_loop`, `spawn_log_shipper` from
-      `src/runtime.rs` along with their `LoopSchedule` fields. Keep `spawn_auto_updater`
-      untouched.
-- [ ] New `spawn_ws_session(api, config, engine, logs, busy, stop)` owning the WS for
-      the lifetime of the run. Internal structure:
-  - [ ] `tokio::select!` over: incoming WS frame, heartbeat tick (every 5 s),
-        log-flush tick (every 1 s), shutdown signal.
-  - [ ] On `Offer`: spawn a `tokio::task::spawn_blocking` for engine dispatch
-        (matches today's pattern). On success, send `CompleteJson` for JSON kinds or
-        run `ApiClient::complete` for binary kinds, then send `ReadyForMore`.
-  - [ ] On engine error: send `Fail` with `retryable` derived from the error type.
-  - [ ] On `error` frame from server (e.g. 4003 duplicate worker): log + exit non-zero.
-- [ ] Refactor `claim_tick` → `dispatch_offer` taking a `JobClaim` directly (no HTTP
-      call inside; the WS supplies the claim). Keep the public outer signature so the
-      existing dispatch tests in `tests/runtime_ticks.rs` still cover engine error
-      paths.
-- [ ] Reconnect policy:
-  - [ ] `ws_reconnect_attempts` (default 5, config-toml + `--ws-reconnect-attempts`),
-        `ws_reconnect_backoff_ms_base` (default 1000) with `2^n` jitter.
-  - [ ] After N failures: emit a final ERROR log, `exit(1)`. The systemd / launchd unit
-        restarts us.
+- [x] Added `src/ws/session.rs` housing the WS lifecycle.  Pure async
+      module that holds the connection for the duration of `run`.
+- [x] `spawn_ws_session(cfg, stop, logs, busy, schedule)`:
+  - [x] Connects via `connect()`, splits into `(WsSender, WsReceiver)`.
+  - [x] Sends `hello` with current capabilities (rebuilt every reconnect).
+  - [x] Spawns a **reader** task that pumps frames into an mpsc channel.
+  - [x] Spawns a **heartbeat** task that pushes a `Heartbeat` frame
+        every `schedule.heartbeat` via the shared sender.
+  - [x] Spawns a **log-shipper** task that flushes the in-memory log
+        buffer to the server as a `LogBatch` frame every
+        `schedule.log_flush`.
+  - [x] Spawns a **shutdown observer** that watches the `stop` flag and
+        injects a `Stopped` event into the dispatch loop.
+  - [x] Dispatch loop reacts to `Welcome` (logged), `Offer` (accept +
+        engine dispatch), `Error` (auth or fatal), `HeartbeatAck`,
+        `CompleteAck`, `FailAck` (ignored).
+  - [x] On `Offer`: spawns a `tokio` task that runs the engine inside
+        `spawn_blocking`.  Binary results go through the existing
+        `ApiClient::complete` HTTP multipart and then send `ReadyForMore`
+        over the WS; JSON results go straight back as `CompleteJson`.
+  - [x] On engine error: send `Fail` with `retryable = !is_unsupported_kind(...)`.
+  - [x] On `Error` frame (`auth_failed` or other): exit the session with
+        the correct `SessionOutcome` variant; reconnect loop decides
+        what to do.
+- [x] Reconnect policy in `spawn_ws_session`:
+  - [x] Tunables in `SessionSchedule`: heartbeat / log_flush /
+        shutdown_tick / base_backoff_ms / max_backoff_ms.
+  - [x] `cfg.ws_reconnect_attempts` (default 5; `0` = infinite).
+  - [x] Backoff is exponential (`base * 2^(attempt-1)`) capped at
+        `max_backoff_ms`.
+  - [x] AuthFailed / Fatal → do not reconnect; bubble error up to
+        `run` which lets the process exit non-zero.
+- [x] `runtime::run_loops` rewritten: now spawns `ws::session::spawn_ws_session`
+      and `spawn_auto_updater` and joins them.  Signature now returns
+      `Result<()>` so auth failures surface to the binary's exit code.
+      The four old `spawn_*` functions stay alive only as no-ops the
+      legacy tests will tick off in Phase 4.
+- [x] `Config` gains `ws_reconnect_attempts: Option<u32>`.
+- [x] All 277 cargo tests still green; clippy + fmt clean.
 
 ## Phase 4 — Delete dead HTTP code
 

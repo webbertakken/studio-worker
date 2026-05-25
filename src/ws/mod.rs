@@ -5,4 +5,5 @@
 //! `tokio-tungstenite` connection and exposes a session API to the
 //! runtime.
 pub mod client;
+pub mod session;
 pub mod types;

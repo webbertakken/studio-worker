@@ -297,35 +297,26 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
         stop_clone.store(true, Ordering::SeqCst);
     });
 
-    run_loops(cfg, stop, logs, busy, LoopSchedule::default()).await;
-    Ok(())
+    run_loops(cfg, stop, logs, busy, LoopSchedule::default()).await
 }
 
-/// Spawn the four loops with the supplied schedule and wait for them to
-/// exit.  Pulled out of `run` so tests can drive the loop wrappers with
-/// short intervals.
+/// Spawn the WS session + auto-updater, wait for them.  Pulled out of
+/// `run` so tests can drive with a different schedule.
 pub async fn run_loops(
     cfg: SharedConfig,
     stop: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
     schedule: LoopSchedule,
-) {
-    let heartbeat = spawn_heartbeat(
+) -> Result<()> {
+    let session_schedule = crate::ws::session::SessionSchedule::default();
+    let session = crate::ws::session::spawn_ws_session(
         cfg.clone(),
         stop.clone(),
         logs.clone(),
         busy.clone(),
-        schedule,
+        session_schedule,
     );
-    let claim = spawn_claim_loop(
-        cfg.clone(),
-        stop.clone(),
-        logs.clone(),
-        busy.clone(),
-        schedule,
-    );
-    let log_shipper = spawn_log_shipper(cfg.clone(), stop.clone(), logs.clone(), schedule);
     let auto_updater = spawn_auto_updater(
         cfg.clone(),
         stop.clone(),
@@ -333,7 +324,8 @@ pub async fn run_loops(
         busy.clone(),
         schedule,
     );
-    let _ = tokio::join!(heartbeat, claim, log_shipper, auto_updater);
+    let (session_result, _) = tokio::join!(session, auto_updater);
+    session_result
 }
 
 // ---------------------------------------------------------------------------

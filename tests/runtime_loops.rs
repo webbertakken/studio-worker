@@ -153,7 +153,8 @@ async fn run_loops_with_fast_schedule_starts_and_stops() {
     let busy = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
     let handle = tokio::spawn(async move {
-        runtime::run_loops(cfg, stop_clone, logs, busy, LoopSchedule::fast_for_tests()).await;
+        let _ =
+            runtime::run_loops(cfg, stop_clone, logs, busy, LoopSchedule::fast_for_tests()).await;
     });
     tokio::time::sleep(Duration::from_millis(40)).await;
     stop.store(true, Ordering::SeqCst);

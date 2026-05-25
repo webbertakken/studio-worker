@@ -13,9 +13,12 @@
 use std::convert::TryFrom;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::StatusCode;
@@ -120,13 +123,108 @@ pub async fn connect(base_url: &str, worker_id: &str, auth_token: &str) -> WsRes
     })
 }
 
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+type WsSource = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+
 /// Active worker-side WS session.  Cheap to construct, expensive to
 /// drop (closes the socket gracefully).
 #[allow(missing_debug_implementations)]
 pub struct WsClient {
-    sink: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-    source: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    sink: WsSink,
+    source: WsSource,
     closed: bool,
+}
+
+impl WsClient {
+    /// Split the client into a cheap-to-clone `WsSender` and a
+    /// single-owner `WsReceiver`.  Used by the runtime so heartbeat,
+    /// log-shipper, and engine-dispatch tasks can all push frames
+    /// concurrently while a dedicated task drains the receive side.
+    pub fn split(self) -> (WsSender, WsReceiver) {
+        let sink = Arc::new(Mutex::new(self.sink));
+        (
+            WsSender { sink },
+            WsReceiver {
+                source: self.source,
+                closed: false,
+            },
+        )
+    }
+}
+
+/// Cheap-to-clone send half.  All senders share one `Mutex` over the
+/// underlying sink so writes from heartbeat / log-shipper / engine
+/// dispatch tasks are serialised correctly.
+#[derive(Clone)]
+#[allow(missing_debug_implementations)]
+pub struct WsSender {
+    sink: Arc<Mutex<WsSink>>,
+}
+
+impl WsSender {
+    pub async fn send(&self, frame: &WorkerInbound) -> WsResult<()> {
+        let text =
+            serde_json::to_string(frame).map_err(|e| WsClientError::Protocol(e.to_string()))?;
+        let mut guard = self.sink.lock().await;
+        guard
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(WsClientError::from)
+    }
+
+    pub async fn close(&self, code: u16, reason: &str) -> WsResult<()> {
+        let frame = CloseFrame {
+            code: CloseCode::from(code),
+            reason: reason.to_owned().into(),
+        };
+        let mut guard = self.sink.lock().await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            guard.send(Message::Close(Some(frame))),
+        )
+        .await;
+        Ok(())
+    }
+}
+
+/// Single-owner receive half.  Owned by the session's reader task.
+#[allow(missing_debug_implementations)]
+pub struct WsReceiver {
+    source: WsSource,
+    closed: bool,
+}
+
+impl WsReceiver {
+    /// Read the next outbound frame.  Same semantics as
+    /// `WsClient::recv` — silent close → `Ok(None)`, close frame with
+    /// 4001 → `AuthFailed`, other closes → `ConnectionClosed`.
+    pub async fn recv(&mut self) -> WsResult<Option<WorkerOutbound>> {
+        if self.closed {
+            return Ok(None);
+        }
+        while let Some(item) = self.source.next().await {
+            match item {
+                Ok(Message::Text(text)) => {
+                    let frame: WorkerOutbound = serde_json::from_str(&text)
+                        .map_err(|e| WsClientError::Protocol(e.to_string()))?;
+                    return Ok(Some(frame));
+                }
+                Ok(Message::Binary(_)) => {
+                    return Err(WsClientError::Protocol(
+                        "unexpected binary frame".to_string(),
+                    ));
+                }
+                Ok(Message::Close(frame)) => {
+                    self.closed = true;
+                    return Err(close_frame_to_error(frame));
+                }
+                Ok(_) => continue,
+                Err(e) => return Err(WsClientError::from(e)),
+            }
+        }
+        self.closed = true;
+        Ok(None)
+    }
 }
 
 impl std::fmt::Debug for WsClient {
