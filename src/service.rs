@@ -8,6 +8,83 @@
 //! unit-tested without touching the real OS.
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use tracing::{info, warn};
+
+const TRACE_TARGET: &str = "studio_worker::service";
+
+/// Outcome of running a single OS command step (e.g. `systemctl
+/// daemon-reload`, `launchctl unload`, `schtasks /Delete`).  Splits the
+/// three observable states so callers can compose them into an overall
+/// activation/deactivation success and so each one emits a distinct
+/// structured tracing event instead of being silently swallowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepOutcome {
+    /// Command spawned and exited with a zero status.
+    Succeeded,
+    /// Command spawned but exited non-zero (with the captured code if any).
+    Failed { code: Option<i32> },
+    /// Spawn itself failed — tool missing on PATH, permission denied, etc.
+    SpawnFailed,
+}
+
+impl StepOutcome {
+    pub(crate) fn is_success(self) -> bool {
+        matches!(self, StepOutcome::Succeeded)
+    }
+}
+
+/// Pure mapping from a `Command::status()` result onto [`StepOutcome`].
+pub(crate) fn classify_status(status: std::io::Result<std::process::ExitStatus>) -> StepOutcome {
+    match status {
+        Ok(s) if s.success() => StepOutcome::Succeeded,
+        Ok(s) => StepOutcome::Failed { code: s.code() },
+        Err(_) => StepOutcome::SpawnFailed,
+    }
+}
+
+/// Run a single command step and emit a structured tracing event for
+/// the outcome.  Returns the classified [`StepOutcome`] so callers can
+/// chain steps and short-circuit on failure.  Without this every
+/// `RealOps::activate` / `deactivate` step would silently swallow
+/// failures of systemctl / launchctl / schtasks.
+fn run_step(op: &'static str, step: &'static str, mut cmd: Command) -> StepOutcome {
+    let started = std::time::Instant::now();
+    let status = cmd.status();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let outcome = classify_status(status);
+    match outcome {
+        StepOutcome::Succeeded => {
+            info!(
+                target: TRACE_TARGET,
+                op,
+                step,
+                elapsed_ms,
+                "service step succeeded"
+            );
+        }
+        StepOutcome::Failed { code } => {
+            warn!(
+                target: TRACE_TARGET,
+                op,
+                step,
+                elapsed_ms,
+                exit_code = code,
+                "service step exited non-zero"
+            );
+        }
+        StepOutcome::SpawnFailed => {
+            warn!(
+                target: TRACE_TARGET,
+                op,
+                step,
+                elapsed_ms,
+                "service step could not be spawned (tool missing on PATH?)"
+            );
+        }
+    }
+    outcome
+}
 
 #[cfg(target_os = "linux")]
 const SERVICE_FILENAME: &str = "minis-studio-worker.service";
@@ -75,16 +152,14 @@ impl ServiceOps for RealOps {
     fn activate(&self, unit_path: &Path) -> bool {
         #[cfg(target_os = "linux")]
         {
-            let status = std::process::Command::new("systemctl")
-                .args(["--user", "daemon-reload"])
-                .status();
-            if status.map(|s| s.success()).unwrap_or(false) {
-                let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "enable", "--now", SERVICE_FILENAME])
-                    .status();
-                return true;
+            let mut reload = Command::new("systemctl");
+            reload.args(["--user", "daemon-reload"]);
+            if !run_step("activate", "daemon-reload", reload).is_success() {
+                return false;
             }
-            false
+            let mut enable = Command::new("systemctl");
+            enable.args(["--user", "enable", "--now", SERVICE_FILENAME]);
+            run_step("activate", "enable-now", enable).is_success()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -92,24 +167,25 @@ impl ServiceOps for RealOps {
         }
     }
 
-    fn deactivate(&self, _unit_path: &Path) {
+    #[allow(unused_variables)]
+    fn deactivate(&self, unit_path: &Path) {
         #[cfg(target_os = "linux")]
         {
-            let _ = std::process::Command::new("systemctl")
-                .args(["--user", "disable", "--now", SERVICE_FILENAME])
-                .status();
+            let mut disable = Command::new("systemctl");
+            disable.args(["--user", "disable", "--now", SERVICE_FILENAME]);
+            let _ = run_step("deactivate", "disable-now", disable);
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = std::process::Command::new("launchctl")
-                .args(["unload", _unit_path.to_string_lossy().as_ref()])
-                .status();
+            let mut unload = Command::new("launchctl");
+            unload.args(["unload", unit_path.to_string_lossy().as_ref()]);
+            let _ = run_step("deactivate", "launchctl-unload", unload);
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("schtasks")
-                .args(["/Delete", "/TN", "MinisStudioWorker", "/F"])
-                .status();
+            let mut delete = Command::new("schtasks");
+            delete.args(["/Delete", "/TN", "MinisStudioWorker", "/F"]);
+            let _ = run_step("deactivate", "schtasks-delete", delete);
         }
     }
 }
@@ -139,11 +215,20 @@ pub fn install_with<O: ServiceOps>(ops: &O, config_path: Option<&str>) -> Result
 
     println!("wrote service unit: {}", path.display());
 
-    if ops.activate(&path) {
+    let activated = ops.activate(&path);
+    if activated {
         println!("activated service unit");
     } else {
         print_activation_instructions(&path);
     }
+    info!(
+        target: TRACE_TARGET,
+        op = "install",
+        unit_path = %path.display(),
+        binary_path = %bin.display(),
+        activated,
+        "service install completed"
+    );
     Ok(())
 }
 
@@ -151,12 +236,21 @@ pub fn uninstall_with<O: ServiceOps>(ops: &O) -> Result<()> {
     let dir = ops.unit_dir()?;
     let path = dir.join(SERVICE_FILENAME);
     ops.deactivate(&path);
-    if path.exists() {
+    let removed = if path.exists() {
         std::fs::remove_file(&path)?;
         println!("removed service unit: {}", path.display());
+        true
     } else {
         println!("no service unit to remove at {}", path.display());
-    }
+        false
+    };
+    info!(
+        target: TRACE_TARGET,
+        op = "uninstall",
+        unit_path = %path.display(),
+        removed,
+        "service uninstall completed"
+    );
     Ok(())
 }
 
@@ -404,5 +498,187 @@ mod tests {
         };
         // No file written; uninstall should still succeed.
         uninstall_with(&ops).unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Structured tracing — proves install/uninstall and the per-platform
+    // RealOps steps emit operator-visible breadcrumbs.  Without these,
+    // a failing `systemctl enable --now`, `launchctl unload` or
+    // `schtasks /Delete` would silently leave the worker un-activated
+    // (or still registered) with no log trail to diagnose it.
+    // -----------------------------------------------------------------
+
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CapturingMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for CapturingMakeWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturingWriter(self.0.clone())
+        }
+    }
+
+    impl io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture<F: FnOnce() + Send + 'static>(f: F) -> String {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let buf_for_thread = buf.clone();
+        // Run the closure on a fresh OS thread so the thread-local
+        // `with_default` is isolated from whatever subscriber state the
+        // test runner left on its worker threads.  Mirrors the pattern
+        // in tests/http_errors.rs and tests/auto_update.rs.
+        std::thread::spawn(move || {
+            let make_writer = CapturingMakeWriter(buf_for_thread);
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(make_writer)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            tracing::subscriber::with_default(subscriber, f);
+        })
+        .join()
+        .expect("capture thread panicked");
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("tracing output should be valid UTF-8")
+    }
+
+    fn fake_ops(dir: PathBuf, activate_returns: bool) -> FakeOps {
+        FakeOps {
+            bin: PathBuf::from("/usr/bin/studio-worker"),
+            dir,
+            activate_returns,
+            activate_calls: RefCell::new(Vec::new()),
+            deactivate_calls: RefCell::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn install_with_emits_info_event_with_activated_true_when_activation_succeeds() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let logs = capture(move || {
+            install_with(&fake_ops(dir_path, true), None).unwrap();
+        });
+        assert!(logs.contains("INFO"), "expected INFO event, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::service"),
+            "expected service target, got: {logs}"
+        );
+        assert!(logs.contains("op=\"install\""), "expected op field: {logs}");
+        assert!(
+            logs.contains("activated=true"),
+            "expected activated=true: {logs}"
+        );
+        assert!(
+            logs.contains(SERVICE_FILENAME),
+            "expected unit_path in log, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn install_with_emits_info_event_with_activated_false_on_manual_fallback() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let logs = capture(move || {
+            install_with(&fake_ops(dir_path, false), None).unwrap();
+        });
+        assert!(
+            logs.contains("activated=false"),
+            "expected activated=false: {logs}"
+        );
+    }
+
+    #[test]
+    fn uninstall_with_emits_info_event_with_removed_true_when_file_existed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(SERVICE_FILENAME);
+        std::fs::write(&path, "dummy").unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let logs = capture(move || {
+            uninstall_with(&fake_ops(dir_path, false)).unwrap();
+        });
+        assert!(
+            logs.contains("op=\"uninstall\""),
+            "expected op field: {logs}"
+        );
+        assert!(
+            logs.contains("removed=true"),
+            "expected removed=true: {logs}"
+        );
+    }
+
+    #[test]
+    fn uninstall_with_emits_info_event_with_removed_false_when_file_missing() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let logs = capture(move || {
+            uninstall_with(&fake_ops(dir_path, false)).unwrap();
+        });
+        assert!(
+            logs.contains("removed=false"),
+            "expected removed=false: {logs}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // StepOutcome — pure helper that classifies the outcome of an OS
+    // command spawned by RealOps so install/uninstall never silently
+    // swallow non-zero exits or missing tools.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classify_status_recognises_zero_exit_as_succeeded() {
+        // Spawn the running test binary with `--list` (the cargo test
+        // harness accepts it and exits 0).
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .status();
+        assert_eq!(classify_status(status), StepOutcome::Succeeded);
+    }
+
+    #[test]
+    fn classify_status_recognises_non_zero_exit_as_failed() {
+        // The cargo test harness rejects an unknown long flag with a
+        // non-zero exit.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--definitely-not-a-real-flag-zzzqx")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match classify_status(status) {
+            StepOutcome::Failed { .. } => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_status_recognises_spawn_failure() {
+        let status =
+            std::process::Command::new("definitely-not-on-path-zzzqxq-studio-worker").status();
+        assert_eq!(classify_status(status), StepOutcome::SpawnFailed);
+    }
+
+    #[test]
+    fn step_outcome_is_success_only_for_succeeded() {
+        assert!(StepOutcome::Succeeded.is_success());
+        assert!(!StepOutcome::Failed { code: Some(1) }.is_success());
+        assert!(!StepOutcome::Failed { code: None }.is_success());
+        assert!(!StepOutcome::SpawnFailed.is_success());
     }
 }
