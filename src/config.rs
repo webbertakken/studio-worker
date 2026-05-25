@@ -4,8 +4,8 @@
 //! Every load/save emits a structured tracing breadcrumb so operators
 //! can tell from `journalctl` which file the worker actually consulted
 //! (and whether the file existed or was freshly bootstrapped with
-//! defaults).  The events deliberately omit the two secret fields
-//! — `bootstrap_token` and `auth_token` — so logs can be shipped
+//! defaults).  The events deliberately omit the secret fields
+//! (`auth_token`, `registration_secret`) so logs can be shipped
 //! off-box without leaking credentials.  See `tests/config_tracing.rs`
 //! for the regression contract.
 use anyhow::{anyhow, Context, Result};
@@ -22,9 +22,8 @@ const TRACE_TARGET: &str = "studio_worker::config";
 pub struct Config {
     /// Base URL of the studio API (e.g. `https://studio.minis.gg`).
     pub api_base_url: String,
-    /// Shared secret used only for the first registration.
-    pub bootstrap_token: String,
-    /// Worker id, filled in by `register`.
+    /// Worker id, written on operator approval.  Cleared by
+    /// `studio-worker register --reset`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>,
     /// Per-worker token issued at registration.
@@ -74,6 +73,24 @@ pub struct Config {
     /// manager to restart it).  `0` = infinite.  Defaults to `5`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_reconnect_attempts: Option<u32>,
+    /// Per-install UUID written once on first launch.  Stable across
+    /// worker restarts so the studio can dedup pending requests.
+    /// Internal state, populated by the auto-register flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<String>,
+    /// Optional human label shown in the studio's Pending Workers
+    /// panel.  Defaults to None; user-settable via
+    /// `studio-worker register --label "..."`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// `requestId` returned by `POST /workers/register-request`.
+    /// Cleared on approval / rejection.  Internal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_request_id: Option<String>,
+    /// Bearer secret presented when polling the request status.
+    /// Cleared on approval / rejection.  Internal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_secret: Option<String>,
 }
 
 fn default_auto_update_enabled() -> bool {
@@ -89,8 +106,7 @@ fn default_auto_update_feed() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api_base_url: "http://localhost:9790".into(),
-            bootstrap_token: "dev-bootstrap-token".into(),
+            api_base_url: "https://studio.minis.gg".into(),
             worker_id: None,
             auth_token: None,
             vram_threshold_gb: 12.0,
@@ -106,6 +122,10 @@ impl Default for Config {
             auto_update_prerelease: false,
             models_root: None,
             ws_reconnect_attempts: None,
+            install_id: None,
+            label: None,
+            registration_request_id: None,
+            registration_secret: None,
         }
     }
 }

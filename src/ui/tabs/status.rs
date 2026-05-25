@@ -7,19 +7,35 @@ use chrono::{DateTime, Utc};
 use eframe::egui;
 
 use crate::{
+    auto_register::RegistrationState,
     config::Config,
     runtime::{HeartbeatOutcome, HeartbeatStatus},
 };
 
-use super::super::register::RegistrationStatus;
-
-/// Pure-data view of the Status tab.  Constructed each frame from the
-/// live shared state; no egui types in scope so it's unit-testable.
+/// Pure-data view of the Status tab.  Constructed each frame from
+/// the live shared state; no egui types in scope so it's
+/// unit-testable.  Maps onto `auto_register::RegistrationState` for
+/// the pre-registration phases.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatusView {
-    Unregistered {
+    /// Worker is auto-registering but hasn't received a request_id
+    /// from the studio yet.  Transient — normally only seen for a
+    /// frame or two on first launch.
+    Initialising { api_base_url: String },
+    /// Studio has a Pending Workers row for this install; UI shows
+    /// the request id + a copy button so the operator can match it
+    /// in the dashboard.
+    Pending {
         api_base_url: String,
-        bootstrap_token_preview: String,
+        request_id: String,
+        since: DateTime<Utc>,
+    },
+    /// Operator rejected the request.  Worker stops trying; the
+    /// hint instructs the user to run `studio-worker register --reset`
+    /// to clear state and try again.
+    Rejected {
+        api_base_url: String,
+        reason: String,
     },
     Registered {
         worker_id: String,
@@ -60,48 +76,41 @@ impl HeartbeatSummary {
 impl StatusView {
     pub fn build(
         cfg: &Config,
+        registration: &RegistrationState,
         busy: bool,
         last_heartbeat: Option<&HeartbeatStatus>,
         vram_total_gb: f32,
     ) -> Self {
         let registered = cfg.worker_id.is_some() && cfg.auth_token.is_some();
-        if !registered {
-            return Self::Unregistered {
+        if registered {
+            return Self::Registered {
+                worker_id: cfg.worker_id.clone().unwrap_or_default(),
                 api_base_url: cfg.api_base_url.clone(),
-                bootstrap_token_preview: redact_token(&cfg.bootstrap_token),
+                engine: cfg.engine.clone(),
+                vram_total_gb,
+                vram_threshold_gb: cfg.vram_threshold_gb,
+                auto_enabled: cfg.auto_enabled,
+                busy,
+                last_heartbeat: last_heartbeat.map(HeartbeatSummary::from),
             };
         }
-        Self::Registered {
-            worker_id: cfg.worker_id.clone().unwrap_or_default(),
-            api_base_url: cfg.api_base_url.clone(),
-            engine: cfg.engine.clone(),
-            vram_total_gb,
-            vram_threshold_gb: cfg.vram_threshold_gb,
-            auto_enabled: cfg.auto_enabled,
-            busy,
-            last_heartbeat: last_heartbeat.map(HeartbeatSummary::from),
+        match registration {
+            RegistrationState::Pending { request_id, since } => Self::Pending {
+                api_base_url: cfg.api_base_url.clone(),
+                request_id: request_id.clone(),
+                since: *since,
+            },
+            RegistrationState::Rejected { reason } => Self::Rejected {
+                api_base_url: cfg.api_base_url.clone(),
+                reason: reason.clone(),
+            },
+            // Pristine — cold start, between requests, or operator
+            // bootstrap path that hasn't completed yet.
+            RegistrationState::Pristine | RegistrationState::Approved => Self::Initialising {
+                api_base_url: cfg.api_base_url.clone(),
+            },
         }
     }
-}
-
-/// Format a secret token for display: first 4 + last 2 characters,
-/// middle replaced by a fixed-width bullet run.  Short tokens are
-/// fully redacted.
-pub fn redact_token(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() < 8 {
-        return "\u{2022}".repeat(chars.len().max(1));
-    }
-    let head: String = chars.iter().take(4).collect();
-    let tail: String = chars
-        .iter()
-        .rev()
-        .take(2)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    format!("{head}\u{2022}\u{2022}\u{2022}\u{2022}{tail}")
 }
 
 /// Human-friendly "5s ago" formatting for a heartbeat timestamp.
@@ -128,121 +137,104 @@ pub fn format_age(now: DateTime<Utc>, when: DateTime<Utc>) -> String {
 // Rendering
 // ---------------------------------------------------------------------------
 
-pub fn render(
-    ui: &mut egui::Ui,
-    view: &StatusView,
-    registration: &RegistrationStatus,
-    register_form: &mut RegisterForm,
-    on_register_clicked: &mut dyn FnMut(&RegisterForm),
-) {
+pub fn render(ui: &mut egui::Ui, view: &StatusView) {
     match view {
-        StatusView::Unregistered {
+        StatusView::Initialising { api_base_url } => render_initialising(ui, api_base_url),
+        StatusView::Pending {
             api_base_url,
-            bootstrap_token_preview,
-        } => {
-            render_unregistered(
-                ui,
-                api_base_url,
-                bootstrap_token_preview,
-                registration,
-                register_form,
-                on_register_clicked,
-            );
-        }
+            request_id,
+            since,
+        } => render_pending(ui, api_base_url, request_id, *since),
+        StatusView::Rejected {
+            api_base_url,
+            reason,
+        } => render_rejected(ui, api_base_url, reason),
         StatusView::Registered { .. } => render_registered(ui, view),
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct RegisterForm {
-    pub api_base_url: String,
-    pub bootstrap_token: String,
-    pub bootstrap_token_visible: bool,
-}
-
-impl RegisterForm {
-    /// Initialise the form fields from the resolved config so users
-    /// see what's currently on disk instead of an empty box.
-    pub fn seeded_from(cfg: &Config) -> Self {
-        Self {
-            api_base_url: cfg.api_base_url.clone(),
-            bootstrap_token: cfg.bootstrap_token.clone(),
-            bootstrap_token_visible: false,
-        }
-    }
-}
-
-fn render_unregistered(
-    ui: &mut egui::Ui,
-    _api_base_url: &str,
-    _bootstrap_token_preview: &str,
-    registration: &RegistrationStatus,
-    form: &mut RegisterForm,
-    on_register_clicked: &mut dyn FnMut(&RegisterForm),
-) {
-    ui.heading("Register this worker");
+fn render_initialising(ui: &mut egui::Ui, api_base_url: &str) {
+    ui.heading("Initialising");
     ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(format!(
+            "Asking {api_base_url} for a registration slot\u{2026}"
+        ));
+    });
+    ui.add_space(8.0);
     ui.label(
-        "This worker hasn't registered with a studio yet.  Fill in the studio's \
-         API base URL and your bootstrap token, then click Register.",
+        egui::RichText::new(
+            "No action needed.  The worker will keep retrying until it gets through.",
+        )
+        .italics()
+        .color(egui::Color32::from_gray(160)),
     );
-    ui.add_space(12.0);
+}
 
-    egui::Grid::new("register_form")
+fn render_pending(ui: &mut egui::Ui, api_base_url: &str, request_id: &str, since: DateTime<Utc>) {
+    ui.heading("Waiting for approval");
+    ui.add_space(4.0);
+    ui.label(format!(
+        "This worker has registered with {api_base_url} and is waiting for the \
+         studio operator to approve it.  You can keep this window open or close \
+         it \u{2014} the worker keeps polling in the background."
+    ));
+    ui.add_space(12.0);
+    egui::Grid::new("pending_grid")
         .num_columns(2)
-        .spacing([12.0, 8.0])
+        .spacing([12.0, 6.0])
         .show(ui, |ui| {
-            ui.label("API base URL");
-            ui.add(
-                egui::TextEdit::singleline(&mut form.api_base_url)
-                    .desired_width(360.0)
-                    .hint_text("https://studio.example.com"),
-            );
+            ui.label("Request ID");
+            ui.horizontal(|ui| {
+                ui.monospace(request_id);
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(request_id.to_string());
+                }
+            });
             ui.end_row();
 
-            ui.label("Bootstrap token");
-            ui.horizontal(|ui| {
-                let edit = egui::TextEdit::singleline(&mut form.bootstrap_token)
-                    .desired_width(280.0)
-                    .password(!form.bootstrap_token_visible);
-                ui.add(edit);
-                ui.checkbox(&mut form.bootstrap_token_visible, "show");
-            });
+            ui.label("Waiting");
+            ui.label(format_age(Utc::now(), since));
             ui.end_row();
         });
-
     ui.add_space(8.0);
-    let can_submit = matches!(
-        registration,
-        RegistrationStatus::Idle | RegistrationStatus::Failed(_)
-    ) && !form.api_base_url.trim().is_empty()
-        && !form.bootstrap_token.trim().is_empty();
-    if ui
-        .add_enabled(can_submit, egui::Button::new("Register"))
-        .clicked()
-    {
-        on_register_clicked(form);
-    }
+    ui.label(
+        egui::RichText::new(
+            "Share the Request ID with the studio operator if you want them to \
+             find your pending row quickly.",
+        )
+        .italics()
+        .color(egui::Color32::from_gray(160)),
+    );
+}
 
+fn render_rejected(ui: &mut egui::Ui, api_base_url: &str, reason: &str) {
+    ui.heading("Registration rejected");
+    ui.add_space(4.0);
+    ui.colored_label(
+        egui::Color32::LIGHT_RED,
+        if reason.is_empty() {
+            "The studio operator rejected this worker's registration.".to_string()
+        } else {
+            format!("The studio operator rejected this worker's registration: {reason}")
+        },
+    );
     ui.add_space(12.0);
-    match registration {
-        RegistrationStatus::Idle => {}
-        RegistrationStatus::InFlight => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Registering\u{2026}");
-            });
-        }
-        RegistrationStatus::Success => {
-            ui.colored_label(egui::Color32::LIGHT_GREEN, "Registered.");
-        }
-        RegistrationStatus::Failed(reason) => {
-            ui.colored_label(
-                egui::Color32::LIGHT_RED,
-                format!("Registration failed: {reason}"),
-            );
-        }
-    }
+    ui.label(format!(
+        "To try again, contact the operator of {api_base_url} to understand why, then run:"
+    ));
+    ui.add_space(4.0);
+    ui.monospace("studio-worker register --reset");
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(
+            "This clears the local request state and submits a fresh request on \
+             the next launch.",
+        )
+        .italics()
+        .color(egui::Color32::from_gray(160)),
+    );
 }
 
 fn render_registered(ui: &mut egui::Ui, view: &StatusView) {
@@ -347,36 +339,84 @@ mod tests {
     }
 
     #[test]
-    fn build_unregistered_when_worker_id_missing() {
+    fn build_initialising_when_pristine_and_unregistered() {
         let cfg = Config::default();
-        let view = StatusView::build(&cfg, false, None, 0.0);
-        assert!(matches!(view, StatusView::Unregistered { .. }));
+        let view = StatusView::build(&cfg, &RegistrationState::Pristine, false, None, 0.0);
+        match view {
+            StatusView::Initialising { api_base_url } => {
+                assert_eq!(api_base_url, cfg.api_base_url);
+            }
+            other => panic!("expected Initialising, got {other:?}"),
+        }
     }
 
     #[test]
-    fn build_unregistered_redacts_the_bootstrap_token_preview() {
-        let cfg = Config {
-            bootstrap_token: "abcd1234ef".into(),
-            ..Config::default()
-        };
-        let view = StatusView::build(&cfg, false, None, 0.0);
+    fn build_pending_when_state_pending() {
+        let cfg = Config::default();
+        let since = Utc::now();
+        let view = StatusView::build(
+            &cfg,
+            &RegistrationState::Pending {
+                request_id: "rr-42".into(),
+                since,
+            },
+            false,
+            None,
+            0.0,
+        );
         match view {
-            StatusView::Unregistered {
-                bootstrap_token_preview,
+            StatusView::Pending {
+                request_id,
+                since: s,
                 ..
             } => {
-                assert!(bootstrap_token_preview.starts_with("abcd"));
-                assert!(bootstrap_token_preview.ends_with("ef"));
-                assert!(bootstrap_token_preview.contains('\u{2022}'));
+                assert_eq!(request_id, "rr-42");
+                assert_eq!(s, since);
             }
-            _ => panic!("expected Unregistered"),
+            other => panic!("expected Pending, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_rejected_when_state_rejected() {
+        let cfg = Config::default();
+        let view = StatusView::build(
+            &cfg,
+            &RegistrationState::Rejected {
+                reason: "unknown contributor".into(),
+            },
+            false,
+            None,
+            0.0,
+        );
+        match view {
+            StatusView::Rejected { reason, .. } => assert_eq!(reason, "unknown contributor"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_registered_takes_precedence_over_registration_state() {
+        // If worker_id + auth_token are set, the registration state
+        // is irrelevant — we're operational.
+        let cfg = registered_cfg();
+        let view = StatusView::build(
+            &cfg,
+            &RegistrationState::Pending {
+                request_id: "rr-stale".into(),
+                since: Utc::now(),
+            },
+            false,
+            None,
+            24.0,
+        );
+        assert!(matches!(view, StatusView::Registered { .. }));
     }
 
     #[test]
     fn build_registered_when_worker_id_and_token_present() {
         let cfg = registered_cfg();
-        let view = StatusView::build(&cfg, false, None, 24.0);
+        let view = StatusView::build(&cfg, &RegistrationState::Approved, false, None, 24.0);
         match view {
             StatusView::Registered {
                 worker_id,
@@ -408,7 +448,7 @@ mod tests {
             last_attempt_at: Utc::now(),
             outcome: HeartbeatOutcome::Ok,
         };
-        let view = StatusView::build(&cfg, false, Some(&hb), 24.0);
+        let view = StatusView::build(&cfg, &RegistrationState::Approved, false, Some(&hb), 24.0);
         match view {
             StatusView::Registered {
                 last_heartbeat: Some(s),
@@ -430,7 +470,7 @@ mod tests {
                 reason: "5xx".into(),
             },
         };
-        let view = StatusView::build(&cfg, true, Some(&hb), 24.0);
+        let view = StatusView::build(&cfg, &RegistrationState::Approved, true, Some(&hb), 24.0);
         match view {
             StatusView::Registered {
                 busy,
@@ -443,20 +483,6 @@ mod tests {
             }
             _ => panic!("expected Registered with err heartbeat"),
         }
-    }
-
-    #[test]
-    fn redact_token_short_token_fully_redacted() {
-        assert_eq!(redact_token("short"), "\u{2022}".repeat(5));
-        assert_eq!(redact_token(""), "\u{2022}");
-    }
-
-    #[test]
-    fn redact_token_preserves_head_and_tail() {
-        let r = redact_token("abcdefghij");
-        assert!(r.starts_with("abcd"));
-        assert!(r.ends_with("ij"));
-        assert_eq!(r.chars().filter(|c| *c == '\u{2022}').count(), 4);
     }
 
     #[test]

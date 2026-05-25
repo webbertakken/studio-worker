@@ -3,6 +3,7 @@
 //! Exposes the worker's modules so integration tests (and downstream
 //! tooling) can drive the contract without going through the CLI.
 
+pub mod auto_register;
 pub mod cli;
 pub mod config;
 pub mod engine;
@@ -33,9 +34,20 @@ pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {
     match args.command {
         cli::Command::Run => runtime::run(args.config.as_deref()).await,
         cli::Command::Register {
-            bootstrap_token,
             api_base_url,
-        } => runtime::register(args.config.as_deref(), bootstrap_token, api_base_url).await,
+            label,
+            reset,
+        } => {
+            runtime::register(
+                args.config.as_deref(),
+                runtime::RegisterArgs {
+                    api_base_url,
+                    label,
+                    reset,
+                },
+            )
+            .await
+        }
         cli::Command::Status => runtime::status(args.config.as_deref()).await,
         cli::Command::InstallService => service::install(args.config.as_deref()),
         cli::Command::UninstallService => service::uninstall(),

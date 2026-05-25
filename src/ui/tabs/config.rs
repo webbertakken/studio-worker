@@ -21,7 +21,6 @@ pub struct ConfigDraft {
     pub current: Config,
     pub original: Config,
     pub last_save_error: Option<String>,
-    pub bootstrap_token_visible: bool,
     pub auth_token_visible: bool,
 }
 
@@ -31,7 +30,6 @@ impl ConfigDraft {
             current: cfg.clone(),
             original: cfg.clone(),
             last_save_error: None,
-            bootstrap_token_visible: false,
             auth_token_visible: false,
         }
     }
@@ -72,8 +70,8 @@ impl ConfigDraft {
 /// the runtime is concerned with semantics, not byte-equality.
 fn configs_equal(a: &Config, b: &Config) -> bool {
     a.api_base_url == b.api_base_url
-        && a.bootstrap_token == b.bootstrap_token
         && a.worker_id == b.worker_id
+        && a.label == b.label
         && a.auth_token == b.auth_token
         && (a.vram_threshold_gb - b.vram_threshold_gb).abs() < f32::EPSILON
         && a.auto_start == b.auto_start
@@ -124,12 +122,7 @@ pub fn render(
 
     section(ui, "Connection", |ui| {
         labeled_text(ui, "API base URL", &mut draft.current.api_base_url);
-        labeled_password(
-            ui,
-            "Bootstrap token",
-            &mut draft.current.bootstrap_token,
-            &mut draft.bootstrap_token_visible,
-        );
+        labeled_optional(ui, "Label", &mut draft.current.label);
         labeled_optional(ui, "Worker ID", &mut draft.current.worker_id);
         labeled_optional_password(
             ui,
@@ -262,19 +255,6 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.label(label);
     ui.add(egui::TextEdit::singleline(value).desired_width(360.0));
-    ui.end_row();
-}
-
-fn labeled_password(ui: &mut egui::Ui, label: &str, value: &mut String, visible: &mut bool) {
-    ui.label(label);
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(value)
-                .desired_width(280.0)
-                .password(!*visible),
-        );
-        ui.checkbox(visible, "show");
-    });
     ui.end_row();
 }
 

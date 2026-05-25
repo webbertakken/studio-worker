@@ -4,7 +4,7 @@
 //! wrong config gives operators nothing in `journalctl` to point at
 //! the file that was actually consulted.
 //!
-//! The config file embeds two secrets — `bootstrap_token` and
+//! The config file embeds two secrets — `registration_secret` and
 //! `auth_token` — so this suite also pins the rule that **neither
 //! value may ever appear in the tracing output**.  Loosening that
 //! check is a production-security regression.
@@ -106,7 +106,7 @@ fn save_emits_debug_event_with_config_path() {
 }
 
 // ---------------------------------------------------------------------------
-// Security: never leak the `bootstrap_token` or `auth_token` values into
+// Security: never leak the `registration_secret` or `auth_token` values into
 // the tracing stream.  These are the two secrets in `Config`; if either
 // shows up verbatim in logs, an operator viewing `journalctl` or
 // shipping logs off-box would inadvertently leak credentials.
@@ -117,7 +117,7 @@ fn load_never_logs_secret_token_values() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let cfg = Config {
-        bootstrap_token: "BOOTSTRAP-SECRET-DO-NOT-LOG".into(),
+        registration_secret: Some("REG-SECRET-DO-NOT-LOG".into()),
         auth_token: Some("AUTH-SECRET-DO-NOT-LOG".into()),
         ..Config::default()
     };
@@ -128,8 +128,8 @@ fn load_never_logs_secret_token_values() {
         let _ = config::load(Some(&path_str)).expect("load must succeed");
     });
     assert!(
-        !logs.contains("BOOTSTRAP-SECRET-DO-NOT-LOG"),
-        "bootstrap_token leaked into logs: {logs}"
+        !logs.contains("REG-SECRET-DO-NOT-LOG"),
+        "registration_secret leaked into logs: {logs}"
     );
     assert!(
         !logs.contains("AUTH-SECRET-DO-NOT-LOG"),
@@ -149,7 +149,7 @@ fn save_never_logs_secret_token_values() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let cfg = Config {
-        bootstrap_token: "BOOTSTRAP-SECRET-DO-NOT-LOG".into(),
+        registration_secret: Some("REG-SECRET-DO-NOT-LOG".into()),
         auth_token: Some("AUTH-SECRET-DO-NOT-LOG".into()),
         ..Config::default()
     };
@@ -157,8 +157,8 @@ fn save_never_logs_secret_token_values() {
         config::save(&cfg, &path).expect("save must succeed");
     });
     assert!(
-        !logs.contains("BOOTSTRAP-SECRET-DO-NOT-LOG"),
-        "bootstrap_token leaked into logs: {logs}"
+        !logs.contains("REG-SECRET-DO-NOT-LOG"),
+        "registration_secret leaked into logs: {logs}"
     );
     assert!(
         !logs.contains("AUTH-SECRET-DO-NOT-LOG"),

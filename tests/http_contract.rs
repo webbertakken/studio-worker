@@ -11,27 +11,8 @@
 //! `ws_client_contract.rs` + the orchestrator unit tests on the API
 //! side.
 use studio_worker::http::ApiClient;
-use studio_worker::types::*;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn caps() -> WorkerCapabilities {
-    WorkerCapabilities {
-        machine_name: "test-machine".into(),
-        username: "tester".into(),
-        agent_version: "0.0.0-test".into(),
-        engine: "synthetic".into(),
-        vram_total_gb: 0.0,
-        vram_threshold_gb: 64.0,
-        auto_enabled: true,
-        auto_start: false,
-        supported_models: vec!["synthetic".into()],
-        task_kinds: vec![TaskKind::Image],
-        supported_models_per_kind: [(TaskKind::Image, vec!["synthetic".into()])]
-            .into_iter()
-            .collect(),
-    }
-}
 
 /// Run a blocking closure outside the current tokio runtime.
 ///
@@ -42,28 +23,6 @@ fn detached<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
     std::thread::spawn(f)
         .join()
         .expect("worker thread panicked")
-}
-
-#[tokio::test]
-async fn register_returns_worker_id_and_auth_token() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/graphics/api/workers/register"))
-        .and(header("authorization", "Bearer boot-token"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .set_body_json(serde_json::json!({ "workerId": "w-1", "authToken": "tok-xyz" })),
-        )
-        .mount(&server)
-        .await;
-
-    let uri = server.uri();
-    let response = detached(move || {
-        let api = ApiClient::new(uri).unwrap();
-        api.register("boot-token", caps(), None).unwrap()
-    });
-    assert_eq!(response.worker_id, "w-1");
-    assert_eq!(response.auth_token, "tok-xyz");
 }
 
 #[tokio::test]

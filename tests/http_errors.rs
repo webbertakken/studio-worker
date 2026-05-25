@@ -33,22 +33,6 @@ fn detached<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
 }
 
 #[tokio::test]
-async fn register_surfaces_5xx() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/graphics/api/workers/register"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&server)
-        .await;
-    let uri = server.uri();
-    let err = detached(move || {
-        let api = ApiClient::new(uri).unwrap();
-        api.register("tok", caps(), None).unwrap_err()
-    });
-    assert!(err.to_string().contains("register failed"));
-}
-
-#[tokio::test]
 async fn complete_surfaces_4xx() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -123,30 +107,37 @@ async fn complete_for_unknown_ext_falls_back_to_octet_stream() {
 async fn successful_call_emits_debug_tracing_event() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/graphics/api/workers/register"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .set_body_json(serde_json::json!({ "workerId": "w", "authToken": "t" })),
-        )
+        .and(path("/graphics/api/workers/register-request"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "rr-1",
+            "status": "pending",
+        })))
         .mount(&server)
         .await;
 
     let uri = server.uri();
     let logs = captured_logs_for(move || {
         let api = ApiClient::new(uri).unwrap();
-        api.register("boot", caps(), None).unwrap();
+        api.register_request(&AutoRegisterRequest {
+            install_id: "id".into(),
+            registration_secret_hash: "h".into(),
+            label: None,
+            capabilities: caps(),
+            user_agent: "studio-worker/test".into(),
+        })
+        .unwrap();
     });
 
     assert!(logs.contains("DEBUG"), "expected DEBUG event, got: {logs}");
     assert!(
-        logs.contains("/graphics/api/workers/register"),
+        logs.contains("/graphics/api/workers/register-request"),
         "expected endpoint in log, got: {logs}"
     );
     assert!(
-        logs.contains("op=\"register\""),
+        logs.contains("op=\"register-request\""),
         "expected op field: {logs}"
     );
-    assert!(logs.contains("status=201"), "expected status field: {logs}");
+    assert!(logs.contains("status=200"), "expected status field: {logs}");
     assert!(logs.contains("elapsed_ms"), "expected elapsed_ms: {logs}");
 }
 
@@ -154,7 +145,7 @@ async fn successful_call_emits_debug_tracing_event() {
 async fn failing_call_emits_warn_tracing_event_with_body() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/graphics/api/workers/register"))
+        .and(path("/graphics/api/workers/register-request"))
         .respond_with(ResponseTemplate::new(503).set_body_string("upstream-unavailable"))
         .mount(&server)
         .await;
@@ -162,12 +153,18 @@ async fn failing_call_emits_warn_tracing_event_with_body() {
     let uri = server.uri();
     let logs = captured_logs_for(move || {
         let api = ApiClient::new(uri).unwrap();
-        let _ = api.register("boot", caps(), None);
+        let _ = api.register_request(&AutoRegisterRequest {
+            install_id: "id".into(),
+            registration_secret_hash: "h".into(),
+            label: None,
+            capabilities: caps(),
+            user_agent: "studio-worker/test".into(),
+        });
     });
 
     assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
     assert!(
-        logs.contains("op=\"register\""),
+        logs.contains("op=\"register-request\""),
         "expected op field: {logs}"
     );
     assert!(logs.contains("status=503"), "expected status field: {logs}");

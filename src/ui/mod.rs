@@ -8,17 +8,18 @@
 pub mod app;
 pub mod autostart;
 pub mod notifier;
-pub mod register;
 pub mod tab;
 pub mod tabs;
 pub mod tray;
 
 use std::sync::{atomic::AtomicBool, Arc};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 
 use crate::{
+    auto_register::{self, RegistrationState},
     config,
     runtime::{self, LoopSchedule, WorkerObservers},
     types::LogEntry,
@@ -37,11 +38,42 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let observers = WorkerObservers::default();
 
+    let registration = auto_register::shared_initial();
+
     // Spawn the loops on the tokio runtime that's already driving
     // `run_cli` (multi-threaded — main.rs builds `Runtime::new()`).
     // `eframe::run_native` blocks the main thread; the loops keep
     // ticking on worker threads.
     let handle = tokio::runtime::Handle::current();
+
+    // Auto-register loop: polls every 30s until Approved or Rejected.
+    // Then the WS session takes over.
+    let cfg_autoreg = cfg.clone();
+    let path_autoreg = path.clone();
+    let registration_autoreg = registration.clone();
+    let stop_autoreg = stop.clone();
+    handle.spawn(async move {
+        loop {
+            if stop_autoreg.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let state =
+                auto_register::tick(&cfg_autoreg, &path_autoreg, &registration_autoreg).await;
+            if matches!(
+                state,
+                RegistrationState::Approved | RegistrationState::Rejected { .. }
+            ) {
+                return;
+            }
+            for _ in 0..30 {
+                if stop_autoreg.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    });
+
     let cfg_loops = cfg.clone();
     let stop_loops = stop.clone();
     let logs_loops = logs.clone();
@@ -88,7 +120,11 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         Box::new(move |cc| {
             // Dark mode by default (project design rule).
             cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
-            let app = app::App::new(app_state);
+            let app = app::App::with_notifier_and_registration(
+                app_state,
+                app::App::default_notifier_box(),
+                registration,
+            );
             let quit_handle = app.quit_requested_handle();
 
             // Best-effort tray icon.  On Linux without a running

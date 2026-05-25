@@ -12,22 +12,21 @@ use parking_lot::Mutex;
 use tokio::runtime::Handle;
 
 use crate::{
-    config::{self, SharedConfig},
-    runtime::{self, WorkerObservers, HEARTBEAT_INTERVAL},
+    config::SharedConfig,
+    runtime::{WorkerObservers, HEARTBEAT_INTERVAL},
     sys,
     types::LogEntry,
 };
 
 use super::{
     notifier::{decide, NotificationPrefs, Notifier, NotifyDecision},
-    register::{self, RegistrationStatus, SharedRegistration},
     tab::Tab,
     tabs::{
         about::{self as about_tab, AboutState},
         config::{self as config_tab, ConfigDraft},
         jobs as jobs_tab,
         logs::{self as logs_tab, LogFilter},
-        status::{self as status_tab, RegisterForm},
+        status as status_tab,
     },
     tray::{self, TrayVariant},
 };
@@ -46,8 +45,7 @@ pub struct AppDeps {
 pub struct App {
     deps: AppDeps,
     tab: Tab,
-    register_form: RegisterForm,
-    registration: SharedRegistration,
+    registration: crate::auto_register::SharedRegistration,
     config_draft: ConfigDraft,
     log_filter: LogFilter,
     about_state: AboutState,
@@ -67,16 +65,25 @@ impl App {
 
     /// Used by tests to inject a `CapturingNotifier`.
     pub fn with_notifier(deps: AppDeps, notifier: Box<dyn Notifier + Send + Sync>) -> Self {
-        let (register_form, config_draft) = {
+        Self::with_notifier_and_registration(deps, notifier, crate::auto_register::shared_initial())
+    }
+
+    /// Used by `ui::run` to share the orchestration loop's
+    /// `SharedRegistration` slot with the UI.
+    pub fn with_notifier_and_registration(
+        deps: AppDeps,
+        notifier: Box<dyn Notifier + Send + Sync>,
+        registration: crate::auto_register::SharedRegistration,
+    ) -> Self {
+        let config_draft = {
             let cfg = deps.cfg.lock();
-            (RegisterForm::seeded_from(&cfg), ConfigDraft::from(&cfg))
+            ConfigDraft::from(&cfg)
         };
         let vram_total_gb = sys::detect_vram_gb().unwrap_or(0.0);
         Self {
             deps,
             tab: Tab::initial(),
-            register_form,
-            registration: register::shared(),
+            registration,
             config_draft,
             log_filter: LogFilter::default(),
             about_state: AboutState::default(),
@@ -88,6 +95,10 @@ impl App {
             quit_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray_state: None,
         }
+    }
+
+    pub fn registration_handle(&self) -> crate::auto_register::SharedRegistration {
+        self.registration.clone()
     }
 
     pub fn attach_tray(&mut self, tray: super::TrayState) {
@@ -111,6 +122,11 @@ impl App {
     }
 
     fn default_notifier() -> Box<dyn Notifier + Send + Sync> {
+        Self::default_notifier_box()
+    }
+
+    /// Exposed for `ui::run` which builds a notifier before App::new.
+    pub fn default_notifier_box() -> Box<dyn Notifier + Send + Sync> {
         Box::new(super::notifier::DesktopNotifier)
     }
 
@@ -267,72 +283,21 @@ impl App {
     }
 
     fn render_status(&mut self, ui: &mut egui::Ui) {
+        let registration_snapshot = self.registration.lock().clone();
         let view = {
             let cfg = self.deps.cfg.lock();
             let busy = self.deps.busy.load(std::sync::atomic::Ordering::SeqCst);
             let hb = self.deps.observers.last_heartbeat.lock().clone();
-            status_tab::StatusView::build(&cfg, busy, hb.as_ref(), self.vram_total_gb)
+            status_tab::StatusView::build(
+                &cfg,
+                &registration_snapshot,
+                busy,
+                hb.as_ref(),
+                self.vram_total_gb,
+            )
         };
-        let registration_now = self.registration.lock().clone();
-        let cfg_shared = self.deps.cfg.clone();
-        let config_path = self.deps.config_path.clone();
-        let registration = self.registration.clone();
-        let tokio = self.deps.tokio.clone();
-        let mut on_click = move |form: &RegisterForm| {
-            spawn_register(
-                tokio.clone(),
-                cfg_shared.clone(),
-                config_path.clone(),
-                registration.clone(),
-                form.api_base_url.clone(),
-                form.bootstrap_token.clone(),
-            );
-        };
-        status_tab::render(
-            ui,
-            &view,
-            &registration_now,
-            &mut self.register_form,
-            &mut on_click,
-        );
+        status_tab::render(ui, &view);
     }
-}
-
-fn spawn_register(
-    tokio: Handle,
-    cfg: SharedConfig,
-    config_path: PathBuf,
-    registration: SharedRegistration,
-    api_base_url: String,
-    bootstrap_token: String,
-) {
-    {
-        let mut guard = registration.lock();
-        if *guard == RegistrationStatus::InFlight {
-            return;
-        }
-        *guard = RegistrationStatus::InFlight;
-    }
-    {
-        let mut guard = cfg.lock();
-        guard.api_base_url = api_base_url;
-        guard.bootstrap_token = bootstrap_token;
-        let snapshot = guard.clone();
-        drop(guard);
-        if let Err(e) = config::save(&snapshot, &config_path) {
-            *registration.lock() = RegistrationStatus::Failed(format!("config save: {e}"));
-            return;
-        }
-    }
-    let path_str = config_path.to_string_lossy().to_string();
-    tokio.spawn(async move {
-        let result = runtime::register(Some(&path_str), None, None).await;
-        let mut guard = registration.lock();
-        *guard = match result {
-            Ok(()) => RegistrationStatus::Success,
-            Err(e) => RegistrationStatus::Failed(e.to_string()),
-        };
-    });
 }
 
 impl eframe::App for App {
