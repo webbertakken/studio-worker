@@ -4,14 +4,13 @@
 
 use std::path::{Path, PathBuf};
 use studio_worker::{cli, config, run_cli, runtime};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn write_config(dir: &Path, api_uri: &str, feed: &str) -> PathBuf {
     let path = dir.join("config.toml");
     let body = format!(
         r#"api_base_url = "{api_uri}"
-bootstrap_token = "boot"
 vram_threshold_gb = 16.0
 auto_start = true
 auto_enabled = true
@@ -27,56 +26,23 @@ auto_update_prerelease = false
 }
 
 #[tokio::test]
-async fn register_helper_writes_worker_id_and_token_to_config() {
-    let api = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/graphics/api/workers/register"))
-        .and(header("authorization", "Bearer boot"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .set_body_json(serde_json::json!({ "workerId": "w-42", "authToken": "tok-42" })),
-        )
-        .mount(&api)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_path = write_config(dir.path(), &api.uri(), "http://feed.invalid");
-    let cfg_path_str = cfg_path.to_string_lossy().to_string();
-
-    runtime::register(Some(&cfg_path_str), None, None)
-        .await
-        .unwrap();
-    let (cfg, _) = config::load(Some(&cfg_path_str)).unwrap();
-    assert_eq!(cfg.worker_id.as_deref(), Some("w-42"));
-    assert_eq!(cfg.auth_token.as_deref(), Some("tok-42"));
-}
-
-#[tokio::test]
-async fn register_helper_honours_overrides() {
-    let api = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/graphics/api/workers/register"))
-        .and(header("authorization", "Bearer override-secret"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .set_body_json(serde_json::json!({ "workerId": "w-2", "authToken": "tok-2" })),
-        )
-        .mount(&api)
-        .await;
-
+async fn register_helper_persists_api_base_url_and_label_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = write_config(dir.path(), "http://placeholder", "http://feed.invalid");
     let cfg_path_str = cfg_path.to_string_lossy().to_string();
     runtime::register(
         Some(&cfg_path_str),
-        Some("override-secret".into()),
-        Some(api.uri()),
+        runtime::RegisterArgs {
+            api_base_url: Some("http://127.0.0.1:0".into()),
+            label: Some("my-rig".into()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
     let (cfg, _) = config::load(Some(&cfg_path_str)).unwrap();
-    assert_eq!(cfg.api_base_url, api.uri());
-    assert_eq!(cfg.bootstrap_token, "override-secret");
+    assert_eq!(cfg.api_base_url, "http://127.0.0.1:0");
+    assert_eq!(cfg.label.as_deref(), Some("my-rig"));
 }
 
 #[tokio::test]
@@ -195,29 +161,23 @@ async fn run_cli_dispatches_config_subcommand() {
 
 #[tokio::test]
 async fn run_cli_dispatches_register_subcommand() {
-    let api = wiremock::MockServer::start().await;
-    wiremock::Mock::given(method("POST"))
-        .and(path("/graphics/api/workers/register"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(201)
-                .set_body_json(serde_json::json!({ "workerId": "w-cli", "authToken": "tok-cli" })),
-        )
-        .mount(&api)
-        .await;
+    // No network mock needed — register no longer makes HTTP calls.
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = write_config(dir.path(), "http://placeholder", "http://feed.invalid");
     let p = cfg_path.to_string_lossy().to_string();
     run_cli(cli::Cli {
         config: Some(p.clone()),
         command: cli::Command::Register {
-            bootstrap_token: Some("boot".into()),
-            api_base_url: Some(api.uri()),
+            api_base_url: Some("http://cli.invalid".into()),
+            label: Some("cli-rig".into()),
+            reset: false,
         },
     })
     .await
     .unwrap();
     let (cfg, _) = config::load(Some(&p)).unwrap();
-    assert_eq!(cfg.worker_id.as_deref(), Some("w-cli"));
+    assert_eq!(cfg.api_base_url, "http://cli.invalid");
+    assert_eq!(cfg.label.as_deref(), Some("cli-rig"));
 }
 
 #[tokio::test]
@@ -289,7 +249,6 @@ async fn run_cli_dispatches_run_then_aborts() {
         &path,
         format!(
             r#"api_base_url = "{}"
-bootstrap_token = "boot"
 worker_id = "w-test"
 auth_token = "tok-test"
 vram_threshold_gb = 16.0

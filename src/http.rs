@@ -76,27 +76,55 @@ impl ApiClient {
         Err(anyhow!("{op} failed: {status} — {body}"))
     }
 
-    pub fn register(
+    // -----------------------------------------------------------------------
+    // Auto-register (operator-approved) flow
+    // -----------------------------------------------------------------------
+
+    /// Create a Pending Workers row.  Unauthenticated on purpose —
+    /// the studio rate-limits this endpoint by source IP and the
+    /// operator manually approves before the worker can do anything.
+    pub fn register_request(
         &self,
-        bootstrap_token: &str,
-        cap: WorkerCapabilities,
-        worker_id: Option<String>,
-    ) -> Result<RegisterResponse> {
-        let body = RegisterRequest {
-            bootstrap_token: bootstrap_token.to_string(),
-            capabilities: cap,
-            worker_id,
-        };
-        let url = self.url("/workers/register");
+        payload: &AutoRegisterRequest,
+    ) -> Result<AutoRegisterRequestResponse> {
+        let url = self.url("/workers/register-request");
+        let started = Instant::now();
+        let response = self.client.post(&url).json(payload).send()?;
+        let response = self.check("register-request", &url, started, response)?;
+        Ok(response.json()?)
+    }
+
+    /// Poll the studio for the operator's decision on a previously
+    /// submitted register-request.  Returns `Ok(None)` when the
+    /// request id is unknown to the studio (likely cleaned up or
+    /// never existed) so the orchestrator can drop the stale id and
+    /// start a fresh one.  Auth is the raw `registration_secret`
+    /// presented as a Bearer token.
+    pub fn poll_register_status(
+        &self,
+        request_id: &str,
+        registration_secret: &str,
+    ) -> Result<Option<RegisterStatus>> {
+        let url = self.url(&format!("/workers/register-requests/{request_id}"));
         let started = Instant::now();
         let response = self
             .client
-            .post(&url)
-            .bearer_auth(bootstrap_token)
-            .json(&body)
+            .get(&url)
+            .bearer_auth(registration_secret)
             .send()?;
-        let response = self.check("register", &url, started, response)?;
-        Ok(response.json()?)
+        if response.status().as_u16() == 404 {
+            debug!(
+                target: TRACE_TARGET,
+                op = "register-poll",
+                endpoint = %url,
+                status = 404,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "register request not found (stale id; orchestrator will recreate)"
+            );
+            return Ok(None);
+        }
+        let response = self.check("register-poll", &url, started, response)?;
+        Ok(Some(response.json()?))
     }
 
     /// Complete a job with binary output (image / audio / video).

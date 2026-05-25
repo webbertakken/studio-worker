@@ -19,12 +19,22 @@ pub struct Cli {
 pub enum Command {
     /// Start the heartbeat + claim loop.
     Run,
-    /// Register the worker against the API (idempotent).
+    /// Pre-set registration metadata before the next launch.
+    ///
+    /// On a fresh install you don't need this — `run` and `ui`
+    /// auto-register themselves.  Use it explicitly to:
+    ///   * set the human label shown in the studio's Pending
+    ///     Workers panel (`--label`)
+    ///   * point the worker at a different studio (`--api-base-url`)
+    ///   * clear local registration state after a rejection or
+    ///     between studios (`--reset`)
     Register {
         #[arg(long)]
-        bootstrap_token: Option<String>,
-        #[arg(long)]
         api_base_url: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        reset: bool,
     },
     /// Print local config + last heartbeat info.
     Status,
@@ -70,21 +80,57 @@ mod tests {
         let cli = Cli::parse_from([
             "studio-worker",
             "register",
-            "--bootstrap-token",
-            "secret",
             "--api-base-url",
             "https://example.invalid",
         ]);
         match cli.command {
             Command::Register {
-                bootstrap_token,
                 api_base_url,
+                label,
+                reset,
             } => {
-                assert_eq!(bootstrap_token.as_deref(), Some("secret"));
                 assert_eq!(api_base_url.as_deref(), Some("https://example.invalid"));
+                assert!(label.is_none());
+                assert!(!reset);
             }
             other => panic!("expected register, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_register_with_label_and_reset() {
+        let cli = Cli::parse_from([
+            "studio-worker",
+            "register",
+            "--label",
+            "alice's rig",
+            "--reset",
+        ]);
+        match cli.command {
+            Command::Register {
+                api_base_url,
+                label,
+                reset,
+            } => {
+                assert!(api_base_url.is_none());
+                assert_eq!(label.as_deref(), Some("alice's rig"));
+                assert!(reset);
+            }
+            other => panic!("expected register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_bare_register() {
+        let cli = Cli::parse_from(["studio-worker", "register"]);
+        assert!(matches!(
+            cli.command,
+            Command::Register {
+                api_base_url: None,
+                label: None,
+                reset: false,
+            }
+        ));
     }
 
     #[test]

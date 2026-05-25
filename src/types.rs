@@ -216,21 +216,63 @@ pub struct WorkerCapabilities {
     pub supported_models_per_kind: BTreeMap<TaskKind, Vec<String>>,
 }
 
+// ---------------------------------------------------------------------------
+// Auto-register wire format — the only registration path.
+//
+// Worker POSTs `/workers/register-request` with hostname / username /
+// VRAM / supported models, gets a `requestId` back, and polls
+// `/workers/register-requests/:id` until the operator approves or
+// rejects from the studio dashboard.
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize)]
-pub struct RegisterRequest {
-    #[serde(rename = "bootstrapToken")]
-    pub bootstrap_token: String,
+pub struct AutoRegisterRequest {
+    /// Per-install UUID stable across worker restarts on the same
+    /// machine.  The studio uses it to dedup re-submissions.
+    #[serde(rename = "installId")]
+    pub install_id: String,
+    /// SHA-256 hex of the worker-side `registration_secret`.  The
+    /// worker keeps the secret locally and presents it as a Bearer
+    /// token when polling for status; only the hash leaves the box.
+    #[serde(rename = "registrationSecretHash")]
+    pub registration_secret_hash: String,
+    /// Optional human label the operator sees in the Pending Workers
+    /// panel (e.g. "alice's gaming rig").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Full capability snapshot — hostname, username, engine, VRAM,
+    /// supported models so the operator can decide.
     pub capabilities: WorkerCapabilities,
-    #[serde(rename = "workerId", skip_serializing_if = "Option::is_none")]
-    pub worker_id: Option<String>,
+    /// `studio-worker/<version>` so the operator sees stale clients.
+    #[serde(rename = "userAgent")]
+    pub user_agent: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RegisterResponse {
-    #[serde(rename = "workerId")]
-    pub worker_id: String,
-    #[serde(rename = "authToken")]
-    pub auth_token: String,
+pub struct AutoRegisterRequestResponse {
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    /// Always `"pending"` on first response.  Idempotent dedup may
+    /// return the existing requestId for the same
+    /// `(installId, sourceIp)` tuple — status is still "pending".
+    pub status: String,
+}
+
+/// Tagged union returned by `GET /workers/register-requests/:id`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum RegisterStatus {
+    Pending,
+    Approved {
+        #[serde(rename = "workerId")]
+        worker_id: String,
+        #[serde(rename = "authToken")]
+        auth_token: String,
+    },
+    Rejected {
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

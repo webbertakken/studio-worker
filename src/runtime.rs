@@ -7,8 +7,7 @@
 //! helpers from the old polling loops are gone.
 use crate::{
     config::{self, Config, SharedConfig},
-    engine::{self, Engine},
-    http::ApiClient,
+    engine::Engine,
     sys,
     types::*,
     update, AGENT_VERSION,
@@ -166,75 +165,59 @@ impl LoopSchedule {
 // One-shot helpers used by the CLI subcommands
 // ---------------------------------------------------------------------------
 
-pub async fn register(
-    config_path: Option<&str>,
-    bootstrap_override: Option<String>,
-    api_base_url: Option<String>,
-) -> Result<()> {
-    let (mut cfg, path) = config::load(config_path)?;
-    if let Some(token) = bootstrap_override {
-        cfg.bootstrap_token = token;
-    }
-    if let Some(url) = api_base_url {
-        cfg.api_base_url = url;
-    }
-    let engine = engine::build(&cfg)?;
-    let cap = build_capabilities(&cfg, &*engine);
-    let api_for_diag = cfg.api_base_url.clone();
-    let response = tokio::task::spawn_blocking({
-        let api_base_url = cfg.api_base_url.clone();
-        let bootstrap = cfg.bootstrap_token.clone();
-        let worker_id = cfg.worker_id.clone();
-        let cap = cap.clone();
-        move || -> Result<RegisterResponse> {
-            let api = ApiClient::new(api_base_url)?;
-            api.register(&bootstrap, cap, worker_id)
-        }
-    })
-    .await?
-    .map_err(|e| friendly_register_error(e, &api_for_diag))?;
-    cfg.worker_id = Some(response.worker_id.clone());
-    cfg.auth_token = Some(response.auth_token);
-    config::save(&cfg, &path)?;
-    info!(
-        worker_id = %response.worker_id,
-        api = %cfg.api_base_url,
-        "registered with studio API"
-    );
-    Ok(())
+/// Bundle of flags from `studio-worker register`.
+#[derive(Debug, Clone, Default)]
+pub struct RegisterArgs {
+    pub api_base_url: Option<String>,
+    pub label: Option<String>,
+    pub reset: bool,
 }
 
-/// Wrap network/HTTP errors from register() with a hint that points the
-/// operator at `--api-base-url` and the right secret.  Saves people from
-/// hitting the default `http://localhost:9790` and wondering what happened.
-fn friendly_register_error(err: anyhow::Error, api_base_url: &str) -> anyhow::Error {
-    // Walk the full error chain so we catch the cause inside
-    // reqwest/hyper, not just the top-level wrap.
-    let message = format!("{:#}", err);
-    let is_connection_refused =
-        message.contains("Connection refused") || message.contains("ConnectionRefused");
-    if is_connection_refused {
-        anyhow!(
-            "could not reach the studio API at {api_base_url}: {message}\n\
-             \n\
-             Hint: pass --api-base-url <URL> on the register command, e.g.\n\
-               studio-worker register \\\n\
-                 --bootstrap-token <TOKEN> \\\n\
-                 --api-base-url https://studio.example.com\n\
-             \n\
-             The bootstrap token is the WORKER_BOOTSTRAP_TOKEN wrangler secret\n\
-             on the studio side (for local dev the default is `dev-bootstrap-token`)."
-        )
-    } else if message.contains("401") || message.contains("403") {
-        anyhow!(
-            "the studio API rejected our bootstrap token: {message}\n\
-             \n\
-             Check that --bootstrap-token matches the WORKER_BOOTSTRAP_TOKEN\n\
-             secret on the studio side."
-        )
-    } else {
-        err
+/// Persist registration metadata for the next launch.  No HTTP — the
+/// auto-register orchestration inside `run` / `ui` is the only thing
+/// that talks to the studio.
+pub async fn register(config_path: Option<&str>, args: RegisterArgs) -> Result<()> {
+    let (mut cfg, path) = config::load(config_path)?;
+
+    if args.reset {
+        cfg.worker_id = None;
+        cfg.auth_token = None;
+        cfg.registration_request_id = None;
+        cfg.registration_secret = None;
+        cfg.install_id = None;
     }
+    if let Some(url) = args.api_base_url {
+        cfg.api_base_url = url;
+    }
+    if let Some(label) = args.label {
+        cfg.label = if label.trim().is_empty() {
+            None
+        } else {
+            Some(label)
+        };
+    }
+
+    config::save(&cfg, &path)?;
+    if args.reset {
+        info!(
+            config_path = %path.display(),
+            "local registration state cleared; next launch will auto-register"
+        );
+        println!(
+            "local registration state cleared; run `studio-worker run` or \
+             `studio-worker ui` to auto-register"
+        );
+    } else {
+        info!(
+            config_path = %path.display(),
+            "register flags persisted; next launch will auto-register"
+        );
+        println!(
+            "saved; run `studio-worker run` or `studio-worker ui` to auto-register against {}",
+            cfg.api_base_url
+        );
+    }
+    Ok(())
 }
 
 pub async fn status(config_path: Option<&str>) -> Result<()> {
@@ -248,11 +231,17 @@ pub fn format_status(cfg: &Config, path: &std::path::Path) -> String {
     use std::fmt::Write as _;
     let _ = writeln!(out, "config path:        {}", path.display());
     let _ = writeln!(out, "api_base_url:       {}", cfg.api_base_url);
-    let _ = writeln!(
-        out,
-        "worker_id:          {}",
-        cfg.worker_id.as_deref().unwrap_or("(not registered)")
-    );
+    let registration_line = if cfg.worker_id.is_some() && cfg.auth_token.is_some() {
+        format!("approved as {}", cfg.worker_id.as_deref().unwrap_or(""))
+    } else if let Some(rid) = cfg.registration_request_id.as_deref() {
+        format!("pending operator approval (request {rid})")
+    } else {
+        "not registered (will auto-register on next launch)".into()
+    };
+    let _ = writeln!(out, "registration:       {registration_line}");
+    if let Some(label) = cfg.label.as_deref() {
+        let _ = writeln!(out, "label:              {label}");
+    }
     let _ = writeln!(out, "engine:             {}", cfg.engine);
     let _ = writeln!(out, "vram_threshold_gb:  {}", cfg.vram_threshold_gb);
     let _ = writeln!(out, "auto_enabled:       {}", cfg.auto_enabled);
@@ -353,34 +342,15 @@ pub fn format_check_outcome(outcome: &update::CheckOutcome) -> String {
 // ---------------------------------------------------------------------------
 
 pub async fn run(config_path: Option<&str>) -> Result<()> {
-    let (mut cfg, path) = config::load(config_path)?;
+    let (cfg, path) = config::load(config_path)?;
     log_startup_banner(&cfg, &path);
-    if cfg.worker_id.is_none() || cfg.auth_token.is_none() {
-        let engine = engine::build(&cfg)?;
-        let cap = build_capabilities(&cfg, &*engine);
-        let response = tokio::task::spawn_blocking({
-            let api_base_url = cfg.api_base_url.clone();
-            let bootstrap = cfg.bootstrap_token.clone();
-            move || -> Result<RegisterResponse> {
-                let api = ApiClient::new(api_base_url)?;
-                api.register(&bootstrap, cap, None)
-            }
-        })
-        .await??;
-        cfg.worker_id = Some(response.worker_id);
-        cfg.auth_token = Some(response.auth_token);
-        config::save(&cfg, &path)?;
-        info!(
-            worker_id = %cfg.worker_id.as_deref().unwrap_or(""),
-            "auto-registered on first run"
-        );
-    }
 
     let cfg = config::shared(cfg);
     let stop = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let observers = WorkerObservers::default();
+    let registration = crate::auto_register::shared_initial();
 
     let stop_clone = stop.clone();
     tokio::spawn(async move {
@@ -388,7 +358,52 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
         stop_clone.store(true, Ordering::SeqCst);
     });
 
+    // Block on auto-register until the operator approves (or rejects).
+    // Polls every 30s; aborts on Ctrl-C.
+    ensure_registered(&cfg, &path, &registration, &stop).await?;
+
     run_loops(cfg, stop, logs, busy, observers, LoopSchedule::default()).await
+}
+
+/// Loop auto_register::tick on a 30s cadence until `worker_id` +
+/// `auth_token` are populated (Approved) or the operator rejects.
+pub async fn ensure_registered(
+    cfg: &SharedConfig,
+    path: &std::path::Path,
+    registration: &crate::auto_register::SharedRegistration,
+    stop: &Arc<AtomicBool>,
+) -> Result<()> {
+    use std::time::Duration;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(anyhow!("shutdown before registration completed"));
+        }
+        {
+            let snap = cfg.lock();
+            if snap.worker_id.is_some() && snap.auth_token.is_some() {
+                return Ok(());
+            }
+        }
+        let state = crate::auto_register::tick(cfg, path, registration).await;
+        match state {
+            crate::auto_register::RegistrationState::Approved => return Ok(()),
+            crate::auto_register::RegistrationState::Rejected { reason } => {
+                return Err(anyhow!(
+                    "registration rejected by the studio operator: {reason}.  \
+                     Run `studio-worker register --reset` to clear local state \
+                     and submit a fresh request."
+                ));
+            }
+            _ => {}
+        }
+        // Sleep with a fast-cancel on stop.
+        for _ in 0..30 {
+            if stop.load(Ordering::SeqCst) {
+                return Err(anyhow!("shutdown during registration wait"));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
 }
 
 /// Spawn the WS session + auto-updater, wait for them.  Pulled out of
@@ -754,8 +769,8 @@ mod tests {
         let out = format_status(&cfg, std::path::Path::new("/tmp/x.toml"));
         assert!(out.contains("config path:"));
         assert!(out.contains("api_base_url:"));
-        assert!(out.contains("worker_id:"));
-        assert!(out.contains("(not registered)"));
+        assert!(out.contains("registration:"));
+        assert!(out.contains("not registered"));
         assert!(out.contains("auto_update:"));
         assert!(out.contains("update_interval:"));
     }
@@ -764,10 +779,33 @@ mod tests {
     fn format_status_shows_worker_id_when_registered() {
         let cfg = Config {
             worker_id: Some("w-abc".into()),
+            auth_token: Some("tok".into()),
             ..Config::default()
         };
         let out = format_status(&cfg, std::path::Path::new("/tmp/x.toml"));
         assert!(out.contains("w-abc"));
+        assert!(out.contains("approved"));
+    }
+
+    #[test]
+    fn format_status_shows_pending_request_id() {
+        let cfg = Config {
+            registration_request_id: Some("rr-7".into()),
+            ..Config::default()
+        };
+        let out = format_status(&cfg, std::path::Path::new("/tmp/x.toml"));
+        assert!(out.contains("pending operator approval"));
+        assert!(out.contains("rr-7"));
+    }
+
+    #[test]
+    fn format_status_shows_label_when_set() {
+        let cfg = Config {
+            label: Some("alice's rig".into()),
+            ..Config::default()
+        };
+        let out = format_status(&cfg, std::path::Path::new("/tmp/x.toml"));
+        assert!(out.contains("alice's rig"));
     }
 
     #[test]
