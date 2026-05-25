@@ -14,9 +14,10 @@ use crate::{
     update, AGENT_VERSION,
 };
 use anyhow::{anyhow, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use parking_lot::Mutex;
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -24,6 +25,114 @@ use std::{
     time::Duration,
 };
 use tracing::{info, warn};
+
+// ---------------------------------------------------------------------------
+// Live observation slots consumed by the upcoming egui UI (see
+// `plans/native-ui.md`).  None of this is wire-format; it's purely
+// in-memory state that the existing tick functions populate so an
+// in-process subscriber can read what the loops already know.
+// ---------------------------------------------------------------------------
+
+/// Maximum number of finished jobs kept in `WorkerObservers::recent_jobs`.
+/// Older entries fall off the back of the ring.
+pub const RECENT_JOBS_CAP: usize = 50;
+
+/// Prompt previews stored in `CurrentJob` / `RecentJob` are clipped to
+/// this many chars so the in-memory state stays bounded even when LLM
+/// prompts are huge.
+pub const PROMPT_PREVIEW_CHARS: usize = 200;
+
+/// Job in flight right now.  Populated by `claim_tick` before
+/// dispatch, cleared once the job finishes (success or failure).
+#[derive(Debug, Clone)]
+pub struct CurrentJob {
+    pub job_id: String,
+    pub kind: TaskKind,
+    pub model: String,
+    pub prompt: String,
+    pub started_at: DateTime<Utc>,
+}
+
+/// Outcome a finished job ended with.  Failures carry the human
+/// reason (already surfaced to logs + Sentry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobOutcome {
+    Completed,
+    Failed { reason: String },
+}
+
+/// One finished job, retained in the recent-jobs ring for the UI.
+#[derive(Debug, Clone)]
+pub struct RecentJob {
+    pub job_id: String,
+    pub kind: TaskKind,
+    pub model: String,
+    pub prompt: String,
+    pub outcome: JobOutcome,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+}
+
+/// Result of the most recent `heartbeat_tick`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartbeatOutcome {
+    Ok,
+    Err { reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct HeartbeatStatus {
+    pub last_attempt_at: DateTime<Utc>,
+    pub outcome: HeartbeatOutcome,
+}
+
+/// Bundle of in-process observation slots written by the runtime
+/// loops and read by the UI.  `Default` gives empty slots so existing
+/// (headless) call sites stay one-liners.  Cheap to clone — every
+/// field is an `Arc`.
+#[derive(Clone, Default)]
+pub struct WorkerObservers {
+    pub current_job: Arc<Mutex<Option<CurrentJob>>>,
+    pub recent_jobs: Arc<Mutex<VecDeque<RecentJob>>>,
+    pub last_heartbeat: Arc<Mutex<Option<HeartbeatStatus>>>,
+}
+
+fn truncate_prompt(s: &str) -> String {
+    if s.chars().count() <= PROMPT_PREVIEW_CHARS {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(PROMPT_PREVIEW_CHARS).collect();
+    out.push('…');
+    out
+}
+
+fn record_recent_job(observers: &WorkerObservers, entry: RecentJob) {
+    let mut ring = observers.recent_jobs.lock();
+    ring.push_front(entry);
+    while ring.len() > RECENT_JOBS_CAP {
+        ring.pop_back();
+    }
+}
+
+/// Test-only helper to populate the recent-jobs ring without driving a
+/// full claim cycle.  Lives in the library surface so integration
+/// tests can pin the ring-capacity contract cheaply.
+#[doc(hidden)]
+pub fn push_recent_job_for_tests(observers: &WorkerObservers, job_id: &str) {
+    let now = Utc::now();
+    record_recent_job(
+        observers,
+        RecentJob {
+            job_id: job_id.to_string(),
+            kind: TaskKind::Image,
+            model: "synthetic".into(),
+            prompt: String::new(),
+            outcome: JobOutcome::Completed,
+            started_at: now,
+            finished_at: now,
+        },
+    );
+}
 
 /// Tracing target for runtime-level events (startup, state mutations).
 /// Stable so operators can filter with `RUST_LOG=studio_worker::runtime=debug`.
@@ -290,6 +399,7 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let observers = WorkerObservers::default();
 
     let stop_clone = stop.clone();
     tokio::spawn(async move {
@@ -297,7 +407,7 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
         stop_clone.store(true, Ordering::SeqCst);
     });
 
-    run_loops(cfg, stop, logs, busy, LoopSchedule::default()).await;
+    run_loops(cfg, stop, logs, busy, observers, LoopSchedule::default()).await;
     Ok(())
 }
 
@@ -309,6 +419,7 @@ pub async fn run_loops(
     stop: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
+    observers: WorkerObservers,
     schedule: LoopSchedule,
 ) {
     let heartbeat = spawn_heartbeat(
@@ -316,6 +427,7 @@ pub async fn run_loops(
         stop.clone(),
         logs.clone(),
         busy.clone(),
+        observers.clone(),
         schedule,
     );
     let claim = spawn_claim_loop(
@@ -323,6 +435,7 @@ pub async fn run_loops(
         stop.clone(),
         logs.clone(),
         busy.clone(),
+        observers.clone(),
         schedule,
     );
     let log_shipper = spawn_log_shipper(cfg.clone(), stop.clone(), logs.clone(), schedule);
@@ -354,11 +467,13 @@ pub enum ClaimOutcome {
 }
 
 /// Send one heartbeat.  Returns Ok regardless of whether the HTTP call
-/// succeeded — failures are captured in the log buffer.
+/// succeeded — failures are captured in the log buffer and in
+/// `observers.last_heartbeat` for the UI.
 pub async fn heartbeat_tick(
     cfg: &Config,
     busy_now: bool,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
+    observers: &WorkerObservers,
 ) -> Result<()> {
     let engine = match engine::build(cfg) {
         Ok(e) => e,
@@ -370,6 +485,12 @@ pub async fn heartbeat_tick(
                 &format!("engine error: {e}"),
                 None,
             );
+            *observers.last_heartbeat.lock() = Some(HeartbeatStatus {
+                last_attempt_at: Utc::now(),
+                outcome: HeartbeatOutcome::Err {
+                    reason: format!("engine error: {e}"),
+                },
+            });
             return Ok(());
         }
     };
@@ -383,8 +504,8 @@ pub async fn heartbeat_tick(
         api.heartbeat(&worker_id, &token, cap, None)
     })
     .await;
-    match result {
-        Ok(Ok(())) => {}
+    let outcome = match result {
+        Ok(Ok(())) => HeartbeatOutcome::Ok,
         Ok(Err(e)) => {
             push_log(
                 &logs_for_task,
@@ -393,6 +514,9 @@ pub async fn heartbeat_tick(
                 &format!("heartbeat failed (busy={busy_now}): {e}"),
                 None,
             );
+            HeartbeatOutcome::Err {
+                reason: e.to_string(),
+            }
         }
         Err(e) => {
             push_log(
@@ -402,8 +526,15 @@ pub async fn heartbeat_tick(
                 &format!("heartbeat task panic: {e}"),
                 None,
             );
+            HeartbeatOutcome::Err {
+                reason: format!("task panic: {e}"),
+            }
         }
-    }
+    };
+    *observers.last_heartbeat.lock() = Some(HeartbeatStatus {
+        last_attempt_at: Utc::now(),
+        outcome,
+    });
     Ok(())
 }
 
@@ -412,6 +543,7 @@ pub async fn claim_tick(
     cfg: &Config,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     busy: &Arc<AtomicBool>,
+    observers: &WorkerObservers,
 ) -> ClaimOutcome {
     if !cfg.auto_enabled {
         return ClaimOutcome::Skipped;
@@ -452,13 +584,28 @@ pub async fn claim_tick(
                 ),
                 Some(job.job_id.clone()),
             );
+
+            // Snapshot for the UI _before_ we move `job` into the
+            // blocking thread.  Resolving the task lazily here lets us
+            // record the real kind even when the wire payload omitted
+            // the explicit `task` field (legacy image-only path).
+            let resolved = job.resolved_task();
+            let snapshot = CurrentJob {
+                job_id: job.job_id.clone(),
+                kind: resolved.kind(),
+                model: job.model.clone(),
+                prompt: truncate_prompt(&prompt_for(&resolved)),
+                started_at: Utc::now(),
+            };
+            *observers.current_job.lock() = Some(snapshot.clone());
+
             // Drop the api on the blocking thread to avoid reqwest's
             // internal runtime dropping inside an async context.
             let logs_clone = logs.clone();
             let token_clone = token.clone();
             let worker_id_clone = worker_id.clone();
             let engine_handle = engine;
-            let _ = tokio::task::spawn_blocking(move || {
+            let join = tokio::task::spawn_blocking(move || {
                 run_job(
                     &api,
                     &token_clone,
@@ -466,9 +613,28 @@ pub async fn claim_tick(
                     &*engine_handle,
                     &logs_clone,
                     job,
-                );
+                )
             })
             .await;
+            let outcome = match join {
+                Ok(o) => o,
+                Err(e) => JobOutcome::Failed {
+                    reason: format!("job task panic: {e}"),
+                },
+            };
+            *observers.current_job.lock() = None;
+            record_recent_job(
+                observers,
+                RecentJob {
+                    job_id: snapshot.job_id,
+                    kind: snapshot.kind,
+                    model: snapshot.model,
+                    prompt: snapshot.prompt,
+                    outcome,
+                    started_at: snapshot.started_at,
+                    finished_at: Utc::now(),
+                },
+            );
             busy.store(false, Ordering::SeqCst);
             ClaimOutcome::RanJob
         }
@@ -638,6 +804,7 @@ pub fn spawn_heartbeat(
     stop: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
+    observers: WorkerObservers,
     schedule: LoopSchedule,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -645,7 +812,7 @@ pub fn spawn_heartbeat(
             tokio::time::sleep(schedule.heartbeat).await;
             let snapshot = cfg.lock().clone();
             let busy_now = busy.load(Ordering::SeqCst);
-            let _ = heartbeat_tick(&snapshot, busy_now, &logs).await;
+            let _ = heartbeat_tick(&snapshot, busy_now, &logs, &observers).await;
         }
     })
 }
@@ -655,6 +822,7 @@ pub fn spawn_claim_loop(
     stop: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
+    observers: WorkerObservers,
     schedule: LoopSchedule,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -662,7 +830,7 @@ pub fn spawn_claim_loop(
         while !stop.load(Ordering::SeqCst) {
             tokio::time::sleep(next_delay).await;
             let snapshot = cfg.lock().clone();
-            let outcome = claim_tick(&snapshot, &logs, &busy).await;
+            let outcome = claim_tick(&snapshot, &logs, &busy, &observers).await;
             next_delay = match outcome {
                 ClaimOutcome::RanJob => schedule.claim_idle,
                 _ => schedule.claim_after_null,
@@ -734,7 +902,7 @@ fn run_job(
     engine: &dyn Engine,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     job: JobClaim,
-) {
+) -> JobOutcome {
     let start = std::time::Instant::now();
     let task = job.resolved_task();
     let task_kind = task.kind();
@@ -770,35 +938,31 @@ fn run_job(
                     api.complete_json(worker_id, token, &job.job_id, &prompt_for_log, &json)
                 }
             };
-            if let Err(e) = outcome {
-                push_log(
-                    logs,
-                    "error",
-                    "complete",
-                    &format!("complete failed: {e}"),
-                    Some(job.job_id.clone()),
-                );
-            } else {
-                push_log(
-                    logs,
-                    "info",
-                    "complete",
-                    "job uploaded",
-                    Some(job.job_id.clone()),
-                );
+            match outcome {
+                Err(e) => {
+                    let reason = format!("complete failed: {e}");
+                    push_log(logs, "error", "complete", &reason, Some(job.job_id.clone()));
+                    JobOutcome::Failed { reason }
+                }
+                Ok(()) => {
+                    push_log(
+                        logs,
+                        "info",
+                        "complete",
+                        "job uploaded",
+                        Some(job.job_id.clone()),
+                    );
+                    JobOutcome::Completed
+                }
             }
         }
         Err(e) => {
             warn!("generate failed: {e:#}");
-            push_log(
-                logs,
-                "error",
-                "generate",
-                &format!("generate failed: {e}"),
-                Some(job.job_id.clone()),
-            );
+            let reason = format!("generate failed: {e}");
+            push_log(logs, "error", "generate", &reason, Some(job.job_id.clone()));
             let retryable = !is_unsupported_kind(&e);
             let _ = api.fail(worker_id, token, &job.job_id, &e.to_string(), retryable);
+            JobOutcome::Failed { reason }
         }
     }
 }
@@ -1072,7 +1236,8 @@ mod tests {
         };
         let logs = Arc::new(Mutex::new(Vec::new()));
         let busy = Arc::new(AtomicBool::new(false));
-        let outcome = claim_tick(&cfg, &logs, &busy).await;
+        let observers = WorkerObservers::default();
+        let outcome = claim_tick(&cfg, &logs, &busy, &observers).await;
         assert_eq!(outcome, ClaimOutcome::Skipped);
     }
 

@@ -42,6 +42,8 @@ pub enum Command {
     Config,
     /// Check the release feed for a newer version (does not install).
     CheckUpdate,
+    /// Launch the desktop UI (requires the `ui` cargo feature).
+    Ui,
 }
 
 #[cfg(test)]
@@ -104,6 +106,7 @@ mod tests {
             ("disable", Command::Disable),
             ("config", Command::Config),
             ("check-update", Command::CheckUpdate),
+            ("ui", Command::Ui),
         ];
         for (name, expected) in cases {
             let cli = Cli::parse_from(["studio-worker", name]);

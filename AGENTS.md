@@ -39,6 +39,14 @@ CI.
 - **image** — encode synthetic WEBP/PNG output
 - **wiremock** — test-only mock HTTP server for integration tests
 - **tracing / tracing-subscriber** — structured logging
+- **egui / eframe** (`ui` feature, off by default) — native desktop
+  UI with tab shell, in-window register form, live job + heartbeat
+  view, full config editor, log tail, manual update check
+- **tray-icon / notify-rust** (`ui` feature, off by default) — system
+  tray icon with Open / Pause-Resume / Quit menu + opt-in OS-native
+  desktop notifications on job completion / failure
+- **gtk** (`ui` feature, Linux only) — needed for `gtk::init()` on a
+  dedicated thread so the tray's AppIndicator backend works
 
 ## Project layout
 

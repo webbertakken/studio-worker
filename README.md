@@ -30,6 +30,65 @@ what the unattended CI suite uses.  Real high-performance backends
 feature flags and are deferred to a follow-up iteration (the trait,
 contract, and dispatch are already in place).
 
+## Desktop UI (optional)
+
+The worker also ships a native desktop window built on `egui`/`eframe`
+that surfaces every config knob, the live job in flight, the
+recent-jobs history, the rolling log tail, and a system-tray icon
+with Open / Pause-Resume / Quit.  Disabled by default so the headless
+`cargo install` + the systemd / launchd service path stay free of GL
+/ winit / dbus / GTK deps.
+
+Enable with the `ui` cargo feature:
+
+```bash
+cargo install studio-worker --features ui
+studio-worker ui
+```
+
+Five tabs:
+
+| Tab     | What it shows                                                     |
+| ------- | ----------------------------------------------------------------- |
+| Status  | Worker id, API URL, VRAM total + threshold, busy / idle / paused badge, last heartbeat age + outcome.  When the worker isn't registered, an in-window Register form. |
+| Jobs    | Current job in flight (kind, model, prompt, elapsed time) + bounded ring of the last 50 finished jobs with completed / failed badges. |
+| Config  | Every `config.toml` field as an editable widget grouped into Connection / Worker / Engine / Auto-update / Models / Notifications / Background mode.  Save writes through `config::save` and the runtime picks up new values on the next tick.  Engine swaps surface a "restart required" banner. |
+| Logs    | Level filter (info / warn / error), free-text search across category / message / job id, auto-scroll toggle, windowed at the last 500 entries. |
+| About   | Version, Sentry release name, resolved config path, "Check for updates" button. |
+
+![Status tab](docs/screenshots/status.png)
+
+The tray icon reflects state (idle = green, busy = amber,
+disconnected = red) and exposes:
+
+- **Open Window** — re-show the window after hide-to-tray.
+- **Pause / Resume claiming** — toggles `auto_enabled`, persisted to
+  `config.toml`.
+- **Quit** — signals the runtime loops to stop, awaits any in-flight
+  job briefly, then exits.
+
+Closing the window hides it to the tray; the worker keeps running.
+For an autostart-on-login workflow, tick the **Run in tray on login**
+toggle on the Config tab (writes `~/.config/autostart/studio-worker-ui.desktop`
+on Linux, a LaunchAgent plist on macOS, a marker file on Windows).
+
+### Linux build-time deps
+
+The tray + notifications stack pulls in GTK + D-Bus.  On a fresh
+Ubuntu / Debian box install:
+
+```bash
+sudo apt-get install -y \
+  libgtk-3-dev \
+  libdbus-1-dev \
+  libxdo-dev \
+  libayatana-appindicator3-dev
+```
+
+For the unattended `ui` builds in CI the same packages are installed
+by `.github/workflows/checks.yml` before `cargo test --features ui`.
+No extra deps are required on macOS / Windows.
+
 ## Quick install
 
 ### Linux / macOS
