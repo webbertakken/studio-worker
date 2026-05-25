@@ -13,6 +13,7 @@
 //!    lower-severity events.  Driven via `sentry::test::with_captured_events`
 //!    which installs a thread-local hub with a noop transport.
 use studio_worker::telemetry::{self, SentryConfig};
+use studio_worker::{AGENT_VERSION, RELEASE_NAME};
 use tracing_subscriber::prelude::*;
 
 const TEST_DSN: &str = "https://public@example.ingest.sentry.io/1";
@@ -199,6 +200,18 @@ fn build_client_options_returns_none_for_invalid_dsn() {
         server_name: "host".into(),
     };
     assert!(telemetry::build_client_options(&cfg).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// RELEASE_NAME — must follow Sentry's `<pkg>@<version>` convention so
+// it doesn't collide with other projects under the same org.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn release_name_uses_pkg_at_version_convention() {
+    assert_eq!(RELEASE_NAME, format!("studio-worker@{AGENT_VERSION}"));
+    assert!(RELEASE_NAME.starts_with("studio-worker@"));
+    assert!(RELEASE_NAME.ends_with(AGENT_VERSION));
 }
 
 #[test]
