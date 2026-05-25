@@ -69,6 +69,11 @@ pub struct Config {
     /// Defaults to the OS cache dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_root: Option<std::path::PathBuf>,
+    /// Maximum number of WebSocket reconnect attempts before the
+    /// worker gives up and exits non-zero (relying on the service
+    /// manager to restart it).  `0` = infinite.  Defaults to `5`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_reconnect_attempts: Option<u32>,
 }
 
 fn default_auto_update_enabled() -> bool {
@@ -100,6 +105,7 @@ impl Default for Config {
             auto_update_feed: default_auto_update_feed(),
             auto_update_prerelease: false,
             models_root: None,
+            ws_reconnect_attempts: None,
         }
     }
 }

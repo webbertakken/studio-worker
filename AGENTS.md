@@ -34,7 +34,13 @@ CI.
 
 - **Rust 2021 edition** with Cargo (pinned via `rust-toolchain.toml`)
 - **clap** — CLI parsing
-- **reqwest** (blocking) — HTTP client; tokio runtime wraps the loop
+- **tokio-tungstenite** (rustls-tls-webpki-roots) — WebSocket session to the
+  studio `WorkerConnections` Durable Object; carries every worker-side
+  frame except the multipart `complete` upload
+- **reqwest** (blocking) — HTTP client for the surviving `/register` +
+  multipart `/complete` routes
+- **futures-util** — sink/stream combinators for the WS split
+- **thiserror** — typed errors on the WS client surface
 - **serde / serde_json / toml** — wire-format + config persistence
 - **image** — encode synthetic WEBP/PNG output
 - **wiremock** — test-only mock HTTP server for integration tests
@@ -54,19 +60,32 @@ CI.
 - `src/lib.rs` — exposes the library surface so integration tests can
   drive the contract without going through the CLI.
 - `src/config.rs` — TOML config persisted next to a per-user dir.
-- `src/engine.rs` — pluggable inference engines (`SyntheticEngine`,
-  `GradioEngine`).
-- `src/http.rs` — `ApiClient` wrapping the studio API endpoints.
-- `src/runtime.rs` — heartbeat + claim + log-shipping loops.
+- `src/engine/` — pluggable inference engines (`SyntheticEngine`,
+  `GradioEngine`, plus feature-gated real backends).
+- `src/http.rs` — `ApiClient` wrapping the surviving HTTP routes
+  (`register` + multipart `complete`).
+- `src/runtime.rs` — CLI helpers + auto-updater loop.  The session
+  loop has moved to `src/ws/session.rs`.
+- `src/ws/{client,session,types}.rs` — WebSocket client + session
+  + wire-format types mirroring `apps/studio/src/shared/types/workerWs.ts`.
 - `src/service.rs` — systemd / launchd / scheduled-task installers.
 - `src/sys.rs` — host probes (hostname, username, VRAM).
-- `src/types.rs` — wire-format mirrors of the studio API.
+- `src/types.rs` — shared types (capabilities, tasks, results) used by
+  both the HTTP and the WS surfaces.
 
 Integration tests in `tests/`:
 
-- `tests/http_contract.rs` — every endpoint against a wiremock fake studio.
+- `tests/ws_wire.rs` — round-trip every frame against the TS contract.
+- `tests/ws_client_contract.rs` — WS client against a real
+  tokio-tungstenite server (upgrade, hello, 401 → AuthFailed, close
+  4001 → AuthFailed, binary-frame rejection, close idempotency).
+- `tests/ws_session_full_loop.rs` — end-to-end hello → welcome →
+  LLM offer → accept + completeJson → STT offer → accept +
+  completeJson → clean close.
+- `tests/http_contract.rs` — register + multipart `complete` against
+  wiremock.
+- `tests/http_errors.rs` — error-status paths + tracing-emission.
 - `tests/gradio_engine.rs` — GradioEngine against a wiremock fake Gradio.
-- `tests/full_loop.rs` — one full claim → generate → complete cycle.
 
 ## CI
 

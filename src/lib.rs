@@ -17,6 +17,7 @@ pub mod types;
 #[cfg(feature = "ui")]
 pub mod ui;
 pub mod update;
+pub mod ws;
 
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 

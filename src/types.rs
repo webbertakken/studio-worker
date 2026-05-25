@@ -292,18 +292,18 @@ pub struct FailRequest {
     pub retryable: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ui", derive(PartialEq, Eq))]
 pub struct LogEntry {
     pub ts: String,
     pub level: String,
     pub category: String,
     pub message: String,
-    #[serde(rename = "jobId", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "jobId", default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogBatch {
     pub entries: Vec<LogEntry>,
 }

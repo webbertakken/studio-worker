@@ -48,7 +48,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     let busy_loops = busy.clone();
     let observers_loops = observers.clone();
     handle.spawn(async move {
-        runtime::run_loops(
+        if let Err(e) = runtime::run_loops(
             cfg_loops,
             stop_loops,
             logs_loops,
@@ -56,7 +56,10 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
             observers_loops,
             LoopSchedule::default(),
         )
-        .await;
+        .await
+        {
+            tracing::error!(target: "studio_worker::ui", error = %e, "run_loops exited");
+        }
     });
 
     let app_state = app::AppDeps {
