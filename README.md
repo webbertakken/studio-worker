@@ -192,8 +192,8 @@ When enabled the worker:
 - captures panics automatically (`sentry`'s default panic handler);
 - forwards `tracing::error!` events as Sentry events;
 - attaches preceding `tracing::warn!` events as breadcrumbs;
-- tags every event with the worker's `release` (= crate version) and
-  hostname (`server_name`).
+- tags every event with the worker's `release` (= `studio-worker@<crate version>`,
+  the Sentry-conventional namespaced form) and hostname (`server_name`).
 
 No DSN is baked into the binary, so the public repo never carries
 credentials.  Performance tracing is intentionally off — Sentry is used

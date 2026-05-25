@@ -18,6 +18,12 @@ pub mod update;
 
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Sentry release identifier in the `<pkg>@<version>` form expected by
+/// Sentry's organisation-wide *Releases* feature.  Bare version strings
+/// collide across projects in the same org, so we namespace with the
+/// crate name.  Matches what `sentry::release_name!()` would expand to.
+pub const RELEASE_NAME: &str = concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION"));
+
 /// Dispatch table for the CLI subcommands.  Lives in the library so we
 /// can drive it from tests without invoking the binary.
 pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {

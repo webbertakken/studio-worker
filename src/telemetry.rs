@@ -16,7 +16,7 @@
 //!
 //! Panic capture is on by default (the `panic` feature is part of
 //! `sentry`'s default feature set).
-use crate::{sys, AGENT_VERSION};
+use crate::{sys, RELEASE_NAME};
 use sentry_tracing::EventFilter;
 use std::borrow::Cow;
 
@@ -42,7 +42,7 @@ impl SentryConfig {
         Self::from_env_inner(
             std::env::var("SENTRY_DSN").ok(),
             std::env::var("SENTRY_ENVIRONMENT").ok(),
-            AGENT_VERSION.to_string(),
+            RELEASE_NAME.to_string(),
             sys::machine_name(),
         )
     }
