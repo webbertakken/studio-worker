@@ -20,6 +20,13 @@ use anyhow::{bail, Context, Result};
 use gif::{Encoder, Frame, Repeat};
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::time::Instant;
+use tracing::{debug, warn};
+
+/// Tracing target for the procedural video engine.  Stable so
+/// operators can filter with
+/// `RUST_LOG=studio_worker::engine::video=debug`.
+const TRACE_TARGET: &str = "studio_worker::engine::video";
 
 pub struct VideoEngine;
 
@@ -50,12 +57,48 @@ impl Engine for VideoEngine {
         }
     }
 
-    fn dispatch(&self, _model: &str, task: Task) -> Result<TaskResult> {
+    fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
+        let kind = task.kind();
+        let started = Instant::now();
         let params = match task {
             Task::Video(p) => p,
-            other => bail!("video engine cannot serve {} tasks", other.kind().as_str()),
+            other => {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    kind = kind.as_str(),
+                    model,
+                    "unsupported task kind"
+                );
+                bail!("video engine cannot serve {} tasks", other.kind().as_str());
+            }
         };
-        let bytes = render_gif(&params)?;
+        let result = render_gif(&params);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(bytes) => debug!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                kind = kind.as_str(),
+                model,
+                seconds = params.seconds,
+                width = params.width,
+                height = params.height,
+                bytes = bytes.len(),
+                elapsed_ms,
+                "ok"
+            ),
+            Err(e) => warn!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                kind = kind.as_str(),
+                model,
+                elapsed_ms,
+                error = %e,
+                "failed"
+            ),
+        }
+        let bytes = result?;
         Ok(TaskResult::Video {
             bytes,
             ext: "gif".into(),

@@ -1,11 +1,26 @@
 //! Thin reqwest wrapper around the studio API.
+//!
+//! Every call goes through [`ApiClient::check`], which:
+//!
+//! - emits a structured `tracing` event on success (`debug`) and
+//!   failure (`warn`) so operators can see what the worker is talking
+//!   to without having to enable wire-level logging in reqwest, and
+//! - turns non-2xx responses into an `anyhow` error tagged with the
+//!   operation name so the existing log shipper messages stay legible.
 use crate::types::*;
 use anyhow::{anyhow, Context, Result};
-use reqwest::blocking::Client;
-use std::time::Duration;
+use reqwest::blocking::{Client, Response};
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 /// Base path under which the worker endpoints are mounted.
 const API_PREFIX: &str = "/graphics/api";
+
+/// Tracing target used for every event emitted by the HTTP client.
+/// Keeping it stable lets operators filter with
+/// `RUST_LOG=studio_worker::http=debug` without touching the rest of
+/// the agent's logs.
+const TRACE_TARGET: &str = "studio_worker::http";
 
 pub struct ApiClient {
     pub base_url: String,
@@ -28,6 +43,39 @@ impl ApiClient {
         format!("{}{}{}", self.base_url, API_PREFIX, path)
     }
 
+    /// Inspect a response, log it, and convert non-2xx into an
+    /// `anyhow` error.  `op` is the human-readable operation name used
+    /// in the error message (kept stable for log-shipper consumers and
+    /// existing tests).
+    fn check(&self, op: &str, url: &str, started: Instant, response: Response) -> Result<Response> {
+        let status = response.status();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if status.is_success() || status.as_u16() == 204 {
+            debug!(
+                target: TRACE_TARGET,
+                op,
+                endpoint = %url,
+                status = status.as_u16(),
+                elapsed_ms,
+                "ok"
+            );
+            return Ok(response);
+        }
+        // Body read consumes the response; we only need it on the
+        // failure path.
+        let body = response.text().unwrap_or_default();
+        warn!(
+            target: TRACE_TARGET,
+            op,
+            endpoint = %url,
+            status = status.as_u16(),
+            elapsed_ms,
+            body = %body,
+            "{op} failed"
+        );
+        Err(anyhow!("{op} failed: {status} — {body}"))
+    }
+
     pub fn register(
         &self,
         bootstrap_token: &str,
@@ -39,19 +87,15 @@ impl ApiClient {
             capabilities: cap,
             worker_id,
         };
+        let url = self.url("/workers/register");
+        let started = Instant::now();
         let response = self
             .client
-            .post(self.url("/workers/register"))
+            .post(&url)
             .bearer_auth(bootstrap_token)
             .json(&body)
             .send()?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "register failed: {} — {}",
-                response.status(),
-                response.text().unwrap_or_default()
-            ));
-        }
+        let response = self.check("register", &url, started, response)?;
         Ok(response.json()?)
     }
 
@@ -66,38 +110,26 @@ impl ApiClient {
             capabilities: cap,
             current_job_id,
         };
+        let url = self.url(&format!("/workers/{worker_id}/heartbeat"));
+        let started = Instant::now();
         let response = self
             .client
-            .post(self.url(&format!("/workers/{worker_id}/heartbeat")))
+            .post(&url)
             .bearer_auth(token)
             .json(&body)
             .send()?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "heartbeat failed: {} — {}",
-                response.status(),
-                response.text().unwrap_or_default()
-            ));
-        }
+        self.check("heartbeat", &url, started, response)?;
         Ok(())
     }
 
     /// Returns `Ok(None)` on HTTP 204 (no jobs).
     pub fn claim(&self, worker_id: &str, token: &str) -> Result<Option<JobClaim>> {
-        let response = self
-            .client
-            .post(self.url(&format!("/workers/{worker_id}/claim")))
-            .bearer_auth(token)
-            .send()?;
+        let url = self.url(&format!("/workers/{worker_id}/claim"));
+        let started = Instant::now();
+        let response = self.client.post(&url).bearer_auth(token).send()?;
+        let response = self.check("claim", &url, started, response)?;
         if response.status().as_u16() == 204 {
             return Ok(None);
-        }
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "claim failed: {} — {}",
-                response.status(),
-                response.text().unwrap_or_default()
-            ));
         }
         Ok(Some(response.json()?))
     }
@@ -127,19 +159,15 @@ impl ApiClient {
             .text("prompt", prompt.to_string())
             .text("ext", ext.to_string())
             .part("image", part);
+        let url = self.url(&format!("/workers/{worker_id}/jobs/{job_id}/complete"));
+        let started = Instant::now();
         let response = self
             .client
-            .post(self.url(&format!("/workers/{worker_id}/jobs/{job_id}/complete")))
+            .post(&url)
             .bearer_auth(token)
             .multipart(form)
             .send()?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "complete failed: {} — {}",
-                response.status(),
-                response.text().unwrap_or_default()
-            ));
-        }
+        self.check("complete", &url, started, response)?;
         Ok(())
     }
 
@@ -158,19 +186,15 @@ impl ApiClient {
             "result": result,
             "resultKind": "json",
         });
+        let url = self.url(&format!("/workers/{worker_id}/jobs/{job_id}/complete-json"));
+        let started = Instant::now();
         let response = self
             .client
-            .post(self.url(&format!("/workers/{worker_id}/jobs/{job_id}/complete-json")))
+            .post(&url)
             .bearer_auth(token)
             .json(&body)
             .send()?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "complete-json failed: {} — {}",
-                response.status(),
-                response.text().unwrap_or_default()
-            ));
-        }
+        self.check("complete-json", &url, started, response)?;
         Ok(())
     }
 
@@ -186,36 +210,28 @@ impl ApiClient {
             error: error.to_string(),
             retryable,
         };
+        let url = self.url(&format!("/workers/{worker_id}/jobs/{job_id}/fail"));
+        let started = Instant::now();
         let response = self
             .client
-            .post(self.url(&format!("/workers/{worker_id}/jobs/{job_id}/fail")))
+            .post(&url)
             .bearer_auth(token)
             .json(&body)
             .send()?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "fail failed: {} — {}",
-                response.status(),
-                response.text().unwrap_or_default()
-            ));
-        }
+        self.check("fail", &url, started, response)?;
         Ok(())
     }
 
     pub fn ship_logs(&self, worker_id: &str, token: &str, batch: LogBatch) -> Result<()> {
+        let url = self.url(&format!("/workers/{worker_id}/logs"));
+        let started = Instant::now();
         let response = self
             .client
-            .post(self.url(&format!("/workers/{worker_id}/logs")))
+            .post(&url)
             .bearer_auth(token)
             .json(&batch)
             .send()?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "log ship failed: {} — {}",
-                response.status(),
-                response.text().unwrap_or_default()
-            ));
-        }
+        self.check("log ship", &url, started, response)?;
         Ok(())
     }
 }

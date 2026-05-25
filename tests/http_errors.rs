@@ -3,6 +3,7 @@
 //! branches.
 
 use studio_worker::http::ApiClient;
+use studio_worker::test_support::capture as captured_logs_for;
 use studio_worker::types::*;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -218,4 +219,74 @@ async fn complete_for_unknown_ext_falls_back_to_octet_stream() {
         api.complete("w", "t", "j", "bin", "p", vec![1, 2, 3])
             .unwrap();
     });
+}
+
+// ---------------------------------------------------------------------------
+// Tracing emission — proves every HTTP call leaves an operator-visible
+// breadcrumb (debug on success, warn on failure) with the endpoint,
+// status and elapsed time.  Without this the operations team only sees
+// the API-shipped log line, which doesn't include the URL the worker
+// actually hit.
+//
+// The shared `test_support::capture` helper (re-exported above as
+// `captured_logs_for`) installs one process-global subscriber +
+// thread-local sink.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn successful_call_emits_debug_tracing_event() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/register"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(serde_json::json!({ "workerId": "w", "authToken": "t" })),
+        )
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let logs = captured_logs_for(move || {
+        let api = ApiClient::new(uri).unwrap();
+        api.register("boot", caps(), None).unwrap();
+    });
+
+    assert!(logs.contains("DEBUG"), "expected DEBUG event, got: {logs}");
+    assert!(
+        logs.contains("/graphics/api/workers/register"),
+        "expected endpoint in log, got: {logs}"
+    );
+    assert!(
+        logs.contains("op=\"register\""),
+        "expected op field: {logs}"
+    );
+    assert!(logs.contains("status=201"), "expected status field: {logs}");
+    assert!(logs.contains("elapsed_ms"), "expected elapsed_ms: {logs}");
+}
+
+#[tokio::test]
+async fn failing_call_emits_warn_tracing_event_with_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/w/heartbeat"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream-unavailable"))
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let logs = captured_logs_for(move || {
+        let api = ApiClient::new(uri).unwrap();
+        let _ = api.heartbeat("w", "t", caps(), None);
+    });
+
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"heartbeat\""),
+        "expected op field: {logs}"
+    );
+    assert!(logs.contains("status=503"), "expected status field: {logs}");
+    assert!(
+        logs.contains("upstream-unavailable"),
+        "expected response body in log, got: {logs}"
+    );
 }

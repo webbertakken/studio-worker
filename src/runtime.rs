@@ -25,6 +25,10 @@ use std::{
 };
 use tracing::{info, warn};
 
+/// Tracing target for runtime-level events (startup, state mutations).
+/// Stable so operators can filter with `RUST_LOG=studio_worker::runtime=debug`.
+const TRACE_TARGET: &str = "studio_worker::runtime";
+
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const CLAIM_INTERVAL_IDLE: Duration = Duration::from_secs(2);
 pub const CLAIM_INTERVAL_AFTER_NULL: Duration = Duration::from_secs(5);
@@ -176,6 +180,13 @@ pub fn set_enabled(config_path: Option<&str>, enabled: bool) -> Result<()> {
     let (mut cfg, path) = config::load(config_path)?;
     cfg.auto_enabled = enabled;
     config::save(&cfg, &path)?;
+    info!(
+        target: TRACE_TARGET,
+        op = "set_enabled",
+        auto_enabled = enabled,
+        config_path = path.display().to_string(),
+        "auto-claim flag persisted"
+    );
     println!("auto_enabled = {enabled}");
     Ok(())
 }
@@ -187,8 +198,36 @@ pub fn set_threshold(config_path: Option<&str>, gb: f32) -> Result<()> {
     let (mut cfg, path) = config::load(config_path)?;
     cfg.vram_threshold_gb = gb;
     config::save(&cfg, &path)?;
+    info!(
+        target: TRACE_TARGET,
+        op = "set_threshold",
+        vram_threshold_gb = gb,
+        config_path = path.display().to_string(),
+        "VRAM threshold persisted"
+    );
     println!("vram_threshold_gb = {gb}");
     Ok(())
+}
+
+/// Emit a one-shot startup banner so operators can confirm which
+/// config the worker actually loaded.  Without this the only thing in
+/// `journalctl -u studio-worker` on a healthy boot is whatever the
+/// loops happen to log on their first tick.
+pub fn log_startup_banner(cfg: &Config, path: &std::path::Path) {
+    info!(
+        target: TRACE_TARGET,
+        op = "startup",
+        version = AGENT_VERSION,
+        config_path = path.display().to_string(),
+        api_base_url = cfg.api_base_url.as_str(),
+        engine = cfg.engine.as_str(),
+        vram_threshold_gb = cfg.vram_threshold_gb,
+        auto_enabled = cfg.auto_enabled,
+        auto_update_enabled = cfg.auto_update_enabled,
+        auto_update_interval_secs = cfg.auto_update_interval_secs,
+        worker_id = cfg.worker_id.as_deref().unwrap_or("(unregistered)"),
+        "studio-worker booting"
+    );
 }
 
 pub fn show_config(config_path: Option<&str>) -> Result<()> {
@@ -225,6 +264,7 @@ pub fn format_check_outcome(outcome: &update::CheckOutcome) -> String {
 
 pub async fn run(config_path: Option<&str>) -> Result<()> {
     let (mut cfg, path) = config::load(config_path)?;
+    log_startup_banner(&cfg, &path);
     if cfg.worker_id.is_none() || cfg.auth_token.is_none() {
         let engine = engine::build(&cfg)?;
         let cap = build_capabilities(&cfg, &*engine);

@@ -17,6 +17,12 @@ use anyhow::{bail, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::time::Instant;
+use tracing::{debug, warn};
+
+/// Tracing target for the formant TTS engine.  Stable so operators can
+/// filter with `RUST_LOG=studio_worker::engine::tts=debug`.
+const TRACE_TARGET: &str = "studio_worker::engine::tts";
 
 pub struct TtsEngine;
 
@@ -144,12 +150,47 @@ impl Engine for TtsEngine {
         }
     }
 
-    fn dispatch(&self, _model: &str, task: Task) -> Result<TaskResult> {
+    fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
+        let kind = task.kind();
+        let started = Instant::now();
         let params = match task {
             Task::AudioTts(p) => p,
-            other => bail!("tts engine cannot serve {} tasks", other.kind().as_str()),
+            other => {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    kind = kind.as_str(),
+                    model,
+                    "unsupported task kind"
+                );
+                bail!("tts engine cannot serve {} tasks", other.kind().as_str());
+            }
         };
-        let bytes = render(&params.text, &params.voice)?;
+        let text_len = params.text.chars().count();
+        let result = render(&params.text, &params.voice);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(bytes) => debug!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                kind = kind.as_str(),
+                model,
+                text_chars = text_len,
+                bytes = bytes.len(),
+                elapsed_ms,
+                "ok"
+            ),
+            Err(e) => warn!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                kind = kind.as_str(),
+                model,
+                elapsed_ms,
+                error = %e,
+                "failed"
+            ),
+        }
+        let bytes = result?;
         Ok(TaskResult::AudioTts {
             bytes,
             ext: "wav".into(),

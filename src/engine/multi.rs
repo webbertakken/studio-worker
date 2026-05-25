@@ -16,6 +16,11 @@ use crate::engine::{Engine, EngineCapabilities};
 use crate::types::*;
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
+use tracing::{debug, warn};
+
+/// Tracing target for the multi engine.  Stable so operators can
+/// filter with `RUST_LOG=studio_worker::engine::multi=debug`.
+const TRACE_TARGET: &str = "studio_worker::engine::multi";
 
 pub struct MultiEngine {
     engines: Vec<Box<dyn Engine>>,
@@ -29,6 +34,15 @@ impl MultiEngine {
     fn pick_for(&self, kind: TaskKind, model: &str) -> Option<&dyn Engine> {
         for e in &self.engines {
             if e.capabilities().supports(kind, model) {
+                debug!(
+                    target: TRACE_TARGET,
+                    op = "pick",
+                    kind = kind.as_str(),
+                    model,
+                    sub_engine = e.name(),
+                    r#match = "exact",
+                    "engine selected"
+                );
                 return Some(e.as_ref());
             }
         }
@@ -38,9 +52,25 @@ impl MultiEngine {
                 .supported_models_per_kind
                 .contains_key(&kind)
             {
+                debug!(
+                    target: TRACE_TARGET,
+                    op = "pick",
+                    kind = kind.as_str(),
+                    model,
+                    sub_engine = e.name(),
+                    r#match = "fallback",
+                    "engine selected by kind fallback"
+                );
                 return Some(e.as_ref());
             }
         }
+        warn!(
+            target: TRACE_TARGET,
+            op = "pick",
+            kind = kind.as_str(),
+            model,
+            "no engine advertises this kind"
+        );
         None
     }
 }

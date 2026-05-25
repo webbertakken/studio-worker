@@ -20,6 +20,12 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::{debug, info, warn};
+
+/// Tracing target for the llama engine.  Stable so operators can
+/// filter with `RUST_LOG=studio_worker::engine::llama=debug`.
+const TRACE_TARGET: &str = "studio_worker::engine::llama";
 
 pub struct LlamaEngine {
     backend: Arc<LlamaBackend>,
@@ -107,17 +113,51 @@ impl LlamaEngine {
         let mut guard = self.cached.lock();
         if let Some(c) = &*guard {
             if c.id == model {
+                debug!(
+                    target: TRACE_TARGET,
+                    op = "load",
+                    model,
+                    cache = "hit",
+                    "reusing cached model"
+                );
                 return Ok(c.model.clone());
             }
         }
+        info!(
+            target: TRACE_TARGET,
+            op = "load",
+            model,
+            path = %path.display(),
+            "loading model"
+        );
+        let started = Instant::now();
         let params = LlamaModelParams::default();
         let loaded = LlamaModel::load_from_file(&self.backend, path, &params)
-            .with_context(|| format!("loading model {} from {}", model, path.display()))?;
+            .with_context(|| format!("loading model {} from {}", model, path.display()))
+            .inspect_err(|e| {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "load",
+                    model,
+                    path = %path.display(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %e,
+                    "failed to load model"
+                );
+            })?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         let arc = Arc::new(loaded);
         *guard = Some(CachedModel {
             id: model.to_string(),
             model: arc.clone(),
         });
+        info!(
+            target: TRACE_TARGET,
+            op = "load",
+            model,
+            elapsed_ms,
+            "model loaded"
+        );
         Ok(arc)
     }
 }
@@ -218,24 +258,71 @@ impl Engine for LlamaEngine {
     }
 
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
+        let kind = task.kind();
         let llm = match task {
             Task::Llm(p) => p,
-            other => bail!("llama engine cannot serve {} tasks", other.kind().as_str()),
+            other => {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    kind = kind.as_str(),
+                    model,
+                    "unsupported task kind"
+                );
+                bail!("llama engine cannot serve {} tasks", other.kind().as_str());
+            }
         };
-        let path = self
-            .resolve_path(model)
-            .ok_or_else(|| anyhow!("model `{model}` not found in {}", self.llm_dir().display()))?;
+        let path = self.resolve_path(model).ok_or_else(|| {
+            warn!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                model,
+                models_root = %self.llm_dir().display(),
+                "model not found"
+            );
+            anyhow!("model `{model}` not found in {}", self.llm_dir().display())
+        })?;
         let loaded = self.load_or_get(model, &path)?;
         let prompt = render_prompt(&llm.messages);
-        let started = std::time::Instant::now();
+        debug!(
+            target: TRACE_TARGET,
+            op = "dispatch",
+            kind = kind.as_str(),
+            model,
+            max_tokens = llm.max_tokens,
+            temperature = llm.temperature,
+            messages = llm.messages.len(),
+            "starting generation"
+        );
+        let started = Instant::now();
         let content = run_generation(
             &loaded,
             &self.backend,
             &prompt,
             llm.max_tokens.max(1),
             llm.temperature.max(0.0),
-        )?;
+        )
+        .inspect_err(|e| {
+            warn!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                kind = kind.as_str(),
+                model,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "generation failed"
+            );
+        })?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
+        info!(
+            target: TRACE_TARGET,
+            op = "dispatch",
+            kind = kind.as_str(),
+            model,
+            elapsed_ms,
+            completion_chars = content.len(),
+            "generation complete"
+        );
 
         let prompt_tokens = prompt.split_whitespace().count();
         let completion_tokens = content.split_whitespace().count();

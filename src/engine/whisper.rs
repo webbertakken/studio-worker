@@ -13,8 +13,13 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+/// Tracing target for the whisper engine.  Stable so operators can
+/// filter with `RUST_LOG=studio_worker::engine::whisper=debug`.
+const TRACE_TARGET: &str = "studio_worker::engine::whisper";
 
 pub struct WhisperEngine {
     models_root: PathBuf,
@@ -66,21 +71,55 @@ impl WhisperEngine {
         let mut guard = self.cached.lock();
         if let Some(c) = &*guard {
             if c.id == model {
+                debug!(
+                    target: TRACE_TARGET,
+                    op = "load",
+                    model,
+                    cache = "hit",
+                    "reusing cached model"
+                );
                 return Ok(c.ctx.clone());
             }
         }
+        info!(
+            target: TRACE_TARGET,
+            op = "load",
+            model,
+            path = %path.display(),
+            "loading model"
+        );
+        let started = Instant::now();
         let params = WhisperContextParameters::default();
         let ctx = WhisperContext::new_with_params(
             path.to_str()
                 .ok_or_else(|| anyhow!("model path not UTF-8: {}", path.display()))?,
             params,
         )
-        .with_context(|| format!("loading whisper model from {}", path.display()))?;
+        .with_context(|| format!("loading whisper model from {}", path.display()))
+        .inspect_err(|e| {
+            warn!(
+                target: TRACE_TARGET,
+                op = "load",
+                model,
+                path = %path.display(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "failed to load model"
+            );
+        })?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         let arc = Arc::new(ctx);
         *guard = Some(CachedModel {
             id: model.to_string(),
             ctx: arc.clone(),
         });
+        info!(
+            target: TRACE_TARGET,
+            op = "load",
+            model,
+            elapsed_ms,
+            "model loaded"
+        );
         Ok(arc)
     }
 }
@@ -193,23 +232,68 @@ impl Engine for WhisperEngine {
     }
 
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
+        let kind = task.kind();
         let stt = match task {
             Task::AudioStt(p) => p,
-            other => bail!(
-                "whisper engine cannot serve {} tasks",
-                other.kind().as_str()
-            ),
+            other => {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    kind = kind.as_str(),
+                    model,
+                    "unsupported task kind"
+                );
+                bail!(
+                    "whisper engine cannot serve {} tasks",
+                    other.kind().as_str()
+                );
+            }
         };
-        let path = self
-            .resolve_path(model)
-            .ok_or_else(|| anyhow!("model `{model}` not found in {}", self.stt_dir().display()))?;
+        let path = self.resolve_path(model).ok_or_else(|| {
+            warn!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                model,
+                models_root = %self.stt_dir().display(),
+                "model not found"
+            );
+            anyhow!("model `{model}` not found in {}", self.stt_dir().display())
+        })?;
         let ctx = self.load_or_get(model, &path)?;
+        let fetch_started = Instant::now();
         let audio = fetch_and_decode_audio(&stt.input_url)
-            .with_context(|| format!("decoding audio from {}", stt.input_url))?;
+            .with_context(|| format!("decoding audio from {}", stt.input_url))
+            .inspect_err(|e| {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "fetch_audio",
+                    url = %stt.input_url,
+                    elapsed_ms = fetch_started.elapsed().as_millis() as u64,
+                    error = %e,
+                    "audio fetch/decode failed"
+                );
+            })?;
+        let fetch_ms = fetch_started.elapsed().as_millis() as u64;
         if audio.is_empty() {
+            warn!(
+                target: TRACE_TARGET,
+                op = "fetch_audio",
+                url = %stt.input_url,
+                "decoded audio is empty"
+            );
             bail!("decoded audio is empty");
         }
+        debug!(
+            target: TRACE_TARGET,
+            op = "fetch_audio",
+            url = %stt.input_url,
+            samples = audio.len(),
+            duration_s = audio.len() as f32 / 16_000.0,
+            elapsed_ms = fetch_ms,
+            "audio ready"
+        );
 
+        let decode_started = Instant::now();
         let mut state = ctx.create_state().context("creating whisper state")?;
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(num_cpus_for_decode() as i32);
@@ -230,6 +314,17 @@ impl Engine for WhisperEngine {
             }
         }
         let duration_seconds = audio.len() as f32 / 16_000.0;
+        let decode_ms = decode_started.elapsed().as_millis() as u64;
+        info!(
+            target: TRACE_TARGET,
+            op = "dispatch",
+            kind = kind.as_str(),
+            model,
+            segments,
+            audio_seconds = duration_seconds,
+            decode_ms,
+            "transcription complete"
+        );
         let json = serde_json::json!({
             "text": text.trim(),
             "language": stt.language.unwrap_or_else(|| "en".into()),
