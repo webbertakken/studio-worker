@@ -64,19 +64,46 @@ defined there. Both sides land together as a hard cutover.
 
 ## Phase 2 — WS client
 
-- [ ] `src/ws/client.rs`:
-  - [ ] `connect(base_url, worker_id, token) -> Result<WsStream>`. Build the upgrade
-        request with `Authorization: Bearer <token>` + `Sec-WebSocket-Protocol:
-        studio-worker-v1`. Coerce `https://` → `wss://` and `http://` → `ws://`.
-  - [ ] `WsSession` wrapper exposing `send(WorkerInbound)` + `recv() -> WorkerOutbound`
-        + `close(code, reason)`. Uses an mpsc to serialise writes from multiple tasks
-        (heartbeat task + dispatcher task).
-- [ ] Error mapping: surface 401 upgrade response as a clear "auth failed, re-register"
-      message (mirrors the existing register friendly-error hint).
-- [ ] Test against a `tokio-tungstenite` server in `tests/ws_client_contract.rs`:
-  - [ ] Successful upgrade + hello round-trip.
-  - [ ] 401 upgrade → friendly auth error returned to caller.
-  - [ ] Server closes with 4001 → client surfaces a typed `AuthFailed` error.
+- [x] `src/ws/client.rs`:
+  - [x] `connect(base_url, worker_id, token) -> WsResult<WsClient>` — builds the
+        upgrade request with `Authorization: Bearer <token>` + the
+        `studio-worker-v1` sub-protocol; coerces `http://`→`ws://`,
+        `https://`→`wss://`; constructs the path as
+        `<base>/workers/<id>/connect`.
+  - [x] `WsClient` exposes `send(&WorkerInbound)`, `recv() -> WsResult<Option<WorkerOutbound>>`,
+        and `close(code, reason)`.  All control frames (ping/pong/etc.) are
+        swallowed silently; text frames parse as `WorkerOutbound`; binary
+        frames are rejected as a protocol error.  `close()` is idempotent and
+        wrapped in a 5 s timeout so a stuck peer can't hang shutdown.
+- [x] Error mapping (`WsClientError`):
+  - [x] `AuthFailed { reason }` for both 401 upgrade and server-sent close 4001.
+  - [x] `ConnectionClosed` for clean close + `AlreadyClosed`.
+  - [x] `Protocol(String)` for malformed JSON / binary frames.
+  - [x] `Transport(String)` for everything else.
+- [x] Test pyramid:
+  - [x] 7 unit tests (`#[cfg(test)] mod tests`) for `build_connect_url`
+        (http/https/ws-passthrough/unknown-scheme/invalid-url),
+        `close_frame_to_error` (4001 / normal / no-frame), and the
+        `From<TError>` mapping for `AlreadyClosed`.
+  - [x] 9 integration tests in `tests/ws_client_contract.rs` against a
+        live `tokio-tungstenite` server:
+        - Successful upgrade + sub-protocol/auth header inspection
+        - hello → welcome round-trip
+        - 401 upgrade → `AuthFailed`
+        - Server closes 4001 → `AuthFailed`
+        - Server closes 1000 → `ConnectionClosed`
+        - Binary frame → `Protocol`
+        - Silent stream end → `Ok(None)` (or `ConnectionClosed`/`Transport`),
+          second `recv()` returns `Ok(None)` cleanly
+        - `close()` writes a close frame the server observes + second
+          `close()` is a no-op
+        - `Debug` impl on `WsClient` renders
+- [x] Coverage on `ws/client.rs`: 91.6% regions / 84.6% functions /
+      95.8% lines.  The remaining gap is one defensive doc-comment region
+      + one unreachable brace artefact — acceptable for an integration
+      surface.
+- [x] `cargo fmt --check`, `cargo clippy --tests -- -D warnings`, and the
+      full `cargo test` suite (275 tests, up from 257) are all clean.
 
 ## Phase 3 — Runtime rewrite
 
