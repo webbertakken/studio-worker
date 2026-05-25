@@ -5,7 +5,10 @@
 //! comparing semver, and selecting the right asset URL.
 
 use semver::Version;
+use std::io;
+use std::sync::{Arc, Mutex};
 use studio_worker::update;
+use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -346,6 +349,154 @@ async fn apply_helper_wraps_real_runner() {
         .unwrap()
         .unwrap_err();
     assert!(err.to_string().contains("release 9.9.9"));
+}
+
+// ---------------------------------------------------------------------------
+// Tracing emission — proves the auto-update path leaves operator-visible
+// breadcrumbs for every state transition (feed fetch, download, installer
+// run).  Without this an update that stalls or misbehaves is invisible
+// outside of the runtime's coarse-grained log-shipper entries.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct CapturingMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> MakeWriter<'a> for CapturingMakeWriter {
+    type Writer = CapturingWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturingWriter(self.0.clone())
+    }
+}
+
+impl io::Write for CapturingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn captured_logs_for<F: FnOnce() + Send + 'static>(f: F) -> String {
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let buf_for_thread = buf.clone();
+    std::thread::spawn(move || {
+        let make_writer = CapturingMakeWriter(buf_for_thread);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+    })
+    .join()
+    .expect("capture thread panicked");
+    let bytes = buf.lock().unwrap().clone();
+    String::from_utf8(bytes).expect("tracing output should be valid UTF-8")
+}
+
+#[tokio::test]
+async fn fetch_releases_emits_debug_event_on_success() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!([release("v0.1.0", false, false)]);
+    Mock::given(method("GET"))
+        .and(path("/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let feed = format!("{}/releases", server.uri());
+    let logs = captured_logs_for(move || {
+        update::fetch_releases(&feed).unwrap();
+    });
+
+    assert!(logs.contains("DEBUG"), "expected DEBUG event, got: {logs}");
+    assert!(logs.contains("/releases"), "expected feed url: {logs}");
+    assert!(logs.contains("status=200"), "expected status field: {logs}");
+    assert!(
+        logs.contains("releases=1"),
+        "expected releases count: {logs}"
+    );
+    assert!(logs.contains("elapsed_ms"), "expected elapsed_ms: {logs}");
+}
+
+#[tokio::test]
+async fn fetch_releases_emits_warn_event_on_non_2xx() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/releases"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+        .mount(&server)
+        .await;
+    let feed = format!("{}/releases", server.uri());
+    let logs = captured_logs_for(move || {
+        let _ = update::fetch_releases(&feed);
+    });
+
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(logs.contains("status=503"), "expected status field: {logs}");
+    assert!(logs.contains("/releases"), "expected feed url: {logs}");
+}
+
+#[tokio::test]
+async fn apply_with_emits_info_events_for_every_state_transition() {
+    use std::path::{Path, PathBuf};
+    use studio_worker::update::UpdateRunner;
+
+    struct FakeRunner {
+        installs: Mutex<Vec<PathBuf>>,
+    }
+    impl UpdateRunner for FakeRunner {
+        fn download(&self, _u: &str, dest: &Path) -> anyhow::Result<()> {
+            std::fs::write(dest, b"#!/bin/sh\necho ok\n").unwrap();
+            Ok(())
+        }
+        fn run_installer(&self, p: &Path) -> anyhow::Result<()> {
+            self.installs.lock().unwrap().push(p.to_path_buf());
+            Ok(())
+        }
+    }
+
+    let server = MockServer::start().await;
+    let body = serde_json::json!([release("v0.2.0", false, false)]);
+    Mock::given(method("GET"))
+        .and(path("/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let feed = format!("{}/releases", server.uri());
+
+    let logs = captured_logs_for(move || {
+        let runner = FakeRunner {
+            installs: Mutex::new(Vec::new()),
+        };
+        update::apply_with(&feed, &Version::new(0, 2, 0), &runner).unwrap();
+    });
+
+    assert!(logs.contains("INFO"), "expected INFO event, got: {logs}");
+    assert!(
+        logs.contains("applying update"),
+        "expected apply-start breadcrumb: {logs}"
+    );
+    assert!(
+        logs.contains("downloading installer"),
+        "expected download breadcrumb: {logs}"
+    );
+    assert!(
+        logs.contains("running installer"),
+        "expected installer run breadcrumb: {logs}"
+    );
+    assert!(
+        logs.contains("installer completed"),
+        "expected installer-completed breadcrumb: {logs}"
+    );
+    assert!(
+        logs.contains("latest=0.2.0"),
+        "expected target version field: {logs}"
+    );
 }
 
 #[tokio::test]

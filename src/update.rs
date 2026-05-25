@@ -11,7 +11,13 @@ use crate::types::GithubRelease;
 use anyhow::{anyhow, bail, Context, Result};
 use semver::Version;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
+
+/// Tracing target used for every event emitted by the updater. Operators
+/// can filter the auto-update breadcrumbs in isolation with
+/// `RUST_LOG=studio_worker::update=debug`.
+const TRACE_TARGET: &str = "studio_worker::update";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -26,16 +32,35 @@ pub fn fetch_releases(feed_url: &str) -> Result<Vec<GithubRelease>> {
         .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building reqwest client")?;
+    let started = Instant::now();
     let response = client
         .get(feed_url)
         .header("accept", "application/vnd.github+json")
         .send()
         .with_context(|| format!("GET {feed_url}"))?;
-    if !response.status().is_success() {
-        bail!("feed {feed_url} returned {}", response.status());
+    let status = response.status();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if !status.is_success() {
+        warn!(
+            target: TRACE_TARGET,
+            feed_url,
+            status = status.as_u16(),
+            elapsed_ms,
+            "feed fetch failed"
+        );
+        bail!("feed {feed_url} returned {status}");
     }
     let text = response.text()?;
-    parse_releases(&text)
+    let releases = parse_releases(&text)?;
+    debug!(
+        target: TRACE_TARGET,
+        feed_url,
+        status = status.as_u16(),
+        elapsed_ms,
+        releases = releases.len(),
+        "feed fetched"
+    );
+    Ok(releases)
 }
 
 /// Pure parser separated from the HTTP call so it's trivially testable.
@@ -123,9 +148,18 @@ impl UpdateRunner for RealRunner {
             .timeout(Duration::from_secs(300))
             .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
             .build()?;
+        let started = Instant::now();
         let mut response = client.get(url).send()?.error_for_status()?;
         let mut file = std::fs::File::create(dest)?;
-        std::io::copy(&mut response, &mut file)?;
+        let bytes = std::io::copy(&mut response, &mut file)?;
+        info!(
+            target: TRACE_TARGET,
+            url,
+            dest = %dest.display(),
+            bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "installer downloaded"
+        );
         Ok(())
     }
 
@@ -158,6 +192,12 @@ impl UpdateRunner for RealRunner {
 }
 
 pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R) -> Result<()> {
+    info!(
+        target: TRACE_TARGET,
+        feed_url,
+        latest = %latest,
+        "applying update"
+    );
     let releases = fetch_releases(feed_url)?;
     let release = releases
         .iter()
@@ -174,8 +214,26 @@ pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R)
 
     let tmp = tempfile::tempdir().context("creating tempdir for installer")?;
     let installer_path = tmp.path().join(installer_asset_name());
+    info!(
+        target: TRACE_TARGET,
+        url,
+        dest = %installer_path.display(),
+        latest = %latest,
+        "downloading installer"
+    );
     runner.download(url, &installer_path)?;
+    info!(
+        target: TRACE_TARGET,
+        installer = %installer_path.display(),
+        latest = %latest,
+        "running installer"
+    );
     runner.run_installer(&installer_path)?;
+    info!(
+        target: TRACE_TARGET,
+        latest = %latest,
+        "installer completed; binary replaced"
+    );
     Ok(())
 }
 
@@ -198,10 +256,22 @@ pub fn restart_argv() -> (PathBuf, Vec<std::ffi::OsString>) {
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub fn restart_self() -> ! {
     let (bin, args) = restart_argv();
+    info!(
+        target: TRACE_TARGET,
+        bin = %bin.display(),
+        argc = args.len(),
+        "restarting into updated binary"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let err = std::process::Command::new(&bin).args(&args).exec();
+        tracing::error!(
+            target: TRACE_TARGET,
+            bin = %bin.display(),
+            %err,
+            "exec into updated binary failed"
+        );
         eprintln!("[studio-worker] exec failed: {err}");
         std::process::exit(1);
     }
@@ -210,6 +280,12 @@ pub fn restart_self() -> ! {
         match std::process::Command::new(&bin).args(&args).spawn() {
             Ok(_) => std::process::exit(0),
             Err(err) => {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    bin = %bin.display(),
+                    %err,
+                    "spawn-restart of updated binary failed"
+                );
                 eprintln!("[studio-worker] spawn-restart failed: {err}");
                 std::process::exit(1);
             }
