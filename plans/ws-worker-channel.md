@@ -149,15 +149,35 @@ defined there. Both sides land together as a hard cutover.
 
 ## Phase 4 — Delete dead HTTP code
 
-- [ ] `src/http.rs`: delete `heartbeat`, `claim`, `complete_json`, `fail`,
-      `ship_logs` methods. Keep `register` + `complete` (multipart).
-- [ ] Delete `tests/http_contract.rs` for the deleted endpoints (the multipart
-      contract test for `complete` survives, slimmed down).
-- [ ] Delete `tests/runtime_loops.rs` (covers the three deleted loops); fold the
-      still-useful assertions about engine dispatch into a new
-      `tests/ws_session_loop.rs`.
-- [ ] `rg "heartbeat|claim_idle|claim_after_null|/logs|complete-json|/fail" src` →
-      zero hits outside `update.rs` (auto-update uses HEAD/GET only).
+- [x] `src/http.rs`: deleted `heartbeat`, `claim`, `complete_json`, `fail`,
+      `ship_logs`.  Only `register` + `complete` (multipart) remain.
+- [x] `src/runtime.rs`: deleted `heartbeat_tick`, `claim_tick`,
+      `log_shipper_tick`, `run_job`, `ClaimOutcome`, `spawn_heartbeat`,
+      `spawn_claim_loop`, `spawn_log_shipper`, `next_delay_for`, and the
+      `HEARTBEAT_INTERVAL`/`CLAIM_INTERVAL_*`/`LOG_FLUSH_INTERVAL`
+      constants.  `LoopSchedule` now only carries `auto_update_tick`.
+      Doc comments updated to reflect the WS-driven flow.
+- [x] `tests/http_contract.rs` slimmed to the surviving routes (register
+      + multipart `complete` for image and wav).
+- [x] `tests/http_errors.rs` slimmed to register + complete error
+      paths + tracing emission contract.
+- [x] `tests/runtime_loops.rs` deleted (covered exactly the three
+      removed loops).
+- [x] `tests/full_loop.rs` deleted (legacy push-based end-to-end; the
+      WS end-to-end is `ws_client_contract.rs` plus the orchestrator
+      contract tests on the API side).
+- [x] `tests/runtime_ticks.rs` slimmed to the surviving auto-update
+      ticks + the `run_returns_when_aborted` smoke test (now points the
+      WS upgrade at a 401-returning wiremock to exercise the
+      AuthFailed exit path).
+- [x] `rg '(heartbeat_tick|claim_tick|log_shipper_tick|spawn_heartbeat|
+      spawn_claim_loop|spawn_log_shipper|complete_json|next_delay_for|
+      ClaimOutcome|api\.fail\b|api\.heartbeat|api\.claim\b|api\.ship_logs)' src tests`
+      returns only comments + the new `spawn_heartbeat_pump` /
+      `spawn_log_shipper_pump` internal task names inside
+      `ws/session.rs`.
+- [x] `cargo test` → 244 tests across 20 suites, all green.
+      `cargo fmt --check` + `cargo clippy --tests -- -D warnings` clean.
 
 ## Phase 5 — Full-loop test
 

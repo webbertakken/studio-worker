@@ -99,42 +99,13 @@ impl ApiClient {
         Ok(response.json()?)
     }
 
-    pub fn heartbeat(
-        &self,
-        worker_id: &str,
-        token: &str,
-        cap: WorkerCapabilities,
-        current_job_id: Option<String>,
-    ) -> Result<()> {
-        let body = HeartbeatRequest {
-            capabilities: cap,
-            current_job_id,
-        };
-        let url = self.url(&format!("/workers/{worker_id}/heartbeat"));
-        let started = Instant::now();
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()?;
-        self.check("heartbeat", &url, started, response)?;
-        Ok(())
-    }
-
-    /// Returns `Ok(None)` on HTTP 204 (no jobs).
-    pub fn claim(&self, worker_id: &str, token: &str) -> Result<Option<JobClaim>> {
-        let url = self.url(&format!("/workers/{worker_id}/claim"));
-        let started = Instant::now();
-        let response = self.client.post(&url).bearer_auth(token).send()?;
-        let response = self.check("claim", &url, started, response)?;
-        if response.status().as_u16() == 204 {
-            return Ok(None);
-        }
-        Ok(Some(response.json()?))
-    }
-
     /// Complete a job with binary output (image / audio / video).
+    ///
+    /// This is the only worker-side HTTP route that survives the WS
+    /// migration: R2 multipart doesn't fit cleanly into WS frames.
+    /// Heartbeats, claim/accept/reject, completeJson, fail, and log
+    /// shipping all flow over the WS session owned by
+    /// `ws::session::spawn_ws_session`.
     pub fn complete(
         &self,
         worker_id: &str,
@@ -168,70 +139,6 @@ impl ApiClient {
             .multipart(form)
             .send()?;
         self.check("complete", &url, started, response)?;
-        Ok(())
-    }
-
-    /// Complete a job with structured JSON output (LLM / STT).
-    pub fn complete_json(
-        &self,
-        worker_id: &str,
-        token: &str,
-        job_id: &str,
-        prompt: &str,
-        result: &serde_json::Value,
-    ) -> Result<()> {
-        let body = serde_json::json!({
-            "jobId": job_id,
-            "prompt": prompt,
-            "result": result,
-            "resultKind": "json",
-        });
-        let url = self.url(&format!("/workers/{worker_id}/jobs/{job_id}/complete-json"));
-        let started = Instant::now();
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()?;
-        self.check("complete-json", &url, started, response)?;
-        Ok(())
-    }
-
-    pub fn fail(
-        &self,
-        worker_id: &str,
-        token: &str,
-        job_id: &str,
-        error: &str,
-        retryable: bool,
-    ) -> Result<()> {
-        let body = FailRequest {
-            error: error.to_string(),
-            retryable,
-        };
-        let url = self.url(&format!("/workers/{worker_id}/jobs/{job_id}/fail"));
-        let started = Instant::now();
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()?;
-        self.check("fail", &url, started, response)?;
-        Ok(())
-    }
-
-    pub fn ship_logs(&self, worker_id: &str, token: &str, batch: LogBatch) -> Result<()> {
-        let url = self.url(&format!("/workers/{worker_id}/logs"));
-        let started = Instant::now();
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .json(&batch)
-            .send()?;
-        self.check("log ship", &url, started, response)?;
         Ok(())
     }
 }

@@ -1,10 +1,10 @@
-//! Long-running heartbeat + claim loop, log shipper, auto-update task,
-//! and the one-shot CLI helpers.
+//! Long-running auto-update task + one-shot CLI helpers.
 //!
-//! The four loops (`spawn_heartbeat`, `spawn_claim_loop`,
-//! `spawn_log_shipper`, `spawn_auto_updater`) are thin `while !stop`
-//! wrappers around the testable `*_tick` helpers below — those are the
-//! places real per-iteration logic lives, and they're 100% unit-tested.
+//! After the WS migration the runtime owns just two background
+//! tasks: the WebSocket session (`ws::session::spawn_ws_session`,
+//! which subsumes heartbeats, claim/accept/complete, fail, and log
+//! shipping) and the auto-updater (`spawn_auto_updater`).  Per-tick
+//! helpers from the old polling loops are gone.
 use crate::{
     config::{self, Config, SharedConfig},
     engine::{self, Engine},
@@ -23,36 +23,24 @@ use std::{
     },
     time::Duration,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 /// Tracing target for runtime-level events (startup, state mutations).
 /// Stable so operators can filter with `RUST_LOG=studio_worker::runtime=debug`.
 const TRACE_TARGET: &str = "studio_worker::runtime";
 
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-pub const CLAIM_INTERVAL_IDLE: Duration = Duration::from_secs(2);
-pub const CLAIM_INTERVAL_AFTER_NULL: Duration = Duration::from_secs(5);
-pub const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 pub const AUTO_UPDATE_TICK: Duration = Duration::from_secs(60);
 
-/// Schedule for the four background loops.  Tests dial these intervals
-/// down to milliseconds so we can exercise the loop bodies quickly.
+/// Schedule for the auto-updater loop.  The WS session has its own
+/// `SessionSchedule` (see `ws::session`).
 #[derive(Debug, Clone, Copy)]
 pub struct LoopSchedule {
-    pub heartbeat: Duration,
-    pub claim_idle: Duration,
-    pub claim_after_null: Duration,
-    pub log_flush: Duration,
     pub auto_update_tick: Duration,
 }
 
 impl Default for LoopSchedule {
     fn default() -> Self {
         Self {
-            heartbeat: HEARTBEAT_INTERVAL,
-            claim_idle: CLAIM_INTERVAL_IDLE,
-            claim_after_null: CLAIM_INTERVAL_AFTER_NULL,
-            log_flush: LOG_FLUSH_INTERVAL,
             auto_update_tick: AUTO_UPDATE_TICK,
         }
     }
@@ -63,10 +51,6 @@ impl LoopSchedule {
     /// loop wrappers without blocking.
     pub fn fast_for_tests() -> Self {
         Self {
-            heartbeat: Duration::from_millis(1),
-            claim_idle: Duration::from_millis(1),
-            claim_after_null: Duration::from_millis(1),
-            log_flush: Duration::from_millis(1),
             auto_update_tick: Duration::from_millis(1),
         }
     }
@@ -332,190 +316,10 @@ pub async fn run_loops(
 // Per-tick helpers — pure async fns, easy to drive from unit tests.
 // ---------------------------------------------------------------------------
 
-/// Outcome of a single claim attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaimOutcome {
-    /// We claimed and ran a job — back to the fast poll interval.
-    RanJob,
-    /// 204 from the API — nothing to do, back off briefly.
-    NoJobs,
-    /// HTTP / wiring error — back off briefly and try again.
-    Error(String),
-    /// Worker is currently `auto_enabled = false`; skip the claim entirely.
-    Skipped,
-}
-
-/// Send one heartbeat.  Returns Ok regardless of whether the HTTP call
-/// succeeded — failures are captured in the log buffer.
-pub async fn heartbeat_tick(
-    cfg: &Config,
-    busy_now: bool,
-    logs: &Arc<Mutex<Vec<LogEntry>>>,
-) -> Result<()> {
-    let engine = match engine::build(cfg) {
-        Ok(e) => e,
-        Err(e) => {
-            push_log(
-                logs,
-                "warn",
-                "heartbeat",
-                &format!("engine error: {e}"),
-                None,
-            );
-            return Ok(());
-        }
-    };
-    let cap = build_capabilities(cfg, &*engine);
-    let token = cfg.auth_token.clone().unwrap_or_default();
-    let worker_id = cfg.worker_id.clone().unwrap_or_default();
-    let api_base_url = cfg.api_base_url.clone();
-    let logs_for_task = logs.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<()> {
-        let api = ApiClient::new(api_base_url)?;
-        api.heartbeat(&worker_id, &token, cap, None)
-    })
-    .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            push_log(
-                &logs_for_task,
-                "warn",
-                "heartbeat",
-                &format!("heartbeat failed (busy={busy_now}): {e}"),
-                None,
-            );
-        }
-        Err(e) => {
-            push_log(
-                &logs_for_task,
-                "warn",
-                "heartbeat",
-                &format!("heartbeat task panic: {e}"),
-                None,
-            );
-        }
-    }
-    Ok(())
-}
-
-/// One claim attempt + (when a job is claimed) run-to-completion.
-pub async fn claim_tick(
-    cfg: &Config,
-    logs: &Arc<Mutex<Vec<LogEntry>>>,
-    busy: &Arc<AtomicBool>,
-) -> ClaimOutcome {
-    if !cfg.auto_enabled {
-        return ClaimOutcome::Skipped;
-    }
-    let engine = match engine::build(cfg) {
-        Ok(e) => e,
-        Err(e) => {
-            push_log(logs, "warn", "claim", &format!("engine error: {e}"), None);
-            return ClaimOutcome::Error(e.to_string());
-        }
-    };
-    let token = cfg.auth_token.clone().unwrap_or_default();
-    let worker_id = cfg.worker_id.clone().unwrap_or_default();
-    let api_base_url = cfg.api_base_url.clone();
-
-    let claim_result = tokio::task::spawn_blocking({
-        let token = token.clone();
-        let worker_id = worker_id.clone();
-        let api_base_url = api_base_url.clone();
-        move || -> Result<(ApiClient, Option<JobClaim>)> {
-            let api = ApiClient::new(api_base_url)?;
-            let claim = api.claim(&worker_id, &token)?;
-            Ok((api, claim))
-        }
-    })
-    .await;
-
-    match claim_result {
-        Ok(Ok((api, Some(job)))) => {
-            busy.store(true, Ordering::SeqCst);
-            push_log(
-                logs,
-                "info",
-                "claim",
-                &format!(
-                    "claimed job {} (model={}, vram={}GB)",
-                    job.job_id, job.model, job.vram_gb_estimate
-                ),
-                Some(job.job_id.clone()),
-            );
-            // Drop the api on the blocking thread to avoid reqwest's
-            // internal runtime dropping inside an async context.
-            let logs_clone = logs.clone();
-            let token_clone = token.clone();
-            let worker_id_clone = worker_id.clone();
-            let engine_handle = engine;
-            let _ = tokio::task::spawn_blocking(move || {
-                run_job(
-                    &api,
-                    &token_clone,
-                    &worker_id_clone,
-                    &*engine_handle,
-                    &logs_clone,
-                    job,
-                );
-            })
-            .await;
-            busy.store(false, Ordering::SeqCst);
-            ClaimOutcome::RanJob
-        }
-        Ok(Ok((_api, None))) => ClaimOutcome::NoJobs,
-        Ok(Err(e)) => {
-            push_log(
-                logs,
-                "warn",
-                "claim",
-                &format!("claim request errored: {e}"),
-                None,
-            );
-            ClaimOutcome::Error(e.to_string())
-        }
-        Err(e) => {
-            push_log(
-                logs,
-                "warn",
-                "claim",
-                &format!("claim task panic: {e}"),
-                None,
-            );
-            ClaimOutcome::Error(e.to_string())
-        }
-    }
-}
-
-/// Flush all buffered logs to the API.  Returns the number of entries
-/// shipped (0 if no logs were buffered or the worker isn't registered).
-pub async fn log_shipper_tick(cfg: &Config, logs: &Arc<Mutex<Vec<LogEntry>>>) -> usize {
-    let token = cfg.auth_token.clone().unwrap_or_default();
-    let worker_id = cfg.worker_id.clone().unwrap_or_default();
-    if worker_id.is_empty() || token.is_empty() {
-        // Drain the buffer anyway so it doesn't grow unbounded.
-        logs.lock().clear();
-        return 0;
-    }
-    let batch = {
-        let mut guard = logs.lock();
-        if guard.is_empty() {
-            return 0;
-        }
-        LogBatch {
-            entries: std::mem::take(&mut *guard),
-        }
-    };
-    let count = batch.entries.len();
-    let api_base_url = cfg.api_base_url.clone();
-    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-        let api = ApiClient::new(api_base_url)?;
-        api.ship_logs(&worker_id, &token, batch)
-    })
-    .await;
-    count
-}
+// (The old per-tick HTTP helpers — heartbeat_tick, claim_tick, log_shipper_tick,
+//  run_job, ClaimOutcome — lived here.  They are gone with the WS migration.
+//  See `ws::session::spawn_ws_session` for the replacement that runs the
+//  whole session in one connected loop.)
 
 /// What the auto-updater decided this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,68 +429,9 @@ pub async fn auto_update_tick(
 // loop on a schedule.  All real logic lives in the ticks.
 // ---------------------------------------------------------------------------
 
-pub fn spawn_heartbeat(
-    cfg: SharedConfig,
-    stop: Arc<AtomicBool>,
-    logs: Arc<Mutex<Vec<LogEntry>>>,
-    busy: Arc<AtomicBool>,
-    schedule: LoopSchedule,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while !stop.load(Ordering::SeqCst) {
-            tokio::time::sleep(schedule.heartbeat).await;
-            let snapshot = cfg.lock().clone();
-            let busy_now = busy.load(Ordering::SeqCst);
-            let _ = heartbeat_tick(&snapshot, busy_now, &logs).await;
-        }
-    })
-}
-
-pub fn spawn_claim_loop(
-    cfg: SharedConfig,
-    stop: Arc<AtomicBool>,
-    logs: Arc<Mutex<Vec<LogEntry>>>,
-    busy: Arc<AtomicBool>,
-    schedule: LoopSchedule,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut next_delay = schedule.claim_idle;
-        while !stop.load(Ordering::SeqCst) {
-            tokio::time::sleep(next_delay).await;
-            let snapshot = cfg.lock().clone();
-            let outcome = claim_tick(&snapshot, &logs, &busy).await;
-            next_delay = match outcome {
-                ClaimOutcome::RanJob => schedule.claim_idle,
-                _ => schedule.claim_after_null,
-            };
-        }
-    })
-}
-
-/// Pure helper so the schedule decision is unit-testable.
-pub fn next_delay_for(outcome: &ClaimOutcome) -> Duration {
-    match outcome {
-        ClaimOutcome::RanJob => CLAIM_INTERVAL_IDLE,
-        ClaimOutcome::NoJobs | ClaimOutcome::Error(_) | ClaimOutcome::Skipped => {
-            CLAIM_INTERVAL_AFTER_NULL
-        }
-    }
-}
-
-pub fn spawn_log_shipper(
-    cfg: SharedConfig,
-    stop: Arc<AtomicBool>,
-    logs: Arc<Mutex<Vec<LogEntry>>>,
-    schedule: LoopSchedule,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while !stop.load(Ordering::SeqCst) {
-            tokio::time::sleep(schedule.log_flush).await;
-            let snapshot = cfg.lock().clone();
-            let _ = log_shipper_tick(&snapshot, &logs).await;
-        }
-    })
-}
+// (`spawn_heartbeat`, `spawn_claim_loop`, `spawn_log_shipper`, and
+//  `next_delay_for` lived here.  Their behaviour is now carried by the
+//  WS-driven tasks in `ws::session`.)
 
 pub fn spawn_auto_updater(
     cfg: SharedConfig,
@@ -715,85 +460,8 @@ pub fn spawn_auto_updater(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Job runner (shared by claim_tick) — pure-ish; HTTP via ApiClient.
-// ---------------------------------------------------------------------------
-
-fn run_job(
-    api: &ApiClient,
-    token: &str,
-    worker_id: &str,
-    engine: &dyn Engine,
-    logs: &Arc<Mutex<Vec<LogEntry>>>,
-    job: JobClaim,
-) {
-    let start = std::time::Instant::now();
-    let task = job.resolved_task();
-    let task_kind = task.kind();
-    let prompt_for_log = prompt_for(&task);
-    let result = engine.dispatch(&job.model, task);
-    match result {
-        Ok(task_result) => {
-            push_log(
-                logs,
-                "info",
-                "generate",
-                &format!(
-                    "{} task generated in {:?}",
-                    task_kind.as_str(),
-                    start.elapsed()
-                ),
-                Some(job.job_id.clone()),
-            );
-            let outcome = match task_result {
-                TaskResult::Image { bytes, ext } => {
-                    api.complete(worker_id, token, &job.job_id, &ext, &prompt_for_log, bytes)
-                }
-                TaskResult::AudioTts { bytes, ext } => {
-                    api.complete(worker_id, token, &job.job_id, &ext, &prompt_for_log, bytes)
-                }
-                TaskResult::Video { bytes, ext } => {
-                    api.complete(worker_id, token, &job.job_id, &ext, &prompt_for_log, bytes)
-                }
-                TaskResult::Llm { json } => {
-                    api.complete_json(worker_id, token, &job.job_id, &prompt_for_log, &json)
-                }
-                TaskResult::AudioStt { json } => {
-                    api.complete_json(worker_id, token, &job.job_id, &prompt_for_log, &json)
-                }
-            };
-            if let Err(e) = outcome {
-                push_log(
-                    logs,
-                    "error",
-                    "complete",
-                    &format!("complete failed: {e}"),
-                    Some(job.job_id.clone()),
-                );
-            } else {
-                push_log(
-                    logs,
-                    "info",
-                    "complete",
-                    "job uploaded",
-                    Some(job.job_id.clone()),
-                );
-            }
-        }
-        Err(e) => {
-            warn!("generate failed: {e:#}");
-            push_log(
-                logs,
-                "error",
-                "generate",
-                &format!("generate failed: {e}"),
-                Some(job.job_id.clone()),
-            );
-            let retryable = !is_unsupported_kind(&e);
-            let _ = api.fail(worker_id, token, &job.job_id, &e.to_string(), retryable);
-        }
-    }
-}
+// (`run_job` lived here.  See `ws::session::run_offered_job` for the
+//  WS-driven replacement.)
 
 pub fn prompt_for(task: &Task) -> String {
     match task {
@@ -972,27 +640,6 @@ mod tests {
     }
 
     #[test]
-    fn next_delay_for_picks_idle_after_a_job() {
-        assert_eq!(next_delay_for(&ClaimOutcome::RanJob), CLAIM_INTERVAL_IDLE);
-    }
-
-    #[test]
-    fn next_delay_for_backs_off_when_no_jobs_or_errors() {
-        assert_eq!(
-            next_delay_for(&ClaimOutcome::NoJobs),
-            CLAIM_INTERVAL_AFTER_NULL
-        );
-        assert_eq!(
-            next_delay_for(&ClaimOutcome::Error("boom".into())),
-            CLAIM_INTERVAL_AFTER_NULL
-        );
-        assert_eq!(
-            next_delay_for(&ClaimOutcome::Skipped),
-            CLAIM_INTERVAL_AFTER_NULL
-        );
-    }
-
-    #[test]
     fn format_status_includes_every_field() {
         let cfg = Config::default();
         let out = format_status(&cfg, std::path::Path::new("/tmp/x.toml"));
@@ -1044,30 +691,6 @@ mod tests {
 
     // --- async tick tests ---
 
-    fn cfg_pointing_at(api_base_url: String) -> Config {
-        Config {
-            api_base_url,
-            worker_id: Some("w-test".into()),
-            auth_token: Some("tok-test".into()),
-            engine: "synthetic".into(),
-            auto_enabled: true,
-            auto_update_enabled: false,
-            ..Config::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn claim_tick_returns_skipped_when_auto_enabled_is_false() {
-        let cfg = Config {
-            auto_enabled: false,
-            ..Config::default()
-        };
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let busy = Arc::new(AtomicBool::new(false));
-        let outcome = claim_tick(&cfg, &logs, &busy).await;
-        assert_eq!(outcome, ClaimOutcome::Skipped);
-    }
-
     #[tokio::test]
     async fn auto_update_tick_disabled_when_flag_off() {
         let cfg = Config {
@@ -1090,31 +713,5 @@ mod tests {
         assert_eq!(decision, AutoUpdateDecision::SkippedBusy);
         let entries = logs.lock();
         assert!(entries.iter().any(|e| e.message.contains("busy on a job")));
-    }
-
-    #[tokio::test]
-    async fn log_shipper_tick_returns_zero_when_buffer_empty() {
-        let cfg = cfg_pointing_at("http://unused.invalid".into());
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let n = log_shipper_tick(&cfg, &logs).await;
-        assert_eq!(n, 0);
-    }
-
-    #[tokio::test]
-    async fn log_shipper_tick_returns_zero_when_unregistered() {
-        let cfg = Config {
-            worker_id: None,
-            auth_token: None,
-            ..cfg_pointing_at("http://unused.invalid".into())
-        };
-        let logs = Arc::new(Mutex::new(vec![LogEntry {
-            ts: "ts".into(),
-            level: "info".into(),
-            category: "x".into(),
-            message: "m".into(),
-            job_id: None,
-        }]));
-        let n = log_shipper_tick(&cfg, &logs).await;
-        assert_eq!(n, 0);
     }
 }
