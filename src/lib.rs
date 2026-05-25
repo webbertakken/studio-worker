@@ -11,6 +11,8 @@ pub mod runtime;
 pub mod service;
 pub mod sys;
 pub mod telemetry;
+#[doc(hidden)]
+pub mod test_support;
 pub mod types;
 pub mod update;
 

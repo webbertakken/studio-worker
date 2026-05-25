@@ -2,37 +2,11 @@
 //! happy-path test in `http_contract.rs`; this file pushes the failure
 //! branches.
 
-use std::io;
-use std::sync::{Arc, Mutex};
 use studio_worker::http::ApiClient;
+use studio_worker::test_support::capture as captured_logs_for;
 use studio_worker::types::*;
-use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// Test helper: a `MakeWriter` that funnels every formatted tracing
-/// event into a shared buffer the test can inspect afterwards.
-#[derive(Clone)]
-struct CapturingMakeWriter(Arc<Mutex<Vec<u8>>>);
-
-struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
-
-impl<'a> MakeWriter<'a> for CapturingMakeWriter {
-    type Writer = CapturingWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        CapturingWriter(self.0.clone())
-    }
-}
-
-impl io::Write for CapturingWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 fn caps() -> WorkerCapabilities {
     WorkerCapabilities {
@@ -253,27 +227,11 @@ async fn complete_for_unknown_ext_falls_back_to_octet_stream() {
 // status and elapsed time.  Without this the operations team only sees
 // the API-shipped log line, which doesn't include the URL the worker
 // actually hit.
+//
+// The shared `test_support::capture` helper (re-exported above as
+// `captured_logs_for`) installs one process-global subscriber +
+// thread-local sink.
 // ---------------------------------------------------------------------------
-
-fn captured_logs_for<F: FnOnce() + Send + 'static>(f: F) -> String {
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let buf_for_thread = buf.clone();
-    // Set the subscriber on the same OS thread that runs the reqwest
-    // call so the (thread-local) `with_default` actually receives the
-    // events.
-    detached(move || {
-        let make_writer = CapturingMakeWriter(buf_for_thread);
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(make_writer)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-    });
-    let bytes = buf.lock().unwrap().clone();
-    String::from_utf8(bytes).expect("tracing output should be valid UTF-8")
-}
 
 #[tokio::test]
 async fn successful_call_emits_debug_tracing_event() {

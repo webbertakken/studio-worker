@@ -5,10 +5,8 @@
 //! comparing semver, and selecting the right asset URL.
 
 use semver::Version;
-use std::io;
-use std::sync::{Arc, Mutex};
+use studio_worker::test_support::capture as captured_logs_for;
 use studio_worker::update;
-use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -356,48 +354,11 @@ async fn apply_helper_wraps_real_runner() {
 // breadcrumbs for every state transition (feed fetch, download, installer
 // run).  Without this an update that stalls or misbehaves is invisible
 // outside of the runtime's coarse-grained log-shipper entries.
+//
+// The shared `test_support::capture` helper (re-exported above as
+// `captured_logs_for`) installs one process-global subscriber +
+// thread-local sink.
 // ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct CapturingMakeWriter(Arc<Mutex<Vec<u8>>>);
-
-struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
-
-impl<'a> MakeWriter<'a> for CapturingMakeWriter {
-    type Writer = CapturingWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        CapturingWriter(self.0.clone())
-    }
-}
-
-impl io::Write for CapturingWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn captured_logs_for<F: FnOnce() + Send + 'static>(f: F) -> String {
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let buf_for_thread = buf.clone();
-    std::thread::spawn(move || {
-        let make_writer = CapturingMakeWriter(buf_for_thread);
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(make_writer)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-    })
-    .join()
-    .expect("capture thread panicked");
-    let bytes = buf.lock().unwrap().clone();
-    String::from_utf8(bytes).expect("tracing output should be valid UTF-8")
-}
 
 #[tokio::test]
 async fn fetch_releases_emits_debug_event_on_success() {
@@ -444,6 +405,7 @@ async fn fetch_releases_emits_warn_event_on_non_2xx() {
 #[tokio::test]
 async fn apply_with_emits_info_events_for_every_state_transition() {
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use studio_worker::update::UpdateRunner;
 
     struct FakeRunner {

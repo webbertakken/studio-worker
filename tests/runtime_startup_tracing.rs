@@ -7,65 +7,13 @@
 //! their first tick — the actual config in effect (engine, API URL,
 //! VRAM threshold, auto-update settings, agent version) is invisible.
 //!
-//! Each test installs a thread-local `tracing_subscriber` on a fresh
-//! OS thread (see `LESSONS_LEARNED.md` — `with_default` is thread
-//! local) and asserts on the captured output.
+//! Uses the shared `studio_worker::test_support::capture` helper
+//! (aliased locally as `captured_logs_for` to keep call sites readable).
 
-use std::io;
-use std::sync::{Arc, Mutex};
 use studio_worker::config::{self, Config};
 use studio_worker::runtime;
+use studio_worker::test_support::capture as captured_logs_for;
 use tempfile::tempdir;
-use tracing_subscriber::fmt::MakeWriter;
-
-// ---------------------------------------------------------------------------
-// Tracing capture helper — mirrors `tests/engine_tracing.rs`.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct CapturingMakeWriter(Arc<Mutex<Vec<u8>>>);
-
-struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
-
-impl<'a> MakeWriter<'a> for CapturingMakeWriter {
-    type Writer = CapturingWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        CapturingWriter(self.0.clone())
-    }
-}
-
-impl io::Write for CapturingWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn detached<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
-    std::thread::spawn(f)
-        .join()
-        .expect("worker thread panicked")
-}
-
-fn captured_logs_for<F: FnOnce() + Send + 'static>(f: F) -> String {
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let buf_for_thread = buf.clone();
-    detached(move || {
-        let make_writer = CapturingMakeWriter(buf_for_thread);
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(make_writer)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-    });
-    let bytes = buf.lock().unwrap().clone();
-    String::from_utf8(bytes).expect("tracing output should be valid UTF-8")
-}
 
 // ---------------------------------------------------------------------------
 // Startup banner — fires once at `run` boot, lists what the worker is

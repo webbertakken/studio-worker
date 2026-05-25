@@ -506,56 +506,14 @@ mod tests {
     // a failing `systemctl enable --now`, `launchctl unload` or
     // `schtasks /Delete` would silently leave the worker un-activated
     // (or still registered) with no log trail to diagnose it.
+    //
+    // The shared `test_support::capture` helper installs one
+    // process-global subscriber + thread-local sink — see that module
+    // for the why (it dodges the tracing callsite-cache flake we used
+    // to hit with `with_default`).
     // -----------------------------------------------------------------
 
-    use std::io;
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone)]
-    struct CapturingMakeWriter(Arc<Mutex<Vec<u8>>>);
-
-    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl<'a> MakeWriter<'a> for CapturingMakeWriter {
-        type Writer = CapturingWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            CapturingWriter(self.0.clone())
-        }
-    }
-
-    impl io::Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture<F: FnOnce() + Send + 'static>(f: F) -> String {
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let buf_for_thread = buf.clone();
-        // Run the closure on a fresh OS thread so the thread-local
-        // `with_default` is isolated from whatever subscriber state the
-        // test runner left on its worker threads.  Mirrors the pattern
-        // in tests/http_errors.rs and tests/auto_update.rs.
-        std::thread::spawn(move || {
-            let make_writer = CapturingMakeWriter(buf_for_thread);
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(make_writer)
-                .with_max_level(tracing::Level::DEBUG)
-                .with_ansi(false)
-                .without_time()
-                .finish();
-            tracing::subscriber::with_default(subscriber, f);
-        })
-        .join()
-        .expect("capture thread panicked");
-        let bytes = buf.lock().unwrap().clone();
-        String::from_utf8(bytes).expect("tracing output should be valid UTF-8")
-    }
+    use crate::test_support::capture;
 
     fn fake_ops(dir: PathBuf, activate_returns: bool) -> FakeOps {
         FakeOps {

@@ -4,56 +4,12 @@
 //! sysfs file format changed) appears in production as "this worker
 //! claims nothing" with zero log evidence pointing at the probe.
 //!
-//! Mirrors the per-module thread-isolated capture pattern from
-//! `tests/http_errors.rs` / `tests/auto_update.rs` — see
-//! `LESSONS_LEARNED.md` for why a fresh OS thread is required.
+//! Uses the shared `studio_worker::test_support::capture` helper,
+//! which installs one process-global subscriber + thread-local sink.
 
-use std::io;
-use std::sync::{Arc, Mutex};
 use studio_worker::sys;
+use studio_worker::test_support::capture;
 use tempfile::tempdir;
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone)]
-struct CapturingMakeWriter(Arc<Mutex<Vec<u8>>>);
-
-struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
-
-impl<'a> MakeWriter<'a> for CapturingMakeWriter {
-    type Writer = CapturingWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        CapturingWriter(self.0.clone())
-    }
-}
-
-impl io::Write for CapturingWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn capture<F: FnOnce() + Send + 'static>(f: F) -> String {
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let buf_for_thread = buf.clone();
-    std::thread::spawn(move || {
-        let make_writer = CapturingMakeWriter(buf_for_thread);
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(make_writer)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-    })
-    .join()
-    .expect("capture thread panicked");
-    let bytes = buf.lock().unwrap().clone();
-    String::from_utf8(bytes).expect("tracing output should be valid UTF-8")
-}
 
 // ---------------------------------------------------------------------------
 // detect_vram_gb_from_sysfs — sysfs missing
