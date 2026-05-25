@@ -124,7 +124,7 @@ Each release ships pre-built binaries for:
 # 1. Register with the studio API.
 studio-worker register \
   --bootstrap-token <TOKEN> \
-  --api-base-url https://studio.example.com
+  --api-base-url https://studio.minis.gg
 
 # 2. Install the auto-start service (systemd --user on Linux, launchd
 #    on macOS, scheduled task on Windows).
@@ -154,7 +154,7 @@ Config lives at:
 - Windows — `%APPDATA%\minis-studio-worker\config.toml`
 
 ```toml
-api_base_url        = "https://studio.example.com"
+api_base_url        = "https://studio.minis.gg"
 bootstrap_token     = "<used only at register>"
 worker_id           = "<filled by register>"
 auth_token          = "<filled by register>"

@@ -225,7 +225,8 @@ pub async fn register(
 
 /// Wrap network/HTTP errors from register() with a hint that points the
 /// operator at `--api-base-url` and the right secret.  Saves people from
-/// hitting the default `http://localhost:9790` and wondering what happened.
+/// hitting the default `https://studio.minis.gg` and wondering what happened
+/// (e.g. they're running a self-hosted studio at a different URL).
 fn friendly_register_error(err: anyhow::Error, api_base_url: &str) -> anyhow::Error {
     // Walk the full error chain so we catch the cause inside
     // reqwest/hyper, not just the top-level wrap.
@@ -239,7 +240,7 @@ fn friendly_register_error(err: anyhow::Error, api_base_url: &str) -> anyhow::Er
              Hint: pass --api-base-url <URL> on the register command, e.g.\n\
                studio-worker register \\\n\
                  --bootstrap-token <TOKEN> \\\n\
-                 --api-base-url https://studio.example.com\n\
+                 --api-base-url https://studio.minis.gg\n\
              \n\
              The bootstrap token is the WORKER_BOOTSTRAP_TOKEN wrangler secret\n\
              on the studio side (for local dev the default is `dev-bootstrap-token`)."

@@ -84,7 +84,7 @@ fn default_auto_update_feed() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api_base_url: "http://localhost:9790".into(),
+            api_base_url: "https://studio.minis.gg".into(),
             bootstrap_token: "dev-bootstrap-token".into(),
             worker_id: None,
             auth_token: None,

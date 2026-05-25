@@ -196,7 +196,7 @@ fn render_unregistered(
             ui.add(
                 egui::TextEdit::singleline(&mut form.api_base_url)
                     .desired_width(360.0)
-                    .hint_text("https://studio.example.com"),
+                    .hint_text("https://studio.minis.gg"),
             );
             ui.end_row();
 
