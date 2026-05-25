@@ -36,15 +36,31 @@ defined there. Both sides land together as a hard cutover.
 
 ## Phase 1 — Wire format types
 
-- [ ] `src/ws/types.rs` — Rust mirrors of the discriminated unions. `serde(tag = "type",
-      rename_all = "camelCase")` to match the TS contract:
-  - [ ] `WorkerInbound` enum: `Hello`, `Heartbeat`, `Accept`, `Reject`, `CompleteJson`,
+- [x] `src/ws/types.rs` — Rust mirrors of the discriminated unions, `#[serde(tag =
+      "type", rename_all = "camelCase")]` with per-variant `rename_all = "camelCase"`
+      for inner fields:
+  - [x] `WorkerInbound` enum: `Hello`, `Heartbeat`, `Accept`, `Reject`, `CompleteJson`,
         `Fail`, `LogBatch`, `ReadyForMore`.
-  - [ ] `WorkerOutbound` enum: `Welcome`, `Offer`, `HeartbeatAck`, `CompleteAck`,
-        `FailAck`, `Error`.
-- [ ] Reuse existing `WorkerCapabilities`, `JobClaim`, `LogEntry` from `src/types.rs`.
-- [ ] Round-trip tests covering every variant (`tests/ws_wire.rs`), seeded with raw
-      JSON strings copied from the TS test fixtures.
+  - [x] `WorkerOutbound` enum: `Welcome`, `Offer`, `HeartbeatAck`, `CompleteAck`,
+        `FailAck`, `Error` (plus `WorkerErrorCode` snake_case enum).
+  - [x] `WsCloseCode` `#[repr(u16)]` enum + `from_error_code` mapping so the
+        close-code ↔ error-code pairing stays single-sourced.
+  - [x] `JobOfferClaim` mirrors `JobClaimResponse` with `into_job_claim()` bridging
+        back to the existing `JobClaim` so engine dispatch stays kind-agnostic.
+- [x] Reuse existing `WorkerCapabilities`, `JobClaim`, `LogEntry`, `Task` from
+      `src/types.rs`. `LogEntry` gained a `Deserialize` derive so inbound `logBatch`
+      frames can be parsed by the DO and by tests.
+- [x] Round-trip tests covering every variant (`tests/ws_wire.rs`, 25 tests): hello,
+      heartbeat (with-id / no-field / explicit null), accept, reject, completeJson
+      (with prompt + array result + no prompt), fail, logBatch (with entry + empty),
+      readyForMore, welcome, offer (image + multimodal LLM task), heartbeatAck,
+      completeAck, failAck, error (every code), unknown-type rejection (inbound +
+      outbound), close-code numeric values, close-code mapping. Plus 2 unit tests
+      inside `src/ws/types.rs` for the `JobOfferClaim` bridge + default-ext
+      behaviour. **100% regions / functions / lines coverage on `src/ws/types.rs`
+      (`cargo llvm-cov`).**
+- [x] `cargo fmt --check`, `cargo clippy --tests -- -D warnings`, and the full
+      `cargo test` suite all pass (256 tests, up from 231).
 
 ## Phase 2 — WS client
 

@@ -15,6 +15,7 @@ pub mod telemetry;
 pub mod test_support;
 pub mod types;
 pub mod update;
+pub mod ws;
 
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
