@@ -132,6 +132,10 @@ pub fn push_recent_job_for_tests(observers: &WorkerObservers, job_id: &str) {
 }
 
 pub const AUTO_UPDATE_TICK: Duration = Duration::from_secs(60);
+/// Default WS heartbeat interval, re-exported here so the native UI
+/// (and any other downstream readers) get a stable constant without
+/// reaching into `ws::session`.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Schedule for the auto-updater loop.  The WS session has its own
 /// `SessionSchedule` (see `ws::session`).
