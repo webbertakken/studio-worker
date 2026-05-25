@@ -15,7 +15,13 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokenizers::Tokenizer;
+use tracing::{debug, info, warn};
+
+/// Tracing target for the candle image engine.  Stable so operators can
+/// filter with `RUST_LOG=studio_worker::engine::candle_image=debug`.
+const TRACE_TARGET: &str = "studio_worker::engine::candle_image";
 
 const HF_REPO_V1_5: &str = "stable-diffusion-v1-5/stable-diffusion-v1-5";
 const HF_TOKENIZER: &str = "openai/clip-vit-base-patch32";
@@ -51,11 +57,18 @@ impl CandleImageEngine {
 
     fn build_pipeline(&self, width: usize, height: usize) -> Result<Pipeline> {
         use hf_hub::api::sync::Api;
+        info!(
+            target: TRACE_TARGET,
+            op = "build_pipeline",
+            model = MODEL_ID,
+            width,
+            height,
+            "building SD pipeline (may download weights)"
+        );
+        let build_started = Instant::now();
         let api = Api::new().context("creating hf-hub api")?;
 
-        let tokenizer_path = api
-            .model(HF_TOKENIZER.to_string())
-            .get("tokenizer.json")
+        let tokenizer_path = download_with_trace(&api, HF_TOKENIZER, "tokenizer.json")
             .context("downloading clip tokenizer")?;
         let tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("loading tokenizer: {e}"))?;
@@ -68,18 +81,21 @@ impl CandleImageEngine {
         let sd_config =
             stable_diffusion::StableDiffusionConfig::v1_5(None, Some(height), Some(width));
 
-        let clip_weights = api
-            .model(HF_REPO_V1_5.to_string())
-            .get("text_encoder/model.safetensors")
-            .context("downloading clip weights")?;
-        let unet_weights = api
-            .model(HF_REPO_V1_5.to_string())
-            .get("unet/diffusion_pytorch_model.safetensors")
-            .context("downloading unet weights")?;
-        let vae_weights = api
-            .model(HF_REPO_V1_5.to_string())
-            .get("vae/diffusion_pytorch_model.safetensors")
-            .context("downloading vae weights")?;
+        let clip_weights =
+            download_with_trace(&api, HF_REPO_V1_5, "text_encoder/model.safetensors")
+                .context("downloading clip weights")?;
+        let unet_weights = download_with_trace(
+            &api,
+            HF_REPO_V1_5,
+            "unet/diffusion_pytorch_model.safetensors",
+        )
+        .context("downloading unet weights")?;
+        let vae_weights = download_with_trace(
+            &api,
+            HF_REPO_V1_5,
+            "vae/diffusion_pytorch_model.safetensors",
+        )
+        .context("downloading vae weights")?;
 
         let device = Device::Cpu;
         let dtype = DType::F32;
@@ -92,6 +108,13 @@ impl CandleImageEngine {
         )?;
         let unet = sd_config.build_unet(unet_weights, &device, 4, false, dtype)?;
         let vae = sd_config.build_vae(vae_weights, &device, dtype)?;
+        info!(
+            target: TRACE_TARGET,
+            op = "build_pipeline",
+            model = MODEL_ID,
+            elapsed_ms = build_started.elapsed().as_millis() as u64,
+            "SD pipeline ready"
+        );
 
         Ok(Pipeline {
             device,
@@ -110,16 +133,69 @@ impl CandleImageEngine {
         let mut guard = self.cached.lock();
         if let Some(c) = &*guard {
             if c.id == model {
+                debug!(
+                    target: TRACE_TARGET,
+                    op = "load",
+                    model,
+                    cache = "hit",
+                    "reusing cached pipeline"
+                );
                 return Ok(c.pipeline.clone());
             }
         }
-        let pipeline = Arc::new(self.build_pipeline(width, height)?);
+        let pipeline = Arc::new(self.build_pipeline(width, height).inspect_err(|e| {
+            warn!(
+                target: TRACE_TARGET,
+                op = "load",
+                model,
+                error = %e,
+                "failed to build pipeline"
+            );
+        })?);
         *guard = Some(CachedModel {
             id: model.to_string(),
             pipeline: pipeline.clone(),
         });
         Ok(pipeline)
     }
+}
+
+fn download_with_trace(
+    api: &hf_hub::api::sync::Api,
+    repo: &str,
+    file: &str,
+) -> Result<PathBuf, hf_hub::api::sync::ApiError> {
+    debug!(
+        target: TRACE_TARGET,
+        op = "download",
+        repo,
+        file,
+        "requesting weight file"
+    );
+    let started = Instant::now();
+    let result = api.model(repo.to_string()).get(file);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(path) => debug!(
+            target: TRACE_TARGET,
+            op = "download",
+            repo,
+            file,
+            path = %path.display(),
+            elapsed_ms,
+            "weight file ready"
+        ),
+        Err(e) => warn!(
+            target: TRACE_TARGET,
+            op = "download",
+            repo,
+            file,
+            elapsed_ms,
+            error = %e,
+            "weight download failed"
+        ),
+    }
+    result
 }
 
 impl Default for CandleImageEngine {
@@ -234,15 +310,33 @@ impl Engine for CandleImageEngine {
     }
 
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
+        let kind = task.kind();
+        let started = Instant::now();
         if model != MODEL_ID {
+            warn!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                model,
+                expected = MODEL_ID,
+                "unsupported model id"
+            );
             bail!("candle-image engine only serves `{MODEL_ID}`, got `{model}`");
         }
         let params = match task {
             Task::Image(p) => p,
-            other => bail!(
-                "candle-image engine cannot serve {} tasks",
-                other.kind().as_str()
-            ),
+            other => {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    kind = kind.as_str(),
+                    model,
+                    "unsupported task kind"
+                );
+                bail!(
+                    "candle-image engine cannot serve {} tasks",
+                    other.kind().as_str()
+                );
+            }
         };
         let width = (params.width as usize).max(64);
         let height = (params.height as usize).max(64);
@@ -250,11 +344,42 @@ impl Engine for CandleImageEngine {
         let width = width - (width % 64);
         let height = height - (height % 64);
         let pipeline = self.load_or_get(model, width, height)?;
-        let text_embeddings = encode_text(&pipeline, &params.prompt)?;
         let n_steps = params.steps.max(1) as usize;
         let seed = params.seed.unwrap_or(0);
-        let latents = run_diffusion(&pipeline, &text_embeddings, n_steps, 7.5, seed)?;
+        debug!(
+            target: TRACE_TARGET,
+            op = "dispatch",
+            kind = kind.as_str(),
+            model,
+            width,
+            height,
+            steps = n_steps,
+            seed,
+            "starting diffusion"
+        );
+        let text_embeddings = encode_text(&pipeline, &params.prompt)?;
+        let latents =
+            run_diffusion(&pipeline, &text_embeddings, n_steps, 7.5, seed).inspect_err(|e| {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    kind = kind.as_str(),
+                    model,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %e,
+                    "diffusion failed"
+                );
+            })?;
         let png = decode_to_png(&pipeline, &latents)?;
+        info!(
+            target: TRACE_TARGET,
+            op = "dispatch",
+            kind = kind.as_str(),
+            model,
+            bytes = png.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "image generated"
+        );
         Ok(TaskResult::Image {
             bytes: png,
             ext: "png".into(),

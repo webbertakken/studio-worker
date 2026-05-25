@@ -14,6 +14,15 @@ use image::{ImageBuffer, Rgb, RgbImage};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::time::Instant;
+use tracing::{debug, warn};
+
+/// Tracing target for the synthetic engine.  Stable so operators can
+/// filter with `RUST_LOG=studio_worker::engine::synthetic=debug`.
+const TRACE_TARGET_SYNTHETIC: &str = "studio_worker::engine::synthetic";
+
+/// Tracing target for the gradio engine.
+const TRACE_TARGET_GRADIO: &str = "studio_worker::engine::gradio";
 
 /// What a single engine is able to do.
 #[derive(Debug, Clone, Default)]
@@ -198,12 +207,12 @@ impl Engine for SyntheticEngine {
         }
     }
 
-    fn dispatch(&self, _model: &str, task: Task) -> Result<TaskResult> {
-        match task {
-            Task::Image(p) => {
-                let bytes = render_procedural(&p.prompt, &p.ext)?;
-                Ok(TaskResult::Image { bytes, ext: p.ext })
-            }
+    fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
+        let kind = task.kind();
+        let started = Instant::now();
+        let result = match task {
+            Task::Image(p) => render_procedural(&p.prompt, &p.ext)
+                .map(|bytes| TaskResult::Image { bytes, ext: p.ext }),
             Task::Llm(p) => {
                 let prompt = p
                     .messages
@@ -211,31 +220,50 @@ impl Engine for SyntheticEngine {
                     .map(|m| format!("{}: {}", m.role, m.content))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let json = synthetic_llm_response(&prompt);
-                Ok(TaskResult::Llm { json })
-            }
-            Task::AudioStt(p) => {
-                let json = synthetic_stt_response(&p.input_url, p.language.as_deref());
-                Ok(TaskResult::AudioStt { json })
-            }
-            Task::AudioTts(p) => {
-                let bytes = render_wav(&p.text)?;
-                Ok(TaskResult::AudioTts {
-                    bytes,
-                    ext: "wav".into(),
+                Ok(TaskResult::Llm {
+                    json: synthetic_llm_response(&prompt),
                 })
             }
+            Task::AudioStt(p) => Ok(TaskResult::AudioStt {
+                json: synthetic_stt_response(&p.input_url, p.language.as_deref()),
+            }),
+            Task::AudioTts(p) => render_wav(&p.text).map(|bytes| TaskResult::AudioTts {
+                bytes,
+                ext: "wav".into(),
+            }),
             Task::Video(p) => {
                 // Synthetic video is a real animated set of frames in WebP
                 // (no built-in H.264 encoder).  We always emit `webp` and
                 // ignore the requested `ext` to keep the bytes decodable.
-                let bytes = render_animated_webp(&p.prompt, p.width, p.height, p.seconds)?;
-                Ok(TaskResult::Video {
-                    bytes,
-                    ext: "webp".into(),
+                render_animated_webp(&p.prompt, p.width, p.height, p.seconds).map(|bytes| {
+                    TaskResult::Video {
+                        bytes,
+                        ext: "webp".into(),
+                    }
                 })
             }
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => debug!(
+                target: TRACE_TARGET_SYNTHETIC,
+                op = "dispatch",
+                kind = kind.as_str(),
+                model,
+                elapsed_ms,
+                "ok"
+            ),
+            Err(e) => warn!(
+                target: TRACE_TARGET_SYNTHETIC,
+                op = "dispatch",
+                kind = kind.as_str(),
+                model,
+                elapsed_ms,
+                error = %e,
+                "failed"
+            ),
         }
+        result
     }
 }
 
@@ -399,11 +427,43 @@ impl Engine for GradioEngine {
     }
 
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
+        let kind = task.kind();
+        let started = Instant::now();
         let image_params = match task {
             Task::Image(p) => p,
-            other => bail!("gradio engine cannot serve {} tasks", other.kind().as_str()),
+            other => {
+                warn!(
+                    target: TRACE_TARGET_GRADIO,
+                    op = "dispatch",
+                    kind = kind.as_str(),
+                    model,
+                    "unsupported task kind"
+                );
+                bail!("gradio engine cannot serve {} tasks", other.kind().as_str());
+            }
         };
-        let bytes = call_gradio(&self.endpoint_url, &image_params.prompt, model)?;
+        let result = call_gradio(&self.endpoint_url, &image_params.prompt, model);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => debug!(
+                target: TRACE_TARGET_GRADIO,
+                op = "dispatch",
+                kind = kind.as_str(),
+                model,
+                elapsed_ms,
+                "ok"
+            ),
+            Err(e) => warn!(
+                target: TRACE_TARGET_GRADIO,
+                op = "dispatch",
+                kind = kind.as_str(),
+                model,
+                elapsed_ms,
+                error = %e,
+                "failed"
+            ),
+        }
+        let bytes = result?;
         Ok(TaskResult::Image {
             bytes,
             ext: image_params.ext,
@@ -419,15 +479,39 @@ fn call_gradio(endpoint_url: &str, prompt: &str, model: &str) -> Result<Vec<u8>>
 
     let url = format!("{}/run/predict", endpoint_url.trim_end_matches('/'));
     let body = serde_json::json!({ "data": [prompt, model] });
+    let started = Instant::now();
 
-    let response = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .map_err(|e| anyhow!("gradio request failed: {e}"))?;
-    if !response.status().is_success() {
-        bail!("gradio returned {}", response.status());
+    let response = client.post(&url).json(&body).send().map_err(|e| {
+        warn!(
+            target: TRACE_TARGET_GRADIO,
+            op = "predict",
+            endpoint = %url,
+            error = %e,
+            "request failed"
+        );
+        anyhow!("gradio request failed: {e}")
+    })?;
+    let status = response.status();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if !status.is_success() {
+        warn!(
+            target: TRACE_TARGET_GRADIO,
+            op = "predict",
+            endpoint = %url,
+            status = status.as_u16(),
+            elapsed_ms,
+            "non-2xx response"
+        );
+        bail!("gradio returned {}", status);
     }
+    debug!(
+        target: TRACE_TARGET_GRADIO,
+        op = "predict",
+        endpoint = %url,
+        status = status.as_u16(),
+        elapsed_ms,
+        "ok"
+    );
     let parsed: serde_json::Value = response.json()?;
     let image_field = parsed
         .get("data")
