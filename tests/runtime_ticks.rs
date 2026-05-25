@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use studio_worker::config::Config;
 use studio_worker::runtime::{
     auto_update_tick, claim_tick, heartbeat_tick, log_shipper_tick, AutoUpdateDecision,
-    ClaimOutcome,
+    ClaimOutcome, WorkerObservers,
 };
 use studio_worker::types::*;
 use wiremock::matchers::{method, path};
@@ -43,7 +43,9 @@ async fn heartbeat_tick_happy_path() {
         .await;
     let cfg = registered_cfg(&server.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
-    heartbeat_tick(&cfg, false, &logs).await.unwrap();
+    heartbeat_tick(&cfg, false, &logs, &WorkerObservers::default())
+        .await
+        .unwrap();
     let entries = logs.lock();
     assert!(entries.iter().all(|e| e.level != "warn"));
 }
@@ -58,7 +60,9 @@ async fn heartbeat_tick_logs_warning_on_5xx() {
         .await;
     let cfg = registered_cfg(&server.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
-    heartbeat_tick(&cfg, true, &logs).await.unwrap();
+    heartbeat_tick(&cfg, true, &logs, &WorkerObservers::default())
+        .await
+        .unwrap();
     let entries = logs.lock();
     let warn = entries
         .iter()
@@ -74,7 +78,9 @@ async fn heartbeat_tick_logs_when_engine_build_fails() {
         ..registered_cfg("http://api.invalid")
     };
     let logs = Arc::new(Mutex::new(Vec::new()));
-    heartbeat_tick(&cfg, false, &logs).await.unwrap();
+    heartbeat_tick(&cfg, false, &logs, &WorkerObservers::default())
+        .await
+        .unwrap();
     let entries = logs.lock();
     assert!(entries
         .iter()
@@ -96,7 +102,7 @@ async fn claim_tick_no_jobs_when_204() {
     let cfg = registered_cfg(&server.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
     let busy = Arc::new(AtomicBool::new(false));
-    let outcome = claim_tick(&cfg, &logs, &busy).await;
+    let outcome = claim_tick(&cfg, &logs, &busy, &WorkerObservers::default()).await;
     assert_eq!(outcome, ClaimOutcome::NoJobs);
 }
 
@@ -111,7 +117,7 @@ async fn claim_tick_returns_error_on_5xx() {
     let cfg = registered_cfg(&server.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
     let busy = Arc::new(AtomicBool::new(false));
-    let outcome = claim_tick(&cfg, &logs, &busy).await;
+    let outcome = claim_tick(&cfg, &logs, &busy, &WorkerObservers::default()).await;
     assert!(matches!(outcome, ClaimOutcome::Error(_)));
 }
 
@@ -140,7 +146,7 @@ async fn claim_tick_runs_job_end_to_end_for_image() {
     let cfg = registered_cfg(&server.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
     let busy = Arc::new(AtomicBool::new(false));
-    let outcome = claim_tick(&cfg, &logs, &busy).await;
+    let outcome = claim_tick(&cfg, &logs, &busy, &WorkerObservers::default()).await;
     assert_eq!(outcome, ClaimOutcome::RanJob);
     assert!(!busy.load(Ordering::SeqCst));
     let entries = logs.lock();
@@ -180,7 +186,7 @@ async fn claim_tick_runs_llm_job_end_to_end() {
     let cfg = registered_cfg(&server.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
     let busy = Arc::new(AtomicBool::new(false));
-    let outcome = claim_tick(&cfg, &logs, &busy).await;
+    let outcome = claim_tick(&cfg, &logs, &busy, &WorkerObservers::default()).await;
     assert_eq!(outcome, ClaimOutcome::RanJob);
 }
 
@@ -215,7 +221,7 @@ async fn claim_tick_runs_audio_tts_job_end_to_end() {
     let cfg = registered_cfg(&server.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
     let busy = Arc::new(AtomicBool::new(false));
-    let outcome = claim_tick(&cfg, &logs, &busy).await;
+    let outcome = claim_tick(&cfg, &logs, &busy, &WorkerObservers::default()).await;
     assert_eq!(outcome, ClaimOutcome::RanJob);
 }
 
@@ -267,7 +273,7 @@ async fn claim_tick_runs_stt_video_jobs_end_to_end() {
     let cfg = registered_cfg(&server.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
     let busy = Arc::new(AtomicBool::new(false));
-    let outcome = claim_tick(&cfg, &logs, &busy).await;
+    let outcome = claim_tick(&cfg, &logs, &busy, &WorkerObservers::default()).await;
     assert_eq!(outcome, ClaimOutcome::RanJob);
 }
 
@@ -304,7 +310,7 @@ async fn claim_tick_runs_video_job_end_to_end() {
     let cfg = registered_cfg(&server.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
     let busy = Arc::new(AtomicBool::new(false));
-    let outcome = claim_tick(&cfg, &logs, &busy).await;
+    let outcome = claim_tick(&cfg, &logs, &busy, &WorkerObservers::default()).await;
     assert_eq!(outcome, ClaimOutcome::RanJob);
 }
 
@@ -344,7 +350,7 @@ async fn claim_tick_fails_job_when_engine_rejects_kind() {
 
     let logs = Arc::new(Mutex::new(Vec::new()));
     let busy = Arc::new(AtomicBool::new(false));
-    let outcome = claim_tick(&cfg, &logs, &busy).await;
+    let outcome = claim_tick(&cfg, &logs, &busy, &WorkerObservers::default()).await;
     assert_eq!(outcome, ClaimOutcome::RanJob);
     let entries = logs.lock();
     assert!(entries
@@ -358,7 +364,7 @@ async fn claim_tick_returns_error_when_engine_build_fails() {
     cfg.engine = "no-such-engine".into();
     let logs = Arc::new(Mutex::new(Vec::new()));
     let busy = Arc::new(AtomicBool::new(false));
-    let outcome = claim_tick(&cfg, &logs, &busy).await;
+    let outcome = claim_tick(&cfg, &logs, &busy, &WorkerObservers::default()).await;
     assert!(matches!(outcome, ClaimOutcome::Error(_)));
 }
 

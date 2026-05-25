@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use studio_worker::config::{self, Config};
 use studio_worker::runtime::{
     self, spawn_auto_updater, spawn_claim_loop, spawn_heartbeat, spawn_log_shipper, LoopSchedule,
+    WorkerObservers,
 };
 use studio_worker::types::*;
 use wiremock::matchers::{method, path};
@@ -51,6 +52,7 @@ async fn spawn_heartbeat_runs_a_tick_then_exits_on_stop() {
         stop.clone(),
         logs,
         busy,
+        WorkerObservers::default(),
         LoopSchedule::fast_for_tests(),
     );
     stop_after(stop, 30).await;
@@ -74,6 +76,7 @@ async fn spawn_claim_loop_runs_then_exits_on_stop() {
         stop.clone(),
         logs,
         busy,
+        WorkerObservers::default(),
         LoopSchedule::fast_for_tests(),
     );
     stop_after(stop, 30).await;
@@ -153,7 +156,15 @@ async fn run_loops_with_fast_schedule_starts_and_stops() {
     let busy = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
     let handle = tokio::spawn(async move {
-        runtime::run_loops(cfg, stop_clone, logs, busy, LoopSchedule::fast_for_tests()).await;
+        runtime::run_loops(
+            cfg,
+            stop_clone,
+            logs,
+            busy,
+            WorkerObservers::default(),
+            LoopSchedule::fast_for_tests(),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(40)).await;
     stop.store(true, Ordering::SeqCst);
