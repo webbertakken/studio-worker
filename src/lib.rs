@@ -10,6 +10,7 @@ pub mod http;
 pub mod runtime;
 pub mod service;
 pub mod sys;
+pub mod telemetry;
 pub mod types;
 pub mod update;
 

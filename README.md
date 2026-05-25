@@ -176,6 +176,29 @@ Set `auto_update_enabled = false` to opt out.  Set
 Each tick of the worker pushes a batch of log entries to
 `POST /workers/<id>/logs`.  The studio surfaces these in its LogViewer.
 
+### Sentry (opt-in)
+
+The worker integrates with [Sentry](https://sentry.io) for crash + error
+reporting.  Disabled by default — set the following env vars before
+launching to enable it:
+
+| Env var              | Purpose                                              |
+| -------------------- | ---------------------------------------------------- |
+| `SENTRY_DSN`         | The project DSN.  Telemetry stays off when unset.    |
+| `SENTRY_ENVIRONMENT` | Optional environment tag (defaults to `production`). |
+
+When enabled the worker:
+
+- captures panics automatically (`sentry`'s default panic handler);
+- forwards `tracing::error!` events as Sentry events;
+- attaches preceding `tracing::warn!` events as breadcrumbs;
+- tags every event with the worker's `release` (= crate version) and
+  hostname (`server_name`).
+
+No DSN is baked into the binary, so the public repo never carries
+credentials.  Performance tracing is intentionally off — Sentry is used
+purely for error/crash visibility.
+
 ## Development
 
 ```bash
