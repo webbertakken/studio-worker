@@ -63,6 +63,11 @@ eframe = { version = "0.34", optional = true, default-features = false, features
 ] }
 tray-icon = { version = "0.24", optional = true }
 notify-rust = { version = "4", optional = true }
+# tray-icon on Linux needs gtk::init() called on the same thread that
+# runs its event loop; pulling gtk in directly is the cleanest way to
+# call into that.  Non-Linux targets don't need it.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
 
 [features]
 default = []
@@ -84,6 +89,7 @@ ui = [
     "dep:eframe",
     "dep:tray-icon",
     "dep:notify-rust",
+    "dep:gtk",
 ]
 # Convenience bundles.  llama and whisper both statically link ggml.cpp,
 # which currently can't coexist in the same binary on Linux (duplicate

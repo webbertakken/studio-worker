@@ -1,6 +1,9 @@
 //! About tab — version, release name, config path, manual update check.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use eframe::egui;
 use parking_lot::Mutex;
@@ -28,11 +31,11 @@ pub struct AboutView {
 }
 
 impl AboutView {
-    pub fn build(state: &AboutState, config_path: &PathBuf) -> Self {
+    pub fn build(state: &AboutState, config_path: &Path) -> Self {
         Self {
             version: AGENT_VERSION,
             release_name: RELEASE_NAME,
-            config_path: config_path.clone(),
+            config_path: config_path.to_path_buf(),
             last_check: state.last_check.lock().clone(),
         }
     }
@@ -43,7 +46,7 @@ pub fn render(
     view: &AboutView,
     state: &AboutState,
     tokio: &Handle,
-    config_path: &PathBuf,
+    config_path: &Path,
 ) {
     ui.heading("About studio-worker");
     ui.add_space(4.0);
@@ -72,7 +75,11 @@ pub fn render(
             .add_enabled(!busy, egui::Button::new("Check for updates"))
             .clicked()
         {
-            spawn_check(tokio.clone(), state.last_check.clone(), config_path.clone());
+            spawn_check(
+                tokio.clone(),
+                state.last_check.clone(),
+                config_path.to_path_buf(),
+            );
         }
         match &view.last_check {
             None => {}
@@ -122,7 +129,7 @@ mod tests {
     #[test]
     fn build_returns_static_version_strings() {
         let state = AboutState::default();
-        let view = AboutView::build(&state, &PathBuf::from("/tmp/c.toml"));
+        let view = AboutView::build(&state, Path::new("/tmp/c.toml"));
         assert_eq!(view.version, AGENT_VERSION);
         assert_eq!(view.release_name, RELEASE_NAME);
         assert_eq!(view.config_path, PathBuf::from("/tmp/c.toml"));
@@ -133,7 +140,7 @@ mod tests {
     fn build_surfaces_last_check_when_set() {
         let state = AboutState::default();
         *state.last_check.lock() = Some(CheckLine::Result("up to date".into()));
-        let view = AboutView::build(&state, &PathBuf::from("/tmp/c.toml"));
+        let view = AboutView::build(&state, Path::new("/tmp/c.toml"));
         assert_eq!(
             view.last_check,
             Some(CheckLine::Result("up to date".into()))

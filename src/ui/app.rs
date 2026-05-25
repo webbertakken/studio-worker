@@ -74,7 +74,7 @@ impl App {
         let vram_total_gb = sys::detect_vram_gb().unwrap_or(0.0);
         Self {
             deps,
-            tab: Tab::default(),
+            tab: Tab::initial(),
             register_form,
             registration: register::shared(),
             config_draft,
@@ -154,10 +154,12 @@ impl App {
         v
     }
 
-    /// Shared by both the real `update` and the headless test harness so
-    /// the layout is exercised in tests too.
-    pub fn render(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
+    /// Shared by both the real `ui` entry point and the headless test
+    /// harness so the layout is exercised in tests too.  Takes a
+    /// `&mut Ui` rather than a `&Context` to match the new eframe
+    /// 0.34 API (`Panel::show_inside`).
+    pub fn render(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("tab_bar").show_inside(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 for tab in Tab::ALL {
@@ -170,7 +172,7 @@ impl App {
             ui.add_space(4.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
                 Tab::Status => self.render_status(ui),
                 Tab::Jobs => self.render_jobs(ui),
@@ -182,7 +184,36 @@ impl App {
 
         // The background loops mutate shared state asynchronously; ask
         // egui to repaint so updates surface without a user event.
-        ctx.request_repaint_after(Duration::from_millis(250));
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
+    }
+
+    /// Shared housekeeping invoked before every frame's render — keeps
+    /// the `ui()` entry point thin.
+    fn pre_render(&mut self, ctx: &egui::Context) {
+        self.drain_notifications();
+        self.refresh_tray_variant();
+
+        // Hide-to-tray: intercept the OS close request, keep loops
+        // alive, hide the window.  Quit comes from the tray menu.
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self
+                .quit_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // Tray Quit was clicked — stop the loops, then close.
+        if self
+            .quit_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.deps
+                .stop
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     /// Expose the current tab for tests + future tray-state derivation.
@@ -305,33 +336,10 @@ fn spawn_register(
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_notifications();
-        self.refresh_tray_variant();
-
-        // Hide-to-tray: intercept the OS close request, keep loops
-        // alive, hide the window.  Quit comes from the tray menu.
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self
-                .quit_requested
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-
-        // Tray Quit was clicked — stop the loops, then close.
-        if self
-            .quit_requested
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            self.deps
-                .stop
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-
-        self.render(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.pre_render(&ctx);
+        self.render(ui);
     }
 }
 
@@ -395,10 +403,10 @@ mod tests {
     /// assert it doesn't panic.  Uses `egui::__run_test_ctx` so no
     /// display server is required — runs fine on CI.
     #[test]
-    fn render_does_not_panic_under_test_ctx() {
+    fn render_does_not_panic_under_test_ui() {
         let mut app = App::new(mock_deps());
-        egui::__run_test_ctx(|ctx| {
-            app.render(ctx);
+        egui::__run_test_ui(|ui| {
+            app.render(ui);
         });
     }
 
@@ -407,8 +415,8 @@ mod tests {
         for tab in Tab::ALL {
             let mut app = App::new(mock_deps());
             app.set_tab(tab);
-            egui::__run_test_ctx(|ctx| {
-                app.render(ctx);
+            egui::__run_test_ui(|ui| {
+                app.render(ui);
             });
         }
     }

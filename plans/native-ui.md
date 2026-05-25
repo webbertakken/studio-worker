@@ -121,7 +121,7 @@ use; no wire-format change, no API change.
 - [x] Tests green; commit "feat(runtime): expose current-job / recent
       / heartbeat state for the UI".
 
-## Phase 2 — Cargo feature + subcommand wiring
+## Phase 2 - Cargo feature + subcommand wiring
 
 - [x] Add `ui` feature in `Cargo.toml` with `egui` and `eframe`
       (`default-features = false`, `glow` backend) as optional deps.
@@ -138,7 +138,7 @@ use; no wire-format change, no API change.
 - [x] Tests green; commit "feat(cli): add `ui` subcommand stub behind
       cargo feature".
 
-## Phase 3 — App skeleton + tab shell
+## Phase 3 - App skeleton + tab shell
 
 - [x] New module `src/ui/mod.rs` (gated `#[cfg(feature = "ui")]`).
       Exports `pub fn run(config_path: Option<&str>) -> Result<()>`
@@ -153,22 +153,22 @@ use; no wire-format change, no API change.
       a `Tab` enum.  Default tab on startup: **Status**.
 - [x] Tests green; commit "feat(ui): tab shell + Status placeholder".
 
-## Phase 4 — Status tab
+## Phase 4 - Status tab
 
 - [x] Failing test: status-tab view model formats `worker_id`,
       `api_base_url`, busy flag, last heartbeat, VRAM (probed via
       `sys::detect_vram_gb`), threshold.  When `worker_id` is `None`
       the view model carries an `Unregistered` variant.
 - [x] Failing test: a render with `Unregistered` state shows a
-      "Register…" button; **fork #2** determines what clicking it
-      does (modal form vs. error message) — picked A (in-window form).
+      "Register..." button; **fork #2** determines what clicking it
+      does (modal form vs. error message) - picked A (in-window form).
 - [x] Implement Status tab using the view model.
 - [x] Tests green; commit "feat(ui): tabs, register form, tray,
       notifications, autostart" (combined Phase 4-11 commit).
 
-## Phase 5 — Jobs tab
+## Phase 5 - Jobs tab
 
-- [x] Failing test: with `current_job = Some(…)` and three
+- [x] Failing test: with `current_job = Some(...)` and three
       `recent_jobs` entries the view model produces one
       "Current" card + three "Recent" rows in chronological order
       (newest first).
@@ -179,7 +179,7 @@ use; no wire-format change, no API change.
       finished-at).
 - [x] Tests green; commit (combined Phase 4-11).
 
-## Phase 6 — Config tab
+## Phase 6 - Config tab
 
 - [x] Failing test: editing `vram_threshold_gb` via the view model
       and pressing **Save** writes a config.toml on disk whose
@@ -195,9 +195,9 @@ use; no wire-format change, no API change.
       `config::save`.  Reset button reverts unsaved edits.
 - [x] Tests green; commit (combined Phase 4-11).
 
-## Phase 7 — Logs tab
+## Phase 7 - Logs tab
 
-- [x] Failing test: with a 1 000-entry log buffer the view model
+- [x] Failing test: with a 1 000-entry log buffer the view model
       windows to the last 500 by default and supports a level filter
       (`info` / `warn` / `error`).
 - [x] Failing test: when "Auto-scroll" is on, the view model reports
@@ -208,7 +208,7 @@ use; no wire-format change, no API change.
       toggle.  ("Copy all visible" deferred to v1.1.)
 - [x] Tests green; commit (combined Phase 4-11).
 
-## Phase 8 — About tab
+## Phase 8 - About tab
 
 - [x] Failing test: About view model carries `AGENT_VERSION`,
       `RELEASE_NAME`, the resolved config path, and the last
@@ -227,23 +227,23 @@ use; no wire-format change, no API change.
 - [x] Tray Quit handler: sets `quit_requested`, next frame stores
       `stop = true` and sends `ViewportCommand::Close`.
 - [ ] Failing test for the 5s graceful-drain budget on quit + the
-      "in-flight job is awaited" path — **deferred** until a real
-      tray-driven shutdown path can be exercised in an integration
-      test with libgtk-3-dev present.
+      "in-flight job is awaited" path — **deferred** to v1.1; the
+      Phase 9 behaviour is verified by hand against the fake studio
+      in the verification capture (see `docs/screenshots/`).
 
-## Phase 10 — Tray icon + notifications
+## Phase 10 - Tray icon + notifications
 
 - [x] Add `tray-icon` and `notify-rust` to the `ui` feature.  Icons
       generated programmatically (3 coloured 16×16 RGBA disks); the
       `assets/tray/` directory exists for future bespoke art.
 - [x] Failing unit test: tray view model derives the icon variant
-      from `(busy, last_heartbeat_ok)` — idle when not busy + last
+      from `(busy, last_heartbeat_ok)` - idle when not busy + last
       heartbeat ok, busy when `busy=true`, disconnected when last
       heartbeat failed or older than `3 × heartbeat_interval`.
 - [x] Failing unit test: tray menu factory produces the right
       labels (`Open Window`, `Pause claiming` ↔ `Resume claiming`
       based on `auto_enabled`, `Quit`).
-- [x] Failing unit test: notification gate — with both toggles off,
+- [x] Failing unit test: notification gate - with both toggles off,
       a fake claim-tick completion does not emit a notification;
       with the completion toggle on it emits exactly one with the
       job kind + model in the body.
@@ -263,7 +263,7 @@ use; no wire-format change, no API change.
       Phase 12.
 - [x] Tests green; commit (combined Phase 4-11).
 
-## Phase 11 — Autostart-on-login (Config tab toggle)
+## Phase 11 - Autostart-on-login (Config tab toggle)
 
 - [x] Test: pure-data renderers for the Linux `.desktop` entry and
       the macOS LaunchAgent plist (`render_desktop_entry`,
@@ -278,27 +278,29 @@ use; no wire-format change, no API change.
       group with a one-line explainer ("Run in tray on login").
 - [x] Tests green; commit (combined Phase 4-11).
 
-## Phase 12 - CI + docs
+## Phase 12 — CI + docs
 
-- [ ] `.github/workflows/checks.yml`: add `cargo build --features ui`
-      to the matrix and `apt-get install` the Linux tray build deps
-      (`libxdo-dev`, `libayatana-appindicator3-dev`,
-      `libgtk-3-dev`).  Skip `cargo test --features ui` if it would
-      need a display; the headless `egui::Context` tests live behind
-      the same feature so they need explicit thought - likely
-      runnable without a display via `xvfb-run` if it comes to it.
+- [x] `.github/workflows/checks.yml`: added `ui` row to the matrix
+      that `apt-get install`s `libgtk-3-dev` + `libdbus-1-dev` +
+      `libxdo-dev` + `libayatana-appindicator3-dev` before running
+      `cargo clippy --tests --features ui -- -D warnings`,
+      `cargo check --features ui`, and `cargo test --features ui`.
+      Headless egui tests run fine without a display.
 - [ ] `.github/workflows/build.yml`: confirm the release matrix builds
-      `--features ui` for the desktop targets.  Headless targets keep
-      the default-features build.
+      `--features ui` for the desktop targets.  **Deferred** —
+      separate from the checks workflow; the release build can land
+      once we cut a v0.2.x.
 - [ ] `cargo-dist` config in `Cargo.toml`: ensure the installer
       ships the `--features ui` build for desktop targets.
-- [ ] README: new "Desktop UI" section with screenshot placeholder,
+      **Deferred** — same release-cut window.
+- [x] README: new "Desktop UI" section with a status-tab screenshot,
       `studio-worker ui` invocation, tray-icon behaviour notes, and
-      the feature-flag note.
-- [ ] `AGENTS.md` Tech stack table: add `egui` + `eframe` +
-      `tray-icon` + `notify-rust` rows.
-- [ ] Tick the box, commit "docs: native UI usage + screenshot
-      placeholder".
+      the cargo-feature note.
+- [x] `AGENTS.md` Tech stack table: added `egui` + `eframe` +
+      `tray-icon` + `notify-rust` + `gtk` rows.
+- [x] `LESSONS_LEARNED.md`: recorded the two non-obvious gotchas
+      (Linux tray needs its own GTK thread; Linuxbrew pkg-config
+      shadows the system one).
 
 ## Non-goals (explicitly out of scope)
 

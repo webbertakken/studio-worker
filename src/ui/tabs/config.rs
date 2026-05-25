@@ -6,7 +6,7 @@
 //! Fork #3 (engine selection) is kept as a yellow "restart required"
 //! banner per the chosen default; we do not auto-restart the loops.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
@@ -46,7 +46,7 @@ impl ConfigDraft {
             || self.current.gradio_endpoint_url != self.original.gradio_endpoint_url
     }
 
-    pub fn save(&mut self, path: &PathBuf) -> Result<(), String> {
+    pub fn save(&mut self, path: &Path) -> Result<(), String> {
         match config::save(&self.current, path) {
             Ok(()) => {
                 self.original = self.current.clone();
@@ -103,7 +103,7 @@ const ENGINE_CHOICES: &[&str] = &[
 pub fn render(
     ui: &mut egui::Ui,
     draft: &mut ConfigDraft,
-    config_path: &PathBuf,
+    config_path: &Path,
     notification_prefs: &mut NotificationPrefs,
 ) {
     ui.heading("Configuration");
@@ -443,8 +443,8 @@ mod tests {
         let cfg = Config::default();
         let mut draft = ConfigDraft::from(&cfg);
         // /proc is read-only on Linux — a write attempt fails.
-        let bad = PathBuf::from("/proc/this-should-fail/config.toml");
-        let res = draft.save(&bad);
+        let bad = Path::new("/proc/this-should-fail/config.toml");
+        let res = draft.save(bad);
         assert!(res.is_err());
         assert!(draft.last_save_error.is_some());
     }

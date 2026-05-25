@@ -9,11 +9,6 @@ use chrono::Utc;
 
 use crate::runtime::HeartbeatStatus;
 
-#[cfg(feature = "ui")]
-use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
-#[cfg(feature = "ui")]
-use tray_icon::{Icon, TrayIconBuilder};
-
 /// What the tray icon currently advertises about the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayVariant {
@@ -95,43 +90,6 @@ pub mod menu_ids {
     pub const OPEN_WINDOW: &str = "studio-worker.open-window";
     pub const TOGGLE_AUTO: &str = "studio-worker.toggle-auto";
     pub const QUIT: &str = "studio-worker.quit";
-}
-
-#[cfg(feature = "ui")]
-pub struct TrayHandle {
-    /// Keep the TrayIcon alive for the duration of the session.
-    pub _icon: tray_icon::TrayIcon,
-}
-
-#[cfg(feature = "ui")]
-pub fn install(variant: TrayVariant, labels: &MenuLabels) -> anyhow::Result<TrayHandle> {
-    let menu = Menu::new();
-    let open = MenuItem::with_id(
-        MenuId::new(menu_ids::OPEN_WINDOW),
-        labels.open_window,
-        true,
-        None,
-    );
-    let toggle = MenuItem::with_id(
-        MenuId::new(menu_ids::TOGGLE_AUTO),
-        &labels.toggle_auto,
-        true,
-        None,
-    );
-    let quit = MenuItem::with_id(MenuId::new(menu_ids::QUIT), labels.quit, true, None);
-    menu.append(&open)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&toggle)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    menu.append(&quit)?;
-
-    let icon = Icon::from_rgba(variant.rgba_16(), 16, 16)?;
-    let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip(variant.tooltip())
-        .with_icon(icon)
-        .build()?;
-    Ok(TrayHandle { _icon: tray })
 }
 
 /// Menu labels the tray exposes given current state.  Pure data so

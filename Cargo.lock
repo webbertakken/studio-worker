@@ -5475,6 +5475,7 @@ dependencies = [
  "egui",
  "encoding_rs",
  "gif",
+ "gtk",
  "hex",
  "hf-hub",
  "hostname",

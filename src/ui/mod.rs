@@ -130,33 +130,38 @@ fn install_tray(
     quit_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     auto_enabled: bool,
 ) -> TrayState {
-    use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
-    use tray_icon::{Icon, TrayIconBuilder};
+    use tray_icon::menu::{MenuEvent, MenuId};
 
-    let labels = tray::menu_labels(auto_enabled);
     let open_id = MenuId::new(tray::menu_ids::OPEN_WINDOW);
     let toggle_id = MenuId::new(tray::menu_ids::TOGGLE_AUTO);
     let quit_id = MenuId::new(tray::menu_ids::QUIT);
-    let menu = Menu::new();
-    let open_item = MenuItem::with_id(open_id.clone(), labels.open_window, true, None);
-    let toggle_item = MenuItem::with_id(toggle_id.clone(), labels.toggle_auto, true, None);
-    let quit_item = MenuItem::with_id(quit_id.clone(), labels.quit, true, None);
-    let _ = menu.append(&open_item);
-    let _ = menu.append(&toggle_item);
-    let _ = menu.append(&quit_item);
 
-    let variant = tray::TrayVariant::Disconnected;
-    let icon = Icon::from_rgba(variant.rgba_16(), 16, 16).ok();
-    let mut builder = TrayIconBuilder::new()
-        .with_tooltip(variant.tooltip())
-        .with_menu(Box::new(menu));
-    if let Some(i) = icon {
-        builder = builder.with_icon(i);
-    }
-    let tray = builder.build().ok();
+    // Linux: tray-icon's AppIndicator backend needs GTK initialised on
+    // the same thread that runs its main loop.  We spawn a dedicated
+    // thread for that, build the TrayIcon there, and let it run
+    // `gtk::main()` until process shutdown.  The TrayIcon handle
+    // stays in that thread's stack; updating the icon variant from
+    // the main thread would race so we skip that for now (variant
+    // changes still drive the in-window Status badge).
+    //
+    // macOS / Windows: tray-icon must be built on the main thread
+    // that owns the winit event loop.  We do that inline.
+    let labels = tray::menu_labels(auto_enabled);
+    let open_label = labels.open_window;
+    let toggle_label = labels.toggle_auto.clone();
+    let quit_label = labels.quit;
+
+    let tray_holder = spawn_tray_thread(
+        open_id.clone(),
+        toggle_id.clone(),
+        quit_id.clone(),
+        open_label,
+        toggle_label,
+        quit_label,
+    );
 
     // Forward muda menu events to the app via the channels the tray
-    // icon crate exposes globally.  We poll on a background thread to
+    // icon crate exposes globally.  Poll on a background thread to
     // request a repaint and route the click.
     let ctx_clone = ctx.clone();
     let cfg_clone = cfg.clone();
@@ -174,9 +179,6 @@ fn install_tray(
                 guard.auto_enabled = !guard.auto_enabled;
                 let snapshot = guard.clone();
                 drop(guard);
-                // Best-effort persistence — the default config path
-                // is the one we loaded from.  Re-resolution happens
-                // via `config::resolve_path(None)`.
                 if let Ok(p) = crate::config::resolve_path(None) {
                     let _ = crate::config::save(&snapshot, &p);
                 }
@@ -189,12 +191,97 @@ fn install_tray(
     });
 
     TrayState {
-        icon: tray,
-        current_variant: variant,
+        icon: tray_holder,
+        current_variant: tray::TrayVariant::Disconnected,
         menu_ids: TrayMenuIds {
             open_window: open_id,
             toggle_auto: toggle_id,
             quit: quit_id,
         },
     }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_tray_thread(
+    open_id: tray_icon::menu::MenuId,
+    toggle_id: tray_icon::menu::MenuId,
+    quit_id: tray_icon::menu::MenuId,
+    open_label: &'static str,
+    toggle_label: String,
+    quit_label: &'static str,
+) -> Option<tray_icon::TrayIcon> {
+    use tray_icon::menu::{Menu, MenuItem};
+    use tray_icon::{Icon, TrayIconBuilder};
+
+    std::thread::spawn(move || {
+        if let Err(e) = gtk::init() {
+            tracing::warn!(
+                target: "studio_worker::ui::tray",
+                "gtk init failed: {e}"
+            );
+            return;
+        }
+        let menu = Menu::new();
+        let open_item = MenuItem::with_id(open_id, open_label, true, None);
+        let toggle_item = MenuItem::with_id(toggle_id, &toggle_label, true, None);
+        let quit_item = MenuItem::with_id(quit_id, quit_label, true, None);
+        let _ = menu.append(&open_item);
+        let _ = menu.append(&toggle_item);
+        let _ = menu.append(&quit_item);
+        let variant = tray::TrayVariant::Disconnected;
+        let icon = Icon::from_rgba(variant.rgba_16(), 16, 16).ok();
+        let mut builder = TrayIconBuilder::new()
+            .with_tooltip(variant.tooltip())
+            .with_menu(Box::new(menu));
+        if let Some(i) = icon {
+            builder = builder.with_icon(i);
+        }
+        let _tray = match builder.build() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    target: "studio_worker::ui::tray",
+                    "tray build failed: {e}"
+                );
+                return;
+            }
+        };
+        // Block this thread on gtk's main loop so the tray stays
+        // alive + AppIndicator events get serviced.
+        gtk::main();
+    });
+    // Linux: handle stays on the gtk thread; the main thread can't
+    // mutate the icon (would race).  We track variant changes for
+    // the in-window status badge instead.
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_tray_thread(
+    open_id: tray_icon::menu::MenuId,
+    toggle_id: tray_icon::menu::MenuId,
+    quit_id: tray_icon::menu::MenuId,
+    open_label: &'static str,
+    toggle_label: String,
+    quit_label: &'static str,
+) -> Option<tray_icon::TrayIcon> {
+    use tray_icon::menu::{Menu, MenuItem};
+    use tray_icon::{Icon, TrayIconBuilder};
+
+    let menu = Menu::new();
+    let open_item = MenuItem::with_id(open_id, open_label, true, None);
+    let toggle_item = MenuItem::with_id(toggle_id, &toggle_label, true, None);
+    let quit_item = MenuItem::with_id(quit_id, quit_label, true, None);
+    let _ = menu.append(&open_item);
+    let _ = menu.append(&toggle_item);
+    let _ = menu.append(&quit_item);
+    let variant = tray::TrayVariant::Disconnected;
+    let icon = Icon::from_rgba(variant.rgba_16(), 16, 16).ok();
+    let mut builder = TrayIconBuilder::new()
+        .with_tooltip(variant.tooltip())
+        .with_menu(Box::new(menu));
+    if let Some(i) = icon {
+        builder = builder.with_icon(i);
+    }
+    builder.build().ok()
 }
