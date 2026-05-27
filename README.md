@@ -152,24 +152,51 @@ Each release ships pre-built binaries for:
 
 ## First run
 
-```bash
-# 1. Register with the studio API.
-studio-worker register \
-  --bootstrap-token <TOKEN> \
-  --api-base-url https://studio.example.com
+No shared secret to copy around.  The worker auto-registers against
+`https://studio.minis.gg` on first launch; the studio operator sees a
+row in the dashboard's Pending Workers panel and clicks Approve, and
+the worker's next 30s poll picks up its `worker_id` + `auth_token`
+and starts heartbeating.  Two ways to launch:
 
-# 2. Install the auto-start service (systemd --user on Linux, launchd
-#    on macOS, scheduled task on Windows).
+```bash
+# Windowed (recommended) — Status tab shows 'Waiting for approval'
+# until the operator approves.
+studio-worker ui
+
+# Headless — same flow, no window; pipe to journalctl in production.
+studio-worker run
+```
+
+Optional pre-launch tweaks (none of these talk to the network):
+
+```bash
+# Pre-set the human label shown in the dashboard's Pending Workers panel.
+studio-worker register --label "alice's gaming rig"
+
+# Point at a self-hosted studio instead of studio.minis.gg.
+studio-worker register --api-base-url https://my-studio.example.com
+
+# Optionally install the auto-start OS service (systemd --user on Linux,
+# launchd on macOS, scheduled task on Windows).  Alternative: the desktop
+# UI's Config tab has a `Run in tray on login` toggle.
 studio-worker install-service
+```
+
+If your registration is rejected (or you want to move the worker to a
+different studio), clear the local state and submit a fresh request:
+
+```bash
+studio-worker register --reset
 ```
 
 ## CLI subcommands
 
 | Subcommand           | Purpose                                                         |
 | -------------------- | --------------------------------------------------------------- |
-| `run`                | Hold the WS session + auto-update loop.                         |
-| `register`           | One-shot register with the API.  Idempotent.                    |
-| `status`             | Print the local config + heartbeat info.                        |
+| `run`                | Auto-register if needed, then hold the WS session + auto-update loop. |
+| `ui` (feature `ui`)  | Same as `run` plus the desktop window + tray + notifications.   |
+| `register`           | Persist `--label` / `--api-base-url`; `--reset` clears local state. |
+| `status`             | Print the local config + registration state.                    |
 | `install-service`    | Install the auto-start OS service.                              |
 | `uninstall-service`  | Remove the auto-start OS service.                               |
 | `enable`             | Set `auto_enabled = true` (resume claiming).                    |
@@ -186,14 +213,14 @@ Config lives at:
 - Windows — `%APPDATA%\minis-studio-worker\config.toml`
 
 ```toml
-api_base_url        = "https://studio.example.com"
-bootstrap_token     = "<used only at register>"
-worker_id           = "<filled by register>"
-auth_token          = "<filled by register>"
+api_base_url        = "https://studio.minis.gg"
+worker_id           = "<filled on operator approval>"
+auth_token          = "<filled on operator approval>"
+label               = "alice's gaming rig"       # optional human label
 vram_threshold_gb   = 12.0                       # max GB per claim
 auto_start          = true
 auto_enabled        = true
-engine              = "synthetic"                # or "gradio"
+engine              = "synthetic"                # or "gradio", "multi", ...
 
 # Only used when engine = "gradio":
 gradio_endpoint_url = "http://127.0.0.1:7860"
@@ -213,7 +240,32 @@ auto_update_prerelease    = false
 # exiting non-zero (and letting systemd/launchd/Task-Scheduler
 # restart it).  `0` = infinite.  Omit to use the default of 5.
 ws_reconnect_attempts     = 5
+
+# Internal state written by the auto-register flow.  Don't edit by hand.
+install_id              = "<uuidv4>"
+registration_request_id = "<rr-...>"             # cleared on approval
+registration_secret     = "<hex>"                # cleared on approval
 ```
+
+## Registration flow
+
+The worker doesn't ship a shared secret.  On first launch:
+
+1. Generates a per-install UUID + 256-bit `registration_secret` and
+   keeps both in `config.toml`.  Only the SHA-256 hash of the secret
+   leaves the box.
+2. POSTs `/workers/register-request` to `api_base_url` with hostname,
+   username, VRAM, supported models, optional label.
+3. The studio creates a Pending Workers row.  The operator sees it in
+   the studio dashboard, clicks Approve (or Reject), and the worker's
+   next 30s poll picks up the decision.
+4. On Approve: `worker_id` + `auth_token` written to `config.toml`,
+   normal heartbeat / claim loops take over.
+5. On Reject: worker stops trying.  `studio-worker register --reset`
+   clears state and the next launch submits a fresh request.
+
+See [`docs/architecture/overview.md`](docs/architecture/overview.md#registration-auto-register-with-approval)
+for the full state machine + per-install identity details.
 
 ## Troubleshooting
 
@@ -221,8 +273,9 @@ ws_reconnect_attempts     = 5
   the auth token on the upgrade (HTTP 401) or via a close-code 4001
   after a successful upgrade.  The token was either revoked, the
   worker was deleted from the studio admin UI, or `config.toml`
-  carries a stale token.  Re-register: `studio-worker register
-  --bootstrap-token <TOKEN> --api-base-url <URL>`.
+  carries a stale token.  Clear local state and let the next launch
+  auto-register again: `studio-worker register --reset` then
+  `studio-worker run` (or `studio-worker ui`).
 - **Worker exits with `ws reconnect cap reached`** — every reconnect
   attempt failed (DNS, TLS, or the API is down).  Service manager will
   restart us; if it keeps happening, check the API is reachable from
