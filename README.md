@@ -104,6 +104,23 @@ For the unattended `ui` builds in CI the same packages are installed
 by `.github/workflows/checks.yml` before `cargo test --features ui`.
 No extra deps are required on macOS / Windows.
 
+#### If you have Linuxbrew installed
+
+Linuxbrew ships its own `pkg-config` ahead of the system one on
+`PATH`.  Its default search path doesn't include
+`/usr/lib/x86_64-linux-gnu/pkgconfig`, so the GTK `.pc` files
+installed by `apt` above are invisible and the build dies with
+`Package cairo was not found`.  Either point `pkg-config` at the
+system paths for the install:
+
+```bash
+PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
+  cargo install studio-worker --features ui
+```
+
+or put `/usr/bin` ahead of Linuxbrew on `PATH` so the system
+`pkgconf` wins.  Pure-apt boxes without Linuxbrew don't need this.
+
 ## Quick install
 
 ### Linux / macOS
