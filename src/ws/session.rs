@@ -561,15 +561,23 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     let job = claim.into_job_claim();
     let resolved_task = job.resolved_task();
     let task_kind = resolved_task.kind();
-    let prompt = truncate_prompt(&prompt_for(&resolved_task));
+    // The FULL prompt goes back to the studio (and to the engine).
+    // The bounded preview (`truncate_prompt`) is only for the UI's
+    // Jobs tab so the in-memory observer ring stays small even when
+    // LLM prompts are huge.  Mixing the two used to send the
+    // truncated 200-char preview as the `prompt` form field on the
+    // multipart `/complete`, which the studio then persisted onto the
+    // row — mangling every operator-facing prompt in the DB.
+    let full_prompt = prompt_for(&resolved_task);
+    let prompt_preview = truncate_prompt(&full_prompt);
     let started_at = chrono::Utc::now();
 
-    // Surface the job to the UI's Jobs tab.
+    // Surface the job to the UI's Jobs tab — bounded preview only.
     *ctx.observers.current_job.lock() = Some(CurrentJob {
         job_id: job_id.clone(),
         kind: task_kind,
         model: job.model.clone(),
-        prompt: prompt.clone(),
+        prompt: prompt_preview.clone(),
         started_at,
     });
 
@@ -594,7 +602,8 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             job,
             started_at,
             task_kind,
-            prompt,
+            full_prompt,
+            prompt_preview,
         )
         .await;
         busy_flag.store(false, Ordering::SeqCst);
@@ -614,7 +623,8 @@ async fn run_offered_job(
     job: crate::types::JobClaim,
     started_at: chrono::DateTime<chrono::Utc>,
     task_kind: crate::types::TaskKind,
-    prompt_for_log: String,
+    full_prompt: String,
+    prompt_preview: String,
 ) {
     let task = job.resolved_task();
     let start = std::time::Instant::now();
@@ -664,7 +674,7 @@ async fn run_offered_job(
                         let job_id = job_id.clone();
                         let auth_token = auth_token.clone();
                         let worker_id = worker_id.clone();
-                        let prompt = prompt_for_log.clone();
+                        let prompt = full_prompt.clone();
                         move || -> Result<()> {
                             let api = ApiClient::new(api_base_url)?;
                             api.complete(&worker_id, &auth_token, &job_id, &ext, &prompt, bytes)
@@ -726,7 +736,7 @@ async fn run_offered_job(
                         .send(&WorkerInbound::CompleteJson {
                             job_id: job_id.clone(),
                             result: json,
-                            prompt: Some(prompt_for_log.clone()),
+                            prompt: Some(full_prompt.clone()),
                         })
                         .await;
                     outcome = JobOutcome::Completed;
@@ -785,7 +795,7 @@ async fn run_offered_job(
             job_id: job_id.clone(),
             kind: task_kind,
             model: job.model.clone(),
-            prompt: prompt_for_log,
+            prompt: prompt_preview,
             outcome,
             started_at,
             finished_at: chrono::Utc::now(),
