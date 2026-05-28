@@ -154,9 +154,12 @@ impl SdCppEngine {
         // tempfile so we can hand the path to `sd-cli --init-img`.
         // This is mandatory — the worker refuses i2i jobs whose
         // init image fails to download (no silent fallback to t2i).
+        // The local extension mirrors the URL's so sd-cli's image
+        // loader can sniff the format.
         let init_img_path = match params.init_image_url.as_deref() {
             Some(url) if !url.is_empty() => {
-                let init_path = out_dir.join(format!("{stem}-init.bin"));
+                let ext = init_image_extension(url);
+                let init_path = out_dir.join(format!("{stem}-init.{ext}"));
                 download_file(url, &init_path).with_context(|| {
                     format!("downloading init image {} -> {}", url, init_path.display())
                 })?;
@@ -490,6 +493,28 @@ fn which(bin: &str) -> Option<PathBuf> {
     None
 }
 
+/// Pick an extension to use for the init-image tempfile that sd-cli's
+/// image loader can sniff.  Reads the trailing `.<ext>` from the URL's
+/// path (ignoring query + fragment).  Defaults to `webp` when no
+/// recognisable extension is present.
+fn init_image_extension(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let lower_tail = path
+        .rsplit('.')
+        .next()
+        .map(|t| t.to_ascii_lowercase())
+        .unwrap_or_default();
+    match lower_tail.as_str() {
+        "png" => "png",
+        "jpg" | "jpeg" => "jpg",
+        "webp" => "webp",
+        "bmp" => "bmp",
+        "gif" => "gif",
+        "tif" | "tiff" => "tif",
+        _ => "webp",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -807,5 +832,25 @@ mod tests {
             .supported_models_per_kind
             .contains_key(&TaskKind::Image));
         assert_eq!(caps.supported_models_per_kind.len(), 1);
+    }
+
+    #[test]
+    fn init_image_extension_reads_url_tail() {
+        assert_eq!(init_image_extension("https://x/y/latest.webp"), "webp");
+        assert_eq!(init_image_extension("https://x/y/latest.PNG"), "png");
+        assert_eq!(init_image_extension("https://x/y/latest.jpg"), "jpg");
+        assert_eq!(init_image_extension("https://x/y/latest.jpeg"), "jpg");
+        // Query strings + fragments don't trick the parser.
+        assert_eq!(
+            init_image_extension("https://x/y/latest.webp?v=42&t=now"),
+            "webp"
+        );
+        assert_eq!(init_image_extension("https://x/y/latest.webp#frag"), "webp");
+        // Unknown extension falls back to webp.
+        assert_eq!(
+            init_image_extension("https://x/y/latest.unknownext"),
+            "webp"
+        );
+        assert_eq!(init_image_extension("https://x/y/no-ext"), "webp");
     }
 }
