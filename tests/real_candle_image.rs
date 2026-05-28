@@ -62,6 +62,7 @@ fn end_to_end_image_generation() {
         steps: 4,
         seed: Some(42),
         ext: "png".into(),
+        ..Default::default()
     });
     let started = std::time::Instant::now();
     let result = engine

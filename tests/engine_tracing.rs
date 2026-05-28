@@ -122,6 +122,7 @@ fn tts_engine_dispatch_emits_trace() {
                     text: "hi".into(),
                     voice: "default".into(),
                     ext: "wav".into(),
+                    ..Default::default()
                 }),
             )
             .unwrap();
@@ -155,6 +156,7 @@ fn video_engine_dispatch_emits_trace() {
                     width: 64,
                     height: 64,
                     ext: "gif".into(),
+                    ..Default::default()
                 }),
             )
             .unwrap();
@@ -190,6 +192,7 @@ fn llama_engine_dispatch_unsupported_kind_emits_warn() {
                 steps: 1,
                 seed: None,
                 ext: "webp".into(),
+                ..Default::default()
             }),
         );
     });
@@ -214,6 +217,7 @@ fn whisper_engine_dispatch_unsupported_kind_emits_warn() {
                 text: "x".into(),
                 voice: "v".into(),
                 ext: "wav".into(),
+                ..Default::default()
             }),
         );
     });
@@ -236,6 +240,7 @@ fn candle_image_engine_dispatch_unsupported_kind_emits_warn() {
                 messages: vec![],
                 max_tokens: 1,
                 temperature: 0.0,
+                ..Default::default()
             }),
         );
     });

@@ -150,6 +150,7 @@ mod tests {
             width: 128,
             height: 128,
             ext: "gif".into(),
+            ..Default::default()
         })
     }
 
@@ -179,6 +180,7 @@ mod tests {
                     messages: vec![],
                     max_tokens: 1,
                     temperature: 0.0,
+                    ..Default::default()
                 }),
             )
             .unwrap_err();
@@ -221,6 +223,7 @@ mod tests {
             width: 64,
             height: 64,
             ext: "gif".into(),
+            ..Default::default()
         })
         .unwrap();
         let big = render_gif(&VideoParams {
@@ -229,6 +232,7 @@ mod tests {
             width: 64,
             height: 64,
             ext: "gif".into(),
+            ..Default::default()
         })
         .unwrap();
         assert!(big.len() > small.len());

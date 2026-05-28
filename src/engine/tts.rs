@@ -231,6 +231,7 @@ mod tests {
                     steps: 1,
                     seed: None,
                     ext: "webp".into(),
+                    ..Default::default()
                 }),
             )
             .unwrap_err();

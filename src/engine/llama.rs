@@ -405,6 +405,7 @@ mod tests {
             }],
             max_tokens: 1,
             temperature: 0.0,
+            ..Default::default()
         });
         let err = engine.dispatch("no-such-model", task).unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -421,6 +422,7 @@ mod tests {
             steps: 1,
             seed: None,
             ext: "webp".into(),
+            ..Default::default()
         });
         let err = engine.dispatch("anything", task).unwrap_err();
         assert!(err.to_string().contains("cannot serve image"));
