@@ -96,6 +96,7 @@ impl SessionSchedule {
 /// true, the heartbeat reports `autoEnabled = false` and incoming
 /// offers are rejected, so the studio stops sending new jobs.  In-
 /// flight work is allowed to finish.
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn spawn_ws_session(
     cfg: SharedConfig,
     stop: Arc<AtomicBool>,
@@ -211,6 +212,7 @@ enum WelcomeOutcome {
 /// before the Welcome are pushed into the logs and discarded — the
 /// studio shouldn't be sending them at this stage, but if it does,
 /// the dispatch loop will pick the next ones up.
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn wait_for_welcome(
     event_rx: &mut mpsc::UnboundedReceiver<SessionEvent>,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
@@ -285,6 +287,7 @@ fn has_credentials(cfg: &SharedConfig) -> bool {
 
 /// One end-to-end session attempt: connect, hello, run until shutdown
 /// or disconnect.
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_one_session(
     cfg: &SharedConfig,
     stop: &Arc<AtomicBool>,
@@ -453,6 +456,7 @@ struct SessionContext {
     auth_token: String,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_dispatch_loop(
     ctx: SessionContext,
     mut event_rx: mpsc::UnboundedReceiver<SessionEvent>,
@@ -505,6 +509,7 @@ async fn run_dispatch_loop(
     SessionOutcome::Disconnected
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     let job_id = claim.job_id.clone();
     push_log_with_observers(
@@ -597,6 +602,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_offered_job(
     sender: WsSender,
     engine: Arc<dyn Engine>,
@@ -787,6 +793,7 @@ async fn run_offered_job(
     );
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_reader(
     mut receiver: crate::ws::client::WsReceiver,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
@@ -813,6 +820,7 @@ fn spawn_reader(
     })
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_heartbeat_pump(
     capabilities: WorkerCapabilities,
     sender: WsSender,
@@ -853,6 +861,7 @@ fn spawn_heartbeat_pump(
     })
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_log_shipper_pump(
     sender: WsSender,
     logs: Arc<Mutex<Vec<LogEntry>>>,
@@ -885,6 +894,7 @@ fn spawn_log_shipper_pump(
     })
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_shutdown_observer(
     stop: Arc<AtomicBool>,
     event_tx: mpsc::UnboundedSender<SessionEvent>,

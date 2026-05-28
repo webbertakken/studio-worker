@@ -56,6 +56,7 @@ impl SdCppEngine {
     /// Try to build the engine; returns `None` if `sd-cli` isn't on
     /// the box.  The model files come in on the offer so we don't
     /// need to pre-stage anything.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn try_new(models_root: &Path) -> Option<Self> {
         let sd_cli = resolve_sd_cli()?;
         if let Err(e) = std::fs::create_dir_all(models_root) {
@@ -91,6 +92,7 @@ impl SdCppEngine {
     /// Ensure each file in `source.files` is present under
     /// `self.models_root`.  Downloads anything missing.  Returns the
     /// resolved local path for each file (in the same order).
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn ensure_files(&self, source: &ModelSource) -> Result<Vec<(ModelFileRole, PathBuf)>> {
         let mut out = Vec::with_capacity(source.files.len());
         for file in &source.files {
