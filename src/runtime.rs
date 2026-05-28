@@ -731,11 +731,7 @@ mod tests {
     fn prompt_for_extracts_per_kind() {
         let image = Task::Image(ImageParams {
             prompt: "a stone golem".into(),
-            width: 512,
-            height: 512,
-            steps: 20,
-            seed: None,
-            ext: "webp".into(),
+            ..Default::default()
         });
         assert_eq!(prompt_for(&image), "a stone golem");
 
@@ -752,19 +748,19 @@ mod tests {
             ],
             max_tokens: 32,
             temperature: 0.5,
+            ..Default::default()
         });
         assert_eq!(prompt_for(&llm), "hi");
 
         let llm_empty = Task::Llm(LlmParams {
             messages: vec![],
-            max_tokens: 1,
-            temperature: 0.0,
+            ..Default::default()
         });
         assert_eq!(prompt_for(&llm_empty), "");
 
         let stt = Task::AudioStt(AudioSttParams {
             input_url: "https://example.com/clip.wav".into(),
-            language: None,
+            ..Default::default()
         });
         assert_eq!(prompt_for(&stt), "https://example.com/clip.wav");
 
@@ -772,6 +768,7 @@ mod tests {
             text: "hi there".into(),
             voice: "v".into(),
             ext: "wav".into(),
+            ..Default::default()
         });
         assert_eq!(prompt_for(&tts), "hi there");
 
@@ -781,6 +778,7 @@ mod tests {
             width: 256,
             height: 256,
             ext: "mp4".into(),
+            ..Default::default()
         });
         assert_eq!(prompt_for(&video), "a tiny dragon");
     }

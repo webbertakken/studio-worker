@@ -19,8 +19,8 @@ fn image_task(prompt: &str) -> Task {
         width: 64,
         height: 64,
         steps: 1,
-        seed: None,
         ext: "webp".into(),
+        ..Default::default()
     })
 }
 

@@ -29,6 +29,7 @@ use crate::engine::{Engine, EngineCapabilities};
 use crate::types::{ImageParams, ModelFileRole, ModelSource, Task, TaskKind, TaskResult};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -149,77 +150,40 @@ impl SdCppEngine {
         );
         let out_path = out_dir.join(format!("{stem}.webp"));
 
-        // Resolution + per-call params come from the OFFER's task
-        // payload first (game manifests pin per-asset dimensions, e.g.
-        // game-of-elements = 768x512).  The model's cliDefaults are
-        // a fallback for offers that don't carry task params.
-        let width = if params.width > 0 {
-            params.width
-        } else if source.cli_defaults.width > 0 {
-            source.cli_defaults.width
-        } else {
-            1024
-        };
-        let height = if params.height > 0 {
-            params.height
-        } else if source.cli_defaults.height > 0 {
-            source.cli_defaults.height
-        } else {
-            1024
-        };
-        // Steps: same priority — task first, model second, fallback last.
-        // Note: ImageParams::default() is 20 steps; we treat that as
-        // "caller didn't pick" so the model's tuned step count wins.
-        let steps = if params.steps > 0 && params.steps != 20 {
-            params.steps
-        } else if source.cli_defaults.steps > 0 {
-            source.cli_defaults.steps
-        } else {
-            STEPS_FALLBACK
-        };
-        let cfg_scale = if source.cli_defaults.cfg_scale > 0.0 {
-            source.cli_defaults.cfg_scale
-        } else {
-            1.0
+        // If the task carries an init image URL, stream it to a
+        // tempfile so we can hand the path to `sd-cli --init-img`.
+        // This is mandatory — the worker refuses i2i jobs whose
+        // init image fails to download (no silent fallback to t2i).
+        let init_img_path = match params.init_image_url.as_deref() {
+            Some(url) if !url.is_empty() => {
+                let init_path = out_dir.join(format!("{stem}-init.bin"));
+                download_file(url, &init_path).with_context(|| {
+                    format!("downloading init image {} -> {}", url, init_path.display())
+                })?;
+                Some(init_path)
+            }
+            _ => None,
         };
 
+        let args = build_sdcli_args(
+            &params,
+            source,
+            diffusion_model,
+            vae,
+            text_encoder,
+            &out_path,
+            init_img_path.as_deref(),
+        );
         let mut cmd = Command::new(&self.sd_cli);
-        cmd.arg("--diffusion-model").arg(diffusion_model);
-        if let Some(p) = vae {
-            cmd.arg("--vae").arg(p);
-        }
-        if let Some(p) = text_encoder {
-            cmd.arg("--llm").arg(p);
-        }
-        cmd.arg("-p")
-            .arg(&params.prompt)
-            .arg("--cfg-scale")
-            .arg(cfg_scale.to_string())
-            .arg("--steps")
-            .arg(steps.to_string())
-            .arg("-W")
-            .arg(width.to_string())
-            .arg("-H")
-            .arg(height.to_string())
-            .arg("-o")
-            .arg(&out_path);
-        if let Some(seed) = params.seed {
-            cmd.arg("--seed").arg(seed.to_string());
-        }
-        if let Some(ref method) = source.cli_defaults.sampling_method {
-            cmd.arg("--sampling-method").arg(method);
-        }
-        // VRAM-saving flags that are safe on every box.
-        cmd.arg("--diffusion-fa");
+        cmd.args(&args);
 
         debug!(
             target: TRACE_TARGET,
             op = "spawn",
             sd_cli = %self.sd_cli.display(),
             model,
-            steps,
-            width,
-            height,
+            i2i = init_img_path.is_some(),
+            arg_count = args.len(),
             "running sd-cli"
         );
 
@@ -249,6 +213,9 @@ impl SdCppEngine {
         let bytes = std::fs::read(&out_path)
             .with_context(|| format!("reading sd-cli output at {}", out_path.display()))?;
         let _ = std::fs::remove_file(&out_path);
+        if let Some(p) = init_img_path.as_deref() {
+            let _ = std::fs::remove_file(p);
+        }
         info!(
             target: TRACE_TARGET,
             op = "dispatch",
@@ -294,11 +261,9 @@ impl Engine for SdCppEngine {
         &self,
         model: &str,
         task: Task,
-        source: Option<&ModelSource>,
+        source: &ModelSource,
     ) -> Result<TaskResult> {
         let kind = task.kind();
-        let source =
-            source.ok_or_else(|| anyhow!("sdcpp engine requires a ModelSource on the offer"))?;
         match task {
             Task::Image(p) => self.dispatch_image(model, p, source),
             _ => bail!("sdcpp engine cannot serve {} tasks", kind.as_str()),
@@ -362,6 +327,131 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
         "done"
     );
     Ok(())
+}
+
+/// Resolve final per-job width / height / steps / cfg / sampler /
+/// negative-prompt by layering `params` over `source.cli_defaults`
+/// with the agreed precedence (per-job override beats model default
+/// beats engine fallback).  Pure for testability.
+fn resolve_image_args(params: &ImageParams, source: &ModelSource) -> ResolvedImageArgs {
+    let width = if params.width > 0 {
+        params.width
+    } else if source.cli_defaults.width > 0 {
+        source.cli_defaults.width
+    } else {
+        1024
+    };
+    let height = if params.height > 0 {
+        params.height
+    } else if source.cli_defaults.height > 0 {
+        source.cli_defaults.height
+    } else {
+        1024
+    };
+    // Steps: per-job override wins (treat the deserialiser default of
+    // 20 as "caller didn't pick" so the model's tuned step count
+    // doesn't get clobbered by a stale default).
+    let steps = if params.steps > 0 && params.steps != 20 {
+        params.steps
+    } else if source.cli_defaults.steps > 0 {
+        source.cli_defaults.steps
+    } else {
+        STEPS_FALLBACK
+    };
+    let source_cfg = if source.cli_defaults.cfg_scale > 0.0 {
+        source.cli_defaults.cfg_scale
+    } else {
+        1.0
+    };
+    let cfg_scale = params.cfg_scale.filter(|v| *v > 0.0).unwrap_or(source_cfg);
+    let sampling_method = params
+        .sampling_method
+        .clone()
+        .or_else(|| source.cli_defaults.sampling_method.clone());
+    ResolvedImageArgs {
+        width,
+        height,
+        steps,
+        cfg_scale,
+        sampling_method,
+    }
+}
+
+/// Resolved per-job sd-cli numerics.  Output of [`resolve_image_args`].
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedImageArgs {
+    width: u32,
+    height: u32,
+    steps: u32,
+    cfg_scale: f32,
+    sampling_method: Option<String>,
+}
+
+/// Build the full `sd-cli` argv for one image job.  Pure (no I/O):
+/// the caller resolves files / out-path / init-image-path, this
+/// function only assembles the flag list so it can be asserted in
+/// unit tests without spawning the binary.
+fn build_sdcli_args(
+    params: &ImageParams,
+    source: &ModelSource,
+    diffusion_model: &Path,
+    vae: Option<&Path>,
+    text_encoder: Option<&Path>,
+    out_path: &Path,
+    init_img_path: Option<&Path>,
+) -> Vec<OsString> {
+    let resolved = resolve_image_args(params, source);
+    let mut args: Vec<OsString> = Vec::with_capacity(32);
+
+    args.push("--diffusion-model".into());
+    args.push(diffusion_model.into());
+    if let Some(p) = vae {
+        args.push("--vae".into());
+        args.push(p.into());
+    }
+    if let Some(p) = text_encoder {
+        args.push("--llm".into());
+        args.push(p.into());
+    }
+    args.push("-p".into());
+    args.push((&params.prompt as &str).into());
+    if let Some(neg) = params.negative_prompt.as_deref() {
+        if !neg.is_empty() {
+            args.push("--negative-prompt".into());
+            args.push(neg.into());
+        }
+    }
+    if let Some(init) = init_img_path {
+        args.push("--init-img".into());
+        args.push(init.into());
+        // `--strength` only makes sense alongside an init image
+        // (sd-cli ignores it otherwise).  Default to 0.75 (sd-cli's
+        // own default) when the caller didn't pick a value.
+        let strength = params.denoise.unwrap_or(0.75);
+        args.push("--strength".into());
+        args.push(strength.to_string().into());
+    }
+    args.push("--cfg-scale".into());
+    args.push(resolved.cfg_scale.to_string().into());
+    args.push("--steps".into());
+    args.push(resolved.steps.to_string().into());
+    args.push("-W".into());
+    args.push(resolved.width.to_string().into());
+    args.push("-H".into());
+    args.push(resolved.height.to_string().into());
+    args.push("-o".into());
+    args.push(out_path.into());
+    if let Some(seed) = params.seed {
+        args.push("--seed".into());
+        args.push(seed.to_string().into());
+    }
+    if let Some(method) = resolved.sampling_method.as_deref() {
+        args.push("--sampling-method".into());
+        args.push(method.into());
+    }
+    // VRAM-saving flags that are safe on every box.
+    args.push("--diffusion-fa".into());
+    args
 }
 
 /// Look up `sd-cli` in env override -> `~/.local/bin` -> `$PATH`.
@@ -470,31 +560,242 @@ mod tests {
             text: "hi".into(),
             voice: "v".into(),
             ext: "wav".into(),
+            ..Default::default()
         });
         let source = fake_source(vec![]);
         let err = engine
-            .dispatch_with_source("anything", task, Some(&source))
+            .dispatch_with_source("anything", task, &source)
             .unwrap_err();
         assert!(err.to_string().contains("cannot serve audio_tts"));
     }
 
+    // The legacy `dispatch_requires_model_source` test is gone: the
+    // trait signature now takes `&ModelSource` so the compiler enforces
+    // it at every call site.  No runtime fallback to police.
+
+    // -----------------------------------------------------------------
+    // Pure arg-builder tests — lock down the sd-cli invocation contract
+    // without needing the binary on the box.
+    // -----------------------------------------------------------------
+
+    fn args_to_strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn idx_after(args: &[String], flag: &str) -> Option<usize> {
+        args.iter().position(|a| a == flag).map(|i| i + 1)
+    }
+
     #[test]
-    fn dispatch_requires_model_source() {
-        use crate::types::ImageParams;
-        let dir = tempdir().unwrap();
-        let engine = SdCppEngine::with_paths(PathBuf::from("/usr/bin/true"), dir.path().into());
-        let task = Task::Image(ImageParams {
-            prompt: "x".into(),
-            width: 64,
-            height: 64,
-            steps: 1,
-            seed: None,
-            ext: "webp".into(),
-        });
-        let err = engine
-            .dispatch_with_source("z-image-turbo-q4_k_m.gguf", task, None)
-            .unwrap_err();
-        assert!(err.to_string().contains("requires"));
+    fn build_sdcli_args_includes_required_flags() {
+        let params = ImageParams {
+            prompt: "hello".into(),
+            width: 768,
+            height: 512,
+            steps: 20, // "caller didn't pick" → source default wins
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            Some(Path::new("/v.safetensors")),
+            Some(Path::new("/llm.gguf")),
+            Path::new("/tmp/out.webp"),
+            None,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--diffusion-model").unwrap()], "/d.gguf");
+        assert_eq!(s[idx_after(&s, "--vae").unwrap()], "/v.safetensors");
+        assert_eq!(s[idx_after(&s, "--llm").unwrap()], "/llm.gguf");
+        assert_eq!(s[idx_after(&s, "-p").unwrap()], "hello");
+        assert_eq!(s[idx_after(&s, "-W").unwrap()], "768");
+        assert_eq!(s[idx_after(&s, "-H").unwrap()], "512");
+        // source default cfg_scale=1.0
+        assert_eq!(s[idx_after(&s, "--cfg-scale").unwrap()], "1");
+        // source default steps=8 wins (param.steps==20 treated as default)
+        assert_eq!(s[idx_after(&s, "--steps").unwrap()], "8");
+        assert_eq!(s[idx_after(&s, "--sampling-method").unwrap()], "euler");
+        assert_eq!(s[idx_after(&s, "-o").unwrap()], "/tmp/out.webp");
+        assert!(s.contains(&"--diffusion-fa".to_string()));
+        // Never includes init-only flags when no init image present.
+        assert!(!s.contains(&"--init-img".to_string()));
+        assert!(!s.contains(&"--strength".to_string()));
+    }
+
+    #[test]
+    fn build_sdcli_args_includes_negative_prompt_when_set() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            negative_prompt: Some("text, watermark, low quality".into()),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(
+            s[idx_after(&s, "--negative-prompt").unwrap()],
+            "text, watermark, low quality"
+        );
+    }
+
+    #[test]
+    fn build_sdcli_args_omits_negative_prompt_when_empty_string() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            negative_prompt: Some(String::new()),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+        );
+        let s = args_to_strings(&args);
+        assert!(!s.contains(&"--negative-prompt".to_string()));
+    }
+
+    #[test]
+    fn build_sdcli_args_includes_init_image_and_strength() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            denoise: Some(0.55),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            Some(Path::new("/tmp/init.webp")),
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--init-img").unwrap()], "/tmp/init.webp");
+        assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.55");
+    }
+
+    #[test]
+    fn build_sdcli_args_defaults_denoise_when_init_image_present_but_denoise_none() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            denoise: None,
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            Some(Path::new("/tmp/init.webp")),
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.75");
+    }
+
+    #[test]
+    fn build_sdcli_args_per_job_cfg_scale_overrides_model_default() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            cfg_scale: Some(7.5),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--cfg-scale").unwrap()], "7.5");
+    }
+
+    #[test]
+    fn build_sdcli_args_per_job_sampling_method_overrides_model_default() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            sampling_method: Some("dpm++2m".into()),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--sampling-method").unwrap()], "dpm++2m");
+    }
+
+    #[test]
+    fn build_sdcli_args_per_job_steps_overrides_when_non_default() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            steps: 30, // != 20 → treat as caller override
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--steps").unwrap()], "30");
+    }
+
+    #[test]
+    fn build_sdcli_args_seed_included_when_set() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            seed: Some(42),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--seed").unwrap()], "42");
     }
 
     #[test]

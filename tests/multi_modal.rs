@@ -19,8 +19,8 @@ fn dispatch_image_round_trips_through_webp_decoder() {
         width: 512,
         height: 512,
         steps: 20,
-        seed: None,
         ext: "webp".into(),
+        ..Default::default()
     });
     let res = synth_engine().dispatch("synthetic", task).unwrap();
     let (bytes, ext) = match res {
@@ -46,6 +46,7 @@ fn dispatch_llm_returns_chat_completion_shape() {
         }],
         max_tokens: 32,
         temperature: 0.5,
+        ..Default::default()
     });
     let res = synth_engine().dispatch("synthetic-llm", task).unwrap();
     let json = match res {
@@ -62,6 +63,7 @@ fn dispatch_stt_returns_whisper_shape() {
     let task = Task::AudioStt(AudioSttParams {
         input_url: "https://example.com/clip.wav".into(),
         language: Some("nl".into()),
+        ..Default::default()
     });
     let res = synth_engine().dispatch("synthetic-stt", task).unwrap();
     let json = match res {
@@ -78,6 +80,7 @@ fn dispatch_tts_round_trips_through_wav_decoder() {
         text: "hello cruel world".into(),
         voice: "default".into(),
         ext: "wav".into(),
+        ..Default::default()
     });
     let res = synth_engine().dispatch("synthetic-tts", task).unwrap();
     let (bytes, ext) = match res {
@@ -103,6 +106,7 @@ fn dispatch_video_emits_decodable_bytes() {
         width: 256,
         height: 256,
         ext: "mp4".into(),
+        ..Default::default()
     });
     let res = synth_engine().dispatch("synthetic-video", task).unwrap();
     let (bytes, ext) = match res {
@@ -179,8 +183,8 @@ fn task_kind_matches_for_every_variant() {
             width: 1,
             height: 1,
             steps: 1,
-            seed: None,
             ext: "webp".into(),
+            ..Default::default()
         })
         .kind(),
         TaskKind::Image
@@ -190,6 +194,7 @@ fn task_kind_matches_for_every_variant() {
             messages: vec![],
             max_tokens: 1,
             temperature: 0.0,
+            ..Default::default()
         })
         .kind(),
         TaskKind::Llm
@@ -198,6 +203,7 @@ fn task_kind_matches_for_every_variant() {
         Task::AudioStt(AudioSttParams {
             input_url: "http://x".into(),
             language: None,
+            ..Default::default()
         })
         .kind(),
         TaskKind::AudioStt
@@ -207,6 +213,7 @@ fn task_kind_matches_for_every_variant() {
             text: "x".into(),
             voice: "v".into(),
             ext: "wav".into(),
+            ..Default::default()
         })
         .kind(),
         TaskKind::AudioTts
@@ -218,6 +225,7 @@ fn task_kind_matches_for_every_variant() {
             width: 256,
             height: 256,
             ext: "mp4".into(),
+            ..Default::default()
         })
         .kind(),
         TaskKind::Video
@@ -313,21 +321,47 @@ fn video_params_uses_serde_defaults_for_missing_fields() {
 }
 
 #[test]
-fn legacy_job_claim_with_no_task_dispatches_as_image() {
-    // The studio API currently doesn't know about `task`.  When the
-    // claim has only the legacy fields, we must still dispatch as Image.
+fn job_claim_without_task_or_model_source_fails_to_deserialise() {
+    // No legacy fallback: an offer that lacks `task` or `modelSource`
+    // is a protocol violation, not a synthesisable image job.
     let json = serde_json::json!({
         "jobId": "j-1",
         "gameId": "g-1",
         "assetName": "g-1/creatures/x",
         "model": "synthetic",
         "vramGbEstimate": 1.0,
-        "prompt": "a koi",
-        "ext": "webp",
+    });
+    let err = serde_json::from_value::<JobClaim>(json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("task") || msg.contains("modelSource"),
+        "expected missing-required-field error, got: {msg}"
+    );
+}
+
+#[test]
+fn job_claim_with_full_task_and_model_source_round_trips() {
+    let json = serde_json::json!({
+        "jobId": "j-1",
+        "gameId": "g-1",
+        "assetName": "g-1/creatures/x",
+        "model": "synthetic-image",
+        "vramGbEstimate": 1.0,
+        "task": {
+            "kind": "image",
+            "prompt": "a koi",
+            "width": 1024,
+            "height": 1024,
+            "ext": "webp",
+        },
+        "modelSource": {
+            "engine": "synthetic",
+            "files": [],
+            "cliDefaults": { "cfgScale": 1.0, "steps": 8, "width": 1024, "height": 1024 },
+        },
     });
     let claim: JobClaim = serde_json::from_value(json).unwrap();
-    let task = claim.resolved_task();
-    let res = synth_engine().dispatch(&claim.model, task).unwrap();
-    let kind = res.kind();
-    assert_eq!(kind, TaskKind::Image);
+    assert_eq!(claim.task.kind(), TaskKind::Image);
+    let res = synth_engine().dispatch(&claim.model, claim.task).unwrap();
+    assert_eq!(res.kind(), TaskKind::Image);
 }

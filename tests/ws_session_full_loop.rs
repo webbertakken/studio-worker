@@ -73,6 +73,19 @@ async fn spawn_studio_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) 
         ))
         .await?;
 
+        // Both offers carry a synthetic ModelSource so the no-fallback
+        // gate is satisfied (every offer needs `task` + `modelSource`).
+        let synthetic_source = json!({
+            "engine": "synthetic",
+            "files": [],
+            "cliDefaults": {
+                "cfgScale": 1.0,
+                "steps": 8,
+                "width": 1024,
+                "height": 1024
+            }
+        });
+
         // 3. LLM offer.
         ws.send(Message::Text(
             serde_json::to_string(&json!({
@@ -83,14 +96,13 @@ async fn spawn_studio_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) 
                     "assetName": "g/dialogue/scribe",
                     "model": "synthetic",
                     "vramGbEstimate": 1.0,
-                    "prompt": "",
-                    "ext": "json",
                     "task": {
                         "kind": "llm",
                         "messages": [{"role": "user", "content": "hi"}],
-                        "max_tokens": 4,
+                        "maxTokens": 4,
                         "temperature": 0.5
-                    }
+                    },
+                    "modelSource": synthetic_source
                 }
             }))?
             .into(),
@@ -110,13 +122,12 @@ async fn spawn_studio_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) 
                     "assetName": "g/dialogue/transcript",
                     "model": "synthetic",
                     "vramGbEstimate": 1.0,
-                    "prompt": "",
-                    "ext": "json",
                     "task": {
                         "kind": "audio_stt",
-                        "input_url": "https://example/audio.wav",
+                        "inputUrl": "https://example/audio.wav",
                         "language": null
-                    }
+                    },
+                    "modelSource": synthetic_source
                 }
             }))?
             .into(),

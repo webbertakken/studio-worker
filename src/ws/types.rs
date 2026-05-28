@@ -75,21 +75,17 @@ pub struct JobOfferClaim {
     pub asset_name: String,
     pub model: String,
     pub vram_gb_estimate: f32,
-    #[serde(default)]
-    pub prompt: String,
-    #[serde(default = "default_image_ext")]
-    pub ext: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task: Option<Task>,
+    /// Structured task payload.  Required — no legacy fallback.
+    pub task: Task,
     /// Download + engine + CLI defaults the studio resolved from its
-    /// model registry.  Absent on legacy queued rows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_source: Option<ModelSource>,
+    /// model registry.  Required — `synthetic` is just another engine
+    /// option, not a fallback for missing rows.
+    pub model_source: ModelSource,
 }
 
 impl JobOfferClaim {
-    /// Bridge to the existing HTTP-shaped `JobClaim` so engine dispatch
-    /// code can stay kind-agnostic.
+    /// Bridge to the HTTP-shaped `JobClaim` so engine dispatch code
+    /// can stay kind-agnostic.
     pub fn into_job_claim(self) -> JobClaim {
         JobClaim {
             job_id: self.job_id,
@@ -97,16 +93,10 @@ impl JobOfferClaim {
             asset_name: self.asset_name,
             model: self.model,
             vram_gb_estimate: self.vram_gb_estimate,
-            prompt: self.prompt,
-            ext: self.ext,
             task: self.task,
             model_source: self.model_source,
         }
     }
-}
-
-fn default_image_ext() -> String {
-    "webp".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,10 +172,25 @@ impl WsCloseCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ImageParams, ModelCliDefaults, ModelEngine};
     use serde_json::json;
 
-    /// Smoke-test that the `From<JobOfferClaim>` bridge round-trips the
-    /// prompt + task without losing fields.
+    fn synthetic_source() -> ModelSource {
+        ModelSource {
+            engine: ModelEngine::Synthetic,
+            files: vec![],
+            cli_defaults: ModelCliDefaults {
+                cfg_scale: 1.0,
+                steps: 8,
+                width: 1024,
+                height: 1024,
+                sampling_method: None,
+            },
+        }
+    }
+
+    /// Round-trip the `From<JobOfferClaim>` bridge: every wire field
+    /// makes it onto the engine-facing `JobClaim`.
     #[test]
     fn job_offer_claim_into_job_claim_preserves_fields() {
         let offer = JobOfferClaim {
@@ -194,21 +199,31 @@ mod tests {
             asset_name: "g/x/y".into(),
             model: "m".into(),
             vram_gb_estimate: 1.5,
-            prompt: "hi".into(),
-            ext: "png".into(),
-            task: None,
-            model_source: None,
+            task: Task::Image(ImageParams {
+                prompt: "hi".into(),
+                ext: "png".into(),
+                ..Default::default()
+            }),
+            model_source: synthetic_source(),
         };
         let claim = offer.into_job_claim();
         assert_eq!(claim.job_id, "j");
         assert_eq!(claim.model, "m");
         assert_eq!(claim.vram_gb_estimate, 1.5);
-        assert_eq!(claim.ext, "png");
+        match claim.task {
+            Task::Image(p) => {
+                assert_eq!(p.prompt, "hi");
+                assert_eq!(p.ext, "png");
+            }
+            other => panic!("expected image, got {:?}", other.kind()),
+        }
+        assert!(matches!(claim.model_source.engine, ModelEngine::Synthetic));
     }
 
-    /// Sanity check that the `prompt` default + `ext` default work.
+    /// An offer JSON without `task` or `modelSource` fails to
+    /// deserialise — the worker refuses to invent a fallback.
     #[test]
-    fn job_offer_claim_uses_default_ext_when_missing() {
+    fn job_offer_claim_rejects_offers_without_task_or_model_source() {
         let json = json!({
             "jobId": "j",
             "gameId": "g",
@@ -216,8 +231,11 @@ mod tests {
             "model": "m",
             "vramGbEstimate": 1.0,
         });
-        let parsed: JobOfferClaim = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.ext, "webp");
-        assert_eq!(parsed.prompt, "");
+        let err = serde_json::from_value::<JobOfferClaim>(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("task") || msg.contains("modelSource"),
+            "expected missing-required-field error, got: {msg}"
+        );
     }
 }

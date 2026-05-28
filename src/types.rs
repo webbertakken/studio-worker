@@ -40,9 +40,33 @@ impl TaskKind {
 // Per-kind task parameters
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageParams {
     pub prompt: String,
+    /// Negative prompt — what the model should steer AWAY from.
+    /// Optional: when `None`, `sd-cli` is invoked without
+    /// `--negative-prompt`.  Wire-format key: `negativePrompt`.
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    /// HTTPS URL to a base image for image-to-image generation.
+    /// When set, the worker downloads the bytes to a local tempfile
+    /// and invokes `sd-cli --init-img <path>`.  Required for any
+    /// task profile that declares the `initImage` capability.
+    #[serde(default)]
+    pub init_image_url: Option<String>,
+    /// Denoise / noise-strength for i2i (0.0 = keep init image
+    /// unchanged, 1.0 = full re-noise).  Maps to `sd-cli --strength`.
+    #[serde(default)]
+    pub denoise: Option<f32>,
+    /// Classifier-free guidance scale.  Per-job override; falls back
+    /// to `ModelSource.cliDefaults.cfgScale` when `None`.
+    #[serde(default)]
+    pub cfg_scale: Option<f32>,
+    /// Sampler choice (`euler`, `euler_a`, `dpm++2m`, ...).  Per-job
+    /// override; falls back to `ModelSource.cliDefaults.samplingMethod`.
+    #[serde(default)]
+    pub sampling_method: Option<String>,
     #[serde(default = "default_image_dim")]
     pub width: u32,
     #[serde(default = "default_image_dim")]
@@ -71,13 +95,31 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LlmParams {
     pub messages: Vec<ChatMessage>,
+    /// System prompt prepended to the conversation.  Engines that
+    /// don't accept a separate system role inline it as the first
+    /// chat turn.
+    #[serde(default)]
+    pub system: Option<String>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub stop: Option<Vec<String>>,
+    /// Strict-JSON output schema.  Engine-specific; passed through
+    /// verbatim to the backend (e.g. llama.cpp's `--grammar` JSON).
+    #[serde(default)]
+    pub json_schema: Option<serde_json::Value>,
+    /// Reasoning effort hint.  Currently honoured by Gemini-style
+    /// backends only; ignored elsewhere.
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -87,19 +129,39 @@ fn default_temperature() -> f32 {
     0.7
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioSttParams {
     /// HTTPS URL to fetch the audio bytes from (e.g. R2 signed URL).
     pub input_url: String,
     #[serde(default)]
     pub language: Option<String>,
+    /// Translate the audio to English (whisper `--translate`).
+    #[serde(default)]
+    pub translate: Option<bool>,
+    /// Initial prompt to bias the transcription.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Voice-activity detection.
+    #[serde(default)]
+    pub vad: Option<bool>,
+    /// Timestamp granularity: `"segment"` or `"word"`.
+    #[serde(default)]
+    pub timestamps: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioTtsParams {
     pub text: String,
     #[serde(default = "default_voice")]
     pub voice: String,
+    /// Playback speed multiplier (1.0 = natural pace).
+    #[serde(default)]
+    pub speed: Option<f32>,
+    /// Spoken-language hint (e.g. `"en"`, `"nl"`).
+    #[serde(default)]
+    pub language: Option<String>,
     #[serde(default = "default_audio_ext")]
     pub ext: String,
 }
@@ -111,11 +173,20 @@ fn default_audio_ext() -> String {
     "wav".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VideoParams {
     pub prompt: String,
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    /// HTTPS URL to a base frame for image-to-video models.
+    #[serde(default)]
+    pub init_image_url: Option<String>,
     #[serde(default = "default_video_seconds")]
     pub seconds: f32,
+    /// Frame rate; defaults to backend-specific value when `None`.
+    #[serde(default)]
+    pub fps: Option<u32>,
     #[serde(default = "default_image_dim")]
     pub width: u32,
     #[serde(default = "default_image_dim")]
@@ -332,63 +403,27 @@ pub struct ModelSource {
 }
 
 // ---------------------------------------------------------------------------
-// JobClaim — backward-compatible with the existing image-only studio API.
+// JobClaim — every offer carries `task` + `model_source` populated by the
+// studio's registry resolver.  No legacy `prompt + ext` shadow fields.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobClaim {
-    #[serde(rename = "jobId")]
     pub job_id: String,
-    #[serde(rename = "gameId")]
     #[allow(dead_code)]
     pub game_id: String,
-    #[serde(rename = "assetName")]
     pub asset_name: String,
     pub model: String,
-    #[serde(rename = "vramGbEstimate")]
     pub vram_gb_estimate: f32,
-    /// Legacy field (image prompt).  Ignored when `task` is present.
-    #[serde(default)]
-    pub prompt: String,
-    /// Legacy field (image extension).  Ignored when `task` is present.
-    #[serde(default = "default_image_ext")]
-    pub ext: String,
-    /// New: structured task spec.  When absent the worker reconstructs
-    /// an `Task::Image` from `prompt` + `ext` above for backward compat.
-    #[serde(default)]
-    pub task: Option<Task>,
+    /// Structured task payload.  Required — the studio refuses to
+    /// promote a job without one.  Worker treats a missing `task`
+    /// as a protocol_violation.
+    pub task: Task,
     /// Download + engine + CLI defaults the studio resolved from its
-    /// model registry.  Absent on legacy rows (the worker must `Fail`
-    /// those with a clear error rather than guess).
-    #[serde(
-        rename = "modelSource",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub model_source: Option<ModelSource>,
-}
-
-impl JobClaim {
-    /// Resolve the structured task, applying the legacy fallback if
-    /// `task` is missing.  The fallback intentionally leaves
-    /// `width / height / steps` at zero so the engine's defaults
-    /// (model cliDefaults for sd-cpp, sensible per-engine fallbacks
-    /// otherwise) win.  Setting concrete numbers here would silently
-    /// override the studio's resolution choice for any legacy offer
-    /// that doesn't carry a task payload.
-    pub fn resolved_task(&self) -> Task {
-        if let Some(t) = self.task.clone() {
-            return t;
-        }
-        Task::Image(ImageParams {
-            prompt: self.prompt.clone(),
-            width: 0,
-            height: 0,
-            steps: 0,
-            seed: None,
-            ext: self.ext.clone(),
-        })
-    }
+    /// model registry.  Required — `synthetic` is just another engine
+    /// option, not a fallback for missing rows.
+    pub model_source: ModelSource,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -439,25 +474,34 @@ pub struct GithubReleaseAsset {
 mod tests {
     use super::*;
 
+    fn synthetic_model_source_json() -> serde_json::Value {
+        serde_json::json!({
+            "engine": "synthetic",
+            "files": [],
+            "cliDefaults": {
+                "cfgScale": 1.0,
+                "steps": 8,
+                "width": 1024,
+                "height": 1024,
+            },
+        })
+    }
+
     #[test]
-    fn job_claim_with_no_task_falls_back_to_image() {
-        let json = serde_json::json!({
+    fn job_claim_requires_task_and_model_source() {
+        // Without `task` or `modelSource` the offer must fail to
+        // deserialise — no silent fallback to an Option/Image default.
+        let bare = serde_json::json!({
             "jobId": "j-1",
             "gameId": "g-1",
             "assetName": "g-1/creatures/x",
-            "model": "synthetic",
+            "model": "synthetic-image",
             "vramGbEstimate": 1.0,
-            "prompt": "a stone golem",
-            "ext": "webp",
         });
-        let claim: JobClaim = serde_json::from_value(json).unwrap();
-        match claim.resolved_task() {
-            Task::Image(p) => {
-                assert_eq!(p.prompt, "a stone golem");
-                assert_eq!(p.ext, "webp");
-            }
-            other => panic!("expected image, got {:?}", other),
-        }
+        assert!(
+            serde_json::from_value::<JobClaim>(bare).is_err(),
+            "JobClaim must reject missing task + modelSource"
+        );
     }
 
     #[test]
@@ -471,12 +515,13 @@ mod tests {
             "task": {
                 "kind": "llm",
                 "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 32,
+                "maxTokens": 32,
                 "temperature": 0.5,
             },
+            "modelSource": synthetic_model_source_json(),
         });
         let claim: JobClaim = serde_json::from_value(json).unwrap();
-        match claim.resolved_task() {
+        match claim.task {
             Task::Llm(p) => {
                 assert_eq!(p.messages.len(), 1);
                 assert_eq!(p.max_tokens, 32);
@@ -491,7 +536,7 @@ mod tests {
             "jobId": "j-3",
             "gameId": "g-1",
             "assetName": "g-1/creatures/y",
-            "model": "synthetic",
+            "model": "synthetic-image",
             "vramGbEstimate": 8.0,
             "task": {
                 "kind": "image",
@@ -501,13 +546,78 @@ mod tests {
                 "steps": 30,
                 "ext": "png",
             },
+            "modelSource": synthetic_model_source_json(),
         });
         let claim: JobClaim = serde_json::from_value(json).unwrap();
-        match claim.resolved_task() {
+        match claim.task {
             Task::Image(p) => {
                 assert_eq!(p.prompt, "a koi");
                 assert_eq!(p.width, 1024);
                 assert_eq!(p.ext, "png");
+            }
+            other => panic!("expected image, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn image_params_round_trips_with_new_fields() {
+        let json = serde_json::json!({
+            "kind": "image",
+            "prompt": "a stone golem",
+            "negativePrompt": "text, watermark, low quality",
+            "initImageUrl": "https://example.invalid/t2-golem-stone/latest.webp",
+            "denoise": 0.55,
+            "cfgScale": 7.5,
+            "samplingMethod": "dpm++2m",
+            "width": 768,
+            "height": 512,
+            "steps": 30,
+            "seed": 1234,
+            "ext": "webp",
+        });
+        let task: Task = serde_json::from_value(json).unwrap();
+        match task {
+            Task::Image(p) => {
+                assert_eq!(p.prompt, "a stone golem");
+                assert_eq!(
+                    p.negative_prompt.as_deref(),
+                    Some("text, watermark, low quality")
+                );
+                assert_eq!(
+                    p.init_image_url.as_deref(),
+                    Some("https://example.invalid/t2-golem-stone/latest.webp")
+                );
+                assert!((p.denoise.unwrap() - 0.55).abs() < 1e-6);
+                assert!((p.cfg_scale.unwrap() - 7.5).abs() < 1e-6);
+                assert_eq!(p.sampling_method.as_deref(), Some("dpm++2m"));
+                assert_eq!(p.width, 768);
+                assert_eq!(p.height, 512);
+                assert_eq!(p.steps, 30);
+                assert_eq!(p.seed, Some(1234));
+            }
+            other => panic!("expected image, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn image_params_defaults_when_optional_fields_absent() {
+        let json = serde_json::json!({
+            "kind": "image",
+            "prompt": "a fox"
+        });
+        let task: Task = serde_json::from_value(json).unwrap();
+        match task {
+            Task::Image(p) => {
+                assert_eq!(p.prompt, "a fox");
+                assert!(p.negative_prompt.is_none());
+                assert!(p.init_image_url.is_none());
+                assert!(p.denoise.is_none());
+                assert!(p.cfg_scale.is_none());
+                assert!(p.sampling_method.is_none());
+                assert_eq!(p.width, 512);
+                assert_eq!(p.height, 512);
+                assert_eq!(p.steps, 20);
+                assert_eq!(p.ext, "webp");
             }
             other => panic!("expected image, got {:?}", other),
         }

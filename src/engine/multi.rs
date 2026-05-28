@@ -111,42 +111,38 @@ impl Engine for MultiEngine {
         &self,
         model: &str,
         task: Task,
-        source: Option<&crate::types::ModelSource>,
+        source: &crate::types::ModelSource,
     ) -> Result<TaskResult> {
         let kind = task.kind();
-        // When the studio attached a ModelSource, pick the engine
-        // whose `name()` matches `source.engine` — the studio knows
-        // exactly which engine should serve this job and we must not
-        // route it elsewhere (e.g. silently to synthetic).
-        if let Some(src) = source {
-            let wanted = match src.engine {
-                crate::types::ModelEngine::SdCpp => "sdcpp",
-                crate::types::ModelEngine::LlamaCpp => "llama",
-                crate::types::ModelEngine::Synthetic => "synthetic",
-            };
-            for e in &self.engines {
-                if e.name() == wanted {
-                    debug!(
-                        target: TRACE_TARGET,
-                        op = "pick",
-                        kind = kind.as_str(),
-                        model,
-                        sub_engine = e.name(),
-                        r#match = "model-source",
-                        "engine selected by ModelSource.engine"
-                    );
-                    return e.dispatch_with_source(model, task, source);
-                }
+        // The studio knows exactly which engine should serve this
+        // job (source.engine); we route strictly to that backend.
+        // No silent fallback to synthetic for real-model offers —
+        // see DECISIONS.md "Synthetic fallback removed for real
+        // models".
+        let wanted = match source.engine {
+            crate::types::ModelEngine::SdCpp => "sdcpp",
+            crate::types::ModelEngine::LlamaCpp => "llama",
+            crate::types::ModelEngine::Synthetic => "synthetic",
+        };
+        for e in &self.engines {
+            if e.name() == wanted {
+                debug!(
+                    target: TRACE_TARGET,
+                    op = "pick",
+                    kind = kind.as_str(),
+                    model,
+                    sub_engine = e.name(),
+                    r#match = "model-source",
+                    "engine selected by ModelSource.engine"
+                );
+                return e.dispatch_with_source(model, task, source);
             }
-            bail!(
-                "multi engine has no `{}` backend compiled in to serve {}",
-                wanted,
-                kind.as_str()
-            );
         }
-        // No ModelSource (legacy / synthetic jobs): fall back to the
-        // existing kind+model lookup.
-        self.dispatch(model, task)
+        bail!(
+            "no `{}` engine compiled into this worker (model {} requires it)",
+            wanted,
+            model
+        );
     }
 }
 
@@ -196,8 +192,8 @@ mod tests {
             width: 64,
             height: 64,
             steps: 1,
-            seed: None,
             ext: "webp".into(),
+            ..Default::default()
         })
     }
 
@@ -206,6 +202,7 @@ mod tests {
             messages: vec![],
             max_tokens: 1,
             temperature: 0.0,
+            ..Default::default()
         })
     }
 
