@@ -149,25 +149,33 @@ impl SdCppEngine {
         );
         let out_path = out_dir.join(format!("{stem}.webp"));
 
-        // Honour the studio's CLI defaults; fall back to the task's
-        // own dimensions only when the studio didn't set them.
-        let width = if source.cli_defaults.width > 0 {
+        // Resolution + per-call params come from the OFFER's task
+        // payload first (game manifests pin per-asset dimensions, e.g.
+        // game-of-elements = 768x512).  The model's cliDefaults are
+        // a fallback for offers that don't carry task params.
+        let width = if params.width > 0 {
+            params.width
+        } else if source.cli_defaults.width > 0 {
             source.cli_defaults.width
         } else {
-            params.width
+            1024
         };
-        let height = if source.cli_defaults.height > 0 {
+        let height = if params.height > 0 {
+            params.height
+        } else if source.cli_defaults.height > 0 {
             source.cli_defaults.height
         } else {
-            params.height
+            1024
         };
-        // The studio's steps default win unless the params explicitly
-        // overrode away from the JobClaim defaults.  When both are at
-        // their respective defaults, take the studio's.
-        let steps = if params.steps == 20 || params.steps == 0 {
-            source.cli_defaults.steps.max(STEPS_FALLBACK)
-        } else {
+        // Steps: same priority — task first, model second, fallback last.
+        // Note: ImageParams::default() is 20 steps; we treat that as
+        // "caller didn't pick" so the model's tuned step count wins.
+        let steps = if params.steps > 0 && params.steps != 20 {
             params.steps
+        } else if source.cli_defaults.steps > 0 {
+            source.cli_defaults.steps
+        } else {
+            STEPS_FALLBACK
         };
         let cfg_scale = if source.cli_defaults.cfg_scale > 0.0 {
             source.cli_defaults.cfg_scale
