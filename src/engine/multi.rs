@@ -33,6 +33,11 @@ impl MultiEngine {
         Self { engines }
     }
 
+    /// Pick the engine that claims `(kind, model)` exactly.  No
+    /// kind-only fallback — the studio's `ModelSource` is
+    /// authoritative.  A model whose engine isn't on this worker is
+    /// rejected loudly so the operator sees what's missing instead of
+    /// silently routing through synthetic placeholder bytes.
     fn pick_for(&self, kind: TaskKind, model: &str) -> Option<&dyn Engine> {
         for e in &self.engines {
             if e.capabilities().supports(kind, model) {
@@ -48,30 +53,12 @@ impl MultiEngine {
                 return Some(e.as_ref());
             }
         }
-        // Fallback: any engine that advertises the kind at all.
-        for e in &self.engines {
-            if e.capabilities()
-                .supported_models_per_kind
-                .contains_key(&kind)
-            {
-                debug!(
-                    target: TRACE_TARGET,
-                    op = "pick",
-                    kind = kind.as_str(),
-                    model,
-                    sub_engine = e.name(),
-                    r#match = "fallback",
-                    "engine selected by kind fallback"
-                );
-                return Some(e.as_ref());
-            }
-        }
         warn!(
             target: TRACE_TARGET,
             op = "pick",
             kind = kind.as_str(),
             model,
-            "no engine advertises this kind"
+            "no engine claims this exact (kind, model) pair"
         );
         None
     }
@@ -102,7 +89,12 @@ impl Engine for MultiEngine {
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
         let kind = task.kind();
         let Some(engine) = self.pick_for(kind, model) else {
-            bail!("multi engine cannot serve {} tasks", kind.as_str());
+            bail!(
+                "no engine on this worker can serve model {} (kind={}); \
+                 synthetic fallback is disabled",
+                model,
+                kind.as_str()
+            );
         };
         engine.dispatch(model, task)
     }
@@ -233,7 +225,11 @@ mod tests {
     }
 
     #[test]
-    fn multi_falls_back_to_first_engine_advertising_the_kind() {
+    fn multi_refuses_unknown_model_without_kind_fallback() {
+        // An LLM engine is present, but no engine claims the
+        // specific model id.  Per the no-fallback policy the
+        // dispatch errors loudly instead of routing to the first
+        // engine that advertises the kind.
         let alpha_only: Box<dyn Engine> = Box::new(StubEngine {
             name: "alpha",
             kinds: vec![TaskKind::Image],
@@ -246,11 +242,13 @@ mod tests {
         });
         let multi = MultiEngine::new(vec![alpha_only, llm_only]);
 
-        let result = multi.dispatch("unknown-model", llm_task()).unwrap();
-        match result {
-            TaskResult::Llm { json } => assert_eq!(json["from"], "llm"),
-            _ => panic!("expected llm"),
-        }
+        let err = multi.dispatch("unknown-model", llm_task()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no engine on this worker can serve model"),
+            "expected no-fallback error, got: {msg}"
+        );
+        assert!(msg.contains("unknown-model"));
     }
 
     #[test]
@@ -262,7 +260,11 @@ mod tests {
         });
         let multi = MultiEngine::new(vec![image_only]);
         let err = multi.dispatch("x", llm_task()).unwrap_err();
-        assert!(err.to_string().contains("cannot serve llm"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no engine on this worker can serve model"),
+            "expected no-fallback error, got: {msg}"
+        );
     }
 
     #[test]

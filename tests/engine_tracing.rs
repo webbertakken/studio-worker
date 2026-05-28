@@ -88,16 +88,18 @@ fn multi_engine_pick_emits_debug_event_with_sub_engine() {
 }
 
 #[test]
-fn multi_engine_fallback_emits_debug_event() {
-    // Synthetic declares specific model ids — request an unknown
-    // model id but a kind it advertises so the fallback branch fires.
+fn multi_engine_logs_no_engine_for_unknown_model() {
+    // No fallback: an unknown model id (kind advertised by synthetic
+    // but model never registered) is rejected.  We assert on the
+    // "no engine claims this exact (kind, model) pair" warn line.
     let logs = captured_logs_for(|| {
         let engine = engine::build(&Config::default()).expect("build engine");
-        let _ = engine.dispatch("not-a-real-model", image_task("hi"));
+        let err = engine.dispatch("not-a-real-model", image_task("hi"));
+        assert!(err.is_err(), "expected dispatch to reject unknown model");
     });
     assert!(
-        logs.contains("match=\"fallback\""),
-        "expected match=fallback: {logs}"
+        logs.contains("no engine claims this exact"),
+        "expected no-engine warn line: {logs}"
     );
 }
 
