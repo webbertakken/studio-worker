@@ -1,16 +1,17 @@
-//! Config tab — every field of `Config` reachable as an editable
-//! widget.  Save writes through `crate::config::save`; the runtime
+//! Config tab — user-editable subset of [`Config`] reachable as
+//! widgets.  Save writes through `crate::config::save`; the runtime
 //! loops pick up the new values on their next tick because every
 //! tick snapshots `Arc<Mutex<Config>>`.
 //!
-//! Fork #3 (engine selection) is kept as a yellow "restart required"
-//! banner per the chosen default; we do not auto-restart the loops.
+//! Internal state (`worker_id`, `auth_token`, `install_id`,
+//! `registration_*`) is deliberately not surfaced here.  The
+//! auto-register flow owns it end-to-end.
 
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::config::{self, Config};
+use crate::config::{self, default_models_root, Config};
 
 use super::super::{autostart, notifier::NotificationPrefs};
 
@@ -21,7 +22,6 @@ pub struct ConfigDraft {
     pub current: Config,
     pub original: Config,
     pub last_save_error: Option<String>,
-    pub auth_token_visible: bool,
 }
 
 impl ConfigDraft {
@@ -30,18 +30,11 @@ impl ConfigDraft {
             current: cfg.clone(),
             original: cfg.clone(),
             last_save_error: None,
-            auth_token_visible: false,
         }
     }
 
     pub fn dirty(&self) -> bool {
         !configs_equal(&self.current, &self.original)
-    }
-
-    pub fn engine_changed(&self) -> bool {
-        self.current.engine != self.original.engine
-            || self.current.engines != self.original.engines
-            || self.current.gradio_endpoint_url != self.original.gradio_endpoint_url
     }
 
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
@@ -65,38 +58,19 @@ impl ConfigDraft {
     }
 }
 
-/// Equality covering every persisted field.  We do this manually
-/// because `Config` doesn't (and shouldn't) implement `PartialEq` —
-/// the runtime is concerned with semantics, not byte-equality.
+/// Equality over the persisted, user-editable fields.  Internal state
+/// (registration ids, auth token, worker id, install id) is excluded
+/// because the UI never mutates it; the auto-register flow owns it.
 fn configs_equal(a: &Config, b: &Config) -> bool {
     a.api_base_url == b.api_base_url
-        && a.worker_id == b.worker_id
-        && a.label == b.label
-        && a.auth_token == b.auth_token
         && (a.vram_threshold_gb - b.vram_threshold_gb).abs() < f32::EPSILON
         && a.auto_start == b.auto_start
-        && a.auto_enabled == b.auto_enabled
-        && a.engine == b.engine
-        && a.engines == b.engines
-        && a.gradio_endpoint_url == b.gradio_endpoint_url
-        && a.supported_models_override == b.supported_models_override
         && a.auto_update_enabled == b.auto_update_enabled
         && a.auto_update_interval_secs == b.auto_update_interval_secs
         && a.auto_update_feed == b.auto_update_feed
         && a.auto_update_prerelease == b.auto_update_prerelease
         && a.models_root == b.models_root
 }
-
-const ENGINE_CHOICES: &[&str] = &[
-    "synthetic",
-    "gradio",
-    "multi",
-    "llama",
-    "whisper",
-    "image-candle",
-    "video",
-    "tts",
-];
 
 pub fn render(
     ui: &mut egui::Ui,
@@ -112,24 +86,8 @@ pub fn render(
     );
     ui.add_space(8.0);
 
-    if draft.engine_changed() {
-        ui.colored_label(
-            egui::Color32::from_rgb(232, 168, 56),
-            "Engine fields changed — restart the worker for the new engine to take effect.",
-        );
-        ui.add_space(4.0);
-    }
-
     section(ui, "Connection", |ui| {
         labeled_text(ui, "API base URL", &mut draft.current.api_base_url);
-        labeled_optional(ui, "Label", &mut draft.current.label);
-        labeled_optional(ui, "Worker ID", &mut draft.current.worker_id);
-        labeled_optional_password(
-            ui,
-            "Auth token",
-            &mut draft.current.auth_token,
-            &mut draft.auth_token_visible,
-        );
     });
 
     section(ui, "Worker", |ui| {
@@ -141,26 +99,6 @@ pub fn render(
             96.0,
         );
         labeled_bool(ui, "Auto-start on boot", &mut draft.current.auto_start);
-        labeled_bool(
-            ui,
-            "Auto-enabled (claim jobs)",
-            &mut draft.current.auto_enabled,
-        );
-    });
-
-    section(ui, "Engine", |ui| {
-        labeled_combo(ui, "Engine", &mut draft.current.engine, ENGINE_CHOICES);
-        labeled_csv(ui, "Engines (multi only)", &mut draft.current.engines);
-        labeled_optional(
-            ui,
-            "Gradio endpoint URL",
-            &mut draft.current.gradio_endpoint_url,
-        );
-        labeled_csv(
-            ui,
-            "Supported models override",
-            &mut draft.current.supported_models_override,
-        );
     });
 
     section(ui, "Auto-update", |ui| {
@@ -183,7 +121,17 @@ pub fn render(
     });
 
     section(ui, "Models", |ui| {
-        labeled_optional_path(ui, "Models root", &mut draft.current.models_root);
+        labeled_folder(ui, "Models root", &mut draft.current.models_root);
+        ui.label("");
+        ui.label(
+            egui::RichText::new(
+                "This is where the models will be stored.  You might need a fair bit \
+                 of disk space to be able to satisfy different types of jobs.",
+            )
+            .italics()
+            .color(egui::Color32::from_gray(160)),
+        );
+        ui.end_row();
     });
 
     section(ui, "Notifications", |ui| {
@@ -258,38 +206,6 @@ fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.end_row();
 }
 
-fn labeled_optional(ui: &mut egui::Ui, label: &str, value: &mut Option<String>) {
-    ui.label(label);
-    let mut buf = value.clone().unwrap_or_default();
-    let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(360.0));
-    if r.changed() {
-        *value = if buf.is_empty() { None } else { Some(buf) };
-    }
-    ui.end_row();
-}
-
-fn labeled_optional_password(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &mut Option<String>,
-    visible: &mut bool,
-) {
-    ui.label(label);
-    let mut buf = value.clone().unwrap_or_default();
-    ui.horizontal(|ui| {
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut buf)
-                .desired_width(280.0)
-                .password(!*visible),
-        );
-        if r.changed() {
-            *value = if buf.is_empty() { None } else { Some(buf) };
-        }
-        ui.checkbox(visible, "show");
-    });
-    ui.end_row();
-}
-
 fn labeled_bool(ui: &mut egui::Ui, label: &str, value: &mut bool) {
     ui.label(label);
     ui.checkbox(value, "");
@@ -316,50 +232,31 @@ fn labeled_u64(ui: &mut egui::Ui, label: &str, value: &mut u64) {
     ui.end_row();
 }
 
-fn labeled_combo(ui: &mut egui::Ui, label: &str, value: &mut String, choices: &[&str]) {
+/// Path-with-folder-picker widget.  The text edit reflects the
+/// current value at all times; the "Browse…" button opens the
+/// native picker (rfd) and overwrites it on confirm.
+fn labeled_folder(ui: &mut egui::Ui, label: &str, value: &mut PathBuf) {
     ui.label(label);
-    egui::ComboBox::from_id_salt(label)
-        .selected_text(value.as_str())
-        .show_ui(ui, |ui| {
-            for choice in choices {
-                ui.selectable_value(value, (*choice).into(), *choice);
+    ui.horizontal(|ui| {
+        let mut buf = value.to_string_lossy().to_string();
+        let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(280.0));
+        if r.changed() {
+            *value = PathBuf::from(buf);
+        }
+        if ui.button("Browse…").clicked() {
+            let starting = if value.is_absolute() {
+                value.clone()
+            } else {
+                default_models_root()
+            };
+            if let Some(picked) = rfd::FileDialog::new()
+                .set_directory(starting.parent().unwrap_or(&starting))
+                .pick_folder()
+            {
+                *value = picked;
             }
-        });
-    ui.end_row();
-}
-
-fn labeled_csv(ui: &mut egui::Ui, label: &str, value: &mut Vec<String>) {
-    ui.label(label);
-    let mut buf = value.join(", ");
-    let r = ui.add(
-        egui::TextEdit::singleline(&mut buf)
-            .desired_width(360.0)
-            .hint_text("comma-separated"),
-    );
-    if r.changed() {
-        *value = buf
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-    }
-    ui.end_row();
-}
-
-fn labeled_optional_path(ui: &mut egui::Ui, label: &str, value: &mut Option<PathBuf>) {
-    ui.label(label);
-    let mut buf = value
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(360.0));
-    if r.changed() {
-        *value = if buf.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(buf))
-        };
-    }
+        }
+    });
     ui.end_row();
 }
 
@@ -373,7 +270,6 @@ mod tests {
         let cfg = Config::default();
         let draft = ConfigDraft::from(&cfg);
         assert!(!draft.dirty());
-        assert!(!draft.engine_changed());
     }
 
     #[test]
@@ -385,13 +281,11 @@ mod tests {
     }
 
     #[test]
-    fn engine_changed_flips_only_for_engine_fields() {
+    fn draft_marks_dirty_when_models_root_changes() {
         let cfg = Config::default();
         let mut draft = ConfigDraft::from(&cfg);
-        draft.current.vram_threshold_gb = 24.0;
-        assert!(!draft.engine_changed());
-        draft.current.engine = "gradio".into();
-        assert!(draft.engine_changed());
+        draft.current.models_root = PathBuf::from("/tmp/other-models");
+        assert!(draft.dirty());
     }
 
     #[test]
@@ -412,9 +306,9 @@ mod tests {
     fn reset_reverts_unsaved_edits() {
         let cfg = Config::default();
         let mut draft = ConfigDraft::from(&cfg);
-        draft.current.engine = "gradio".into();
+        draft.current.vram_threshold_gb = 33.0;
         draft.reset();
-        assert_eq!(draft.current.engine, "synthetic");
+        assert!((draft.current.vram_threshold_gb - cfg.vram_threshold_gb).abs() < f32::EPSILON);
         assert!(!draft.dirty());
     }
 

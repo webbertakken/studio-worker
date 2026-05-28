@@ -53,7 +53,7 @@ fn load_emits_debug_with_source_existing_file_when_file_present() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let cfg = Config {
-        engine: "gradio".into(),
+        api_base_url: "https://canary.example/".into(),
         ..Config::default()
     };
     config::save(&cfg, &path).unwrap();
@@ -61,7 +61,7 @@ fn load_emits_debug_with_source_existing_file_when_file_present() {
 
     let logs = capture(move || {
         let (loaded, _) = config::load(Some(&path_str)).expect("load must succeed");
-        assert_eq!(loaded.engine, "gradio");
+        assert_eq!(loaded.api_base_url, "https://canary.example/");
     });
     assert!(logs.contains("DEBUG"), "expected DEBUG event, got: {logs}");
     assert!(
@@ -72,10 +72,10 @@ fn load_emits_debug_with_source_existing_file_when_file_present() {
         logs.contains("source=\"existing_file\""),
         "expected source=existing_file, got: {logs}"
     );
-    // `%cfg.engine` (Display) renders unquoted; `?` would quote it.
+    // `%cfg.api_base_url` (Display) renders unquoted; `?` would quote it.
     assert!(
-        logs.contains("engine=gradio"),
-        "expected engine field, got: {logs}"
+        logs.contains("api_base_url=https://canary.example/"),
+        "expected api_base_url field, got: {logs}"
     );
 }
 

@@ -121,7 +121,6 @@ async fn successful_call_emits_debug_tracing_event() {
         api.register_request(&AutoRegisterRequest {
             install_id: "id".into(),
             registration_secret_hash: "h".into(),
-            label: None,
             capabilities: caps(),
             user_agent: "studio-worker/test".into(),
         })
@@ -156,7 +155,6 @@ async fn failing_call_emits_warn_tracing_event_with_body() {
         let _ = api.register_request(&AutoRegisterRequest {
             install_id: "id".into(),
             registration_secret_hash: "h".into(),
-            label: None,
             capabilities: caps(),
             user_agent: "studio-worker/test".into(),
         });

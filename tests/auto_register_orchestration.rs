@@ -24,8 +24,6 @@ fn pristine_cfg(api: &str) -> Config {
         api_base_url: api.into(),
         worker_id: None,
         auth_token: None,
-        engine: "synthetic".into(),
-        auto_enabled: true,
         auto_update_enabled: false,
         ..Config::default()
     }

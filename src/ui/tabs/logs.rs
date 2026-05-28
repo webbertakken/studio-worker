@@ -1,8 +1,9 @@
-//! Logs tab — windowed view over the shared `Vec<LogEntry>` the runtime
-//! loops are filling.  The buffer is drained periodically by
-//! `log_shipper_tick`, so the UI sees a rolling window that's
-//! re-filled at heartbeat / claim cadence.
+//! Logs tab — windowed view over the bounded ring the runtime keeps
+//! in `WorkerObservers::recent_logs`.  Separate from the shipping
+//! queue (which is drained every WS tick); reading from the ring
+//! means the display doesn't blank out between ships.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use eframe::egui;
@@ -99,7 +100,7 @@ impl LogsView {
     }
 }
 
-pub fn render(ui: &mut egui::Ui, buffer: &Arc<Mutex<Vec<LogEntry>>>, filter: &mut LogFilter) {
+pub fn render(ui: &mut egui::Ui, buffer: &Arc<Mutex<VecDeque<LogEntry>>>, filter: &mut LogFilter) {
     ui.heading("Logs");
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -126,7 +127,9 @@ pub fn render(ui: &mut egui::Ui, buffer: &Arc<Mutex<Vec<LogEntry>>>, filter: &mu
 
     let view = {
         let buf = buffer.lock();
-        LogsView::build(&buf, filter, LOGS_WINDOW)
+        // VecDeque doesn't slice directly; copy the (bounded) snapshot.
+        let snapshot: Vec<LogEntry> = buf.iter().cloned().collect();
+        LogsView::build(&snapshot, filter, LOGS_WINDOW)
     };
 
     if view.entries.is_empty() {
@@ -141,7 +144,7 @@ pub fn render(ui: &mut egui::Ui, buffer: &Arc<Mutex<Vec<LogEntry>>>, filter: &mu
     if view.windowed {
         ui.label(
             egui::RichText::new(format!(
-                "showing last {} entries (buffer holds {} total before next ship)",
+                "showing last {} entries (buffer holds {} total)",
                 view.entries.len(),
                 view.total_buffer
             ))

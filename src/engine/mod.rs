@@ -9,7 +9,7 @@
 //! implementation block below.
 use crate::config::Config;
 use crate::types::*;
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use image::{ImageBuffer, Rgb, RgbImage};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -20,9 +20,6 @@ use tracing::{debug, warn};
 /// Tracing target for the synthetic engine.  Stable so operators can
 /// filter with `RUST_LOG=studio_worker::engine::synthetic=debug`.
 const TRACE_TARGET_SYNTHETIC: &str = "studio_worker::engine::synthetic";
-
-/// Tracing target for the gradio engine.
-const TRACE_TARGET_GRADIO: &str = "studio_worker::engine::gradio";
 
 /// What a single engine is able to do.
 #[derive(Debug, Clone, Default)]
@@ -57,6 +54,7 @@ pub mod candle_image;
 #[cfg(feature = "llama")]
 pub mod llama;
 pub mod multi;
+pub mod sdcpp;
 #[cfg(feature = "tts")]
 pub mod tts;
 #[cfg(feature = "video")]
@@ -68,69 +66,70 @@ pub trait Engine: Send + Sync {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> EngineCapabilities;
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult>;
+
+    /// Dispatch with the studio's `ModelSource` attached.  Engines
+    /// that need it (download URLs / CLI defaults) override this;
+    /// engines that don't (synthetic) keep using the plain
+    /// `dispatch` method via the default impl below.
+    fn dispatch_with_source(
+        &self,
+        model: &str,
+        task: Task,
+        _source: Option<&crate::types::ModelSource>,
+    ) -> Result<TaskResult> {
+        self.dispatch(model, task)
+    }
 }
 
+/// Build the engine for this worker.
+///
+/// There's no engine selection knob in the config any more: the
+/// worker advertises capabilities for every backend compiled into
+/// this binary, and routes each incoming job to the first backend
+/// that supports its (kind, model) pair.  See `multi::MultiEngine`.
+///
+/// The default build ships only the synthetic engine.  Optional
+/// backends (llama, whisper, image-candle, video, tts) are added
+/// when their cargo features are enabled.
 pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
-    if cfg.engine == "multi" {
-        return build_multi(cfg);
-    }
-    build_single(cfg, cfg.engine.as_str())
-}
-
-fn build_multi(cfg: &Config) -> Result<Box<dyn Engine>> {
-    let names = &cfg.engines;
-    if names.is_empty() {
-        bail!("multi engine requires a non-empty `engines` list in the config");
-    }
-    let mut built: Vec<Box<dyn Engine>> = Vec::with_capacity(names.len());
-    for name in names {
-        built.push(build_single(cfg, name)?);
-    }
-    Ok(Box::new(multi::MultiEngine::new(built)))
-}
-
-fn build_single(cfg: &Config, name: &str) -> Result<Box<dyn Engine>> {
-    match name {
-        "synthetic" => Ok(Box::new(SyntheticEngine::new(
-            cfg.supported_models_override.clone(),
-        ))),
-        "gradio" => {
-            let url = cfg
-                .gradio_endpoint_url
-                .clone()
-                .ok_or_else(|| anyhow!("gradio engine requires gradio_endpoint_url"))?;
-            Ok(Box::new(GradioEngine::new(
-                url,
-                cfg.supported_models_override.clone(),
-            )))
-        }
+    // Real backends first so they win the "supports" check ahead of
+    // the catch-all synthetic engine.  Synthetic is always last:
+    // deterministic real bytes for every kind, zero-VRAM fallback so
+    // CI + smoke-tests stay self-contained.
+    #[allow(clippy::vec_init_then_push)]
+    let engines: Vec<Box<dyn Engine>> = {
+        let mut v: Vec<Box<dyn Engine>> = Vec::new();
         #[cfg(feature = "llama")]
-        "llama" => {
-            let root = cfg.models_root.clone().unwrap_or_else(default_models_root);
-            Ok(Box::new(llama::LlamaEngine::new(root)?))
-        }
+        v.push(Box::new(llama::LlamaEngine::new(cfg.models_root.clone())?));
         #[cfg(feature = "whisper")]
-        "whisper" => {
-            let root = cfg.models_root.clone().unwrap_or_else(default_models_root);
-            Ok(Box::new(whisper::WhisperEngine::new(root)))
-        }
+        v.push(Box::new(whisper::WhisperEngine::new(
+            cfg.models_root.clone(),
+        )));
         #[cfg(feature = "image-candle")]
-        "image-candle" => Ok(Box::new(candle_image::CandleImageEngine::new())),
+        v.push(Box::new(candle_image::CandleImageEngine::new()));
         #[cfg(feature = "video")]
-        "video" => Ok(Box::new(video::VideoEngine::new())),
+        v.push(Box::new(video::VideoEngine::new()));
         #[cfg(feature = "tts")]
-        "tts" => Ok(Box::new(tts::TtsEngine::new())),
-        "multi" => bail!("nested `multi` engines are not allowed"),
-        other => bail!("unknown engine: {other}"),
-    }
+        v.push(Box::new(tts::TtsEngine::new()));
+        // stable-diffusion.cpp-backed image engine.  Self-registers
+        // only when both the `sd-cli` binary is on the box AND at
+        // least one model's component files are present under
+        // `cfg.models_root`.  Skipped silently otherwise so CI builds
+        // (no sd-cli, no models) stay green.
+        if let Some(eng) = sdcpp::SdCppEngine::try_new(&cfg.models_root) {
+            v.push(Box::new(eng));
+        }
+        v.push(Box::new(SyntheticEngine::new()));
+        v
+    };
+
+    Ok(Box::new(multi::MultiEngine::new(engines)))
 }
 
-/// Default cache dir for downloaded model files.
+/// Legacy hook retained for any external caller; mirrors
+/// `Config::default().models_root`.
 pub fn default_models_root() -> std::path::PathBuf {
-    if let Some(dir) = directories::ProjectDirs::from("gg", "minis", "minis-studio-worker") {
-        return dir.cache_dir().to_path_buf();
-    }
-    std::env::temp_dir().join("studio-worker-models")
+    crate::config::default_models_root()
 }
 
 // ---------------------------------------------------------------------------
@@ -138,27 +137,40 @@ pub fn default_models_root() -> std::path::PathBuf {
 // SHA-256(prompt|text|json).  Zero VRAM, zero network, zero install steps.
 // ---------------------------------------------------------------------------
 
-pub struct SyntheticEngine {
-    overrides: Vec<String>,
-}
+pub struct SyntheticEngine;
 
 impl SyntheticEngine {
-    pub fn new(overrides: Vec<String>) -> Self {
-        Self { overrides }
+    pub fn new() -> Self {
+        Self
     }
 }
 
-const DEFAULT_IMAGE_MODELS: &[&str] = &[
-    "synthetic",
-    "synthetic-image",
-    "flux1-dev",
-    "flux1-dev-i2i",
-    "sdxl-1.0",
-];
-const DEFAULT_LLM_MODELS: &[&str] = &["synthetic", "synthetic-llm", "llama-3.1-8b-instruct-q4"];
-const DEFAULT_STT_MODELS: &[&str] = &["synthetic", "synthetic-stt", "whisper-medium"];
-const DEFAULT_TTS_MODELS: &[&str] = &["synthetic", "synthetic-tts", "piper-en"];
+impl Default for SyntheticEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Sentinel string the studio's claim filter recognises as "any
+/// model is fine".  Real engines that can actually serve any model
+/// (e.g. a GGUF-aware image engine that downloads on demand) advertise
+/// it.  The synthetic engine deliberately does NOT — it would happily
+/// fulfil real-model jobs with placeholder bytes, which is destructive
+/// on a live queue.
+pub const MODEL_WILDCARD: &str = "*";
+
+// Synthetic engine advertises only its own `synthetic*` model names
+// so it never claims a job that names a real model the operator is
+// expecting actual inference for.
+const DEFAULT_IMAGE_MODELS: &[&str] = &["synthetic", "synthetic-image"];
+const DEFAULT_LLM_MODELS: &[&str] = &["synthetic", "synthetic-llm"];
+const DEFAULT_STT_MODELS: &[&str] = &["synthetic", "synthetic-stt"];
+const DEFAULT_TTS_MODELS: &[&str] = &["synthetic", "synthetic-tts"];
 const DEFAULT_VIDEO_MODELS: &[&str] = &["synthetic", "synthetic-video"];
+
+fn models(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_string()).collect()
+}
 
 impl Engine for SyntheticEngine {
     fn name(&self) -> &'static str {
@@ -167,41 +179,11 @@ impl Engine for SyntheticEngine {
 
     fn capabilities(&self) -> EngineCapabilities {
         let mut map: BTreeMap<TaskKind, Vec<String>> = BTreeMap::new();
-        let (image_models, llm_models, stt_models, tts_models, video_models) =
-            if self.overrides.is_empty() {
-                (
-                    DEFAULT_IMAGE_MODELS
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect::<Vec<_>>(),
-                    DEFAULT_LLM_MODELS
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect::<Vec<_>>(),
-                    DEFAULT_STT_MODELS
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect::<Vec<_>>(),
-                    DEFAULT_TTS_MODELS
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect::<Vec<_>>(),
-                    DEFAULT_VIDEO_MODELS
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                // Operator-declared list — apply to every kind so synthetic stays
-                // permissive.  Real engines would not do this.
-                let same = self.overrides.clone();
-                (same.clone(), same.clone(), same.clone(), same.clone(), same)
-            };
-        map.insert(TaskKind::Image, image_models);
-        map.insert(TaskKind::Llm, llm_models);
-        map.insert(TaskKind::AudioStt, stt_models);
-        map.insert(TaskKind::AudioTts, tts_models);
-        map.insert(TaskKind::Video, video_models);
+        map.insert(TaskKind::Image, models(DEFAULT_IMAGE_MODELS));
+        map.insert(TaskKind::Llm, models(DEFAULT_LLM_MODELS));
+        map.insert(TaskKind::AudioStt, models(DEFAULT_STT_MODELS));
+        map.insert(TaskKind::AudioTts, models(DEFAULT_TTS_MODELS));
+        map.insert(TaskKind::Video, models(DEFAULT_VIDEO_MODELS));
         EngineCapabilities {
             supported_models_per_kind: map,
         }
@@ -393,167 +375,6 @@ fn sha256_bytes(input: &str) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// GradioEngine — image only (preserves the original behaviour).  Other
-// kinds return UnsupportedKind which the worker translates to a
-// retryable=false fail so the API can either reschedule on a different
-// worker or mark it permanently failed.
-// ---------------------------------------------------------------------------
-
-pub struct GradioEngine {
-    pub endpoint_url: String,
-    overrides: Vec<String>,
-}
-
-impl GradioEngine {
-    pub fn new(endpoint_url: String, overrides: Vec<String>) -> Self {
-        Self {
-            endpoint_url,
-            overrides,
-        }
-    }
-}
-
-impl Engine for GradioEngine {
-    fn name(&self) -> &'static str {
-        "gradio"
-    }
-
-    fn capabilities(&self) -> EngineCapabilities {
-        let mut map: BTreeMap<TaskKind, Vec<String>> = BTreeMap::new();
-        map.insert(TaskKind::Image, self.overrides.clone());
-        EngineCapabilities {
-            supported_models_per_kind: map,
-        }
-    }
-
-    fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
-        let kind = task.kind();
-        let started = Instant::now();
-        let image_params = match task {
-            Task::Image(p) => p,
-            other => {
-                warn!(
-                    target: TRACE_TARGET_GRADIO,
-                    op = "dispatch",
-                    kind = kind.as_str(),
-                    model,
-                    "unsupported task kind"
-                );
-                bail!("gradio engine cannot serve {} tasks", other.kind().as_str());
-            }
-        };
-        let result = call_gradio(&self.endpoint_url, &image_params.prompt, model);
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        match &result {
-            Ok(_) => debug!(
-                target: TRACE_TARGET_GRADIO,
-                op = "dispatch",
-                kind = kind.as_str(),
-                model,
-                elapsed_ms,
-                "ok"
-            ),
-            Err(e) => warn!(
-                target: TRACE_TARGET_GRADIO,
-                op = "dispatch",
-                kind = kind.as_str(),
-                model,
-                elapsed_ms,
-                error = %e,
-                "failed"
-            ),
-        }
-        let bytes = result?;
-        Ok(TaskResult::Image {
-            bytes,
-            ext: image_params.ext,
-        })
-    }
-}
-
-fn call_gradio(endpoint_url: &str, prompt: &str, model: &str) -> Result<Vec<u8>> {
-    use base64::Engine as _;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
-
-    let url = format!("{}/run/predict", endpoint_url.trim_end_matches('/'));
-    let body = serde_json::json!({ "data": [prompt, model] });
-    let started = Instant::now();
-
-    let response = client.post(&url).json(&body).send().map_err(|e| {
-        warn!(
-            target: TRACE_TARGET_GRADIO,
-            op = "predict",
-            endpoint = %url,
-            error = %e,
-            "request failed"
-        );
-        anyhow!("gradio request failed: {e}")
-    })?;
-    let status = response.status();
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    if !status.is_success() {
-        warn!(
-            target: TRACE_TARGET_GRADIO,
-            op = "predict",
-            endpoint = %url,
-            status = status.as_u16(),
-            elapsed_ms,
-            "non-2xx response"
-        );
-        bail!("gradio returned {}", status);
-    }
-    debug!(
-        target: TRACE_TARGET_GRADIO,
-        op = "predict",
-        endpoint = %url,
-        status = status.as_u16(),
-        elapsed_ms,
-        "ok"
-    );
-    let parsed: serde_json::Value = response.json()?;
-    let image_field = parsed
-        .get("data")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .ok_or_else(|| anyhow!("gradio response missing data[0]"))?;
-
-    if let Some(s) = image_field.as_str() {
-        if let Some(rest) = s.strip_prefix("data:") {
-            if let Some(idx) = rest.find(',') {
-                let payload = &rest[idx + 1..];
-                let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(payload)
-                    .map_err(|e| anyhow!("invalid base64 image: {e}"))?;
-                return Ok(decoded);
-            }
-        }
-        let abs_url = if s.starts_with("http") {
-            s.to_string()
-        } else {
-            format!(
-                "{}/{}",
-                endpoint_url.trim_end_matches('/'),
-                s.trim_start_matches('/')
-            )
-        };
-        let response = client.get(&abs_url).send()?;
-        if !response.status().is_success() {
-            bail!("gradio image fetch returned {}", response.status());
-        }
-        return Ok(response.bytes()?.to_vec());
-    }
-    if let Some(obj) = image_field.as_object() {
-        if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
-            let response = client.get(url).send()?;
-            return Ok(response.bytes()?.to_vec());
-        }
-    }
-    bail!("unsupported gradio image payload")
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -564,7 +385,7 @@ mod tests {
 
     #[test]
     fn synthetic_image_round_trips_as_webp() {
-        let engine = SyntheticEngine::new(vec![]);
+        let engine = SyntheticEngine::new();
         let task = Task::Image(ImageParams {
             prompt: "hello world".into(),
             width: 512,
@@ -588,7 +409,7 @@ mod tests {
 
     #[test]
     fn synthetic_llm_returns_chat_completion_shape() {
-        let engine = SyntheticEngine::new(vec![]);
+        let engine = SyntheticEngine::new();
         let task = Task::Llm(LlmParams {
             messages: vec![ChatMessage {
                 role: "user".into(),
@@ -611,7 +432,7 @@ mod tests {
 
     #[test]
     fn synthetic_stt_returns_whisper_shape() {
-        let engine = SyntheticEngine::new(vec![]);
+        let engine = SyntheticEngine::new();
         let task = Task::AudioStt(AudioSttParams {
             input_url: "https://example.com/audio.wav".into(),
             language: Some("nl".into()),
@@ -627,7 +448,7 @@ mod tests {
 
     #[test]
     fn synthetic_tts_produces_real_wav() {
-        let engine = SyntheticEngine::new(vec![]);
+        let engine = SyntheticEngine::new();
         let task = Task::AudioTts(AudioTtsParams {
             text: "hello world".into(),
             voice: "default".into(),
@@ -653,7 +474,7 @@ mod tests {
 
     #[test]
     fn synthetic_video_emits_decodable_bytes() {
-        let engine = SyntheticEngine::new(vec![]);
+        let engine = SyntheticEngine::new();
         let task = Task::Video(VideoParams {
             prompt: "a tiny dragon".into(),
             seconds: 1.0,
@@ -675,7 +496,7 @@ mod tests {
 
     #[test]
     fn synthetic_engine_advertises_all_kinds() {
-        let engine = SyntheticEngine::new(vec![]);
+        let engine = SyntheticEngine::new();
         let caps = engine.capabilities();
         for k in TaskKind::ALL {
             assert!(
@@ -685,21 +506,33 @@ mod tests {
             );
         }
         assert!(caps.supports(TaskKind::Image, "synthetic"));
-        assert!(caps.supports(TaskKind::Llm, "llama-3.1-8b-instruct-q4"));
+        assert!(
+            !caps.supports(TaskKind::Image, "*"),
+            "synthetic engine MUST NOT advertise the wildcard \
+             (it would happily fulfil real-model jobs with placeholder \
+             bytes, which is destructive on a live queue)"
+        );
     }
 
     #[test]
-    fn synthetic_engine_overrides_apply_to_every_kind() {
-        let engine = SyntheticEngine::new(vec!["only-this".into()]);
-        let caps = engine.capabilities();
+    fn build_default_yields_multi_engine_with_synthetic_inside() {
+        // Default features = synthetic-only.  `build()` should always
+        // return a MultiEngine (so the routing layer is uniform), and
+        // synthetic capabilities should be visible through it.
+        let cfg = crate::config::Config::default();
+        let eng = build(&cfg).unwrap();
+        assert_eq!(eng.name(), "multi");
+        let caps = eng.capabilities();
         for k in TaskKind::ALL {
-            assert_eq!(caps.supported_models_per_kind[&k], vec!["only-this"]);
+            assert!(caps.supported_models_per_kind.contains_key(&k));
         }
+        assert!(caps.supports(TaskKind::Image, "synthetic"));
+        assert!(caps.supports(TaskKind::Llm, "synthetic"));
     }
 
     #[test]
     fn synthetic_engine_is_deterministic_per_prompt() {
-        let engine = SyntheticEngine::new(vec![]);
+        let engine = SyntheticEngine::new();
         let task = || {
             Task::Image(ImageParams {
                 prompt: "deterministic".into(),
@@ -718,17 +551,5 @@ mod tests {
             }
             _ => panic!("expected images"),
         }
-    }
-
-    #[test]
-    fn gradio_engine_refuses_non_image_tasks() {
-        let engine = GradioEngine::new("http://localhost".into(), vec!["foo".into()]);
-        let task = Task::Llm(LlmParams {
-            messages: vec![],
-            max_tokens: 1,
-            temperature: 0.0,
-        });
-        let err = engine.dispatch("foo", task).unwrap_err();
-        assert!(err.to_string().contains("cannot serve llm"));
     }
 }

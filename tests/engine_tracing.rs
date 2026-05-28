@@ -1,19 +1,17 @@
 //! Proves every engine emits operator-visible `tracing` events on
 //! dispatch and on its key failure paths.  Without these the only
 //! breadcrumbs operators get from `RUST_LOG=studio_worker=debug` come
-//! from `runtime::run_job`, which logs *that* a job took N seconds but
+//! from the WS session, which logs *that* a job took N seconds but
 //! never which engine handled it, which model was loaded, or which
-//! HTTP call to gradio actually went out.
+//! sub-engine MultiEngine picked.
 //!
 //! Uses the shared `studio_worker::test_support::capture` helper (aliased
 //! locally as `captured_logs_for` to keep call sites readable).
 
 use studio_worker::config::Config;
-use studio_worker::engine::{self, render_procedural, Engine, SyntheticEngine};
+use studio_worker::engine::{self, Engine, SyntheticEngine};
 use studio_worker::test_support::capture as captured_logs_for;
 use studio_worker::types::*;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn image_task(prompt: &str) -> Task {
     Task::Image(ImageParams {
@@ -26,17 +24,6 @@ fn image_task(prompt: &str) -> Task {
     })
 }
 
-fn llm_task() -> Task {
-    Task::Llm(LlmParams {
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: "hi".into(),
-        }],
-        max_tokens: 1,
-        temperature: 0.0,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // SyntheticEngine
 // ---------------------------------------------------------------------------
@@ -44,7 +31,7 @@ fn llm_task() -> Task {
 #[test]
 fn synthetic_engine_dispatch_emits_debug_event() {
     let logs = captured_logs_for(|| {
-        let engine = SyntheticEngine::new(vec![]);
+        let engine = SyntheticEngine::new();
         engine.dispatch("synthetic", image_task("dragon")).unwrap();
     });
     assert!(
@@ -71,124 +58,14 @@ fn synthetic_engine_dispatch_emits_debug_event() {
 }
 
 // ---------------------------------------------------------------------------
-// GradioEngine
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn gradio_engine_dispatch_success_emits_debug_event() {
-    use base64::Engine as _;
-    let server = MockServer::start().await;
-    let bytes = render_procedural("dragon", "png").expect("render");
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let data_url = format!("data:image/png;base64,{b64}");
-    Mock::given(method("POST"))
-        .and(path("/run/predict"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [data_url] })),
-        )
-        .mount(&server)
-        .await;
-
-    let uri = server.uri();
-    let logs = captured_logs_for(move || {
-        let cfg = Config {
-            engine: "gradio".into(),
-            gradio_endpoint_url: Some(uri),
-            supported_models_override: vec!["tiny-test".into()],
-            ..Config::default()
-        };
-        let engine = engine::build(&cfg).expect("build engine");
-        engine
-            .dispatch("tiny-test", image_task("dragon"))
-            .expect("dispatch");
-    });
-    assert!(
-        logs.contains("studio_worker::engine::gradio"),
-        "expected gradio target, got: {logs}"
-    );
-    assert!(logs.contains("DEBUG"), "expected DEBUG event, got: {logs}");
-    assert!(
-        logs.contains("op=\"dispatch\""),
-        "expected op field: {logs}"
-    );
-    assert!(
-        logs.contains("kind=\"image\""),
-        "expected kind field: {logs}"
-    );
-    assert!(
-        logs.contains("model=\"tiny-test\""),
-        "expected model field: {logs}"
-    );
-    assert!(
-        logs.contains("elapsed_ms"),
-        "expected elapsed_ms field: {logs}"
-    );
-    assert!(
-        logs.contains("/run/predict"),
-        "expected predict URL in inner http log: {logs}"
-    );
-}
-
-#[test]
-fn gradio_engine_unsupported_kind_emits_warn() {
-    let logs = captured_logs_for(|| {
-        let cfg = Config {
-            engine: "gradio".into(),
-            gradio_endpoint_url: Some("http://example.invalid".into()),
-            supported_models_override: vec!["tiny-test".into()],
-            ..Config::default()
-        };
-        let engine = engine::build(&cfg).expect("build engine");
-        let _ = engine.dispatch("tiny-test", llm_task());
-    });
-    assert!(
-        logs.contains("studio_worker::engine::gradio"),
-        "expected gradio target, got: {logs}"
-    );
-    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
-    assert!(logs.contains("kind=\"llm\""), "expected kind field: {logs}");
-}
-
-#[tokio::test]
-async fn gradio_engine_5xx_emits_warn_with_status() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/run/predict"))
-        .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
-        .mount(&server)
-        .await;
-    let uri = server.uri();
-    let logs = captured_logs_for(move || {
-        let cfg = Config {
-            engine: "gradio".into(),
-            gradio_endpoint_url: Some(uri),
-            supported_models_override: vec!["tiny-test".into()],
-            ..Config::default()
-        };
-        let engine = engine::build(&cfg).expect("build engine");
-        let _ = engine.dispatch("tiny-test", image_task("anything"));
-    });
-    assert!(
-        logs.contains("studio_worker::engine::gradio"),
-        "expected gradio target, got: {logs}"
-    );
-    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
-    assert!(logs.contains("status=503"), "expected status field: {logs}");
-}
-
-// ---------------------------------------------------------------------------
-// MultiEngine
+// MultiEngine — engine::build always wraps in MultiEngine now, so we
+// can drive the routing trace events straight through it.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn multi_engine_pick_emits_debug_event_with_sub_engine() {
     let logs = captured_logs_for(|| {
-        let cfg = Config {
-            engine: "multi".into(),
-            engines: vec!["synthetic".into()],
-            ..Config::default()
-        };
-        let engine = engine::build(&cfg).expect("build engine");
+        let engine = engine::build(&Config::default()).expect("build engine");
         engine.dispatch("synthetic", image_task("hi")).unwrap();
     });
     assert!(
@@ -212,49 +89,16 @@ fn multi_engine_pick_emits_debug_event_with_sub_engine() {
 
 #[test]
 fn multi_engine_fallback_emits_debug_event() {
-    // Synthetic only declares specific model ids — request an unknown
+    // Synthetic declares specific model ids — request an unknown
     // model id but a kind it advertises so the fallback branch fires.
     let logs = captured_logs_for(|| {
-        let cfg = Config {
-            engine: "multi".into(),
-            engines: vec!["synthetic".into()],
-            ..Config::default()
-        };
-        let engine = engine::build(&cfg).expect("build engine");
+        let engine = engine::build(&Config::default()).expect("build engine");
         let _ = engine.dispatch("not-a-real-model", image_task("hi"));
     });
     assert!(
         logs.contains("match=\"fallback\""),
         "expected match=fallback: {logs}"
     );
-}
-
-#[test]
-fn multi_engine_no_engine_for_kind_emits_warn() {
-    // Build a synthetic-only multi engine, but ask for a kind it
-    // doesn't advertise — actually synthetic advertises every kind, so
-    // we need an empty multi engine.
-    let logs = captured_logs_for(|| {
-        let cfg = Config {
-            engine: "multi".into(),
-            // Even with synthetic engines configured, asking for a kind
-            // it advertises succeeds; instead build an empty list via
-            // build_multi error path — that won't trigger pick.  Use a
-            // gradio-only multi (image-only) and request llm.
-            engines: vec!["gradio".into()],
-            gradio_endpoint_url: Some("http://example.invalid".into()),
-            supported_models_override: vec!["tiny".into()],
-            ..Config::default()
-        };
-        let engine = engine::build(&cfg).expect("build engine");
-        let _ = engine.dispatch("tiny", llm_task());
-    });
-    assert!(
-        logs.contains("studio_worker::engine::multi"),
-        "expected multi target, got: {logs}"
-    );
-    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
-    assert!(logs.contains("kind=\"llm\""), "expected kind field: {logs}");
 }
 
 // ---------------------------------------------------------------------------

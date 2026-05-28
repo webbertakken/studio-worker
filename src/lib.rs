@@ -35,14 +35,12 @@ pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {
         cli::Command::Run => runtime::run(args.config.as_deref()).await,
         cli::Command::Register {
             api_base_url,
-            label,
             reset,
         } => {
             runtime::register(
                 args.config.as_deref(),
                 runtime::RegisterArgs {
                     api_base_url,
-                    label,
                     reset,
                 },
             )
@@ -51,8 +49,6 @@ pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {
         cli::Command::Status => runtime::status(args.config.as_deref()).await,
         cli::Command::InstallService => service::install(args.config.as_deref()),
         cli::Command::UninstallService => service::uninstall(),
-        cli::Command::Enable => runtime::set_enabled(args.config.as_deref(), true),
-        cli::Command::Disable => runtime::set_enabled(args.config.as_deref(), false),
         cli::Command::SetThreshold { gb } => runtime::set_threshold(args.config.as_deref(), gb),
         cli::Command::Config => runtime::show_config(args.config.as_deref()),
         cli::Command::CheckUpdate => runtime::check_update(args.config.as_deref()).await,

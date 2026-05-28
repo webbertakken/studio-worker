@@ -162,8 +162,6 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
         api_base_url: format!("http://{ws_addr}"),
         worker_id: Some("w-test".into()),
         auth_token: Some("tok-test".into()),
-        engine: "synthetic".into(),
-        auto_enabled: true,
         auto_update_enabled: false,
         ws_reconnect_attempts: Some(1),
         ..Config::default()
@@ -172,18 +170,21 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
     let stop = Arc::new(AtomicBool::new(false));
     let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
     let busy = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
 
     let session_handle = tokio::spawn({
         let shared = shared.clone();
         let stop = stop.clone();
         let logs = logs.clone();
         let busy = busy.clone();
+        let paused = paused.clone();
         async move {
             spawn_ws_session(
                 shared,
                 stop,
                 logs,
                 busy,
+                paused,
                 WorkerObservers::default(),
                 SessionSchedule::fast_for_tests(),
             )

@@ -34,6 +34,7 @@ fn sample_claim() -> JobOfferClaim {
         prompt: "an aurora fox at dusk".into(),
         ext: "webp".into(),
         task: None,
+        model_source: None,
     }
 }
 

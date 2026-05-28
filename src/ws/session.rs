@@ -24,7 +24,8 @@ use crate::config::SharedConfig;
 use crate::engine::Engine;
 use crate::http::ApiClient;
 use crate::runtime::{
-    build_capabilities, is_unsupported_kind, prompt_for, push_log, WorkerObservers,
+    is_unsupported_kind, prompt_for, push_log_with_observers, record_recent_job, truncate_prompt,
+    CurrentJob, JobOutcome, RecentJob, WorkerObservers,
 };
 use crate::types::{LogEntry, TaskResult, WorkerCapabilities};
 use crate::ws::client::{connect, WsClientError, WsSender};
@@ -90,19 +91,20 @@ impl SessionSchedule {
 
 /// Top-level driver: connect, run a session, reconnect on disconnect,
 /// give up after `cfg.ws_reconnect_attempts` failures.
+///
+/// `paused` is a runtime-only flag (not persisted to `Config`).  When
+/// true, the heartbeat reports `autoEnabled = false` and incoming
+/// offers are rejected, so the studio stops sending new jobs.  In-
+/// flight work is allowed to finish.
 pub async fn spawn_ws_session(
     cfg: SharedConfig,
     stop: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
-    _observers: WorkerObservers,
+    paused: Arc<AtomicBool>,
+    observers: WorkerObservers,
     schedule: SessionSchedule,
 ) -> Result<()> {
-    // `observers` is threaded through so the optional native UI gets a
-    // live view of the worker.  Wired into the dispatch path in a
-    // follow-up commit; for now the slots stay empty (Default::default
-    // on the WorkerObservers).  The headless build doesn't care.
-    let _ = &_observers;
     let max_attempts = {
         let guard = cfg.lock();
         guard
@@ -111,15 +113,39 @@ pub async fn spawn_ws_session(
     };
 
     let mut attempt: u32 = 0;
+    let mut waiting_for_creds_logged = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match run_one_session(&cfg, &stop, &logs, &busy, schedule).await {
+        // Credentials may not exist yet (first launch — the
+        // auto-register loop is racing to populate them).  Poll the
+        // shared config until both `worker_id` and `auth_token` show
+        // up, instead of failing the whole session loop.  This is
+        // what lets the UI's parallel auto-register + WS flow work.
+        if !has_credentials(&cfg) {
+            if !waiting_for_creds_logged {
+                push_log_with_observers(
+                    &logs,
+                    Some(&observers),
+                    "info",
+                    "ws",
+                    "waiting for operator approval before opening the session",
+                    None,
+                );
+                waiting_for_creds_logged = true;
+            }
+            wait_with_stop(Duration::from_secs(1), &stop, schedule.shutdown_tick).await;
+            continue;
+        }
+        waiting_for_creds_logged = false;
+
+        match run_one_session(&cfg, &stop, &logs, &busy, &paused, &observers, schedule).await {
             Ok(SessionOutcome::Stopped) => return Ok(()),
             Ok(SessionOutcome::AuthFailed(reason)) => {
-                push_log(
+                push_log_with_observers(
                     &logs,
+                    Some(&observers),
                     "error",
                     "ws",
                     &format!("auth failed: {reason}. Re-register the worker."),
@@ -128,14 +154,22 @@ pub async fn spawn_ws_session(
                 return Err(anyhow!("ws auth failed: {reason}"));
             }
             Ok(SessionOutcome::Fatal(reason)) => {
-                push_log(&logs, "error", "ws", &format!("fatal: {reason}"), None);
+                push_log_with_observers(
+                    &logs,
+                    Some(&observers),
+                    "error",
+                    "ws",
+                    &format!("fatal: {reason}"),
+                    None,
+                );
                 return Err(anyhow!("ws fatal: {reason}"));
             }
             Ok(SessionOutcome::Disconnected) | Err(_) => {
                 attempt += 1;
                 if max_attempts > 0 && attempt > max_attempts {
-                    push_log(
+                    push_log_with_observers(
                         &logs,
+                        Some(&observers),
                         "error",
                         "ws",
                         &format!("giving up after {attempt} reconnect attempts"),
@@ -144,8 +178,9 @@ pub async fn spawn_ws_session(
                     return Err(anyhow!("ws reconnect cap reached"));
                 }
                 let backoff = backoff_for(attempt, schedule);
-                push_log(
+                push_log_with_observers(
                     &logs,
+                    Some(&observers),
                     "warn",
                     "ws",
                     &format!(
@@ -160,6 +195,94 @@ pub async fn spawn_ws_session(
     }
 }
 
+/// Outcome of waiting for the server's Welcome (or an error) right
+/// after sending Hello.  Drives the precondition gate that keeps the
+/// heartbeat / log-shipper pumps from racing the studio's async auth
+/// flow.
+enum WelcomeOutcome {
+    Welcomed,
+    AuthFailed(String),
+    Fatal(String),
+    Disconnected,
+}
+
+/// Pull events from the reader until we see a Welcome (success) or an
+/// Error / Disconnect (failure).  Any acks / offers that arrive
+/// before the Welcome are pushed into the logs and discarded — the
+/// studio shouldn't be sending them at this stage, but if it does,
+/// the dispatch loop will pick the next ones up.
+async fn wait_for_welcome(
+    event_rx: &mut mpsc::UnboundedReceiver<SessionEvent>,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    observers: &WorkerObservers,
+) -> WelcomeOutcome {
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            SessionEvent::Frame(WorkerOutbound::Welcome { worker_id: wid, .. }) => {
+                push_log_with_observers(
+                    logs,
+                    Some(observers),
+                    "info",
+                    "ws",
+                    &format!("server welcomed {wid}"),
+                    None,
+                );
+                return WelcomeOutcome::Welcomed;
+            }
+            SessionEvent::Frame(WorkerOutbound::Error { code, message }) => {
+                push_log_with_observers(
+                    logs,
+                    Some(observers),
+                    "error",
+                    "ws",
+                    &format!("server error before welcome {code:?}: {message}"),
+                    None,
+                );
+                return match code {
+                    crate::ws::types::WorkerErrorCode::AuthFailed => {
+                        WelcomeOutcome::AuthFailed(message)
+                    }
+                    _ => WelcomeOutcome::Fatal(message),
+                };
+            }
+            SessionEvent::Frame(other) => {
+                push_log_with_observers(
+                    logs,
+                    Some(observers),
+                    "warn",
+                    "ws",
+                    &format!("server sent unexpected frame before welcome: {other:?}"),
+                    None,
+                );
+                // Keep waiting — maybe the next frame is Welcome.
+            }
+            SessionEvent::Disconnected(WsClientError::AuthFailed { reason }) => {
+                return WelcomeOutcome::AuthFailed(reason);
+            }
+            SessionEvent::Disconnected(_) => return WelcomeOutcome::Disconnected,
+            SessionEvent::Stopped => return WelcomeOutcome::Disconnected,
+        }
+    }
+    WelcomeOutcome::Disconnected
+}
+
+/// True iff the shared config has both `worker_id` and `auth_token`
+/// populated.  The auto-register flow writes them through on
+/// approval.
+fn has_credentials(cfg: &SharedConfig) -> bool {
+    let guard = cfg.lock();
+    guard
+        .worker_id
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+        && guard
+            .auth_token
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+}
+
 /// One end-to-end session attempt: connect, hello, run until shutdown
 /// or disconnect.
 async fn run_one_session(
@@ -167,6 +290,8 @@ async fn run_one_session(
     stop: &Arc<AtomicBool>,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     busy: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+    observers: &WorkerObservers,
     schedule: SessionSchedule,
 ) -> Result<SessionOutcome> {
     let (api_base_url, worker_id, auth_token) = {
@@ -183,8 +308,9 @@ async fn run_one_session(
         ));
     }
 
-    push_log(
+    push_log_with_observers(
         logs,
+        Some(observers),
         "info",
         "ws",
         &format!("connecting to {api_base_url}"),
@@ -196,7 +322,14 @@ async fn run_one_session(
             return Ok(SessionOutcome::AuthFailed(reason));
         }
         Err(e) => {
-            push_log(logs, "warn", "ws", &format!("connect failed: {e}"), None);
+            push_log_with_observers(
+                logs,
+                Some(observers),
+                "warn",
+                "ws",
+                &format!("connect failed: {e}"),
+                None,
+            );
             return Ok(SessionOutcome::Disconnected);
         }
     };
@@ -204,7 +337,11 @@ async fn run_one_session(
 
     // Send hello with the current capabilities.
     let engine = crate::engine::build(&cfg.lock())?;
-    let capabilities = build_capabilities(&cfg.lock(), &*engine);
+    let capabilities = crate::runtime::build_capabilities_with(
+        &cfg.lock(),
+        &*engine,
+        !paused.load(Ordering::SeqCst),
+    );
     sender
         .send(&WorkerInbound::Hello(HelloFrame {
             auth_token: auth_token.clone(),
@@ -219,12 +356,45 @@ async fn run_one_session(
     // Reader task: pump frames into the event channel.
     let reader = spawn_reader(receiver, event_tx.clone());
 
-    // Heartbeat task.
+    // Wait for the server's `Welcome` (or an error) before starting
+    // the heartbeat / log-shipper pumps.  Without this gate, the
+    // first heartbeat fires immediately (tokio `interval()` returns
+    // at t=0) and races the studio's async Hello-auth flow: a
+    // heartbeat arriving while the session is still marked
+    // `authenticated: false` server-side gets rejected with
+    // `protocol_violation: session not authenticated`, killing the
+    // session.
+    let mut event_rx = event_rx;
+    match wait_for_welcome(&mut event_rx, logs, observers).await {
+        WelcomeOutcome::Welcomed => {}
+        WelcomeOutcome::AuthFailed(reason) => {
+            let _ = sender.close(1000, "auth failed").await;
+            let _ = reader.await;
+            return Ok(SessionOutcome::AuthFailed(reason));
+        }
+        WelcomeOutcome::Fatal(reason) => {
+            let _ = sender.close(1000, "protocol violation").await;
+            let _ = reader.await;
+            return Ok(SessionOutcome::Fatal(reason));
+        }
+        WelcomeOutcome::Disconnected => {
+            let _ = reader.await;
+            return Ok(SessionOutcome::Disconnected);
+        }
+    }
+
+    // Heartbeat task.  Reuse the engine we already built for the
+    // Hello frame instead of rebuilding it on every heartbeat —
+    // rebuilding fires every engine's `try_new` / registration log
+    // every 5s, floods the logs, and (for real engines like sd-cpp)
+    // walks the disk to re-check model presence.
+    let capabilities_for_heartbeat = capabilities.clone();
     let heartbeat = spawn_heartbeat_pump(
-        cfg.clone(),
+        capabilities_for_heartbeat,
         sender.clone(),
         stop.clone(),
         busy.clone(),
+        paused.clone(),
         schedule,
     );
 
@@ -241,6 +411,8 @@ async fn run_one_session(
         engine: engine_arc,
         logs: logs.clone(),
         busy: busy.clone(),
+        paused: paused.clone(),
+        observers: observers.clone(),
         api_base_url: api_base_url.clone(),
         worker_id: worker_id.clone(),
         auth_token: auth_token.clone(),
@@ -274,6 +446,8 @@ struct SessionContext {
     engine: Arc<dyn Engine>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    observers: WorkerObservers,
     api_base_url: String,
     worker_id: String,
     auth_token: String,
@@ -292,8 +466,9 @@ async fn run_dispatch_loop(
             SessionEvent::Stopped => return SessionOutcome::Stopped,
             SessionEvent::Frame(frame) => match frame {
                 WorkerOutbound::Welcome { worker_id: wid, .. } => {
-                    push_log(
+                    push_log_with_observers(
                         &ctx.logs,
+                        Some(&ctx.observers),
                         "info",
                         "ws",
                         &format!("server welcomed {wid}"),
@@ -301,11 +476,12 @@ async fn run_dispatch_loop(
                     );
                 }
                 WorkerOutbound::Offer { claim } => {
-                    handle_offer(&ctx, claim);
+                    handle_offer(&ctx, *claim);
                 }
                 WorkerOutbound::Error { code, message } => {
-                    push_log(
+                    push_log_with_observers(
                         &ctx.logs,
+                        Some(&ctx.observers),
                         "error",
                         "ws",
                         &format!("server error {code:?}: {message}"),
@@ -331,8 +507,9 @@ async fn run_dispatch_loop(
 
 fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     let job_id = claim.job_id.clone();
-    push_log(
+    push_log_with_observers(
         &ctx.logs,
+        Some(&ctx.observers),
         "info",
         "ws",
         &format!(
@@ -341,6 +518,30 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         ),
         Some(job_id.clone()),
     );
+    // Operator pressed Pause: reject the offer so the studio retries
+    // on a different worker (or requeues until we resume).  No engine
+    // dispatch, no busy flag flip.
+    if ctx.paused.load(Ordering::SeqCst) {
+        push_log_with_observers(
+            &ctx.logs,
+            Some(&ctx.observers),
+            "info",
+            "ws",
+            &format!("rejecting offer {job_id}: worker is paused"),
+            Some(job_id.clone()),
+        );
+        let sender_for_reject = ctx.sender.clone();
+        let job_id_for_reject = job_id.clone();
+        tokio::spawn(async move {
+            let _ = sender_for_reject
+                .send(&WorkerInbound::Reject {
+                    job_id: job_id_for_reject,
+                    reason: "worker paused by operator".to_string(),
+                })
+                .await;
+        });
+        return;
+    }
     // Send accept first so the server marks the offer consumed.
     let sender_for_accept = ctx.sender.clone();
     let job_id_for_accept = job_id.clone();
@@ -353,9 +554,24 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     });
 
     let job = claim.into_job_claim();
+    let resolved_task = job.resolved_task();
+    let task_kind = resolved_task.kind();
+    let prompt = truncate_prompt(&prompt_for(&resolved_task));
+    let started_at = chrono::Utc::now();
+
+    // Surface the job to the UI's Jobs tab.
+    *ctx.observers.current_job.lock() = Some(CurrentJob {
+        job_id: job_id.clone(),
+        kind: task_kind,
+        model: job.model.clone(),
+        prompt: prompt.clone(),
+        started_at,
+    });
+
     let busy_flag = ctx.busy.clone();
     busy_flag.store(true, Ordering::SeqCst);
     let logs_for_task = ctx.logs.clone();
+    let observers_for_task = ctx.observers.clone();
     let sender_for_task = ctx.sender.clone();
     let engine_for_task = ctx.engine.clone();
     let api_base_url = ctx.api_base_url.clone();
@@ -366,42 +582,66 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             sender_for_task,
             engine_for_task,
             logs_for_task,
+            observers_for_task,
             api_base_url,
             worker_id,
             auth_token,
             job,
+            started_at,
+            task_kind,
+            prompt,
         )
         .await;
         busy_flag.store(false, Ordering::SeqCst);
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_offered_job(
     sender: WsSender,
     engine: Arc<dyn Engine>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
+    observers: WorkerObservers,
     api_base_url: String,
     worker_id: String,
     auth_token: String,
     job: crate::types::JobClaim,
+    started_at: chrono::DateTime<chrono::Utc>,
+    task_kind: crate::types::TaskKind,
+    prompt_for_log: String,
 ) {
     let task = job.resolved_task();
-    let task_kind = task.kind();
-    let prompt_for_log = prompt_for(&task);
     let start = std::time::Instant::now();
+    // Pass the studio's `ModelSource` (if attached) to the engine so
+    // sd-cpp / llama-cpp know which files to load.  Engines that don't
+    // need it ignore the parameter; the synthetic engine still works.
     let dispatch = tokio::task::spawn_blocking({
         let model = job.model.clone();
+        let model_source = job.model_source.clone();
         let task_for_engine = task;
         let engine = engine.clone();
-        move || -> Result<TaskResult> { engine.dispatch(&model, task_for_engine) }
+        move || -> Result<TaskResult> {
+            engine.dispatch_with_source(&model, task_for_engine, model_source.as_ref())
+        }
     })
     .await;
 
     let job_id = job.job_id.clone();
+    // Tracks the outcome we record into the RecentJob ring once every
+    // dispatch arm below has either succeeded or surfaced an error.
+    // The default value here only survives if the match falls through
+    // without assigning, which is unreachable; we keep it as a
+    // belt-and-braces default so the recent-jobs ring is never left
+    // half-populated by a future code-path that forgets to assign.
+    #[allow(unused_assignments)]
+    let mut outcome = JobOutcome::Failed {
+        reason: "dispatch did not run to completion".to_string(),
+    };
     match dispatch {
         Ok(Ok(result)) => {
-            push_log(
+            push_log_with_observers(
                 &logs,
+                Some(&observers),
                 "info",
                 "ws",
                 &format!("{} dispatched in {:?}", task_kind.as_str(), start.elapsed()),
@@ -431,7 +671,17 @@ async fn run_offered_job(
                         Err(e) => Some(format!("upload task panic: {e}")),
                     };
                     if let Some(msg) = msg {
-                        push_log(&logs, "error", "ws", &msg, Some(job_id.clone()));
+                        push_log_with_observers(
+                            &logs,
+                            Some(&observers),
+                            "error",
+                            "ws",
+                            &msg,
+                            Some(job_id.clone()),
+                        );
+                        outcome = JobOutcome::Failed {
+                            reason: msg.clone(),
+                        };
                         let _ = sender
                             .send(&WorkerInbound::Fail {
                                 job_id: job_id.clone(),
@@ -440,15 +690,29 @@ async fn run_offered_job(
                             })
                             .await;
                     } else {
-                        push_log(
+                        push_log_with_observers(
                             &logs,
+                            Some(&observers),
                             "info",
                             "ws",
                             "binary upload ok",
                             Some(job_id.clone()),
                         );
-                        // Nudge the server so it offers the next job.
-                        let _ = sender.send(&WorkerInbound::ReadyForMore).await;
+                        outcome = JobOutcome::Completed;
+                        // The studio's HTTP `/complete` handler defers a
+                        // `notifyJobCompleted` RPC to the
+                        // WorkerConnections DO; that's the canonical
+                        // "offer next job" nudge.  Sending an extra
+                        // `ReadyForMore` here races that flow: both can
+                        // call `offerNextFor` concurrently, double-
+                        // reserve the session's `currentJob` slot, and
+                        // ship two `Offer` frames — the second `Accept`
+                        // then trips the studio's `session not
+                        // authenticated`-shaped `accept for unknown
+                        // jobId` invariant and the DO kills the
+                        // session.  See:
+                        //   apps/studio/src/worker/modules/graphics/
+                        //     WorkerConnections/orchestrator.ts (commitOffer)
                     }
                 }
                 TaskResult::Llm { json } | TaskResult::AudioStt { json } => {
@@ -459,18 +723,23 @@ async fn run_offered_job(
                             prompt: Some(prompt_for_log.clone()),
                         })
                         .await;
+                    outcome = JobOutcome::Completed;
                 }
             }
         }
         Ok(Err(e)) => {
             warn!(target: TRACE_TARGET, error = %e, "engine dispatch failed");
-            push_log(
+            push_log_with_observers(
                 &logs,
+                Some(&observers),
                 "error",
                 "ws",
                 &format!("dispatch failed: {e}"),
                 Some(job_id.clone()),
             );
+            outcome = JobOutcome::Failed {
+                reason: e.to_string(),
+            };
             let _ = sender
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
@@ -480,13 +749,17 @@ async fn run_offered_job(
                 .await;
         }
         Err(e) => {
-            push_log(
+            push_log_with_observers(
                 &logs,
+                Some(&observers),
                 "error",
                 "ws",
                 &format!("dispatch task panic: {e}"),
                 Some(job_id.clone()),
             );
+            outcome = JobOutcome::Failed {
+                reason: e.to_string(),
+            };
             let _ = sender
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
@@ -496,6 +769,22 @@ async fn run_offered_job(
                 .await;
         }
     }
+
+    // Surface the finished job to the UI: clear the current-job slot
+    // and push a RecentJob entry into the ring.
+    *observers.current_job.lock() = None;
+    record_recent_job(
+        &observers,
+        RecentJob {
+            job_id: job_id.clone(),
+            kind: task_kind,
+            model: job.model.clone(),
+            prompt: prompt_for_log,
+            outcome,
+            started_at,
+            finished_at: chrono::Utc::now(),
+        },
+    );
 }
 
 fn spawn_reader(
@@ -525,10 +814,11 @@ fn spawn_reader(
 }
 
 fn spawn_heartbeat_pump(
-    cfg: SharedConfig,
+    capabilities: WorkerCapabilities,
     sender: WsSender,
     stop: Arc<AtomicBool>,
     busy: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     schedule: SessionSchedule,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -539,11 +829,20 @@ fn spawn_heartbeat_pump(
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            let snapshot = build_heartbeat_snapshot(&cfg, &busy);
+            // The capability snapshot is captured once at session
+            // start.  Only `auto_enabled` (the pause flag) and the
+            // current job id can change between heartbeats.
+            let mut caps = capabilities.clone();
+            caps.auto_enabled = !paused.load(Ordering::SeqCst);
+            let current_job_id = if busy.load(Ordering::SeqCst) {
+                Some("in-flight".to_string())
+            } else {
+                None
+            };
             if let Err(e) = sender
                 .send(&WorkerInbound::Heartbeat {
-                    capabilities: snapshot.capabilities,
-                    current_job_id: snapshot.current_job_id,
+                    capabilities: caps,
+                    current_job_id,
                 })
                 .await
             {
@@ -552,47 +851,6 @@ fn spawn_heartbeat_pump(
             }
         }
     })
-}
-
-struct HeartbeatSnapshot {
-    capabilities: WorkerCapabilities,
-    current_job_id: Option<String>,
-}
-
-fn build_heartbeat_snapshot(cfg: &SharedConfig, busy: &Arc<AtomicBool>) -> HeartbeatSnapshot {
-    let engine = match crate::engine::build(&cfg.lock()) {
-        Ok(e) => e,
-        Err(_) => return placeholder_snapshot(),
-    };
-    let capabilities = build_capabilities(&cfg.lock(), &*engine);
-    let current_job_id = if busy.load(Ordering::SeqCst) {
-        Some("in-flight".to_string())
-    } else {
-        None
-    };
-    HeartbeatSnapshot {
-        capabilities,
-        current_job_id,
-    }
-}
-
-fn placeholder_snapshot() -> HeartbeatSnapshot {
-    HeartbeatSnapshot {
-        capabilities: WorkerCapabilities {
-            machine_name: String::new(),
-            username: String::new(),
-            agent_version: crate::AGENT_VERSION.to_string(),
-            engine: "synthetic".to_string(),
-            vram_total_gb: 0.0,
-            vram_threshold_gb: 0.0,
-            auto_enabled: false,
-            auto_start: false,
-            supported_models: vec![],
-            task_kinds: vec![],
-            supported_models_per_kind: Default::default(),
-        },
-        current_job_id: None,
-    }
 }
 
 fn spawn_log_shipper_pump(
@@ -687,9 +945,38 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_snapshot_has_no_current_job() {
-        let snap = placeholder_snapshot();
-        assert!(snap.current_job_id.is_none());
-        assert_eq!(snap.capabilities.engine, "synthetic");
+    fn has_credentials_false_when_either_missing() {
+        let mut cfg = crate::config::Config::default();
+        let shared = crate::config::shared(cfg.clone());
+        assert!(!has_credentials(&shared), "both missing");
+        cfg.worker_id = Some("w-1".into());
+        let shared = crate::config::shared(cfg.clone());
+        assert!(!has_credentials(&shared), "only worker_id");
+        cfg.worker_id = None;
+        cfg.auth_token = Some("tok".into());
+        let shared = crate::config::shared(cfg.clone());
+        assert!(!has_credentials(&shared), "only auth_token");
+    }
+
+    #[test]
+    fn has_credentials_true_when_both_present() {
+        let cfg = crate::config::Config {
+            worker_id: Some("w-1".into()),
+            auth_token: Some("tok".into()),
+            ..crate::config::Config::default()
+        };
+        let shared = crate::config::shared(cfg);
+        assert!(has_credentials(&shared));
+    }
+
+    #[test]
+    fn has_credentials_false_when_empty_strings() {
+        let cfg = crate::config::Config {
+            worker_id: Some("".into()),
+            auth_token: Some("".into()),
+            ..crate::config::Config::default()
+        };
+        let shared = crate::config::shared(cfg);
+        assert!(!has_credentials(&shared));
     }
 }

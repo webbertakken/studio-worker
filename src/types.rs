@@ -236,10 +236,6 @@ pub struct AutoRegisterRequest {
     /// token when polling for status; only the hash leaves the box.
     #[serde(rename = "registrationSecretHash")]
     pub registration_secret_hash: String,
-    /// Optional human label the operator sees in the Pending Workers
-    /// panel (e.g. "alice's gaming rig").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
     /// Full capability snapshot — hostname, username, engine, VRAM,
     /// supported models so the operator can decide.
     pub capabilities: WorkerCapabilities,
@@ -283,6 +279,59 @@ pub struct HeartbeatRequest {
 }
 
 // ---------------------------------------------------------------------------
+// ModelSource — download spec the studio attaches to every offer so
+// the worker can fetch + run any model without per-model knowledge.
+// Mirrors `WorkerModelSource` on the TS side.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelFileRole {
+    DiffusionModel,
+    TextEncoder,
+    Vae,
+    Lora,
+    Model,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelEngine {
+    SdCpp,
+    LlamaCpp,
+    Synthetic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelFile {
+    pub role: ModelFileRole,
+    pub url: String,
+    pub filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approx_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCliDefaults {
+    pub cfg_scale: f32,
+    pub steps: u32,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_method: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSource {
+    pub engine: ModelEngine,
+    pub files: Vec<ModelFile>,
+    pub cli_defaults: ModelCliDefaults,
+}
+
+// ---------------------------------------------------------------------------
 // JobClaim — backward-compatible with the existing image-only studio API.
 // ---------------------------------------------------------------------------
 
@@ -308,6 +357,15 @@ pub struct JobClaim {
     /// an `Task::Image` from `prompt` + `ext` above for backward compat.
     #[serde(default)]
     pub task: Option<Task>,
+    /// Download + engine + CLI defaults the studio resolved from its
+    /// model registry.  Absent on legacy rows (the worker must `Fail`
+    /// those with a clear error rather than guess).
+    #[serde(
+        rename = "modelSource",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_source: Option<ModelSource>,
 }
 
 impl JobClaim {

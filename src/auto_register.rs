@@ -87,14 +87,13 @@ pub async fn tick(
     ensure_install_state(cfg, config_path);
 
     // Branch on whether we already have a request id.
-    let (api_base_url, request_id, secret, install_id, label) = {
+    let (api_base_url, request_id, secret, install_id) = {
         let snap = cfg.lock();
         (
             snap.api_base_url.clone(),
             snap.registration_request_id.clone(),
             snap.registration_secret.clone(),
             snap.install_id.clone(),
-            snap.label.clone(),
         )
     };
 
@@ -109,7 +108,6 @@ pub async fn tick(
                 observers,
                 api_base_url,
                 install_id.expect("ensure_install_state seeds install_id"),
-                label,
             )
             .await
         }
@@ -147,7 +145,6 @@ async fn create_request(
     observers: &SharedRegistration,
     api_base_url: String,
     install_id: String,
-    label: Option<String>,
 ) -> RegistrationState {
     let secret = match cfg.lock().registration_secret.clone() {
         Some(s) => s,
@@ -161,7 +158,7 @@ async fn create_request(
     let secret_hash = sha256_hex(&secret);
 
     // Build the capabilities snapshot the operator will see.
-    let payload = match build_payload(cfg, install_id.clone(), secret_hash, label) {
+    let payload = match build_payload(cfg, install_id.clone(), secret_hash) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
@@ -325,7 +322,6 @@ fn build_payload(
     cfg: &SharedConfig,
     install_id: String,
     registration_secret_hash: String,
-    label: Option<String>,
 ) -> Result<AutoRegisterRequest> {
     let snap = cfg.lock().clone();
     let engine_handle = engine::build(&snap)?;
@@ -333,7 +329,6 @@ fn build_payload(
     Ok(AutoRegisterRequest {
         install_id,
         registration_secret_hash,
-        label,
         capabilities,
         user_agent: format!("studio-worker/{AGENT_VERSION}"),
     })

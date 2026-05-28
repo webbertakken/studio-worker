@@ -35,6 +35,9 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     let cfg = config::shared(cfg);
     let stop = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
+    // Operator pause toggle.  Runtime-only: never persisted so the
+    // worker comes up unpaused on every launch.
+    let paused = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let observers = WorkerObservers::default();
 
@@ -78,6 +81,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     let stop_loops = stop.clone();
     let logs_loops = logs.clone();
     let busy_loops = busy.clone();
+    let paused_loops = paused.clone();
     let observers_loops = observers.clone();
     handle.spawn(async move {
         if let Err(e) = runtime::run_loops(
@@ -85,6 +89,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
             stop_loops,
             logs_loops,
             busy_loops,
+            paused_loops,
             observers_loops,
             LoopSchedule::default(),
         )
@@ -98,6 +103,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         cfg: cfg.clone(),
         logs: logs.clone(),
         busy: busy.clone(),
+        paused: paused.clone(),
         observers: observers.clone(),
         stop: stop.clone(),
         config_path: path,
@@ -112,7 +118,10 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         ..Default::default()
     };
 
-    let auto_enabled = { cfg.lock().auto_enabled };
+    // The tray menu label flips between "Pause" / "Resume" based on
+    // the current paused state; start with the live value so the
+    // first render is correct.
+    let initial_paused = paused.load(std::sync::atomic::Ordering::SeqCst);
 
     eframe::run_native(
         "studio-worker",
@@ -131,8 +140,12 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
             // app-indicator host (e.g. an X session with no system
             // tray) `build()` returns Err; we keep the UI usable
             // without a tray rather than aborting startup.
-            let tray_state =
-                install_tray(cc.egui_ctx.clone(), cfg.clone(), quit_handle, auto_enabled);
+            let tray_state = install_tray(
+                cc.egui_ctx.clone(),
+                paused.clone(),
+                quit_handle,
+                initial_paused,
+            );
             // Stash the tray inside the App so it lives as long as the
             // event loop (dropping it removes the icon).
             let mut app = app;
@@ -165,9 +178,9 @@ pub struct TrayMenuIds {
 
 fn install_tray(
     ctx: eframe::egui::Context,
-    cfg: crate::config::SharedConfig,
+    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     quit_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    auto_enabled: bool,
+    initial_paused: bool,
 ) -> TrayState {
     use tray_icon::menu::{MenuEvent, MenuId};
 
@@ -185,7 +198,7 @@ fn install_tray(
     //
     // macOS / Windows: tray-icon must be built on the main thread
     // that owns the winit event loop.  We do that inline.
-    let labels = tray::menu_labels(auto_enabled);
+    let labels = tray::menu_labels(initial_paused);
     let open_label = labels.open_window;
     let toggle_label = labels.toggle_auto.clone();
     let quit_label = labels.quit;
@@ -203,7 +216,7 @@ fn install_tray(
     // icon crate exposes globally.  Poll on a background thread to
     // request a repaint and route the click.
     let ctx_clone = ctx.clone();
-    let cfg_clone = cfg.clone();
+    let paused_clone = paused.clone();
     let open_for_thread = open_id.clone();
     let toggle_for_thread = toggle_id.clone();
     let quit_for_thread = quit_id.clone();
@@ -214,13 +227,12 @@ fn install_tray(
                 ctx_clone.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
                 ctx_clone.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
             } else if event.id == toggle_for_thread {
-                let mut guard = cfg_clone.lock();
-                guard.auto_enabled = !guard.auto_enabled;
-                let snapshot = guard.clone();
-                drop(guard);
-                if let Ok(p) = crate::config::resolve_path(None) {
-                    let _ = crate::config::save(&snapshot, &p);
-                }
+                let was_paused = paused_clone.fetch_xor(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!(
+                    target: "studio_worker::ui::tray",
+                    paused = !was_paused,
+                    "pause toggled from tray menu"
+                );
             } else if event.id == quit_for_thread {
                 quit_requested.store(true, std::sync::atomic::Ordering::SeqCst);
                 ctx_clone.request_repaint();
