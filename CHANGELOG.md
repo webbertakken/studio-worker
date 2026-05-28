@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.1](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.2.0...studio-worker-v0.2.1) (2026-05-28)
+
+
+### Features
+
+* real image inference via stable-diffusion.cpp ([#17](https://github.com/webbertakken/studio-worker/issues/17)) ([3db534f](https://github.com/webbertakken/studio-worker/commit/3db534fc4d1a772590b33318a2f1de513bd241d2))
+
+
+### Bug Fixes
+
+* **types:** resolved_task fallback leaves width/height/steps at 0 ([#19](https://github.com/webbertakken/studio-worker/issues/19)) ([71052aa](https://github.com/webbertakken/studio-worker/commit/71052aa6c1a7dd0350ea5b5657ca70d971adf8ab))
+* **ws:** send the full prompt on complete, not the 200-char preview ([#20](https://github.com/webbertakken/studio-worker/issues/20)) ([95a1240](https://github.com/webbertakken/studio-worker/commit/95a12403b9209cc58292969257332c118c55311d))
+
 ## [0.2.0](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.1.2...studio-worker-v0.2.0) (2026-05-25)
 
 
