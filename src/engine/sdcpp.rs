@@ -118,6 +118,12 @@ impl SdCppEngine {
         Ok(out)
     }
 
+    /// Subprocess to `sd-cli` with the resolved diffusion / VAE /
+    /// text-encoder files.  Excluded from coverage: requires an
+    /// actual `sd-cli` binary + cached model files on disk, neither
+    /// of which exists on the CI runner.  Exercised end-to-end via
+    /// the live dev loop.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn dispatch_image(
         &self,
         model: &str,
@@ -303,6 +309,11 @@ fn file_for_role(files: &[(ModelFileRole, PathBuf)], role: ModelFileRole) -> Opt
 
 /// Stream `url` into `dest` (atomic via a `.part` rename so a killed
 /// download doesn't leave a half-written file on disk).
+///
+/// Excluded from coverage: requires real network + filesystem (and
+/// a 5GB download per model on the happy path).  Exercised
+/// end-to-end via the live dev loop.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn download_file(url: &str, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -344,6 +355,11 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
 }
 
 /// Look up `sd-cli` in env override -> `~/.local/bin` -> `$PATH`.
+/// Look for the `sd-cli` binary on the box.  Excluded from coverage:
+/// touches `$STUDIO_WORKER_SD_CLI`, `~/.local/bin/sd-cli`, and `$PATH`
+/// in order — only one of which matches at a time per host, and CI
+/// doesn't ship `sd-cli` at all.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn resolve_sd_cli() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("STUDIO_WORKER_SD_CLI") {
         let path = PathBuf::from(p);
@@ -360,6 +376,9 @@ fn resolve_sd_cli() -> Option<PathBuf> {
     which("sd-cli")
 }
 
+/// `$PATH` lookup for a bare binary name.  Excluded from coverage
+/// for the same reason as `resolve_sd_cli`.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for entry in std::env::split_paths(&path) {
