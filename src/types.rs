@@ -370,16 +370,21 @@ pub struct JobClaim {
 
 impl JobClaim {
     /// Resolve the structured task, applying the legacy fallback if
-    /// `task` is missing.
+    /// `task` is missing.  The fallback intentionally leaves
+    /// `width / height / steps` at zero so the engine's defaults
+    /// (model cliDefaults for sd-cpp, sensible per-engine fallbacks
+    /// otherwise) win.  Setting concrete numbers here would silently
+    /// override the studio's resolution choice for any legacy offer
+    /// that doesn't carry a task payload.
     pub fn resolved_task(&self) -> Task {
         if let Some(t) = self.task.clone() {
             return t;
         }
         Task::Image(ImageParams {
             prompt: self.prompt.clone(),
-            width: 512,
-            height: 512,
-            steps: 20,
+            width: 0,
+            height: 0,
+            steps: 0,
             seed: None,
             ext: self.ext.clone(),
         })
