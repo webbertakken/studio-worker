@@ -285,4 +285,61 @@ mod tests {
         let multi = MultiEngine::new(vec![]);
         assert_eq!(multi.name(), "multi");
     }
+
+    fn sd_cpp_source() -> crate::types::ModelSource {
+        crate::types::ModelSource {
+            engine: crate::types::ModelEngine::SdCpp,
+            files: vec![],
+            cli_defaults: crate::types::ModelCliDefaults {
+                cfg_scale: 1.0,
+                steps: 8,
+                width: 1024,
+                height: 1024,
+                sampling_method: None,
+            },
+        }
+    }
+
+    /// The no-fallback policy: when the studio asks for an `sd-cpp`
+    /// model but no sd-cpp engine is compiled in (e.g. CI / minimal
+    /// build), dispatch errors loudly instead of silently routing the
+    /// job to synthetic.
+    #[test]
+    fn dispatch_with_source_refuses_to_fall_back_to_synthetic_for_real_models() {
+        let synth: Box<dyn Engine> = Box::new(SyntheticEngine::new());
+        let multi = MultiEngine::new(vec![synth]);
+        let source = sd_cpp_source();
+        let err = multi
+            .dispatch_with_source("some-real-flux-model", image_task(), &source)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no `sdcpp` engine compiled"),
+            "expected no-sdcpp-backend error, got: {err}"
+        );
+    }
+
+    /// Synthetic offers (engine == Synthetic) still route to the
+    /// synthetic engine.  This is *not* a fallback — the studio
+    /// explicitly asked for it.
+    #[test]
+    fn dispatch_with_source_routes_synthetic_engine_for_synthetic_models() {
+        let synth: Box<dyn Engine> = Box::new(SyntheticEngine::new());
+        let multi = MultiEngine::new(vec![synth]);
+        let source = crate::types::ModelSource {
+            engine: crate::types::ModelEngine::Synthetic,
+            files: vec![],
+            cli_defaults: crate::types::ModelCliDefaults {
+                cfg_scale: 1.0,
+                steps: 8,
+                width: 1024,
+                height: 1024,
+                sampling_method: None,
+            },
+        };
+        let result = multi
+            .dispatch_with_source("synthetic", image_task(), &source)
+            .unwrap();
+        assert!(matches!(result, TaskResult::Image { .. }));
+    }
 }
