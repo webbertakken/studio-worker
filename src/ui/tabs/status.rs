@@ -3,6 +3,8 @@
 //! hasn't registered yet, this tab shows the in-window Register form
 //! (fork #2 of plans/native-ui.md, default A).
 
+use std::sync::{atomic::AtomicBool, Arc};
+
 use chrono::{DateTime, Utc};
 use eframe::egui;
 
@@ -40,10 +42,9 @@ pub enum StatusView {
     Registered {
         worker_id: String,
         api_base_url: String,
-        engine: String,
         vram_total_gb: f32,
         vram_threshold_gb: f32,
-        auto_enabled: bool,
+        paused: bool,
         busy: bool,
         last_heartbeat: Option<HeartbeatSummary>,
     },
@@ -78,6 +79,7 @@ impl StatusView {
         cfg: &Config,
         registration: &RegistrationState,
         busy: bool,
+        paused: bool,
         last_heartbeat: Option<&HeartbeatStatus>,
         vram_total_gb: f32,
     ) -> Self {
@@ -86,10 +88,9 @@ impl StatusView {
             return Self::Registered {
                 worker_id: cfg.worker_id.clone().unwrap_or_default(),
                 api_base_url: cfg.api_base_url.clone(),
-                engine: cfg.engine.clone(),
                 vram_total_gb,
                 vram_threshold_gb: cfg.vram_threshold_gb,
-                auto_enabled: cfg.auto_enabled,
+                paused,
                 busy,
                 last_heartbeat: last_heartbeat.map(HeartbeatSummary::from),
             };
@@ -137,7 +138,7 @@ pub fn format_age(now: DateTime<Utc>, when: DateTime<Utc>) -> String {
 // Rendering
 // ---------------------------------------------------------------------------
 
-pub fn render(ui: &mut egui::Ui, view: &StatusView) {
+pub fn render(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<AtomicBool>) {
     match view {
         StatusView::Initialising { api_base_url } => render_initialising(ui, api_base_url),
         StatusView::Pending {
@@ -149,7 +150,7 @@ pub fn render(ui: &mut egui::Ui, view: &StatusView) {
             api_base_url,
             reason,
         } => render_rejected(ui, api_base_url, reason),
-        StatusView::Registered { .. } => render_registered(ui, view),
+        StatusView::Registered { .. } => render_registered(ui, view, paused_flag),
     }
 }
 
@@ -237,14 +238,13 @@ fn render_rejected(ui: &mut egui::Ui, api_base_url: &str, reason: &str) {
     );
 }
 
-fn render_registered(ui: &mut egui::Ui, view: &StatusView) {
+fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<AtomicBool>) {
     let StatusView::Registered {
         worker_id,
         api_base_url,
-        engine,
         vram_total_gb,
         vram_threshold_gb,
-        auto_enabled,
+        paused,
         busy,
         last_heartbeat,
     } = view
@@ -257,21 +257,37 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView) {
 
     let badge = if *busy {
         ("BUSY", egui::Color32::from_rgb(232, 168, 56))
-    } else if *auto_enabled {
-        ("IDLE", egui::Color32::LIGHT_GREEN)
-    } else {
+    } else if *paused {
         ("PAUSED", egui::Color32::LIGHT_GRAY)
+    } else {
+        ("IDLE", egui::Color32::LIGHT_GREEN)
     };
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(badge.0).color(badge.1).strong());
         ui.label("\u{2014}");
         ui.label(if *busy {
             "running a job"
-        } else if *auto_enabled {
-            "waiting for work"
+        } else if *paused {
+            "claiming paused by operator"
         } else {
-            "claiming disabled"
+            "waiting for work"
         });
+    });
+    ui.add_space(8.0);
+
+    ui.horizontal(|ui| {
+        let (label, hint) = if *paused {
+            ("Resume", "start accepting new job offers again")
+        } else {
+            (
+                "Pause",
+                "stop accepting new job offers (in-flight job, if any, will finish)",
+            )
+        };
+        if ui.button(label).on_hover_text(hint).clicked() {
+            // fetch_xor returns the previous value; flipping it.
+            paused_flag.fetch_xor(true, std::sync::atomic::Ordering::SeqCst);
+        }
     });
     ui.add_space(8.0);
 
@@ -285,10 +301,6 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView) {
 
             ui.label("API base URL");
             ui.monospace(api_base_url);
-            ui.end_row();
-
-            ui.label("Engine");
-            ui.monospace(engine);
             ui.end_row();
 
             ui.label("VRAM total");
@@ -331,9 +343,7 @@ mod tests {
             worker_id: Some("w-abc".into()),
             auth_token: Some("tok-xyz".into()),
             api_base_url: "https://studio.example".into(),
-            engine: "synthetic".into(),
             vram_threshold_gb: 12.0,
-            auto_enabled: true,
             ..Config::default()
         }
     }
@@ -341,7 +351,7 @@ mod tests {
     #[test]
     fn build_initialising_when_pristine_and_unregistered() {
         let cfg = Config::default();
-        let view = StatusView::build(&cfg, &RegistrationState::Pristine, false, None, 0.0);
+        let view = StatusView::build(&cfg, &RegistrationState::Pristine, false, false, None, 0.0);
         match view {
             StatusView::Initialising { api_base_url } => {
                 assert_eq!(api_base_url, cfg.api_base_url);
@@ -360,6 +370,7 @@ mod tests {
                 request_id: "rr-42".into(),
                 since,
             },
+            false,
             false,
             None,
             0.0,
@@ -386,6 +397,7 @@ mod tests {
                 reason: "unknown contributor".into(),
             },
             false,
+            false,
             None,
             0.0,
         );
@@ -407,6 +419,7 @@ mod tests {
                 since: Utc::now(),
             },
             false,
+            false,
             None,
             24.0,
         );
@@ -416,27 +429,35 @@ mod tests {
     #[test]
     fn build_registered_when_worker_id_and_token_present() {
         let cfg = registered_cfg();
-        let view = StatusView::build(&cfg, &RegistrationState::Approved, false, None, 24.0);
+        let view = StatusView::build(&cfg, &RegistrationState::Approved, false, false, None, 24.0);
         match view {
             StatusView::Registered {
                 worker_id,
                 api_base_url,
-                engine,
                 vram_total_gb,
                 vram_threshold_gb,
-                auto_enabled,
+                paused,
                 busy,
                 last_heartbeat,
             } => {
                 assert_eq!(worker_id, "w-abc");
                 assert_eq!(api_base_url, "https://studio.example");
-                assert_eq!(engine, "synthetic");
                 assert!((vram_total_gb - 24.0).abs() < f32::EPSILON);
                 assert!((vram_threshold_gb - 12.0).abs() < f32::EPSILON);
-                assert!(auto_enabled);
+                assert!(!paused);
                 assert!(!busy);
                 assert!(last_heartbeat.is_none());
             }
+            _ => panic!("expected Registered"),
+        }
+    }
+
+    #[test]
+    fn build_registered_propagates_paused() {
+        let cfg = registered_cfg();
+        let view = StatusView::build(&cfg, &RegistrationState::Approved, false, true, None, 24.0);
+        match view {
+            StatusView::Registered { paused, .. } => assert!(paused),
             _ => panic!("expected Registered"),
         }
     }
@@ -448,7 +469,14 @@ mod tests {
             last_attempt_at: Utc::now(),
             outcome: HeartbeatOutcome::Ok,
         };
-        let view = StatusView::build(&cfg, &RegistrationState::Approved, false, Some(&hb), 24.0);
+        let view = StatusView::build(
+            &cfg,
+            &RegistrationState::Approved,
+            false,
+            false,
+            Some(&hb),
+            24.0,
+        );
         match view {
             StatusView::Registered {
                 last_heartbeat: Some(s),
@@ -470,7 +498,14 @@ mod tests {
                 reason: "5xx".into(),
             },
         };
-        let view = StatusView::build(&cfg, &RegistrationState::Approved, true, Some(&hb), 24.0);
+        let view = StatusView::build(
+            &cfg,
+            &RegistrationState::Approved,
+            true,
+            false,
+            Some(&hb),
+            24.0,
+        );
         match view {
             StatusView::Registered {
                 busy,

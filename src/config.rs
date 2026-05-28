@@ -8,8 +8,22 @@
 //! (`auth_token`, `registration_secret`) so logs can be shipped
 //! off-box without leaking credentials.  See `tests/config_tracing.rs`
 //! for the regression contract.
+//!
+//! What lives here vs. what's stripped from the user-editable surface:
+//!
+//! * **Operator-facing**: `api_base_url`, `vram_threshold_gb`,
+//!   `auto_start`, `auto_update_*`, `models_root`.
+//!   These are exposed in the desktop UI's Config tab.
+//! * **Internal state, persisted but not user-editable**: `worker_id`,
+//!   `auth_token`, `install_id`, `registration_request_id`,
+//!   `registration_secret`.  The auto-register flow owns them; the UI
+//!   hides them entirely.
+//! * **Engine selection**: removed.  The runtime always builds a
+//!   `MultiEngine` containing every backend compiled into this binary
+//!   and routes each job to the right one.
+
 use anyhow::{anyhow, Context, Result};
-use directories::ProjectDirs;
+use directories::{ProjectDirs, UserDirs};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -20,36 +34,21 @@ const TRACE_TARGET: &str = "studio_worker::config";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Base URL of the studio API (e.g. `https://studio.minis.gg`).
+    /// Base URL of the studio API (e.g. `https://studio.minis.gg/`).
     pub api_base_url: String,
     /// Worker id, written on operator approval.  Cleared by
-    /// `studio-worker register --reset`.
+    /// `studio-worker register --reset`.  Internal — not surfaced as
+    /// a user-editable widget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>,
-    /// Per-worker token issued at registration.
+    /// Per-worker token issued at registration.  Internal — never
+    /// surfaced in the UI and redacted from log events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
     /// VRAM threshold the worker reports as its max claim size, in GB.
     pub vram_threshold_gb: f32,
     /// Whether to auto-launch the run loop at boot via the OS service.
     pub auto_start: bool,
-    /// Whether the worker should claim new jobs.
-    pub auto_enabled: bool,
-    /// Engine identifier: `synthetic`, `gradio`, `multi`, or — when
-    /// built with the matching cargo feature — `llama`, `whisper`,
-    /// `image-candle`, `video`, `tts`.
-    pub engine: String,
-    /// When `engine = "multi"`, the per-modality engines to combine.
-    /// First engine that claims support for a job's kind+model wins.
-    #[serde(default)]
-    pub engines: Vec<String>,
-    /// Local Gradio endpoint URL when `engine = "gradio"`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gradio_endpoint_url: Option<String>,
-    /// Explicit override of supported models.  When empty, the engine
-    /// reports its native list.
-    #[serde(default)]
-    pub supported_models_override: Vec<String>,
     /// Periodically check the release feed and auto-install newer
     /// versions when no job is running.
     #[serde(default = "default_auto_update_enabled")]
@@ -65,9 +64,9 @@ pub struct Config {
     pub auto_update_prerelease: bool,
     /// Root directory for downloaded model files (per-engine
     /// subdirectories: `llm/`, `stt/`, `tts/`, `image/`, `video/`).
-    /// Defaults to the OS cache dir.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models_root: Option<std::path::PathBuf>,
+    /// Defaults to `~/models` (resolved at load time).
+    #[serde(default = "default_models_root_persisted")]
+    pub models_root: PathBuf,
     /// Maximum number of WebSocket reconnect attempts before the
     /// worker gives up and exits non-zero (relying on the service
     /// manager to restart it).  `0` = infinite.  Defaults to `5`.
@@ -78,11 +77,6 @@ pub struct Config {
     /// Internal state, populated by the auto-register flow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_id: Option<String>,
-    /// Optional human label shown in the studio's Pending Workers
-    /// panel.  Defaults to None; user-settable via
-    /// `studio-worker register --label "..."`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
     /// `requestId` returned by `POST /workers/register-request`.
     /// Cleared on approval / rejection.  Internal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,27 +97,54 @@ fn default_auto_update_feed() -> String {
     "https://api.github.com/repos/webbertakken/studio-worker/releases".into()
 }
 
+/// Resolve `~/models` for the user running the worker.  Falls back to
+/// `$TMPDIR/studio-worker-models` on the (extremely unusual) machines
+/// where `directories` can't find a home directory.
+pub fn default_models_root() -> PathBuf {
+    if let Some(user) = UserDirs::new() {
+        return user.home_dir().join("models");
+    }
+    std::env::temp_dir().join("studio-worker-models")
+}
+
+fn default_models_root_persisted() -> PathBuf {
+    default_models_root()
+}
+
+/// Resolve a leading `~` to the running user's home dir.  Stops the
+/// worker from creating a literal `~` directory on disk when the
+/// config carries an unexpanded path (most commonly: a hand-edited
+/// `models_root = "~/models"`).
+fn expand_home(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        return UserDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .unwrap_or(path);
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(d) = UserDirs::new() {
+            return d.home_dir().join(rest);
+        }
+    }
+    path
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api_base_url: "https://studio.minis.gg".into(),
+            api_base_url: "https://studio.minis.gg/".into(),
             worker_id: None,
             auth_token: None,
             vram_threshold_gb: 12.0,
             auto_start: true,
-            auto_enabled: true,
-            engine: "synthetic".into(),
-            engines: Vec::new(),
-            gradio_endpoint_url: None,
-            supported_models_override: Vec::new(),
             auto_update_enabled: default_auto_update_enabled(),
             auto_update_interval_secs: default_auto_update_interval(),
             auto_update_feed: default_auto_update_feed(),
             auto_update_prerelease: false,
-            models_root: None,
+            models_root: default_models_root(),
             ws_reconnect_attempts: None,
             install_id: None,
-            label: None,
             registration_request_id: None,
             registration_secret: None,
         }
@@ -154,26 +175,27 @@ pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
             op = "load",
             source = "default_created",
             config_path = %path.display(),
-            engine = %cfg.engine,
             api_base_url = %cfg.api_base_url,
             vram_threshold_gb = cfg.vram_threshold_gb,
-            auto_enabled = cfg.auto_enabled,
+            auto_start = cfg.auto_start,
+            models_root = %cfg.models_root.display(),
             "config file missing — bootstrapped defaults"
         );
         return Ok((cfg, path));
     }
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config = toml::from_str(&text).with_context(|| "parsing config.toml")?;
+    let mut cfg: Config = toml::from_str(&text).with_context(|| "parsing config.toml")?;
+    cfg.models_root = expand_home(std::mem::take(&mut cfg.models_root));
     tracing::debug!(
         target: TRACE_TARGET,
         op = "load",
         source = "existing_file",
         config_path = %path.display(),
-        engine = %cfg.engine,
         api_base_url = %cfg.api_base_url,
         vram_threshold_gb = cfg.vram_threshold_gb,
-        auto_enabled = cfg.auto_enabled,
+        auto_start = cfg.auto_start,
+        models_root = %cfg.models_root.display(),
         worker_id = cfg.worker_id.as_deref().unwrap_or("(unregistered)"),
         has_auth_token = cfg.auth_token.is_some(),
         "loaded config from disk"
@@ -193,9 +215,9 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
         target: TRACE_TARGET,
         op = "save",
         config_path = %path.display(),
-        engine = %cfg.engine,
         vram_threshold_gb = cfg.vram_threshold_gb,
-        auto_enabled = cfg.auto_enabled,
+        auto_start = cfg.auto_start,
+        models_root = %cfg.models_root.display(),
         bytes = bytes,
         "persisted config to disk"
     );
@@ -217,8 +239,7 @@ mod tests {
     #[test]
     fn default_values_are_sensible() {
         let cfg = Config::default();
-        assert_eq!(cfg.engine, "synthetic");
-        assert!(cfg.auto_enabled);
+        assert_eq!(cfg.api_base_url, "https://studio.minis.gg/");
         assert!(cfg.auto_start);
         assert!(cfg.auto_update_enabled);
         assert_eq!(cfg.auto_update_interval_secs, 1800);
@@ -227,6 +248,10 @@ mod tests {
         assert_eq!(cfg.vram_threshold_gb, 12.0);
         assert!(cfg.worker_id.is_none());
         assert!(cfg.auth_token.is_none());
+        // Models root defaults to ~/models (or a temp fallback on
+        // headless boxes without UserDirs).
+        let m = cfg.models_root.to_string_lossy().to_string();
+        assert!(m.ends_with("models") || m.contains("studio-worker-models"));
     }
 
     #[test]
@@ -253,7 +278,7 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
         let (cfg, returned_path) = load(Some(&path_str)).unwrap();
         assert_eq!(returned_path, path);
-        assert_eq!(cfg.engine, "synthetic");
+        assert_eq!(cfg.api_base_url, "https://studio.minis.gg/");
         // File should have been written.
         assert!(path.exists());
     }
@@ -263,29 +288,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let cfg = Config {
-            engine: "gradio".into(),
-            gradio_endpoint_url: Some("http://example.invalid".into()),
             worker_id: Some("w-123".into()),
             auth_token: Some("tok-xyz".into()),
             vram_threshold_gb: 24.0,
             auto_update_prerelease: true,
-            supported_models_override: vec!["foo".into(), "bar".into()],
+            models_root: PathBuf::from("/tmp/test-models"),
             ..Config::default()
         };
         save(&cfg, &path).unwrap();
 
         let path_str = path.to_string_lossy().to_string();
         let (loaded, _) = load(Some(&path_str)).unwrap();
-        assert_eq!(loaded.engine, cfg.engine);
-        assert_eq!(loaded.gradio_endpoint_url, cfg.gradio_endpoint_url);
+        assert_eq!(loaded.api_base_url, cfg.api_base_url);
         assert_eq!(loaded.worker_id, cfg.worker_id);
         assert_eq!(loaded.auth_token, cfg.auth_token);
         assert_eq!(loaded.vram_threshold_gb, cfg.vram_threshold_gb);
         assert_eq!(loaded.auto_update_prerelease, cfg.auto_update_prerelease);
-        assert_eq!(
-            loaded.supported_models_override,
-            cfg.supported_models_override
-        );
+        assert_eq!(loaded.models_root, cfg.models_root);
     }
 
     #[test]
@@ -293,7 +312,7 @@ mod tests {
         let cfg = Config::default();
         let shared = shared(cfg.clone());
         let guard = shared.lock();
-        assert_eq!(guard.engine, cfg.engine);
+        assert_eq!(guard.api_base_url, cfg.api_base_url);
     }
 
     #[test]
@@ -304,5 +323,69 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
         let err = load(Some(&path_str)).unwrap_err();
         assert!(err.to_string().contains("parsing config.toml"));
+    }
+
+    #[test]
+    fn load_strips_legacy_engine_fields_silently() {
+        // Older configs had `engine`, `engines`, `auto_enabled`, `label`.
+        // serde::Deserialize on the new struct should ignore them (they
+        // aren't in the schema any more); the worker keeps running.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let legacy = r#"
+            api_base_url = "https://example.invalid"
+            vram_threshold_gb = 8.0
+            auto_start = true
+            engine = "multi"
+            engines = ["llama", "synthetic"]
+            auto_enabled = false
+            label = "alice's rig"
+        "#;
+        std::fs::write(&path, legacy).unwrap();
+        let (cfg, _) = load(Some(&path.to_string_lossy())).unwrap();
+        assert_eq!(cfg.api_base_url, "https://example.invalid");
+        assert_eq!(cfg.vram_threshold_gb, 8.0);
+    }
+
+    #[test]
+    fn load_expands_leading_tilde_in_models_root() {
+        // Users who hand-edit `config.toml` often write `~/models`;
+        // the worker must expand it, not create a literal `~` dir.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = r#"
+            api_base_url = "https://x.invalid"
+            vram_threshold_gb = 4.0
+            auto_start = true
+            auto_update_enabled = false
+            auto_update_interval_secs = 1
+            auto_update_feed = "https://x.invalid"
+            auto_update_prerelease = false
+            models_root = "~/models-test"
+        "#;
+        std::fs::write(&path, raw).unwrap();
+        let (cfg, _) = load(Some(&path.to_string_lossy())).unwrap();
+        assert!(
+            cfg.models_root.is_absolute(),
+            "~/ should expand to an absolute path, got {}",
+            cfg.models_root.display()
+        );
+        assert!(cfg.models_root.ends_with("models-test"));
+    }
+
+    #[test]
+    fn expand_home_leaves_absolute_paths_alone() {
+        let p = PathBuf::from("/tmp/anywhere");
+        assert_eq!(expand_home(p.clone()), p);
+    }
+
+    #[test]
+    fn expand_home_handles_bare_tilde() {
+        let expanded = expand_home(PathBuf::from("~"));
+        assert!(
+            expanded.is_absolute() || expanded == Path::new("~"),
+            "bare ~ expands to home (or stays put on weird boxes), got {}",
+            expanded.display()
+        );
     }
 }

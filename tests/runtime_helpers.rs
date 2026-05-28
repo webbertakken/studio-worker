@@ -13,8 +13,6 @@ fn write_config(dir: &Path, api_uri: &str, feed: &str) -> PathBuf {
         r#"api_base_url = "{api_uri}"
 vram_threshold_gb = 16.0
 auto_start = true
-auto_enabled = true
-engine = "synthetic"
 auto_update_enabled = true
 auto_update_interval_secs = 60
 auto_update_feed = "{feed}"
@@ -26,7 +24,7 @@ auto_update_prerelease = false
 }
 
 #[tokio::test]
-async fn register_helper_persists_api_base_url_and_label_overrides() {
+async fn register_helper_persists_api_base_url_override() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = write_config(dir.path(), "http://placeholder", "http://feed.invalid");
     let cfg_path_str = cfg_path.to_string_lossy().to_string();
@@ -34,7 +32,6 @@ async fn register_helper_persists_api_base_url_and_label_overrides() {
         Some(&cfg_path_str),
         runtime::RegisterArgs {
             api_base_url: Some("http://127.0.0.1:0".into()),
-            label: Some("my-rig".into()),
             ..Default::default()
         },
     )
@@ -42,7 +39,6 @@ async fn register_helper_persists_api_base_url_and_label_overrides() {
     .unwrap();
     let (cfg, _) = config::load(Some(&cfg_path_str)).unwrap();
     assert_eq!(cfg.api_base_url, "http://127.0.0.1:0");
-    assert_eq!(cfg.label.as_deref(), Some("my-rig"));
 }
 
 #[tokio::test]
@@ -72,16 +68,14 @@ async fn check_update_helper_calls_feed_and_prints_outcome() {
 }
 
 #[tokio::test]
-async fn set_enabled_and_threshold_persist_to_disk() {
+async fn set_threshold_persists_to_disk() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = write_config(dir.path(), "http://api.invalid", "http://feed.invalid");
     let cfg_path_str = cfg_path.to_string_lossy().to_string();
 
-    runtime::set_enabled(Some(&cfg_path_str), false).unwrap();
     runtime::set_threshold(Some(&cfg_path_str), 33.0).unwrap();
 
     let (cfg, _) = config::load(Some(&cfg_path_str)).unwrap();
-    assert!(!cfg.auto_enabled);
     assert_eq!(cfg.vram_threshold_gb, 33.0);
 }
 
@@ -114,28 +108,10 @@ async fn run_cli_dispatches_status_subcommand() {
 }
 
 #[tokio::test]
-async fn run_cli_dispatches_enable_disable_and_set_threshold() {
+async fn run_cli_dispatches_set_threshold() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = write_config(dir.path(), "http://api.invalid", "http://feed.invalid");
     let p = cfg_path.to_string_lossy().to_string();
-
-    run_cli(cli::Cli {
-        config: Some(p.clone()),
-        command: cli::Command::Disable,
-    })
-    .await
-    .unwrap();
-    let (cfg, _) = config::load(Some(&p)).unwrap();
-    assert!(!cfg.auto_enabled);
-
-    run_cli(cli::Cli {
-        config: Some(p.clone()),
-        command: cli::Command::Enable,
-    })
-    .await
-    .unwrap();
-    let (cfg, _) = config::load(Some(&p)).unwrap();
-    assert!(cfg.auto_enabled);
 
     run_cli(cli::Cli {
         config: Some(p.clone()),
@@ -169,7 +145,6 @@ async fn run_cli_dispatches_register_subcommand() {
         config: Some(p.clone()),
         command: cli::Command::Register {
             api_base_url: Some("http://cli.invalid".into()),
-            label: Some("cli-rig".into()),
             reset: false,
         },
     })
@@ -177,7 +152,6 @@ async fn run_cli_dispatches_register_subcommand() {
     .unwrap();
     let (cfg, _) = config::load(Some(&p)).unwrap();
     assert_eq!(cfg.api_base_url, "http://cli.invalid");
-    assert_eq!(cfg.label.as_deref(), Some("cli-rig"));
 }
 
 #[tokio::test]
@@ -253,8 +227,6 @@ worker_id = "w-test"
 auth_token = "tok-test"
 vram_threshold_gb = 16.0
 auto_start = true
-auto_enabled = true
-engine = "synthetic"
 auto_update_enabled = true
 auto_update_interval_secs = 9999
 auto_update_feed = "{}/releases"

@@ -20,8 +20,6 @@ fn registered_cfg(api: &str) -> Config {
         api_base_url: api.into(),
         worker_id: Some("w-test".into()),
         auth_token: Some("tok-test".into()),
-        engine: "synthetic".into(),
-        auto_enabled: true,
         auto_update_enabled: false,
         ..Config::default()
     }
@@ -140,18 +138,16 @@ async fn run_returns_when_aborted() {
         &cfg_path,
         format!(
             r#"api_base_url = "{}"
-bootstrap_token = "boot"
 worker_id = "w-test"
 auth_token = "tok-test"
 vram_threshold_gb = 16.0
 auto_start = true
-auto_enabled = true
-engine = "synthetic"
 auto_update_enabled = true
 auto_update_interval_secs = 60
 auto_update_feed = "{}/releases"
 auto_update_prerelease = false
 ws_reconnect_attempts = 1
+models_root = "/tmp/studio-worker-test-models"
 "#,
             api.uri(),
             feed.uri()

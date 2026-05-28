@@ -1,15 +1,17 @@
-//! Proves the `run` startup and the persisted-state mutation helpers
-//! (`set_enabled`, `set_threshold`) emit operator-visible `tracing`
-//! events.
+//! Proves the `run` startup banner and the `set_threshold` mutation
+//! helper emit operator-visible `tracing` events.
 //!
 //! Without these the only thing a `journalctl -u studio-worker` shows
 //! on a healthy worker boot is whatever the loops happen to log on
-//! their first tick — the actual config in effect (engine, API URL,
-//! VRAM threshold, auto-update settings, agent version) is invisible.
+//! their first tick — the actual config in effect (API URL, VRAM
+//! threshold, auto-update settings, agent version, models root) is
+//! invisible.
 //!
 //! Uses the shared `studio_worker::test_support::capture` helper
-//! (aliased locally as `captured_logs_for` to keep call sites readable).
+//! (aliased locally as `captured_logs_for` to keep call sites
+//! readable).
 
+use std::path::PathBuf;
 use studio_worker::config::{self, Config};
 use studio_worker::runtime;
 use studio_worker::test_support::capture as captured_logs_for;
@@ -26,11 +28,11 @@ fn log_startup_banner_records_key_config_fields() {
     let path = dir.path().join("config.toml");
     let cfg = Config {
         api_base_url: "https://studio.example.com".into(),
-        engine: "synthetic".into(),
         vram_threshold_gb: 8.5,
-        auto_enabled: false,
+        auto_start: false,
         auto_update_enabled: true,
         auto_update_interval_secs: 900,
+        models_root: PathBuf::from("/tmp/audit-models"),
         worker_id: Some("worker-42".into()),
         ..Config::default()
     };
@@ -53,16 +55,12 @@ fn log_startup_banner_records_key_config_fields() {
         "expected api_base_url field: {logs}"
     );
     assert!(
-        logs.contains("engine=\"synthetic\""),
-        "expected engine field: {logs}"
-    );
-    assert!(
         logs.contains("vram_threshold_gb=8.5"),
         "expected vram_threshold_gb field: {logs}"
     );
     assert!(
-        logs.contains("auto_enabled=false"),
-        "expected auto_enabled field: {logs}"
+        logs.contains("auto_start=false"),
+        "expected auto_start field: {logs}"
     );
     assert!(
         logs.contains("auto_update_enabled=true"),
@@ -71,6 +69,10 @@ fn log_startup_banner_records_key_config_fields() {
     assert!(
         logs.contains("auto_update_interval_secs=900"),
         "expected auto_update_interval_secs field: {logs}"
+    );
+    assert!(
+        logs.contains("models_root=\"/tmp/audit-models\""),
+        "expected models_root field: {logs}"
     );
     assert!(
         logs.contains("worker_id=\"worker-42\""),
@@ -102,38 +104,11 @@ fn log_startup_banner_marks_unregistered_worker() {
 }
 
 // ---------------------------------------------------------------------------
-// State-mutation audit trail — `set_enabled` / `set_threshold` persist
-// changes that affect job intake.  They MUST leave a tracing record so
-// the operator can correlate "worker stopped claiming" with the actual
-// CLI invocation that flipped the flag.
+// State-mutation audit trail — `set_threshold` persists a change that
+// affects job intake.  It MUST leave a tracing record so the operator
+// can correlate "worker stopped claiming jobs of size X" with the
+// actual CLI invocation that flipped the threshold.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn set_enabled_emits_audit_trail() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("config.toml");
-    // Seed the file so `set_enabled` round-trips through load/save.
-    config::save(&Config::default(), &path).unwrap();
-
-    let path_str = path.to_string_lossy().to_string();
-    let logs = captured_logs_for(move || {
-        runtime::set_enabled(Some(&path_str), false).unwrap();
-    });
-
-    assert!(
-        logs.contains("studio_worker::runtime"),
-        "expected runtime target: {logs}"
-    );
-    assert!(logs.contains("INFO"), "expected INFO event: {logs}");
-    assert!(
-        logs.contains("op=\"set_enabled\""),
-        "expected op field: {logs}"
-    );
-    assert!(
-        logs.contains("auto_enabled=false"),
-        "expected auto_enabled field: {logs}"
-    );
-}
 
 #[test]
 fn set_threshold_emits_audit_trail() {

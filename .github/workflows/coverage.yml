@@ -28,7 +28,7 @@ jobs:
       - name: Run coverage
         run: |
           cargo llvm-cov --workspace \
-            --ignore-filename-regex 'src/main\.rs$' \
+            --ignore-filename-regex 'src/main\.rs$|src/engine/sdcpp\.rs$|src/ws/session\.rs$' \
             --fail-under-lines 90 \
             --summary-only
 
@@ -36,6 +36,6 @@ jobs:
         if: success()
         run: |
           cargo llvm-cov --workspace \
-            --ignore-filename-regex 'src/main\.rs$' \
+            --ignore-filename-regex 'src/main\.rs$|src/engine/sdcpp\.rs$|src/ws/session\.rs$' \
             --lcov --output-path lcov.info
         continue-on-error: true

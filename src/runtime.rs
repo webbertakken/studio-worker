@@ -33,6 +33,11 @@ const TRACE_TARGET: &str = "studio_worker::runtime";
 /// Older entries fall off the back of the ring.
 pub const RECENT_JOBS_CAP: usize = 50;
 
+/// Maximum number of log entries kept in `WorkerObservers::recent_logs`
+/// for the UI's Logs tab.  The shipping queue (`logs: Arc<Mutex<Vec<…>>>`)
+/// is drained on every WS tick — the display ring is what the UI reads.
+pub const RECENT_LOGS_CAP: usize = 1000;
+
 /// Prompt previews stored in `CurrentJob` / `RecentJob` are clipped to
 /// this many chars so the in-memory state stays bounded even when LLM
 /// prompts are huge.
@@ -91,6 +96,11 @@ pub struct WorkerObservers {
     pub current_job: Arc<Mutex<Option<CurrentJob>>>,
     pub recent_jobs: Arc<Mutex<VecDeque<RecentJob>>>,
     pub last_heartbeat: Arc<Mutex<Option<HeartbeatStatus>>>,
+    /// Bounded ring of every log entry the worker has emitted, kept
+    /// for the UI's Logs tab.  Separate from the WS ship queue
+    /// (which is drained every second) so the display doesn't blank
+    /// out between ticks.
+    pub recent_logs: Arc<Mutex<VecDeque<LogEntry>>>,
 }
 
 pub fn truncate_prompt(s: &str) -> String {
@@ -169,7 +179,6 @@ impl LoopSchedule {
 #[derive(Debug, Clone, Default)]
 pub struct RegisterArgs {
     pub api_base_url: Option<String>,
-    pub label: Option<String>,
     pub reset: bool,
 }
 
@@ -188,13 +197,6 @@ pub async fn register(config_path: Option<&str>, args: RegisterArgs) -> Result<(
     }
     if let Some(url) = args.api_base_url {
         cfg.api_base_url = url;
-    }
-    if let Some(label) = args.label {
-        cfg.label = if label.trim().is_empty() {
-            None
-        } else {
-            Some(label)
-        };
     }
 
     config::save(&cfg, &path)?;
@@ -239,13 +241,9 @@ pub fn format_status(cfg: &Config, path: &std::path::Path) -> String {
         "not registered (will auto-register on next launch)".into()
     };
     let _ = writeln!(out, "registration:       {registration_line}");
-    if let Some(label) = cfg.label.as_deref() {
-        let _ = writeln!(out, "label:              {label}");
-    }
-    let _ = writeln!(out, "engine:             {}", cfg.engine);
     let _ = writeln!(out, "vram_threshold_gb:  {}", cfg.vram_threshold_gb);
-    let _ = writeln!(out, "auto_enabled:       {}", cfg.auto_enabled);
     let _ = writeln!(out, "auto_start:         {}", cfg.auto_start);
+    let _ = writeln!(out, "models_root:        {}", cfg.models_root.display());
     let _ = writeln!(out, "auto_update:        {}", cfg.auto_update_enabled);
     let _ = writeln!(
         out,
@@ -253,21 +251,6 @@ pub fn format_status(cfg: &Config, path: &std::path::Path) -> String {
         cfg.auto_update_interval_secs
     );
     out
-}
-
-pub fn set_enabled(config_path: Option<&str>, enabled: bool) -> Result<()> {
-    let (mut cfg, path) = config::load(config_path)?;
-    cfg.auto_enabled = enabled;
-    config::save(&cfg, &path)?;
-    info!(
-        target: TRACE_TARGET,
-        op = "set_enabled",
-        auto_enabled = enabled,
-        config_path = path.display().to_string(),
-        "auto-claim flag persisted"
-    );
-    println!("auto_enabled = {enabled}");
-    Ok(())
 }
 
 pub fn set_threshold(config_path: Option<&str>, gb: f32) -> Result<()> {
@@ -299,11 +282,11 @@ pub fn log_startup_banner(cfg: &Config, path: &std::path::Path) {
         version = AGENT_VERSION,
         config_path = path.display().to_string(),
         api_base_url = cfg.api_base_url.as_str(),
-        engine = cfg.engine.as_str(),
         vram_threshold_gb = cfg.vram_threshold_gb,
-        auto_enabled = cfg.auto_enabled,
+        auto_start = cfg.auto_start,
         auto_update_enabled = cfg.auto_update_enabled,
         auto_update_interval_secs = cfg.auto_update_interval_secs,
+        models_root = cfg.models_root.display().to_string(),
         worker_id = cfg.worker_id.as_deref().unwrap_or("(unregistered)"),
         "studio-worker booting"
     );
@@ -348,6 +331,9 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     let cfg = config::shared(cfg);
     let stop = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
+    // Operator pause toggle.  Runtime-only — never persisted, so the
+    // worker comes up unpaused after every restart.
+    let paused = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let observers = WorkerObservers::default();
     let registration = crate::auto_register::shared_initial();
@@ -362,7 +348,16 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     // Polls every 30s; aborts on Ctrl-C.
     ensure_registered(&cfg, &path, &registration, &stop).await?;
 
-    run_loops(cfg, stop, logs, busy, observers, LoopSchedule::default()).await
+    run_loops(
+        cfg,
+        stop,
+        logs,
+        busy,
+        paused,
+        observers,
+        LoopSchedule::default(),
+    )
+    .await
 }
 
 /// Loop auto_register::tick on a 30s cadence until `worker_id` +
@@ -408,11 +403,17 @@ pub async fn ensure_registered(
 
 /// Spawn the WS session + auto-updater, wait for them.  Pulled out of
 /// `run` so tests can drive with a different schedule.
+///
+/// `paused` is the runtime-only Pause / Resume toggle the UI flips.
+/// When set, the WS session advertises `auto_enabled = false` in
+/// heartbeats and refuses new job offers without restarting the
+/// session.
 pub async fn run_loops(
     cfg: SharedConfig,
     stop: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     observers: WorkerObservers,
     schedule: LoopSchedule,
 ) -> Result<()> {
@@ -422,6 +423,7 @@ pub async fn run_loops(
         stop.clone(),
         logs.clone(),
         busy.clone(),
+        paused.clone(),
         observers.clone(),
         session_schedule,
     );
@@ -610,6 +612,18 @@ pub fn is_unsupported_kind(e: &anyhow::Error) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn build_capabilities(cfg: &Config, engine: &dyn Engine) -> WorkerCapabilities {
+    build_capabilities_with(cfg, engine, true)
+}
+
+/// Same as [`build_capabilities`] but lets the caller drive
+/// `auto_enabled` from a runtime pause flag (the UI's Pause/Resume
+/// button).  The persisted [`Config`] no longer carries that bit —
+/// it's an in-process toggle.
+pub fn build_capabilities_with(
+    cfg: &Config,
+    engine: &dyn Engine,
+    auto_enabled: bool,
+) -> WorkerCapabilities {
     let vram = sys::detect_vram_gb().unwrap_or(0.0);
     let caps = engine.capabilities();
     let supported_models_per_kind = caps.supported_models_per_kind.clone();
@@ -623,20 +637,15 @@ pub fn build_capabilities(cfg: &Config, engine: &dyn Engine) -> WorkerCapabiliti
         all.dedup();
         all
     };
-    let supported_models = if cfg.supported_models_override.is_empty() {
-        supported_models
-    } else {
-        cfg.supported_models_override.clone()
-    };
 
     WorkerCapabilities {
         machine_name: sys::machine_name(),
         username: sys::username(),
         agent_version: AGENT_VERSION.to_string(),
-        engine: cfg.engine.clone(),
+        engine: engine.name().to_string(),
         vram_total_gb: vram,
         vram_threshold_gb: cfg.vram_threshold_gb,
-        auto_enabled: cfg.auto_enabled,
+        auto_enabled,
         auto_start: cfg.auto_start,
         supported_models,
         task_kinds,
@@ -646,6 +655,22 @@ pub fn build_capabilities(cfg: &Config, engine: &dyn Engine) -> WorkerCapabiliti
 
 pub fn push_log(
     logs: &Arc<Mutex<Vec<LogEntry>>>,
+    level: &str,
+    category: &str,
+    message: &str,
+    job_id: Option<String>,
+) {
+    push_log_with_observers(logs, None, level, category, message, job_id);
+}
+
+/// Same as [`push_log`] but also appends to
+/// [`WorkerObservers::recent_logs`] so the UI's Logs tab keeps a
+/// rolling display window.  The WS session uses this variant so
+/// operators don't see the Logs tab blank out every second when the
+/// shipping queue gets drained.
+pub fn push_log_with_observers(
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    observers: Option<&WorkerObservers>,
     level: &str,
     category: &str,
     message: &str,
@@ -665,7 +690,14 @@ pub fn push_log(
     } else {
         info!(target: "studio_worker", "[{category}] {message}");
     }
-    logs.lock().push(entry);
+    logs.lock().push(entry.clone());
+    if let Some(o) = observers {
+        let mut ring = o.recent_logs.lock();
+        ring.push_back(entry);
+        while ring.len() > RECENT_LOGS_CAP {
+            ring.pop_front();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -677,24 +709,22 @@ mod tests {
     #[test]
     fn capabilities_advertises_all_synthetic_kinds() {
         let cfg = Config::default();
-        let engine = SyntheticEngine::new(vec![]);
+        let engine = SyntheticEngine::new();
         let cap = build_capabilities(&cfg, &engine);
         assert_eq!(cap.engine, "synthetic");
         assert_eq!(cap.task_kinds.len(), TaskKind::ALL.len());
+        assert!(cap.auto_enabled, "default capability snapshot is unpaused");
         for kind in TaskKind::ALL {
             assert!(cap.supported_models_per_kind.contains_key(&kind));
         }
     }
 
     #[test]
-    fn capabilities_uses_override_for_legacy_flat_list() {
-        let cfg = Config {
-            supported_models_override: vec!["only-this".into()],
-            ..Config::default()
-        };
-        let engine = SyntheticEngine::new(vec![]);
-        let cap = build_capabilities(&cfg, &engine);
-        assert_eq!(cap.supported_models, vec!["only-this".to_string()]);
+    fn capabilities_with_paused_flag_drives_auto_enabled() {
+        let cfg = Config::default();
+        let engine = SyntheticEngine::new();
+        let paused_caps = build_capabilities_with(&cfg, &engine, false);
+        assert!(!paused_caps.auto_enabled);
     }
 
     #[test]
@@ -757,7 +787,7 @@ mod tests {
 
     #[test]
     fn is_unsupported_kind_matches_engine_message() {
-        let err = anyhow!("gradio engine cannot serve llm tasks");
+        let err = anyhow!("multi engine cannot serve llm tasks");
         assert!(is_unsupported_kind(&err));
         let other = anyhow!("network timeout");
         assert!(!is_unsupported_kind(&other));
@@ -771,6 +801,7 @@ mod tests {
         assert!(out.contains("api_base_url:"));
         assert!(out.contains("registration:"));
         assert!(out.contains("not registered"));
+        assert!(out.contains("models_root:"));
         assert!(out.contains("auto_update:"));
         assert!(out.contains("update_interval:"));
     }
@@ -796,16 +827,6 @@ mod tests {
         let out = format_status(&cfg, std::path::Path::new("/tmp/x.toml"));
         assert!(out.contains("pending operator approval"));
         assert!(out.contains("rr-7"));
-    }
-
-    #[test]
-    fn format_status_shows_label_when_set() {
-        let cfg = Config {
-            label: Some("alice's rig".into()),
-            ..Config::default()
-        };
-        let out = format_status(&cfg, std::path::Path::new("/tmp/x.toml"));
-        assert!(out.contains("alice's rig"));
     }
 
     #[test]

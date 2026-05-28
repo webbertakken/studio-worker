@@ -191,6 +191,7 @@ mod tests {
             current_job: Arc::new(Mutex::new(None)),
             recent_jobs: Arc::new(Mutex::new(VecDeque::new())),
             last_heartbeat: Arc::new(Mutex::new(None)),
+            recent_logs: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 

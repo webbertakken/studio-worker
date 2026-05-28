@@ -4,7 +4,7 @@
 
 use std::io::Cursor;
 use studio_worker::config::Config;
-use studio_worker::engine::{self, Engine};
+use studio_worker::engine;
 use studio_worker::types::*;
 
 fn synth_engine() -> Box<dyn engine::Engine> {
@@ -144,20 +144,18 @@ fn capabilities_supports_returns_false_for_unknown_model() {
 }
 
 #[test]
-fn capabilities_supports_returns_false_for_unsupported_kind() {
-    use studio_worker::engine::{Engine, GradioEngine};
-    let engine = GradioEngine::new("http://localhost".into(), vec!["x".into()]);
+fn capabilities_supports_returns_false_for_unsupported_model() {
+    let engine = synth_engine();
     let caps = engine.capabilities();
-    assert!(!caps.supports(TaskKind::Llm, "x"));
+    assert!(!caps.supports(TaskKind::Llm, "definitely-not-a-model"));
 }
 
 #[test]
-fn engines_expose_their_name() {
-    let synth = synth_engine();
-    assert_eq!(synth.name(), "synthetic");
-    use studio_worker::engine::GradioEngine;
-    let gradio = GradioEngine::new("http://x".into(), vec![]);
-    assert_eq!(gradio.name(), "gradio");
+fn build_returns_a_multi_engine_named_multi() {
+    let engine = synth_engine();
+    // `engine::build` always wraps the available backends in a
+    // MultiEngine, even when only synthetic is compiled in.
+    assert_eq!(engine.name(), "multi");
 }
 
 #[test]

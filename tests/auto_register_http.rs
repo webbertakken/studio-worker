@@ -18,7 +18,7 @@ fn caps() -> WorkerCapabilities {
         machine_name: "alice-rig".into(),
         username: "alice".into(),
         agent_version: env!("CARGO_PKG_VERSION").into(),
-        engine: "synthetic".into(),
+        engine: "multi".into(),
         vram_total_gb: 24.0,
         vram_threshold_gb: 12.0,
         auto_enabled: true,
@@ -33,7 +33,6 @@ fn payload() -> AutoRegisterRequest {
     AutoRegisterRequest {
         install_id: "11111111-2222-3333-4444-555555555555".into(),
         registration_secret_hash: "0123456789abcdef".repeat(4),
-        label: Some("alice's gaming rig".into()),
         capabilities: caps(),
         user_agent: format!("studio-worker/{}", env!("CARGO_PKG_VERSION")),
     }

@@ -42,6 +42,12 @@ mp4 = "0.14.0"
 semver = "1.0.28"
 tempfile = "3"
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Direct rustls dep so we can call `crypto::ring::default_provider`.
+# rustls 0.23 stopped auto-picking a CryptoProvider from cargo
+# features; the first wss/https handshake panics without an explicit
+# `install_default`.  Pin to the same major as tokio-tungstenite's
+# transitive copy so only one rustls ends up in the build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 thiserror = "2"
 # Real-engine deps; each behind its own cargo feature so the default
@@ -66,6 +72,7 @@ eframe = { version = "0.34", optional = true, default-features = false, features
 ] }
 tray-icon = { version = "0.24", optional = true }
 notify-rust = { version = "4", optional = true }
+rfd = { version = "0.15", optional = true, default-features = false, features = ["xdg-portal", "tokio"] }
 # tray-icon on Linux needs gtk::init() called on the same thread that
 # runs its event loop; pulling gtk in directly is the cleanest way to
 # call into that.  Non-Linux targets don't need it.
@@ -93,6 +100,7 @@ ui = [
     "dep:tray-icon",
     "dep:notify-rust",
     "dep:gtk",
+    "dep:rfd",
 ]
 # Convenience bundles.  llama and whisper both statically link ggml.cpp,
 # which currently can't coexist in the same binary on Linux (duplicate

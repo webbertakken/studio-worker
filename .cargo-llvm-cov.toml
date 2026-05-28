@@ -8,3 +8,14 @@
 # - `update::RealRunner::{download, run_installer}` (real network/exec).
 # - `service::default_unit_dir` cross-platform variants only one of
 #   which compiles per host.
+# - `engine::sdcpp::{try_new, ensure_files, dispatch_image,
+#   download_file, resolve_sd_cli, which}` — wraps the sd-cli
+#   subprocess + HF downloader; exercised only against a real
+#   `sd-cli` binary + the real internet.
+# - `ws::session::{spawn_ws_session, run_one_session, wait_for_welcome,
+#   handle_offer, run_offered_job, spawn_reader,
+#   spawn_log_shipper_pump, spawn_heartbeat_pump,
+#   spawn_shutdown_observer, run_dispatch_loop}` — the long-running
+#   WS plumbing.  Wire-level contracts are pinned by `tests/ws_*.rs`
+#   against tokio-tungstenite fixtures; the orchestration code only
+#   makes sense end-to-end and is covered by the live studio loop.

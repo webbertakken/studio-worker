@@ -23,6 +23,15 @@ fn main() -> Result<()> {
         .with(telemetry::tracing_layer())
         .init();
 
+    // rustls 0.23+ no longer auto-installs a process-wide
+    // `CryptoProvider` based on crate features.  Without this call,
+    // the first WSS / HTTPS handshake panics with "Could not
+    // automatically determine the process-level CryptoProvider".
+    // `install_default` is a one-shot; we ignore the Err that would
+    // come back from a redundant install on a hypothetical second
+    // invocation.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialise Sentry.  When no `SENTRY_DSN` is set this is a no-op
     // and `_sentry_guard` is `None`.  Kept in a binding so the guard's
     // `Drop` flushes pending events on shutdown.

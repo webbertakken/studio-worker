@@ -23,16 +23,12 @@ pub enum Command {
     ///
     /// On a fresh install you don't need this — `run` and `ui`
     /// auto-register themselves.  Use it explicitly to:
-    ///   * set the human label shown in the studio's Pending
-    ///     Workers panel (`--label`)
     ///   * point the worker at a different studio (`--api-base-url`)
     ///   * clear local registration state after a rejection or
     ///     between studios (`--reset`)
     Register {
         #[arg(long)]
         api_base_url: Option<String>,
-        #[arg(long)]
-        label: Option<String>,
         #[arg(long)]
         reset: bool,
     },
@@ -42,10 +38,6 @@ pub enum Command {
     InstallService,
     /// Uninstall the auto-start service.
     UninstallService,
-    /// Enable auto-claim.
-    Enable,
-    /// Disable auto-claim.
-    Disable,
     /// Set the VRAM threshold (GB) the worker reports.
     SetThreshold { gb: f32 },
     /// Print resolved config + relevant paths.
@@ -86,11 +78,9 @@ mod tests {
         match cli.command {
             Command::Register {
                 api_base_url,
-                label,
                 reset,
             } => {
                 assert_eq!(api_base_url.as_deref(), Some("https://example.invalid"));
-                assert!(label.is_none());
                 assert!(!reset);
             }
             other => panic!("expected register, got {other:?}"),
@@ -98,22 +88,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_register_with_label_and_reset() {
-        let cli = Cli::parse_from([
-            "studio-worker",
-            "register",
-            "--label",
-            "alice's rig",
-            "--reset",
-        ]);
+    fn parses_register_with_reset() {
+        let cli = Cli::parse_from(["studio-worker", "register", "--reset"]);
         match cli.command {
             Command::Register {
                 api_base_url,
-                label,
                 reset,
             } => {
                 assert!(api_base_url.is_none());
-                assert_eq!(label.as_deref(), Some("alice's rig"));
                 assert!(reset);
             }
             other => panic!("expected register, got {other:?}"),
@@ -127,7 +109,6 @@ mod tests {
             cli.command,
             Command::Register {
                 api_base_url: None,
-                label: None,
                 reset: false,
             }
         ));
@@ -148,8 +129,6 @@ mod tests {
             ("status", Command::Status),
             ("install-service", Command::InstallService),
             ("uninstall-service", Command::UninstallService),
-            ("enable", Command::Enable),
-            ("disable", Command::Disable),
             ("config", Command::Config),
             ("check-update", Command::CheckUpdate),
             ("ui", Command::Ui),

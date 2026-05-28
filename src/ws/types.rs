@@ -4,7 +4,7 @@
 //! Field names use camelCase on the wire (matching the TS contract);
 //! Rust snake_case identifiers are translated with serde renames.  The
 //! tag field is `"type"` with camelCase variant names.
-use crate::types::{JobClaim, LogEntry, Task, WorkerCapabilities};
+use crate::types::{JobClaim, LogEntry, ModelSource, Task, WorkerCapabilities};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -81,6 +81,10 @@ pub struct JobOfferClaim {
     pub ext: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<Task>,
+    /// Download + engine + CLI defaults the studio resolved from its
+    /// model registry.  Absent on legacy queued rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_source: Option<ModelSource>,
 }
 
 impl JobOfferClaim {
@@ -96,6 +100,7 @@ impl JobOfferClaim {
             prompt: self.prompt,
             ext: self.ext,
             task: self.task,
+            model_source: self.model_source,
         }
     }
 }
@@ -123,7 +128,10 @@ pub enum WorkerOutbound {
         server_time: String,
     },
     Offer {
-        claim: JobOfferClaim,
+        // Boxed to keep the WorkerOutbound enum compact — JobOfferClaim
+        // grew to ~300 bytes once we started carrying the ModelSource
+        // (download URLs + CLI defaults) on every offer.
+        claim: Box<JobOfferClaim>,
     },
     HeartbeatAck,
     #[serde(rename_all = "camelCase")]
@@ -189,6 +197,7 @@ mod tests {
             prompt: "hi".into(),
             ext: "png".into(),
             task: None,
+            model_source: None,
         };
         let claim = offer.into_job_claim();
         assert_eq!(claim.job_id, "j");

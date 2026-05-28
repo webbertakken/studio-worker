@@ -1,17 +1,19 @@
-//! Composite engine that delegates per task kind.
+//! Composite engine that delegates per (kind, model).
 //!
-//! Operators set `engine = "multi"` and `engines = [...]` in their
-//! config to combine multiple inference backends in a single binary:
+//! The worker no longer has an `engine` knob in its config: instead,
+//! `engine::build()` returns a `MultiEngine` populated with every
+//! backend compiled into the binary (synthetic always; llama /
+//! whisper / image-candle / video / tts when their cargo features
+//! are on).
 //!
-//! ```toml
-//! engine = "multi"
-//! engines = ["llama", "tts", "video", "synthetic"]
-//! ```
-//!
-//! For each task kind, [`MultiEngine`] picks the first engine in the
-//! list that advertises support for the requested model.  If no engine
-//! claims it, the dispatch fails with the same "cannot serve <kind>"
-//! shape the studio's claim loop already knows how to handle.
+//! For each incoming job [`MultiEngine`] picks the first engine in
+//! the list that advertises support for the requested model.  If no
+//! engine claims the exact model it falls back to the first engine
+//! that handles the task kind at all.  Real backends are inserted
+//! ahead of synthetic so they win when both could serve the same
+//! (kind, model).  If nothing matches the dispatch fails with the
+//! "cannot serve <kind>" shape the studio's claim loop already
+//! knows how to handle.
 use crate::engine::{Engine, EngineCapabilities};
 use crate::types::*;
 use anyhow::{bail, Result};
@@ -103,6 +105,48 @@ impl Engine for MultiEngine {
             bail!("multi engine cannot serve {} tasks", kind.as_str());
         };
         engine.dispatch(model, task)
+    }
+
+    fn dispatch_with_source(
+        &self,
+        model: &str,
+        task: Task,
+        source: Option<&crate::types::ModelSource>,
+    ) -> Result<TaskResult> {
+        let kind = task.kind();
+        // When the studio attached a ModelSource, pick the engine
+        // whose `name()` matches `source.engine` — the studio knows
+        // exactly which engine should serve this job and we must not
+        // route it elsewhere (e.g. silently to synthetic).
+        if let Some(src) = source {
+            let wanted = match src.engine {
+                crate::types::ModelEngine::SdCpp => "sdcpp",
+                crate::types::ModelEngine::LlamaCpp => "llama",
+                crate::types::ModelEngine::Synthetic => "synthetic",
+            };
+            for e in &self.engines {
+                if e.name() == wanted {
+                    debug!(
+                        target: TRACE_TARGET,
+                        op = "pick",
+                        kind = kind.as_str(),
+                        model,
+                        sub_engine = e.name(),
+                        r#match = "model-source",
+                        "engine selected by ModelSource.engine"
+                    );
+                    return e.dispatch_with_source(model, task, source);
+                }
+            }
+            bail!(
+                "multi engine has no `{}` backend compiled in to serve {}",
+                wanted,
+                kind.as_str()
+            );
+        }
+        // No ModelSource (legacy / synthetic jobs): fall back to the
+        // existing kind+model lookup.
+        self.dispatch(model, task)
     }
 }
 
@@ -226,7 +270,7 @@ mod tests {
 
     #[test]
     fn capabilities_union_across_all_engines() {
-        let img: Box<dyn Engine> = Box::new(SyntheticEngine::new(vec![]));
+        let img: Box<dyn Engine> = Box::new(SyntheticEngine::new());
         let stub: Box<dyn Engine> = Box::new(StubEngine {
             name: "extra",
             kinds: vec![TaskKind::Image],

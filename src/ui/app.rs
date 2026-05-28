@@ -36,6 +36,10 @@ pub struct AppDeps {
     pub cfg: SharedConfig,
     pub logs: Arc<Mutex<Vec<LogEntry>>>,
     pub busy: Arc<AtomicBool>,
+    /// Runtime-only Pause / Resume flag, shared with the WS session
+    /// (heartbeat advertises `auto_enabled = !paused`, new offers
+    /// are rejected while set).  Not persisted to `Config`.
+    pub paused: Arc<AtomicBool>,
     pub observers: WorkerObservers,
     pub stop: Arc<AtomicBool>,
     pub config_path: PathBuf,
@@ -268,7 +272,7 @@ impl App {
     }
 
     fn render_logs(&mut self, ui: &mut egui::Ui) {
-        logs_tab::render(ui, &self.deps.logs, &mut self.log_filter);
+        logs_tab::render(ui, &self.deps.observers.recent_logs, &mut self.log_filter);
     }
 
     fn render_about(&mut self, ui: &mut egui::Ui) {
@@ -284,19 +288,22 @@ impl App {
 
     fn render_status(&mut self, ui: &mut egui::Ui) {
         let registration_snapshot = self.registration.lock().clone();
+        let paused_flag = self.deps.paused.clone();
         let view = {
             let cfg = self.deps.cfg.lock();
             let busy = self.deps.busy.load(std::sync::atomic::Ordering::SeqCst);
+            let paused = paused_flag.load(std::sync::atomic::Ordering::SeqCst);
             let hb = self.deps.observers.last_heartbeat.lock().clone();
             status_tab::StatusView::build(
                 &cfg,
                 &registration_snapshot,
                 busy,
+                paused,
                 hb.as_ref(),
                 self.vram_total_gb,
             )
         };
-        status_tab::render(ui, &view);
+        status_tab::render(ui, &view, &paused_flag);
     }
 }
 
@@ -334,16 +341,19 @@ mod tests {
         let cfg = crate::config::shared(Config::default());
         let logs = Arc::new(Mutex::new(Vec::new()));
         let busy = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let observers = WorkerObservers {
             current_job: Arc::new(Mutex::new(None)),
             recent_jobs: Arc::new(Mutex::new(VecDeque::new())),
             last_heartbeat: Arc::new(Mutex::new(None)),
+            recent_logs: Arc::new(Mutex::new(VecDeque::new())),
         };
         let stop = Arc::new(AtomicBool::new(false));
         AppDeps {
             cfg,
             logs,
             busy,
+            paused,
             observers,
             stop,
             config_path: PathBuf::from("/tmp/studio-worker-test.toml"),
