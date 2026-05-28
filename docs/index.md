@@ -20,6 +20,9 @@ top-level [`README.md`](../README.md).  For active plans, see
   serve any model the studio adds without a rebuild.
 - [Pause / Resume](runtime/pause-resume.md) — runtime-only operator
   toggle that replaces the legacy persisted `auto_enabled` field.
+- [No-fallback policy](operations/no-fallback.md) — every offer
+  carries `task` + `modelSource`; the synthetic engine only serves
+  models whose source engine is `synthetic`.
 
 ## Engines
 
