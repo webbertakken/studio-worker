@@ -74,7 +74,7 @@ The worker speaks **three** different surfaces to the studio:
 | Channel | Lifetime | Carries |
 |---|---|---|
 | `POST /workers/register-request` + `GET /workers/register-requests/:id` | One-shot at install + 30s polling until approved | Operator-gated registration; mints `worker_id` + `auth_token` |
-| WebSocket at `GET /workers/:id/connect` | Long-lived, reconnect on disconnect | Heartbeats, claim offers, accept/reject, complete-json, fail, log batches |
+| WebSocket at `GET /workers/:id/connect` | Long-lived, reconnect on disconnect | Heartbeats, claim offers (carrying the [`ModelSource`](../runtime/model-source.md) the worker needs to download + run the model), accept/reject, complete-json, fail, log batches |
 | `POST /workers/:id/jobs/:jobId/complete` (multipart) | Per finished job with binary output | Image / audio / video bytes \u2192 R2 |
 
 Everything else (heartbeat ack, accept, fail, log shipping, etc.) is
@@ -144,9 +144,9 @@ src/
 ├── test_support.rs   #[doc(hidden)] tracing capture helper for integration tests.
 │
 ├── engine/           Pluggable inference backends.
-│   ├── mod.rs        Engine trait + dispatch(model, task) -> TaskResult.  SyntheticEngine.
-│   ├── multi.rs      MultiEngine that fans out per TaskKind.
-│   ├── gradio.rs     Talks to a local Gradio app (image-only).
+│   ├── mod.rs        Engine trait + dispatch / dispatch_with_source.  Always-on SyntheticEngine.
+│   ├── multi.rs      MultiEngine; routes by ModelSource.engine (or kind fallback).
+│   ├── sdcpp.rs      Real image inference via stable-diffusion.cpp subprocess.
 │   ├── llama.rs      (feature `llama`) llama-cpp-2 wrapper for LLM tasks.
 │   ├── whisper.rs    (feature `whisper`) whisper-rs wrapper for STT.
 │   ├── candle_image.rs (feature `image-candle`) candle-transformers SD pipeline.
@@ -358,19 +358,32 @@ pub trait Engine: Send + Sync {
 - `AudioTts { bytes, ext }` (wav)
 - `Video { bytes, ext }` (animated webp / mp4)
 
-Built-in engines:
+Engines are no longer config-selectable.  `engine::build()` always
+returns a `MultiEngine` populated with every backend compiled into
+this binary; per-offer routing happens inside the MultiEngine and is
+driven by the offer's `ModelSource.engine` field (see [Job
+lifecycle](#job-lifecycle-one-claim-end-to-end)).
 
-- **`synthetic`** (default) \u2014 deterministic real bytes for every
-  kind, keyed by SHA-256 of the prompt.  Real WEBP, real WAV, real
-  animated WEBP, real OpenAI-shaped JSON.  No GPU, no model
-  downloads, ~0ms per task.  Powers CI + smoke-tests.
-- **`gradio`** \u2014 image-only, posts to a local `127.0.0.1` Gradio
-  endpoint.  `gradio_endpoint_url` in config.
-- **`multi`** \u2014 combines multiple per-kind engines.  `engines = [...]`
-  in config; first one that claims support for a job's kind+model wins.
+Built-in:
 
-Feature-gated real engines (`llama`, `whisper`, `image-candle`,
-`video`, `tts`) drop in via the same trait.  See
+- **`synthetic`** \u2014 deterministic real bytes for every kind,
+  keyed by SHA-256 of the prompt.  Real WEBP, real WAV, real animated
+  WEBP, real OpenAI-shaped JSON.  No GPU, no model downloads, ~0ms
+  per task.  Powers CI + smoke-tests.  Advertises only `synthetic*`
+  model names so it never claims a real-model job (it would happily
+  upload placeholder bytes for a real manifest, which is destructive
+  on a live queue).
+- **`sdcpp`** \u2014 real image inference via `stable-diffusion.cpp` as a
+  subprocess.  Reads the `ModelSource` off every offer, downloads
+  any missing files into `cfg.models_root`, invokes `sd-cli` with
+  the right `--diffusion-model` / `--llm` / `--vae` flags + CLI
+  defaults from the source.  Image kind only today.  Deep dive in
+  [`docs/engines/sdcpp.md`](../engines/sdcpp.md).
+
+The legacy `gradio` engine is gone (operators run a Gradio app via
+an external service if they need it).  Feature-gated heavyweights
+(`llama`, `whisper`, `image-candle`, `video`, `tts`) still drop in
+via the same trait when their cargo features are enabled \u2014 see
 [`plans/real-engines.md`](../../plans/real-engines.md).
 
 ---
@@ -384,13 +397,20 @@ Feature-gated real engines (`llama`, `whisper`, `image-candle`,
      - capabilities.supportedModels contains X
      - vramThresholdGb >= Y
      - last heartbeat fresh (< 30s)
-   …and pushes an Offer frame down its WS session.
+   Model-name matching is gone — the studio attaches the download
+   spec, the worker is dumb.  Server pushes an Offer frame down the
+   WS session with the model + ModelSource included.
 
 3. Worker receives Offer:
-     - Looks up the engine that handles (kind, model).
-     - If supported: sends Accept frame; sets busy flag;
-       hands the task to engine.dispatch on a blocking thread.
-     - If not supported: sends Reject { reason } frame; server requeues.
+     - Sends Accept frame; sets busy flag; populates
+       `observers.current_job` for the Jobs tab.
+     - Hands the task to `engine.dispatch_with_source(model, task,
+       source)` on a blocking thread.
+     - The MultiEngine routes by `source.engine`; the sdcpp engine
+       ensures every file in `source.files` is cached under
+       `cfg.models_root` (downloading any missing ones), then runs
+       `sd-cli` with the CLI defaults.
+     - If the engine bails: sends `Fail { error, retryable }`.
 
 4. Engine produces a TaskResult:
      - Image / AudioTts / Video → HTTP POST multipart to
@@ -405,12 +425,41 @@ Feature-gated real engines (`llama`, `whisper`, `image-candle`,
      - Clears busy flag.
      - Pushes CurrentJob → RecentJob in the observers ring (UI Status
        + Jobs tabs surface this).
-     - Sends ReadyForMore (optional hint).
+
+Server-driven offer pipeline: the next Offer comes from the studio's
+`notifyJobCompleted` (defer'd from the multipart route's `waitUntil`),
+not from the worker.  The worker no longer sends `ReadyForMore` —
+the dual trigger raced the studio's `commitOffer` and produced
+`protocol_violation: accept for unknown jobId` errors that killed
+sessions.
 
 If engine returns Err:
      - Worker sends Fail { error, retryable }.
      - Server requeues (retryable) or marks failed (terminal).
 ```
+
+Rules worth pinning explicitly:
+
+- **Selection is kind-based, not model-name-based.**  The studio's
+  `pickWorkerForJob` and `findQueuedJobForWorker` filter on the
+  worker's `taskKinds`.  Model-name whitelisting on the worker is
+  gone (a brief `'*'` wildcard sentinel shipped + got reverted in
+  the same session as the model registry; the registry approach is
+  cleaner because the studio already knows everything about the
+  model).
+- **Only one Offer in flight per worker.**  Server-driven offer
+  cadence as above; no worker-side `ReadyForMore`.
+- **Hello waits for Welcome before starting heartbeat / log-shipper.**
+  `tokio::interval()` ticks at t=0, so the first heartbeat used to
+  race the studio's async Hello-auth flow and trip
+  `protocol_violation: session not authenticated`.  The session
+  loop now blocks on the Welcome reply before spawning the
+  background pumps.
+- **Worker waits for credentials before opening a session.**  The
+  UI's parallel auto-register + WS-session flow used to race; the
+  WS session now polls the shared config every second until
+  `worker_id` + `auth_token` are populated, rather than
+  fatal-bailing on first attempt.
 
 The runtime tracks all three observable slots in
 [`runtime::WorkerObservers`](../../src/runtime.rs):
@@ -434,30 +483,42 @@ These are `Arc<Mutex<…>>` and read directly by the UI for live state.
 - Linux / macOS: `~/.config/minis-studio-worker/config.toml`
 - Windows: `%APPDATA%\minis-studio-worker\config.toml`
 
-**Fields**:
+**Operator-facing fields** (exposed in the UI's Config tab):
 
 | Field | Default | Purpose |
 |---|---|---|
-| `api_base_url` | `https://studio.minis.gg` | Studio API root |
-| `worker_id` | unset | Filled on operator approval |
-| `auth_token` | unset | Filled on operator approval, presented in WS Hello |
+| `api_base_url` | `https://studio.minis.gg/` | Studio API root |
 | `vram_threshold_gb` | `12.0` | Max VRAM per claim |
 | `auto_start` | `true` | OS service auto-start at boot |
-| `auto_enabled` | `true` | Whether to claim new jobs (vs. paused) |
-| `engine` | `"synthetic"` | Active engine identifier |
-| `engines` | `[]` | Per-kind engines for `engine = "multi"` |
-| `gradio_endpoint_url` | unset | Used by `engine = "gradio"` |
-| `supported_models_override` | `[]` | Force-declare models (skip engine's native list) |
 | `auto_update_enabled` | `true` | Check the GitHub release feed |
 | `auto_update_interval_secs` | `1800` | How often (default 30 min) |
 | `auto_update_feed` | release URL | GitHub feed to poll |
 | `auto_update_prerelease` | `false` | Track pre-releases |
-| `models_root` | unset | Override for model cache dir |
-| `ws_reconnect_attempts` | `5` | WS session reconnect budget |
-| `install_id` | unset | Per-install UUID (auto-register internal) |
-| `label` | unset | Human label shown in Pending Workers panel |
-| `registration_request_id` | unset | Set during Pending, cleared on Approved/Rejected |
-| `registration_secret` | unset | Same |
+| `models_root` | `~/models` (resolved at load) | Where downloaded model files live |
+
+**Internal state** (persisted but not exposed in the UI; the
+auto-register flow owns it end-to-end):
+
+| Field | Purpose |
+|---|---|
+| `worker_id` | Filled on operator approval; presented in the WS URL path |
+| `auth_token` | Filled on operator approval; presented in WS Hello + the multipart `complete` Bearer |
+| `ws_reconnect_attempts` | WS session reconnect budget (defaults to `5` when unset) |
+| `install_id` | Per-install UUID generated on first launch |
+| `registration_request_id` | Set during Pending, cleared on Approved/Rejected |
+| `registration_secret` | Same |
+
+**Runtime-only** (not in the file at all):
+
+| Flag | Where it lives | Purpose |
+|---|---|---|
+| `paused: Arc<AtomicBool>` | Top-level state passed into `runtime::run_loops` | Operator pause toggle.  When true, heartbeats advertise `autoEnabled = false` and incoming offers are rejected.  Restarts come up unpaused.  See [`docs/runtime/pause-resume.md`](../runtime/pause-resume.md). |
+
+The legacy fields `engine`, `engines`, `gradio_endpoint_url`,
+`supported_models_override`, `auto_enabled` and `label` are gone:
+engine selection is automatic ([Engine abstraction](#engine-abstraction)),
+the runtime pause flag replaces `auto_enabled`, and the studio's
+Pending Workers panel no longer surfaces a label.
 
 Every load + save emits a structured `tracing` event on the
 `studio_worker::config` target with the resolved path \u2014 makes
@@ -481,10 +542,10 @@ headless server install stays lean.
 
 | Tab | What it shows |
 |---|---|
-| **Status** | Worker id, API URL, VRAM total / threshold, IDLE / BUSY / PAUSED badge, last heartbeat freshness.  When unregistered: Initialising / Pending (with request id + copy button) / Rejected (with reason + `--reset` hint) state. |
+| **Status** | Worker id, API URL, VRAM total / threshold, IDLE / BUSY / PAUSED badge, last heartbeat freshness, **Pause / Resume button** (flips the runtime `paused` flag).  When unregistered: Initialising / Pending (with request id + copy button) / Rejected (with reason + `--reset` hint) state. |
 | **Jobs** | Current job card (kind, model, prompt preview, elapsed) + last 50 finished jobs with outcome / duration. |
-| **Config** | Every `Config` field as a widget grouped into Connection / Worker / Engine / Auto-update / Models / Notifications / Background mode.  Save writes through; Reset reverts. |
-| **Logs** | Level filter (all/info/warn/error), free-text search across category/message/job id, auto-scroll toggle, last-500-entries window. |
+| **Config** | The operator-facing subset of `Config` as widgets, grouped into Connection (API base URL) / Worker (VRAM threshold + Auto-start) / Auto-update / Models (folder picker for `models_root`) / Notifications / Background mode.  Save writes through; Reset reverts.  Internal state (`worker_id`, `auth_token`, `install_id`, registration ids) is deliberately not shown \u2014 the auto-register flow owns it. |
+| **Logs** | Level filter (all/info/warn/error), free-text search across category/message/job id, auto-scroll toggle.  Reads from `WorkerObservers.recent_logs` (bounded 1000-entry ring) so it doesn't blank out when the WS log-shipper drains every second. |
 | **About** | Version, Sentry release name, config path, manual "Check for updates" button. |
 
 Screenshots in [`docs/screenshots/`](../screenshots/).
@@ -498,7 +559,8 @@ Three coloured variants derived from `(busy, last_heartbeat)`:
 - **Disconnected** \u2014 red; heartbeat stale (> 3 \u00d7 interval), missing,
   or returned an error
 
-Menu: **Open Window** / **Pause / Resume claiming** / **Quit**.
+Menu: **Open Window** / **Pause / Resume** / **Quit**.  The label
+flips between Pause and Resume based on the runtime `paused` flag.
 
 Closing the window hides to the tray; loops keep running.  Quit comes
 from the tray menu (signals `stop`, awaits in-flight job up to ~5s,
@@ -624,6 +686,13 @@ contributors.
 | `complete` multipart 5xx | runtime job-runner | `Fail` so the server can retry |
 | Auto-update download / install failure | `update::apply` | Log + leave worker running on the old version; try again next interval |
 | Auto-update `execvp` failure (unix) | `update::restart_self` | Should never happen; if it does, exit 0 and let systemd restart |
+| Offer without `ModelSource` to sdcpp engine | engine `dispatch_with_source` | `Fail { retryable: false }` with "requires a ModelSource on the offer" |
+| Model file download fails | sdcpp `ensure_files` | `Fail { retryable: true }`; the next claim of the same job retries the download |
+| `sd-cli` non-zero exit | sdcpp `dispatch_image` | `Fail { retryable: true }` with the last stderr line included so operators can spot OOM / driver issues quickly |
+| `sd-cli` binary missing | `SdCppEngine::try_new` | Engine doesn't register itself; the worker still boots with synthetic as the only available image engine and the studio sees a worker that advertises `image` kind only |
+| rustls 0.23+ CryptoProvider missing | first WSS handshake | Process panics on `crypto/mod.rs:249`.  Fix is `rustls::crypto::ring::default_provider().install_default()` once at startup; see [`src/main.rs`](../../src/main.rs) |
+| `worker_id` / `auth_token` missing at WS connect | `has_credentials` check | Session loop waits (polling cfg every 1s) instead of fatal-bailing.  Lets the UI's parallel auto-register + WS flow work. |
+| Hello-without-Welcome race | `wait_for_welcome` gate | Block heartbeat + log-shipper spawn until the studio's Welcome reply arrives, so `tokio::interval()`'s t=0 first tick doesn't ship a heartbeat into an unauthenticated session |
 
 All worker-side failures emit a structured `tracing::warn!` or
 `error!` event before they're handled, so logs ship and Sentry
