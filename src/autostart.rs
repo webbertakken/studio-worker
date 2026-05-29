@@ -94,17 +94,37 @@ fn autostart_path() -> Result<PathBuf> {
 }
 
 pub fn is_enabled() -> bool {
-    autostart_path().map(|p| p.exists()).unwrap_or(false)
+    is_enabled_at(autostart_path().ok().as_deref())
 }
 
 pub fn enable(exe: &Path) -> Result<()> {
-    let path = autostart_path()?;
-    write_entry(&path, &render_artefact(exe))
+    enable_at(&autostart_path()?, exe)
 }
 
 pub fn disable() -> Result<()> {
-    let path = autostart_path()?;
-    remove_entry(&path)
+    disable_at(&autostart_path()?)
+}
+
+/// Path-injectable core of [`is_enabled`].  `None` (e.g. `HOME` /
+/// `LOCALAPPDATA` unset, so the path can't be resolved) reads as
+/// disabled rather than panicking.
+fn is_enabled_at(path: Option<&Path>) -> bool {
+    path.map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Path-injectable core of [`enable`]: render the platform artefact
+/// for `exe` and persist it at `path`.  Split out so the
+/// render-then-write round-trip is unit-tested against a tempdir
+/// without mutating the process `HOME` / `LOCALAPPDATA` (mirrors the
+/// [`write_entry`] / [`remove_entry`] seam).
+fn enable_at(path: &Path, exe: &Path) -> Result<()> {
+    write_entry(path, &render_artefact(exe))
+}
+
+/// Path-injectable core of [`disable`]: remove the artefact at `path`
+/// (idempotent).
+fn disable_at(path: &Path) -> Result<()> {
+    remove_entry(path)
 }
 
 /// Write the autostart artefact to `path`, emitting a structured
@@ -294,5 +314,89 @@ mod tests {
         assert!(s.contains("<string>/usr/local/bin/studio-worker</string>"));
         assert!(s.contains("<string>ui</string>"));
         assert!(s.contains("gg.minis.studio-worker-ui"));
+    }
+
+    // -----------------------------------------------------------------
+    // Toggle round-trip via the path-injectable `*_at` seam.  Locks the
+    // behaviour the public `enable` / `disable` / `is_enabled` wrappers
+    // delegate to verbatim, against a tempdir — never touching the real
+    // `HOME` / `LOCALAPPDATA` or mutating the process environment.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn enable_at_persists_rendered_artefact_and_disable_at_removes_it() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("autostart")
+            .join(format!("{ENTRY_NAME}.desktop"));
+        let exe = Path::new("/opt/studio-worker/studio-worker");
+
+        assert!(
+            !is_enabled_at(Some(&path)),
+            "a fresh tempdir must report autostart disabled"
+        );
+
+        enable_at(&path, exe).unwrap();
+        assert!(
+            is_enabled_at(Some(&path)),
+            "enable_at must create the artefact so is_enabled_at sees it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            render_artefact(exe),
+            "enable_at must persist the platform artefact verbatim"
+        );
+
+        disable_at(&path).unwrap();
+        assert!(
+            !is_enabled_at(Some(&path)),
+            "disable_at must remove the artefact"
+        );
+    }
+
+    #[test]
+    fn is_enabled_at_reports_disabled_when_path_unresolved() {
+        // `autostart_path()` returns `Err` when `HOME` / `LOCALAPPDATA`
+        // is unset; the wrapper maps that to `None`, which must read as
+        // disabled rather than panic.
+        assert!(!is_enabled_at(None));
+    }
+
+    #[test]
+    fn render_artefact_selects_the_platform_template() {
+        let exe = Path::new("/opt/studio-worker/studio-worker");
+        let body = render_artefact(exe);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            body,
+            render_desktop_entry("/opt/studio-worker/studio-worker")
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            body,
+            render_launch_agent("/opt/studio-worker/studio-worker")
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert!(body.contains("autostart enabled for /opt/studio-worker/studio-worker"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn autostart_path_targets_xdg_autostart_and_is_enabled_mirrors_it() {
+        let path = autostart_path().expect("HOME should be set in the test environment");
+        assert!(
+            path.ends_with(format!("{ENTRY_NAME}.desktop")),
+            "unexpected file name: {}",
+            path.display()
+        );
+        let parent = path.parent().expect("autostart path must have a parent");
+        assert!(
+            parent.ends_with(".config/autostart"),
+            "unexpected parent dir: {}",
+            parent.display()
+        );
+        // The public wrapper must agree with the resolved path's state.
+        assert_eq!(is_enabled(), path.exists());
     }
 }
