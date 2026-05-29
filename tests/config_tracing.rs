@@ -106,6 +106,69 @@ fn save_emits_debug_event_with_config_path() {
 }
 
 // ---------------------------------------------------------------------------
+// save() — failure path leaves an operator-visible WARN breadcrumb.
+// Without it a failed persist (disk full, read-only path, permissions)
+// is invisible in `journalctl` / Sentry: the only callers that logged
+// the Err were the ones that remembered to, and the UI Save button
+// swallowed it entirely (`let _ = draft.save(...)`).
+// ---------------------------------------------------------------------------
+
+/// A regular file standing where `save()` needs a directory makes
+/// `create_dir_all` on the parent fail, so `save()` errors.  Portable
+/// across OSes (no reliance on `/proc`).
+fn unwritable_target(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+    blocker.join("config.toml")
+}
+
+#[test]
+fn save_emits_warn_event_when_write_fails() {
+    let dir = tempdir().unwrap();
+    let target = unwritable_target(&dir);
+    let logs = capture(move || {
+        let cfg = Config::default();
+        let res = config::save(&cfg, &target);
+        assert!(res.is_err(), "save into a file-as-parent must fail");
+    });
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"save\""),
+        "expected op=save, got: {logs}"
+    );
+    assert!(
+        logs.contains("blocker"),
+        "expected the failing config_path in the log, got: {logs}"
+    );
+}
+
+#[test]
+fn save_failure_never_logs_secret_token_values() {
+    let dir = tempdir().unwrap();
+    let target = unwritable_target(&dir);
+    let cfg = Config {
+        registration_secret: Some("REG-SECRET-DO-NOT-LOG".into()),
+        auth_token: Some("AUTH-SECRET-DO-NOT-LOG".into()),
+        ..Config::default()
+    };
+    let logs = capture(move || {
+        let _ = config::save(&cfg, &target);
+    });
+    assert!(
+        !logs.contains("REG-SECRET-DO-NOT-LOG"),
+        "registration_secret leaked into the failure log: {logs}"
+    );
+    assert!(
+        !logs.contains("AUTH-SECRET-DO-NOT-LOG"),
+        "auth_token leaked into the failure log: {logs}"
+    );
+    assert!(
+        logs.contains("op=\"save\""),
+        "expected the save event to fire, got: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Security: never leak the `registration_secret` or `auth_token` values into
 // the tracing stream.  These are the two secrets in `Config`; if either
 // shows up verbatim in logs, an operator viewing `journalctl` or

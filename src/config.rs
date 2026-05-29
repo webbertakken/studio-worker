@@ -204,6 +204,44 @@ pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
 }
 
 pub fn save(cfg: &Config, path: &Path) -> Result<()> {
+    match write_config(cfg, path) {
+        Ok(bytes) => {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                op = "save",
+                config_path = %path.display(),
+                vram_threshold_gb = cfg.vram_threshold_gb,
+                auto_start = cfg.auto_start,
+                models_root = %cfg.models_root.display(),
+                bytes = bytes,
+                "persisted config to disk"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Log at the source so a failed persist is never silent,
+            // regardless of whether the caller logs the returned Err
+            // (the UI Save button discards it, the auto-register flow
+            // logs it with extra context).  `error` carries an
+            // IO / serialisation message + the path only — never the
+            // config's secret fields — so this stays log-shippable.
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "save",
+                config_path = %path.display(),
+                error = %e,
+                "failed to persist config to disk"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Side-effecting half of [`save`]: serialise + write, returning the
+/// byte count on success.  Split out so `save` can log a structured
+/// event on both the success and failure branch without duplicating
+/// the happy path.
+fn write_config(cfg: &Config, path: &Path) -> Result<usize> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -211,17 +249,7 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
     let text = toml::to_string_pretty(cfg).with_context(|| "serialising config")?;
     let bytes = text.len();
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-    tracing::debug!(
-        target: TRACE_TARGET,
-        op = "save",
-        config_path = %path.display(),
-        vram_threshold_gb = cfg.vram_threshold_gb,
-        auto_start = cfg.auto_start,
-        models_root = %cfg.models_root.display(),
-        bytes = bytes,
-        "persisted config to disk"
-    );
-    Ok(())
+    Ok(bytes)
 }
 
 /// Wrap a Config in a mutex for use across the runtime.
