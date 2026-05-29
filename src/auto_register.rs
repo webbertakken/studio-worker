@@ -272,7 +272,13 @@ async fn poll_existing(
                 snap.registration_secret = None;
                 let snapshot = snap.clone();
                 drop(snap);
-                let _ = config::save(&snapshot, config_path);
+                if let Err(e) = config::save(&snapshot, config_path) {
+                    tracing::warn!(
+                        target: "studio_worker::auto_register",
+                        config_path = %config_path.display(),
+                        "failed to persist cleared request state after stale 404; the stale request id stays on disk until the next successful save: {e}"
+                    );
+                }
             }
             *observers.lock() = RegistrationState::Pristine;
             RegistrationState::Pristine
@@ -297,7 +303,13 @@ async fn poll_existing(
                 snap.registration_secret = None;
                 let snapshot = snap.clone();
                 drop(snap);
-                let _ = config::save(&snapshot, config_path);
+                if let Err(e) = config::save(&snapshot, config_path) {
+                    tracing::error!(
+                        target: "studio_worker::auto_register",
+                        config_path = %config_path.display(),
+                        "failed to persist approved credentials; this session is registered in memory but the worker will re-register from scratch on the next restart: {e}"
+                    );
+                }
             }
             *observers.lock() = RegistrationState::Approved;
             RegistrationState::Approved
@@ -309,7 +321,13 @@ async fn poll_existing(
                 snap.registration_secret = None;
                 let snapshot = snap.clone();
                 drop(snap);
-                let _ = config::save(&snapshot, config_path);
+                if let Err(e) = config::save(&snapshot, config_path) {
+                    tracing::warn!(
+                        target: "studio_worker::auto_register",
+                        config_path = %config_path.display(),
+                        "failed to persist cleared request state after rejection; the stale request id stays on disk until the next successful save: {e}"
+                    );
+                }
             }
             let state = RegistrationState::Rejected { reason };
             *observers.lock() = state.clone();
