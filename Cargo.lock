@@ -5546,6 +5546,7 @@ dependencies = [
  "egui",
  "encoding_rs",
  "futures-util",
+ "getrandom 0.3.4",
  "gif",
  "gtk",
  "hex",
