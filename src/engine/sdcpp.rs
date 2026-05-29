@@ -15,9 +15,12 @@
 //! ~/models/<filename2>
 //! \u2026
 //! ```
-//! Files are downloaded on first use (HEAD-checked length so we don't
-//! re-download something that's already there) and re-used across
-//! every subsequent job that names them.
+//! Files are downloaded on first use - skipped when already present
+//! under `cfg.models_root`.  The streamed body is checked against the
+//! server's `Content-Length` so a truncated download is rejected and
+//! cleaned up instead of being renamed into place as a corrupt model
+//! that every later job would fail to load.  Cached files are re-used
+//! across every subsequent job that names them.
 //!
 //! The engine self-registers only when `sd-cli` is present on the box
 //! (either at `$STUDIO_WORKER_SD_CLI`, or `~/.local/bin/sd-cli`, or on
@@ -278,6 +281,22 @@ impl Engine for SdCppEngine {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Verify a streamed download wrote exactly the body the server
+/// promised.  `expected` is the response's `Content-Length`; it's
+/// `None` for chunked transfers, where there's nothing to check and
+/// we accept whatever arrived (the behaviour before this guard).  A
+/// mismatch in either direction means the download is truncated or
+/// corrupt, so we surface a clear error rather than cache a bad model.
+fn verify_download_len(copied: u64, expected: Option<u64>) -> Result<()> {
+    match expected {
+        Some(expected) if copied != expected => bail!(
+            "size mismatch: wrote {copied} bytes but the server declared \
+             Content-Length {expected} (download truncated or corrupt)"
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn file_for_role(files: &[(ModelFileRole, PathBuf)], role: ModelFileRole) -> Option<&Path> {
     files
         .iter()
@@ -313,10 +332,26 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
     if !response.status().is_success() {
         bail!("GET {url} -> {}", response.status());
     }
+    // The server's Content-Length (absent on chunked transfers) is what
+    // lets us catch a short read before committing the file.
+    let expected_len = response.content_length();
     let mut file =
         std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-    let bytes = std::io::copy(&mut response, &mut file).context("streaming body")?;
+    let copied = std::io::copy(&mut response, &mut file);
+    // Close the handle before any remove / rename so the cleanup path
+    // works on Windows, where an open file can't be unlinked.
     drop(file);
+    let bytes = match copied {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(e).context("streaming body");
+        }
+    };
+    if let Err(e) = verify_download_len(bytes, expected_len) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e).with_context(|| format!("downloading {url}"));
+    }
     std::fs::rename(&part, dest)
         .with_context(|| format!("renaming {} -> {}", part.display(), dest.display()))?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -852,5 +887,32 @@ mod tests {
             "webp"
         );
         assert_eq!(init_image_extension("https://x/y/no-ext"), "webp");
+    }
+
+    #[test]
+    fn verify_download_len_accepts_exact_match() {
+        assert!(verify_download_len(2_700_000_000, Some(2_700_000_000)).is_ok());
+    }
+
+    #[test]
+    fn verify_download_len_accepts_when_length_unknown() {
+        // Chunked transfers omit Content-Length; we can't check, so we
+        // accept whatever streamed in (same as before this guard).
+        assert!(verify_download_len(123, None).is_ok());
+    }
+
+    #[test]
+    fn verify_download_len_rejects_truncated_download() {
+        let err = verify_download_len(40, Some(100)).unwrap_err().to_string();
+        assert!(err.contains("size mismatch"), "got: {err}");
+        assert!(err.contains("40"), "got: {err}");
+        assert!(err.contains("100"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_download_len_rejects_overlong_download() {
+        // A body longer than the declared length is just as corrupt as a
+        // short one - reject both rather than caching a bad model.
+        assert!(verify_download_len(120, Some(100)).is_err());
     }
 }
