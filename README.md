@@ -32,7 +32,7 @@ worker HTTP routes (`heartbeat`, `claim`, `complete-json`, `fail`,
 
 | Kind        | Wire `kind`   | Synthetic engine (default)                   | Real engine (planned)     |
 | ----------- | ------------- | -------------------------------------------- | ------------------------- |
-| Image       | `image`       | real WEBP / PNG via the `image` crate        | `image-candle` / `gradio` |
+| Image       | `image`       | real WEBP / PNG via the `image` crate        | `image-candle` / `sd-cpp` |
 | LLM         | `llm`         | OpenAI-shape JSON (`chat.completion`)        | `llama` (llama.cpp)       |
 | Audio STT   | `audio_stt`   | Whisper-shape JSON                           | `whisper` (whisper.cpp)   |
 | Audio TTS   | `audio_tts`   | real WAV (sine wave keyed by hash(text))     | `tts-piper`               |
@@ -216,17 +216,11 @@ Config lives at:
 api_base_url        = "https://studio.minis.gg"
 worker_id           = "<filled on operator approval>"
 auth_token          = "<filled on operator approval>"
-label               = "alice's gaming rig"       # optional human label
 vram_threshold_gb   = 12.0                       # max GB per claim
 auto_start          = true
-auto_enabled        = true
-engine              = "synthetic"                # or "gradio", "multi", ...
 
-# Only used when engine = "gradio":
-gradio_endpoint_url = "http://127.0.0.1:7860"
-
-# Optional: only declare these models to the studio.
-supported_models_override = []
+# Where on-demand model files are cached (defaults to ~/models).
+models_root         = "~/models"
 
 # Auto-update — checks the release feed on the cadence below, applies
 # updates only when no job is running, then re-execs the new binary.
@@ -283,18 +277,27 @@ for the full state machine + per-install identity details.
 
 ## Engines
 
-- **`synthetic`** (default) — produces deterministic, real WEBP/PNG/WAV/JSON
-  outputs keyed by SHA-256 of the prompt/text/input.  No GPU required.  Use
-  for smoke-tests, CI, and end-to-end verification of every modality.
-- **`gradio`** — talks to a Gradio app running on `127.0.0.1` (image only).
-  Drops the cloudflared tunnel entirely.  Supply the local Gradio URL in
-  `gradio_endpoint_url` and the models you've verified in
-  `supported_models_override`.
+There's no engine-selection knob in the config.  The worker advertises
+capabilities for every backend compiled into the binary and routes each
+incoming job to the first backend that supports its `(kind, model)` pair
+(see [`MultiEngine`](src/engine/multi.rs)).
+
+- **`synthetic`** (always present, last in the chain) — produces
+  deterministic, real WEBP/PNG/WAV/JSON outputs keyed by SHA-256 of the
+  prompt/text/input.  No GPU required.  Use for smoke-tests, CI, and
+  end-to-end verification of every modality.
+- **`sd-cpp`** — real image inference via `stable-diffusion.cpp` as a
+  subprocess.  Self-registers only when the `sd-cli` binary and at least
+  one model's files are present under `models_root`.  See
+  [`docs/engines/sdcpp.md`](docs/engines/sdcpp.md).
+- **feature-gated heavyweights** — `llama`, `whisper`, `image-candle`,
+  `video`, `tts` drop in via the same trait when their cargo feature is
+  enabled.
 
 ### Adding a real engine
 
-Implement the `Engine` trait in `src/engine.rs` (see `SyntheticEngine`
-and `GradioEngine` for examples).  An engine declares its `capabilities`
+Implement the `Engine` trait under `src/engine/` (see `SyntheticEngine`
+and `SdCppEngine` for examples).  An engine declares its `capabilities`
 (per-kind supported models) and a `dispatch(model, task) -> TaskResult`
 function.  Wire it into `engine::build()` behind a cargo feature, e.g.:
 
@@ -398,8 +401,6 @@ Integration tests live under `tests/`:
   + audio) against wiremock.
 - `tests/http_errors.rs` — error-status paths for register +
   multipart `complete` plus the tracing-emission contract.
-- `tests/gradio_engine.rs` — GradioEngine code paths against a fake
-  Gradio (incl. data-URL / relative-URL / object-with-url responses).
 - `tests/multi_modal.rs` — every TaskKind round-trips through the
   synthetic engine + decoders.
 - `tests/auto_update.rs` — release feed parsing + apply_with full flow.

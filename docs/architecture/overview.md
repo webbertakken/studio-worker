@@ -248,7 +248,7 @@ Each `register-request` carries a full
 
 - `machineName`, `username` (host identity from `whoami`)
 - `agentVersion` (from `Cargo.toml`)
-- `engine` (synthetic / gradio / multi / llama / ...)
+- `engine` (`multi` — the dispatcher wrapping every compiled-in backend)
 - `vramTotalGb` (probed from `/proc/driver/nvidia/gpus` on Linux; 0 elsewhere)
 - `vramThresholdGb` (operator-set max GB per claim)
 - `autoEnabled`, `autoStart` (operator toggles)

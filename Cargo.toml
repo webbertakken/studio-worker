@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/webbertakken/studio-worker"
 homepage = "https://github.com/webbertakken/studio-worker"
 readme = "README.md"
-keywords = ["studio", "image-generation", "worker", "gradio"]
+keywords = ["studio", "image-generation", "worker", "inference"]
 categories = ["command-line-utilities"]
 
 [[bin]]

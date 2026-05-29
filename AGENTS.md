@@ -7,8 +7,8 @@ with code in this repository.
 
 `studio-worker` is a pull-based image-generation agent for the minis.gg
 studio.  It registers with the studio API, heartbeats, claims jobs that
-fit its VRAM threshold, runs them locally (synthetic or Gradio), and
-posts the results back.
+fit its VRAM threshold, runs them locally (synthetic or a real
+backend), and posts the results back.
 
 The repo is public and CI runs on free-tier GitHub Actions, so all tests
 must run without a GPU.
@@ -60,8 +60,9 @@ CI.
 - `src/lib.rs` — exposes the library surface so integration tests can
   drive the contract without going through the CLI.
 - `src/config.rs` — TOML config persisted next to a per-user dir.
-- `src/engine/` — pluggable inference engines (`SyntheticEngine`,
-  `GradioEngine`, plus feature-gated real backends).
+- `src/engine/` — pluggable inference engines (`SyntheticEngine` +
+  `MultiEngine` dispatcher, `SdCppEngine`, plus feature-gated `llama`
+  / `whisper` / `image-candle` / `video` / `tts` backends).
 - `src/http.rs` — `ApiClient` wrapping the surviving HTTP routes
   (`register` + multipart `complete`).
 - `src/runtime.rs` — CLI helpers + auto-updater loop.  The session
@@ -85,7 +86,8 @@ Integration tests in `tests/`:
 - `tests/http_contract.rs` — register + multipart `complete` against
   wiremock.
 - `tests/http_errors.rs` — error-status paths + tracing-emission.
-- `tests/gradio_engine.rs` — GradioEngine against a wiremock fake Gradio.
+- `tests/multi_modal.rs` — every TaskKind round-trips through the
+  synthetic engine + decoders.
 
 ## CI
 
@@ -107,7 +109,7 @@ Repo secrets required:
 - Public repo — never commit secrets, internal URLs, or non-public
   customer identifiers.
 - All tests must run in GitHub Actions free-tier — no GPU, no real
-  studio.  Use wiremock for the studio API and Gradio.
+  studio.  Use wiremock for the studio API.
 - Conventional-commit PR titles are enforced.  Keep first line ≤ 52
   characters.
 - Don't add hard dependencies that pull in heavy native libs (CUDA,
