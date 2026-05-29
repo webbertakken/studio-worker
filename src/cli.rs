@@ -48,6 +48,26 @@ pub enum Command {
     Ui,
 }
 
+impl Command {
+    /// Stable kebab-case label for the subcommand.  Used as the
+    /// structured `command` field in the CLI startup breadcrumb so
+    /// operators can filter `journalctl` by which subcommand a
+    /// process is running.  Matches clap's derived subcommand names.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Run => "run",
+            Command::Register { .. } => "register",
+            Command::Status => "status",
+            Command::InstallService => "install-service",
+            Command::UninstallService => "uninstall-service",
+            Command::SetThreshold { .. } => "set-threshold",
+            Command::Config => "config",
+            Command::CheckUpdate => "check-update",
+            Command::Ui => "ui",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +141,26 @@ mod tests {
             Command::SetThreshold { gb } => assert!((gb - 12.5).abs() < 1e-6),
             other => panic!("expected set-threshold, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn name_is_stable_kebab_case_for_every_subcommand() {
+        assert_eq!(Command::Run.name(), "run");
+        assert_eq!(
+            Command::Register {
+                api_base_url: None,
+                reset: false
+            }
+            .name(),
+            "register"
+        );
+        assert_eq!(Command::Status.name(), "status");
+        assert_eq!(Command::InstallService.name(), "install-service");
+        assert_eq!(Command::UninstallService.name(), "uninstall-service");
+        assert_eq!(Command::SetThreshold { gb: 1.0 }.name(), "set-threshold");
+        assert_eq!(Command::Config.name(), "config");
+        assert_eq!(Command::CheckUpdate.name(), "check-update");
+        assert_eq!(Command::Ui.name(), "ui");
     }
 
     #[test]
