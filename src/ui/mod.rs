@@ -223,6 +223,10 @@ fn install_tray(
         let rx = MenuEvent::receiver();
         while let Ok(event) = rx.recv() {
             if event.id == open_for_thread {
+                tracing::info!(
+                    target: "studio_worker::ui::tray",
+                    "open window requested from tray menu"
+                );
                 ctx_clone.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
                 ctx_clone.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
             } else if event.id == toggle_for_thread {
@@ -233,6 +237,10 @@ fn install_tray(
                     "pause toggled from tray menu"
                 );
             } else if event.id == quit_for_thread {
+                tracing::info!(
+                    target: "studio_worker::ui::tray",
+                    "quit requested from tray menu; stopping worker"
+                );
                 quit_requested.store(true, std::sync::atomic::Ordering::SeqCst);
                 ctx_clone.request_repaint();
             }

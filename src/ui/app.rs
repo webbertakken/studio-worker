@@ -31,6 +31,24 @@ use super::{
     tray::{self, TrayVariant},
 };
 
+/// Tracing target for App-level lifecycle + tray events.  Stable so
+/// operators can filter with `RUST_LOG=studio_worker::ui::app=info`.
+const TRACE_TARGET: &str = "studio_worker::ui::app";
+
+/// Emit a structured breadcrumb when the tray health indicator flips
+/// between idle / busy / disconnected.  Pulled out of
+/// [`App::refresh_tray_variant`] so it is unit-testable without
+/// constructing a (non-`Send`) `App` + a real OS tray.
+fn log_tray_variant_change(from: TrayVariant, to: TrayVariant) {
+    tracing::info!(
+        target: TRACE_TARGET,
+        op = "tray_variant",
+        from = ?from,
+        to = ?to,
+        "tray status indicator changed"
+    );
+}
+
 /// Everything `App` needs to render and act on the world.
 pub struct AppDeps {
     pub cfg: SharedConfig,
@@ -160,12 +178,39 @@ impl App {
         let hb = self.deps.observers.last_heartbeat.lock().clone();
         let v = tray::derive_variant(busy, hb.as_ref(), HEARTBEAT_INTERVAL);
         if v != self.tray_variant {
+            log_tray_variant_change(self.tray_variant, v);
             if let Some(state) = self.tray_state.as_mut() {
                 if let Some(icon) = state.icon.as_ref() {
-                    if let Ok(new_icon) = tray_icon::Icon::from_rgba(v.rgba_16(), 16, 16) {
-                        let _ = icon.set_icon(Some(new_icon));
+                    // Surface tray-update failures instead of swallowing
+                    // them with `let _ =`: a failed `set_icon` leaves a
+                    // stale health indicator and the operator would be
+                    // misled with zero diagnostics.
+                    match tray_icon::Icon::from_rgba(v.rgba_16(), 16, 16) {
+                        Ok(new_icon) => {
+                            if let Err(e) = icon.set_icon(Some(new_icon)) {
+                                tracing::warn!(
+                                    target: TRACE_TARGET,
+                                    op = "tray_variant",
+                                    error = %e,
+                                    "failed to update tray icon"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            target: TRACE_TARGET,
+                            op = "tray_variant",
+                            error = %e,
+                            "failed to build tray icon image"
+                        ),
                     }
-                    let _ = icon.set_tooltip(Some(v.tooltip()));
+                    if let Err(e) = icon.set_tooltip(Some(v.tooltip())) {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            op = "tray_variant",
+                            error = %e,
+                            "failed to update tray tooltip"
+                        );
+                    }
                 }
                 state.current_variant = v;
             }
@@ -220,6 +265,11 @@ impl App {
                 .quit_requested
                 .load(std::sync::atomic::Ordering::SeqCst)
         {
+            tracing::info!(
+                target: TRACE_TARGET,
+                op = "hide_to_tray",
+                "window close intercepted; hiding to tray (worker keeps running)"
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -359,6 +409,28 @@ mod tests {
             config_path: PathBuf::from("/tmp/studio-worker-test.toml"),
             tokio: handle,
         }
+    }
+
+    #[test]
+    fn log_tray_variant_change_emits_structured_transition() {
+        use crate::test_support::capture;
+        let logs = capture(|| {
+            super::log_tray_variant_change(TrayVariant::Disconnected, TrayVariant::Busy);
+        });
+        assert!(logs.contains("INFO"), "expected INFO event, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::ui::app"),
+            "expected app target, got: {logs}"
+        );
+        assert!(
+            logs.contains("op=\"tray_variant\""),
+            "expected op field: {logs}"
+        );
+        assert!(
+            logs.contains("from=Disconnected"),
+            "expected from field: {logs}"
+        );
+        assert!(logs.contains("to=Busy"), "expected to field: {logs}");
     }
 
     #[test]
