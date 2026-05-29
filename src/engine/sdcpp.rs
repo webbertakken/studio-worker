@@ -218,9 +218,9 @@ impl SdCppEngine {
 
         let bytes = std::fs::read(&out_path)
             .with_context(|| format!("reading sd-cli output at {}", out_path.display()))?;
-        let _ = std::fs::remove_file(&out_path);
+        remove_temp_file(&out_path);
         if let Some(p) = init_img_path.as_deref() {
-            let _ = std::fs::remove_file(p);
+            remove_temp_file(p);
         }
         info!(
             target: TRACE_TARGET,
@@ -285,6 +285,28 @@ impl Engine for SdCppEngine {
 /// promised.  `expected` is the response's `Content-Length`; it's
 /// `None` for chunked transfers, where there's nothing to check and
 /// we accept whatever arrived (the behaviour before this guard).  A
+/// Best-effort removal of a temporary file (a per-job `sd-cli` output,
+/// an init image, or a half-written `.part` download).  Removal is
+/// non-fatal — the artefact has already been read or the job already
+/// failed — but a remove that keeps failing silently leaks temp files
+/// and can quietly fill the worker's disk over a long-running session,
+/// so we surface the failure instead of swallowing it.  A `NotFound`
+/// is the desired end state (something already cleaned it up), so it's
+/// not logged.
+fn remove_temp_file(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                target: TRACE_TARGET,
+                op = "cleanup",
+                path = %path.display(),
+                error = %e,
+                "failed to remove temp file"
+            );
+        }
+    }
+}
+
 /// mismatch in either direction means the download is truncated or
 /// corrupt, so we surface a clear error rather than cache a bad model.
 fn verify_download_len(copied: u64, expected: Option<u64>) -> Result<()> {
@@ -344,12 +366,12 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
     let bytes = match copied {
         Ok(bytes) => bytes,
         Err(e) => {
-            let _ = std::fs::remove_file(&part);
+            remove_temp_file(&part);
             return Err(e).context("streaming body");
         }
     };
     if let Err(e) = verify_download_len(bytes, expected_len) {
-        let _ = std::fs::remove_file(&part);
+        remove_temp_file(&part);
         return Err(e).with_context(|| format!("downloading {url}"));
     }
     std::fs::rename(&part, dest)
@@ -572,6 +594,56 @@ mod tests {
                 sampling_method: Some("euler".to_string()),
             },
         }
+    }
+
+    #[test]
+    fn remove_temp_file_deletes_an_existing_file_quietly() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("artefact.webp");
+        std::fs::write(&f, b"bytes").unwrap();
+        let out = crate::test_support::capture({
+            let f = f.clone();
+            move || remove_temp_file(&f)
+        });
+        assert!(!f.exists(), "file should be gone after cleanup");
+        assert!(
+            !out.contains("failed to remove temp file"),
+            "the success path must not warn: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_temp_file_ignores_an_already_missing_file() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("never-existed.webp");
+        let out = crate::test_support::capture(move || remove_temp_file(&missing));
+        assert!(
+            !out.contains("failed to remove temp file"),
+            "a not-found file is the desired end state, not a warning: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_temp_file_surfaces_a_failed_removal() {
+        // Pointing the helper at a directory makes `remove_file` fail
+        // on every platform (it refuses to unlink a dir): the closest
+        // portable stand-in for a locked / permission-denied temp file.
+        let dir = tempdir().unwrap();
+        let stubborn = dir.path().join("subdir");
+        std::fs::create_dir(&stubborn).unwrap();
+        let out = crate::test_support::capture(move || remove_temp_file(&stubborn));
+        assert!(
+            out.contains("failed to remove temp file"),
+            "a failed removal must surface in the logs: {out:?}"
+        );
+        assert!(
+            out.contains("subdir"),
+            "the warning must name the offending path: {out:?}"
+        );
+        assert!(
+            out.contains("cleanup"),
+            "the warning should tag the cleanup op: {out:?}"
+        );
     }
 
     #[test]
