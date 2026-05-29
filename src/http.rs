@@ -143,14 +143,7 @@ impl ApiClient {
         prompt: &str,
         image: Vec<u8>,
     ) -> Result<()> {
-        let mime = match ext {
-            "png" => "image/png",
-            "webp" => "image/webp",
-            "wav" => "audio/wav",
-            "mp3" => "audio/mpeg",
-            "mp4" => "video/mp4",
-            _ => "application/octet-stream",
-        };
+        let mime = mime_for_ext(ext);
         let part = reqwest::blocking::multipart::Part::bytes(image)
             .file_name(format!("{job_id}.{ext}"))
             .mime_str(mime)?;
@@ -168,5 +161,61 @@ impl ApiClient {
             .send()?;
         self.check("complete", &url, started, response)?;
         Ok(())
+    }
+}
+
+/// Map a binary output's file extension to the MIME type sent as the
+/// multipart `complete` upload's `Content-Type`.  Single source of
+/// truth: every engine that emits a `TaskResult` binary extension
+/// (synthetic image → `png`/`webp`, sd-cpp → `webp`, tts → `wav`,
+/// synthetic video → `webp`, the `video` feature → `gif`) routes
+/// through here, so a new extension can't silently drift into
+/// `application/octet-stream` and break the studio's stored
+/// content-type.
+pub fn mime_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mime_for_ext_maps_known_image_audio_video_types() {
+        assert_eq!(mime_for_ext("png"), "image/png");
+        assert_eq!(mime_for_ext("webp"), "image/webp");
+        assert_eq!(mime_for_ext("gif"), "image/gif");
+        assert_eq!(mime_for_ext("wav"), "audio/wav");
+        assert_eq!(mime_for_ext("mp3"), "audio/mpeg");
+        assert_eq!(mime_for_ext("mp4"), "video/mp4");
+    }
+
+    #[test]
+    fn mime_for_ext_falls_back_to_octet_stream_for_unknown() {
+        assert_eq!(mime_for_ext("bin"), "application/octet-stream");
+        assert_eq!(mime_for_ext(""), "application/octet-stream");
+    }
+
+    #[test]
+    fn mime_for_ext_covers_every_extension_engines_emit() {
+        // Lock the contract: each binary extension an engine actually
+        // emits must resolve to a real MIME type, never the
+        // octet-stream fallback.  `gif` is the one the `video`
+        // feature produces and that regressed before this guard.
+        for ext in ["png", "webp", "gif", "wav"] {
+            assert_ne!(
+                mime_for_ext(ext),
+                "application/octet-stream",
+                "engine output extension {ext:?} must map to a real MIME type"
+            );
+        }
     }
 }
