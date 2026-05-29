@@ -86,6 +86,7 @@ fn end_to_end_inference_with_smollm() {
         }],
         max_tokens: 24,
         temperature: 0.0,
+        ..Default::default()
     });
     let started = std::time::Instant::now();
     let result = engine

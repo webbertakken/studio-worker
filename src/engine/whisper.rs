@@ -376,6 +376,7 @@ mod tests {
             text: "x".into(),
             voice: "v".into(),
             ext: "wav".into(),
+            ..Default::default()
         });
         let err = engine.dispatch("anything", task).unwrap_err();
         assert!(err.to_string().contains("cannot serve audio_tts"));
@@ -388,6 +389,7 @@ mod tests {
         let task = Task::AudioStt(AudioSttParams {
             input_url: "file:///dev/null".into(),
             language: None,
+            ..Default::default()
         });
         let err = engine.dispatch("no-such", task).unwrap_err();
         assert!(err.to_string().contains("not found"));

@@ -559,8 +559,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     });
 
     let job = claim.into_job_claim();
-    let resolved_task = job.resolved_task();
-    let task_kind = resolved_task.kind();
+    let task_kind = job.task.kind();
     // The FULL prompt goes back to the studio (and to the engine).
     // The bounded preview (`truncate_prompt`) is only for the UI's
     // Jobs tab so the in-memory observer ring stays small even when
@@ -568,7 +567,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     // truncated 200-char preview as the `prompt` form field on the
     // multipart `/complete`, which the studio then persisted onto the
     // row — mangling every operator-facing prompt in the DB.
-    let full_prompt = prompt_for(&resolved_task);
+    let full_prompt = prompt_for(&job.task);
     let prompt_preview = truncate_prompt(&full_prompt);
     let started_at = chrono::Utc::now();
 
@@ -626,18 +625,18 @@ async fn run_offered_job(
     full_prompt: String,
     prompt_preview: String,
 ) {
-    let task = job.resolved_task();
     let start = std::time::Instant::now();
-    // Pass the studio's `ModelSource` (if attached) to the engine so
-    // sd-cpp / llama-cpp know which files to load.  Engines that don't
-    // need it ignore the parameter; the synthetic engine still works.
+    // Pass the studio's `ModelSource` to the engine so sd-cpp /
+    // llama-cpp know which files to load.  Required on every offer
+    // — the studio refuses to promote a job without a model source
+    // and the worker refuses any claim that lacks one.
     let dispatch = tokio::task::spawn_blocking({
         let model = job.model.clone();
         let model_source = job.model_source.clone();
-        let task_for_engine = task;
+        let task_for_engine = job.task.clone();
         let engine = engine.clone();
         move || -> Result<TaskResult> {
-            engine.dispatch_with_source(&model, task_for_engine, model_source.as_ref())
+            engine.dispatch_with_source(&model, task_for_engine, &model_source)
         }
     })
     .await;

@@ -25,16 +25,31 @@ fn capabilities() -> WorkerCapabilities {
 }
 
 fn sample_claim() -> JobOfferClaim {
+    use studio_worker::types::{ImageParams, ModelCliDefaults, ModelEngine, ModelSource};
     JobOfferClaim {
         job_id: "job-1".into(),
         game_id: "game-of-elements".into(),
         asset_name: "game-of-elements/creatures/aurora-fox".into(),
         model: "synthetic".into(),
         vram_gb_estimate: 4.0,
-        prompt: "an aurora fox at dusk".into(),
-        ext: "webp".into(),
-        task: None,
-        model_source: None,
+        task: Task::Image(ImageParams {
+            prompt: "an aurora fox at dusk".into(),
+            width: 1024,
+            height: 1024,
+            ext: "webp".into(),
+            ..Default::default()
+        }),
+        model_source: ModelSource {
+            engine: ModelEngine::Synthetic,
+            files: vec![],
+            cli_defaults: ModelCliDefaults {
+                cfg_scale: 1.0,
+                steps: 8,
+                width: 1024,
+                height: 1024,
+                sampling_method: None,
+            },
+        },
     }
 }
 
@@ -289,21 +304,43 @@ fn outbound_welcome_round_trips() {
 
 #[test]
 fn outbound_offer_round_trips() {
+    let synth_source = json!({
+        "engine": "synthetic",
+        "files": [],
+        "cliDefaults": {
+            "cfgScale": 1.0,
+            "steps": 8,
+            "width": 1024,
+            "height": 1024,
+        },
+    });
     let claim_json = json!({
         "jobId": "job-1",
         "gameId": "game-of-elements",
         "assetName": "game-of-elements/creatures/aurora-fox",
-        "model": "synthetic",
+        "model": "synthetic-image",
         "vramGbEstimate": 4.0,
-        "prompt": "an aurora fox at dusk",
-        "ext": "webp",
+        "task": {
+            "kind": "image",
+            "prompt": "an aurora fox at dusk",
+            "width": 1024,
+            "height": 1024,
+            "ext": "webp",
+        },
+        "modelSource": synth_source,
     });
     let json = json!({ "type": "offer", "claim": claim_json });
     let parsed: WorkerOutbound = serde_json::from_value(json).unwrap();
     match parsed {
         WorkerOutbound::Offer { ref claim } => {
             assert_eq!(claim.job_id, "job-1");
-            assert_eq!(claim.ext, "webp");
+            match &claim.task {
+                Task::Image(p) => {
+                    assert_eq!(p.ext, "webp");
+                    assert_eq!(p.prompt, "an aurora fox at dusk");
+                }
+                other => panic!("expected image task, got {:?}", other.kind()),
+            }
         }
         ref other => panic!("expected Offer, got {other:?}"),
     }
@@ -311,30 +348,59 @@ fn outbound_offer_round_trips() {
 
 #[test]
 fn outbound_offer_carrying_a_multimodal_task_round_trips() {
+    let synth_source = json!({
+        "engine": "synthetic",
+        "files": [],
+        "cliDefaults": {
+            "cfgScale": 1.0,
+            "steps": 8,
+            "width": 1024,
+            "height": 1024,
+        },
+    });
     let claim_json = json!({
         "jobId": "job-7",
         "gameId": "game-of-elements",
         "assetName": "game-of-elements/dialogue/elder-line",
         "model": "smol-llm",
         "vramGbEstimate": 6.0,
-        "prompt": "",
-        "ext": "json",
         "task": {
             "kind": "llm",
             "messages": [{ "role": "user", "content": "hi" }],
-            "max_tokens": 32,
+            "maxTokens": 32,
             "temperature": 0.5,
         },
+        "modelSource": synth_source,
     });
     let json = json!({ "type": "offer", "claim": claim_json });
     let parsed: WorkerOutbound = serde_json::from_value(json).unwrap();
     match parsed {
         WorkerOutbound::Offer { claim } => {
             assert_eq!(claim.job_id, "job-7");
-            assert!(matches!(claim.task, Some(Task::Llm(_))));
+            assert!(matches!(claim.task, Task::Llm(_)));
         }
         other => panic!("expected Offer with task, got {other:?}"),
     }
+}
+
+#[test]
+fn outbound_offer_without_task_or_model_source_fails_to_deserialise() {
+    let json = json!({
+        "type": "offer",
+        "claim": {
+            "jobId": "job-no-task",
+            "gameId": "g",
+            "assetName": "g/x/y",
+            "model": "flux1-dev",
+            "vramGbEstimate": 12.0,
+        },
+    });
+    let err = serde_json::from_value::<WorkerOutbound>(json).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("task") || msg.contains("modelSource"),
+        "expected missing-required-field error, got: {msg}"
+    );
 }
 
 #[test]

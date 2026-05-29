@@ -423,6 +423,7 @@ mod tests {
             steps: 1,
             seed: None,
             ext: "png".into(),
+            ..Default::default()
         });
         let err = engine.dispatch("not-the-model", task).unwrap_err();
         assert!(err.to_string().contains("only serves"));
@@ -435,6 +436,7 @@ mod tests {
             messages: vec![],
             max_tokens: 1,
             temperature: 0.0,
+            ..Default::default()
         });
         let err = engine.dispatch(MODEL_ID, task).unwrap_err();
         assert!(err.to_string().contains("cannot serve llm"));

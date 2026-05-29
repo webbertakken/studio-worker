@@ -106,6 +106,7 @@ fn end_to_end_transcribes_synthesized_audio() {
     let task = Task::AudioStt(AudioSttParams {
         input_url: url,
         language: Some("en".into()),
+        ..Default::default()
     });
     let result = engine
         .dispatch(MODEL_ID, task)

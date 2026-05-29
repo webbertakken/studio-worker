@@ -75,7 +75,7 @@ pub trait Engine: Send + Sync {
         &self,
         model: &str,
         task: Task,
-        _source: Option<&crate::types::ModelSource>,
+        _source: &crate::types::ModelSource,
     ) -> Result<TaskResult> {
         self.dispatch(model, task)
     }
@@ -391,8 +391,8 @@ mod tests {
             width: 512,
             height: 512,
             steps: 20,
-            seed: None,
             ext: "webp".into(),
+            ..Default::default()
         });
         let result = engine.dispatch("synthetic", task).unwrap();
         let (bytes, ext) = match result {
@@ -417,6 +417,7 @@ mod tests {
             }],
             max_tokens: 64,
             temperature: 0.5,
+            ..Default::default()
         });
         let result = engine.dispatch("synthetic", task).unwrap();
         let json = match result {
@@ -436,6 +437,7 @@ mod tests {
         let task = Task::AudioStt(AudioSttParams {
             input_url: "https://example.com/audio.wav".into(),
             language: Some("nl".into()),
+            ..Default::default()
         });
         let result = engine.dispatch("synthetic", task).unwrap();
         let json = match result {
@@ -453,6 +455,7 @@ mod tests {
             text: "hello world".into(),
             voice: "default".into(),
             ext: "wav".into(),
+            ..Default::default()
         });
         let result = engine.dispatch("synthetic", task).unwrap();
         let (bytes, ext) = match result {
@@ -481,6 +484,7 @@ mod tests {
             width: 256,
             height: 256,
             ext: "mp4".into(), // engine intentionally downgrades to webp
+            ..Default::default()
         });
         let result = engine.dispatch("synthetic", task).unwrap();
         let (bytes, ext) = match result {
@@ -539,8 +543,8 @@ mod tests {
                 width: 512,
                 height: 512,
                 steps: 20,
-                seed: None,
                 ext: "webp".into(),
+                ..Default::default()
             })
         };
         let a = engine.dispatch("synthetic", task()).unwrap();

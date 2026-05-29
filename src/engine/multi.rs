@@ -33,6 +33,11 @@ impl MultiEngine {
         Self { engines }
     }
 
+    /// Pick the engine that claims `(kind, model)` exactly.  No
+    /// kind-only fallback — the studio's `ModelSource` is
+    /// authoritative.  A model whose engine isn't on this worker is
+    /// rejected loudly so the operator sees what's missing instead of
+    /// silently routing through synthetic placeholder bytes.
     fn pick_for(&self, kind: TaskKind, model: &str) -> Option<&dyn Engine> {
         for e in &self.engines {
             if e.capabilities().supports(kind, model) {
@@ -48,30 +53,12 @@ impl MultiEngine {
                 return Some(e.as_ref());
             }
         }
-        // Fallback: any engine that advertises the kind at all.
-        for e in &self.engines {
-            if e.capabilities()
-                .supported_models_per_kind
-                .contains_key(&kind)
-            {
-                debug!(
-                    target: TRACE_TARGET,
-                    op = "pick",
-                    kind = kind.as_str(),
-                    model,
-                    sub_engine = e.name(),
-                    r#match = "fallback",
-                    "engine selected by kind fallback"
-                );
-                return Some(e.as_ref());
-            }
-        }
         warn!(
             target: TRACE_TARGET,
             op = "pick",
             kind = kind.as_str(),
             model,
-            "no engine advertises this kind"
+            "no engine claims this exact (kind, model) pair"
         );
         None
     }
@@ -102,7 +89,12 @@ impl Engine for MultiEngine {
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
         let kind = task.kind();
         let Some(engine) = self.pick_for(kind, model) else {
-            bail!("multi engine cannot serve {} tasks", kind.as_str());
+            bail!(
+                "no engine on this worker can serve model {} (kind={}); \
+                 synthetic fallback is disabled",
+                model,
+                kind.as_str()
+            );
         };
         engine.dispatch(model, task)
     }
@@ -111,42 +103,38 @@ impl Engine for MultiEngine {
         &self,
         model: &str,
         task: Task,
-        source: Option<&crate::types::ModelSource>,
+        source: &crate::types::ModelSource,
     ) -> Result<TaskResult> {
         let kind = task.kind();
-        // When the studio attached a ModelSource, pick the engine
-        // whose `name()` matches `source.engine` — the studio knows
-        // exactly which engine should serve this job and we must not
-        // route it elsewhere (e.g. silently to synthetic).
-        if let Some(src) = source {
-            let wanted = match src.engine {
-                crate::types::ModelEngine::SdCpp => "sdcpp",
-                crate::types::ModelEngine::LlamaCpp => "llama",
-                crate::types::ModelEngine::Synthetic => "synthetic",
-            };
-            for e in &self.engines {
-                if e.name() == wanted {
-                    debug!(
-                        target: TRACE_TARGET,
-                        op = "pick",
-                        kind = kind.as_str(),
-                        model,
-                        sub_engine = e.name(),
-                        r#match = "model-source",
-                        "engine selected by ModelSource.engine"
-                    );
-                    return e.dispatch_with_source(model, task, source);
-                }
+        // The studio knows exactly which engine should serve this
+        // job (source.engine); we route strictly to that backend.
+        // No silent fallback to synthetic for real-model offers —
+        // see DECISIONS.md "Synthetic fallback removed for real
+        // models".
+        let wanted = match source.engine {
+            crate::types::ModelEngine::SdCpp => "sdcpp",
+            crate::types::ModelEngine::LlamaCpp => "llama",
+            crate::types::ModelEngine::Synthetic => "synthetic",
+        };
+        for e in &self.engines {
+            if e.name() == wanted {
+                debug!(
+                    target: TRACE_TARGET,
+                    op = "pick",
+                    kind = kind.as_str(),
+                    model,
+                    sub_engine = e.name(),
+                    r#match = "model-source",
+                    "engine selected by ModelSource.engine"
+                );
+                return e.dispatch_with_source(model, task, source);
             }
-            bail!(
-                "multi engine has no `{}` backend compiled in to serve {}",
-                wanted,
-                kind.as_str()
-            );
         }
-        // No ModelSource (legacy / synthetic jobs): fall back to the
-        // existing kind+model lookup.
-        self.dispatch(model, task)
+        bail!(
+            "no `{}` engine compiled into this worker (model {} requires it)",
+            wanted,
+            model
+        );
     }
 }
 
@@ -196,8 +184,8 @@ mod tests {
             width: 64,
             height: 64,
             steps: 1,
-            seed: None,
             ext: "webp".into(),
+            ..Default::default()
         })
     }
 
@@ -206,6 +194,7 @@ mod tests {
             messages: vec![],
             max_tokens: 1,
             temperature: 0.0,
+            ..Default::default()
         })
     }
 
@@ -236,7 +225,11 @@ mod tests {
     }
 
     #[test]
-    fn multi_falls_back_to_first_engine_advertising_the_kind() {
+    fn multi_refuses_unknown_model_without_kind_fallback() {
+        // An LLM engine is present, but no engine claims the
+        // specific model id.  Per the no-fallback policy the
+        // dispatch errors loudly instead of routing to the first
+        // engine that advertises the kind.
         let alpha_only: Box<dyn Engine> = Box::new(StubEngine {
             name: "alpha",
             kinds: vec![TaskKind::Image],
@@ -249,11 +242,13 @@ mod tests {
         });
         let multi = MultiEngine::new(vec![alpha_only, llm_only]);
 
-        let result = multi.dispatch("unknown-model", llm_task()).unwrap();
-        match result {
-            TaskResult::Llm { json } => assert_eq!(json["from"], "llm"),
-            _ => panic!("expected llm"),
-        }
+        let err = multi.dispatch("unknown-model", llm_task()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no engine on this worker can serve model"),
+            "expected no-fallback error, got: {msg}"
+        );
+        assert!(msg.contains("unknown-model"));
     }
 
     #[test]
@@ -265,7 +260,11 @@ mod tests {
         });
         let multi = MultiEngine::new(vec![image_only]);
         let err = multi.dispatch("x", llm_task()).unwrap_err();
-        assert!(err.to_string().contains("cannot serve llm"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no engine on this worker can serve model"),
+            "expected no-fallback error, got: {msg}"
+        );
     }
 
     #[test]
@@ -287,5 +286,62 @@ mod tests {
     fn name_is_multi() {
         let multi = MultiEngine::new(vec![]);
         assert_eq!(multi.name(), "multi");
+    }
+
+    fn sd_cpp_source() -> crate::types::ModelSource {
+        crate::types::ModelSource {
+            engine: crate::types::ModelEngine::SdCpp,
+            files: vec![],
+            cli_defaults: crate::types::ModelCliDefaults {
+                cfg_scale: 1.0,
+                steps: 8,
+                width: 1024,
+                height: 1024,
+                sampling_method: None,
+            },
+        }
+    }
+
+    /// The no-fallback policy: when the studio asks for an `sd-cpp`
+    /// model but no sd-cpp engine is compiled in (e.g. CI / minimal
+    /// build), dispatch errors loudly instead of silently routing the
+    /// job to synthetic.
+    #[test]
+    fn dispatch_with_source_refuses_to_fall_back_to_synthetic_for_real_models() {
+        let synth: Box<dyn Engine> = Box::new(SyntheticEngine::new());
+        let multi = MultiEngine::new(vec![synth]);
+        let source = sd_cpp_source();
+        let err = multi
+            .dispatch_with_source("some-real-flux-model", image_task(), &source)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no `sdcpp` engine compiled"),
+            "expected no-sdcpp-backend error, got: {err}"
+        );
+    }
+
+    /// Synthetic offers (engine == Synthetic) still route to the
+    /// synthetic engine.  This is *not* a fallback — the studio
+    /// explicitly asked for it.
+    #[test]
+    fn dispatch_with_source_routes_synthetic_engine_for_synthetic_models() {
+        let synth: Box<dyn Engine> = Box::new(SyntheticEngine::new());
+        let multi = MultiEngine::new(vec![synth]);
+        let source = crate::types::ModelSource {
+            engine: crate::types::ModelEngine::Synthetic,
+            files: vec![],
+            cli_defaults: crate::types::ModelCliDefaults {
+                cfg_scale: 1.0,
+                steps: 8,
+                width: 1024,
+                height: 1024,
+                sampling_method: None,
+            },
+        };
+        let result = multi
+            .dispatch_with_source("synthetic", image_task(), &source)
+            .unwrap();
+        assert!(matches!(result, TaskResult::Image { .. }));
     }
 }
