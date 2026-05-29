@@ -6,7 +6,6 @@
 //! egui / eframe / tray-icon / notify-rust + their system libs.
 
 pub mod app;
-pub mod autostart;
 pub mod notifier;
 pub mod tab;
 pub mod tabs;

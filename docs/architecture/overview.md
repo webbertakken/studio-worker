@@ -139,6 +139,7 @@ src/
 │                     TaskResult, JobClaim, LogEntry, AutoRegisterRequest, RegisterStatus.
 ├── sys.rs            hostname/username/VRAM probe.
 ├── service.rs        Per-OS service file writers (systemd --user / launchd / schtasks XML).
+├── autostart.rs      Cross-OS "run in tray on login" toggle (logged; desktop UI calls it).
 ├── update.rs         GitHub release feed poll + installer script download + re-exec on success.
 ├── telemetry.rs      Sentry init (opt-in via SENTRY_DSN env var) + tracing-subscriber layer.
 ├── test_support.rs   #[doc(hidden)] tracing capture helper for integration tests.
@@ -172,8 +173,7 @@ src/
     │   ├── logs.rs   Level filter + free-text search + auto-scroll, windowed.
     │   └── about.rs  Version / sentry release / config path / Check for updates.
     ├── tray.rs       3-variant icon (idle/busy/disconnected), menu factory.
-    ├── notifier.rs   Trait + DesktopNotifier + per-event NotificationPrefs gate.
-    └── autostart.rs  Cross-OS \"run in tray on login\" toggle.
+    └── notifier.rs   Trait + DesktopNotifier + per-event NotificationPrefs gate.
 ```
 
 Pluggable engine backends are gated behind cargo features so the
@@ -658,8 +658,11 @@ under an `XDG_CONFIG_HOME` override.
 
 ### "Run in tray on login" (UI mode)
 
-[`src/ui/autostart.rs`](../../src/ui/autostart.rs).  Toggle in the
-Config tab's "Background mode" group.  Writes:
+[`src/autostart.rs`](../../src/autostart.rs) (always compiled, like
+`service.rs`; the desktop UI's Config tab is the only caller).  Toggle
+in the Config tab's "Background mode" group.  Each enable/disable emits
+a structured `tracing` event on target `studio_worker::autostart`.
+Writes:
 
 - Linux: `~/.config/autostart/studio-worker-ui.desktop`
 - macOS: `~/Library/LaunchAgents/gg.minis.studio-worker-ui.plist`

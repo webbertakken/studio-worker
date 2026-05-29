@@ -4,6 +4,7 @@
 //! tooling) can drive the contract without going through the CLI.
 
 pub mod auto_register;
+pub mod autostart;
 pub mod cli;
 pub mod config;
 pub mod engine;
