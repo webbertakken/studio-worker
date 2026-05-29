@@ -345,6 +345,18 @@ async fn run_one_session(
         &*engine,
         !paused.load(Ordering::SeqCst),
     );
+    // Record exactly what we're about to advertise so the worker's logs
+    // (and the studio's shipped-log view) show the offered kinds /
+    // models / VRAM budget — otherwise the handshake is opaque and
+    // "why won't it claim X jobs" can't be answered from the logs.
+    push_log_with_observers(
+        logs,
+        Some(observers),
+        "info",
+        "ws",
+        &crate::runtime::summarize_capabilities(&capabilities),
+        None,
+    );
     sender
         .send(&WorkerInbound::Hello(HelloFrame {
             auth_token: auth_token.clone(),

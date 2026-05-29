@@ -714,6 +714,35 @@ pub fn build_capabilities_with(
     }
 }
 
+/// One-line, operator-facing summary of what this worker advertises to
+/// the studio on the WS handshake.  Logged once per session attempt so
+/// the worker's own logs (and the studio's shipped-log view) record
+/// exactly which task kinds, models, and VRAM budget were offered — the
+/// missing complement to [`log_startup_banner`], which only covers the
+/// loaded config.  Without it, an operator chasing "why won't my worker
+/// claim image jobs" has no record of what the worker told the studio
+/// it could do.  Pure so the formatting is unit-tested without a live
+/// session.
+pub fn summarize_capabilities(caps: &WorkerCapabilities) -> String {
+    let kinds = caps
+        .task_kinds
+        .iter()
+        .map(|k| k.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "advertising engine={}, vram={:.1}/{:.1}GB threshold, auto_enabled={}, \
+         kinds=[{}], {} model(s)=[{}]",
+        caps.engine,
+        caps.vram_total_gb,
+        caps.vram_threshold_gb,
+        caps.auto_enabled,
+        kinds,
+        caps.supported_models.len(),
+        caps.supported_models.join(", "),
+    )
+}
+
 pub fn push_log(
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     level: &str,
@@ -786,6 +815,52 @@ mod tests {
         let engine = SyntheticEngine::new();
         let paused_caps = build_capabilities_with(&cfg, &engine, false);
         assert!(!paused_caps.auto_enabled);
+    }
+
+    #[test]
+    fn summarize_capabilities_lists_engine_kinds_models_vram_and_pause_state() {
+        let cfg = Config {
+            vram_threshold_gb: 6.0,
+            ..Config::default()
+        };
+        let engine = SyntheticEngine::new();
+        let caps = build_capabilities_with(&cfg, &engine, true);
+        let summary = summarize_capabilities(&caps);
+        // Engine name + every advertised kind is present.
+        assert!(summary.contains("engine=synthetic"), "got: {summary}");
+        for kind in &caps.task_kinds {
+            assert!(
+                summary.contains(kind.as_str()),
+                "missing kind {} in: {summary}",
+                kind.as_str()
+            );
+        }
+        // Model count + an actual advertised model id are present.
+        assert!(
+            summary.contains(&format!("{} model(s)", caps.supported_models.len())),
+            "missing model count in: {summary}"
+        );
+        assert!(
+            summary.contains("synthetic"),
+            "missing model id in: {summary}"
+        );
+        // VRAM budget (total/threshold) + unpaused state are visible.
+        assert!(
+            summary.contains("6.0"),
+            "missing vram threshold in: {summary}"
+        );
+        assert!(summary.contains("auto_enabled=true"), "got: {summary}");
+    }
+
+    #[test]
+    fn summarize_capabilities_reflects_paused_state() {
+        let cfg = Config::default();
+        let engine = SyntheticEngine::new();
+        let caps = build_capabilities_with(&cfg, &engine, false);
+        assert!(
+            summarize_capabilities(&caps).contains("auto_enabled=false"),
+            "paused worker must advertise auto_enabled=false"
+        );
     }
 
     #[test]

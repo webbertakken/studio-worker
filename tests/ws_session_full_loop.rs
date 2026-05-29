@@ -144,6 +144,36 @@ async fn spawn_studio_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) 
     (addr, handle)
 }
 
+/// Minimal studio server: accept the upgrade, read `hello`, reply
+/// `welcome`, then close.  Enough to drive the worker through the
+/// capability-advertising handshake without any job offers.
+async fn spawn_handshake_only_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut ws = tokio_tungstenite::accept_hdr_async(stream, echo_subprotocol).await?;
+        let hello = ws
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("hello missing"))??
+            .into_text()
+            .map_err(|_| anyhow::anyhow!("hello not text"))?;
+        let hello_json: serde_json::Value = serde_json::from_str(&hello)?;
+        assert_eq!(hello_json["type"], "hello");
+        ws.send(Message::Text(
+            serde_json::to_string(
+                &json!({"type":"welcome","workerId":"w-test","serverTime":"now"}),
+            )?
+            .into(),
+        ))
+        .await?;
+        ws.close(None).await?;
+        Ok(())
+    });
+    (addr, handle)
+}
+
 async fn collect_frames(
     ws: &mut WebSocketStream<TcpStream>,
     expected: &[&str],
@@ -226,4 +256,77 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
     // returned Ok then every frame in the script reached the worker and
     // every expected reply (accept + completeJson per offer) flowed back.
     let _ = logs;
+}
+
+#[tokio::test]
+async fn ws_session_logs_advertised_capabilities_on_handshake() {
+    let (ws_addr, server_handle) = spawn_handshake_only_ws().await;
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let shared = config::shared(cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
+    let busy = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    // The session pushes operator log lines through `recent_logs`,
+    // which — unlike `logs` — is *not* drained by the log shipper, so
+    // the capability summary stays inspectable after the run.
+    let observers = WorkerObservers::default();
+
+    let session_handle = tokio::spawn({
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let logs = logs.clone();
+        let busy = busy.clone();
+        let paused = paused.clone();
+        let observers = observers.clone();
+        async move {
+            spawn_ws_session(
+                shared,
+                stop,
+                logs,
+                busy,
+                paused,
+                observers,
+                SessionSchedule::fast_for_tests(),
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(TIMEOUT, server_handle)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked")
+        .expect("server returned err");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(5), session_handle)
+        .await
+        .expect("session loop timed out");
+
+    // The handshake must have recorded what the worker advertised: the
+    // engine, the served task kinds, and at least one model id.
+    let summary = observers
+        .recent_logs
+        .lock()
+        .iter()
+        .find(|e| e.message.contains("advertising engine="))
+        .map(|e| e.message.clone())
+        .expect("capability summary must be logged on the handshake");
+    assert!(summary.contains("kinds=["), "missing kinds: {summary}");
+    assert!(summary.contains("image"), "missing image kind: {summary}");
+    assert!(summary.contains("synthetic"), "missing model id: {summary}");
+    assert!(
+        summary.contains("auto_enabled=true"),
+        "unpaused worker must advertise auto_enabled=true: {summary}"
+    );
 }
