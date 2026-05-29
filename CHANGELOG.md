@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.2.1...studio-worker-v0.3.0) (2026-05-29)
+
+
+### Features
+
+* per-game image config + no-fallback policy ([#22](https://github.com/webbertakken/studio-worker/issues/22)) ([e7564af](https://github.com/webbertakken/studio-worker/commit/e7564af8185686c65c29252db98a242dc5b2353c))
+
 ## [0.2.1](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.2.0...studio-worker-v0.2.1) (2026-05-28)
 
 
