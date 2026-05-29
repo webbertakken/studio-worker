@@ -617,7 +617,11 @@ trait \u2014 they're excluded from the 90% coverage gate
   `RUST_LOG=studio_worker=debug` (or any of the per-target filters
   documented per module: `studio_worker::http`,
   `studio_worker::config`, `studio_worker::runtime`,
-  `studio_worker::ws::session`, etc.).
+  `studio_worker::ws::session`, `studio_worker::ws::client`, etc.).
+  The `studio_worker::ws::client` target carries transport-boundary
+  breadcrumbs (connect / recv / send / close) so a dropped frame or a
+  dead studio is never silent, even though the session discards recv
+  errors and fires `let _ = sender.send(...)`.
 - **Studio-side logs**: every tick of the worker pushes its log
   buffer over the WS LogBatch frame.  The studio drops them into the
   `workerLogs` D1 table; the dashboard's LogViewer renders them.
