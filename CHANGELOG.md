@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.2](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.2.1...studio-worker-v0.2.2) (2026-05-29)
+## [0.3.0](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.2.1...studio-worker-v0.3.0) (2026-05-29)
 
 
 ### Features

@@ -1,6 +1,6 @@
 [package]
 name = "studio-worker"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Pull-based image-generation worker for the minis.gg studio."
 authors = ["Webber Takken"]
