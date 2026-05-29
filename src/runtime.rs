@@ -23,7 +23,7 @@ use std::{
     },
     time::Duration,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Tracing target for runtime-level events (startup, state mutations).
 /// Stable so operators can filter with `RUST_LOG=studio_worker::runtime=debug`.
@@ -340,8 +340,8 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
 
     let stop_clone = stop.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        stop_clone.store(true, Ordering::SeqCst);
+        let signal = wait_for_shutdown_signal().await;
+        request_shutdown(&stop_clone, signal);
     });
 
     // Block on auto-register until the operator approves (or rejects).
@@ -358,6 +358,67 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
         LoopSchedule::default(),
     )
     .await
+}
+
+/// Flip the `stop` flag and emit a shutdown breadcrumb so an operator
+/// tailing the journal sees a clean stop, mirroring
+/// [`log_startup_banner`].  Pulled out of the signal task so the
+/// shutdown decision is unit-testable without delivering a real OS
+/// signal.  `signal` names whatever woke us (e.g. `"SIGTERM"`).
+pub fn request_shutdown(stop: &AtomicBool, signal: &str) {
+    let already_stopping = stop.swap(true, Ordering::SeqCst);
+    info!(
+        target: TRACE_TARGET,
+        op = "shutdown",
+        signal,
+        already_stopping,
+        "shutdown signal received; stopping worker gracefully"
+    );
+}
+
+/// Block until the OS asks the worker to stop, returning the name of
+/// the signal that fired.
+///
+/// On Unix we wait on **both** SIGINT (interactive Ctrl-C) and SIGTERM.
+/// SIGTERM is the signal `systemctl stop` / `launchctl unload` / host
+/// shutdown deliver by default, and the worker ships as a `Type=simple`
+/// systemd unit (see `service::render_service`).  Listening for Ctrl-C
+/// alone meant the service manager's stop never reached the graceful
+/// path: the WS session was killed mid-`close`, the studio saw an
+/// abrupt disconnect, and the final log batch never flushed.  If the
+/// SIGTERM handler can't be installed we degrade to Ctrl-C only rather
+/// than abort the shutdown task.
+///
+/// On non-Unix we wait on Ctrl-C, which tokio maps to the console
+/// Ctrl-C / close events.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "shutdown",
+                    error = %e,
+                    "could not install SIGTERM handler; falling back to Ctrl-C only"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                return "SIGINT";
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl-c"
+    }
 }
 
 /// Loop auto_register::tick on a 30s cadence until `worker_id` +
@@ -856,6 +917,44 @@ mod tests {
     }
 
     // --- async tick tests ---
+
+    #[test]
+    fn request_shutdown_sets_the_stop_flag() {
+        let stop = AtomicBool::new(false);
+        request_shutdown(&stop, "SIGTERM");
+        assert!(stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn request_shutdown_reconfirms_when_already_stopping() {
+        // A second signal (or a race with another shutdown path) must
+        // not panic or clear the flag — it just re-confirms the stop.
+        let stop = AtomicBool::new(true);
+        request_shutdown(&stop, "SIGINT");
+        assert!(stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn request_shutdown_emits_a_named_shutdown_breadcrumb() {
+        use crate::test_support::capture;
+        let logs = capture(|| {
+            let stop = AtomicBool::new(false);
+            request_shutdown(&stop, "SIGTERM");
+        });
+        assert!(logs.contains("INFO"), "expected INFO event, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::runtime"),
+            "expected runtime target, got: {logs}"
+        );
+        assert!(
+            logs.contains("op=\"shutdown\""),
+            "expected op field, got: {logs}"
+        );
+        assert!(
+            logs.contains("signal=\"SIGTERM\""),
+            "expected signal field, got: {logs}"
+        );
+    }
 
     #[tokio::test]
     async fn auto_update_tick_disabled_when_flag_off() {
