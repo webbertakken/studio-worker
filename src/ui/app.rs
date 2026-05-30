@@ -72,7 +72,12 @@ pub struct App {
     log_filter: LogFilter,
     about_state: AboutState,
     vram_total_gb: f32,
-    last_seen_recent_count: usize,
+    /// Identity (`job_id` + `finished_at`) of the newest recent-job we
+    /// have already raised a notification for.  Tracking identity
+    /// rather than ring length means a saturated, capped
+    /// `recent_jobs` ring (whose length pins at `RECENT_JOBS_CAP`)
+    /// can't make new arrivals invisible.
+    last_notified: Option<(String, chrono::DateTime<chrono::Utc>)>,
     notifier: Box<dyn Notifier + Send + Sync>,
     notification_prefs: NotificationPrefs,
     tray_variant: TrayVariant,
@@ -110,7 +115,7 @@ impl App {
             log_filter: LogFilter::default(),
             about_state: AboutState::default(),
             vram_total_gb,
-            last_seen_recent_count: 0,
+            last_notified: None,
             notifier,
             notification_prefs: NotificationPrefs::default(),
             tray_variant: TrayVariant::Disconnected,
@@ -155,16 +160,32 @@ impl App {
     /// Process any new entries in the recent-jobs ring and emit
     /// notifications according to current prefs.  Idempotent.
     pub fn drain_notifications(&mut self) {
+        // `record_recent_job` pushes newest-first, so walk from the
+        // front collecting every entry newer than the last one we
+        // notified on (identified by `job_id` + `finished_at`).  This
+        // stays correct even once the capped ring saturates and its
+        // length stops changing.
         let new_entries: Vec<_> = {
             let ring = self.deps.observers.recent_jobs.lock();
-            if ring.len() == self.last_seen_recent_count {
-                return;
+            let mut collected = Vec::new();
+            for entry in ring.iter() {
+                if self
+                    .last_notified
+                    .as_ref()
+                    .is_some_and(|(id, ts)| entry.job_id == *id && entry.finished_at == *ts)
+                {
+                    break;
+                }
+                collected.push(entry.clone());
             }
-            let added = ring.len().saturating_sub(self.last_seen_recent_count);
-            self.last_seen_recent_count = ring.len();
-            ring.iter().take(added).rev().cloned().collect()
+            collected
         };
-        for entry in new_entries {
+        if let Some(newest) = new_entries.first() {
+            self.last_notified = Some((newest.job_id.clone(), newest.finished_at));
+        }
+        // `collected` is newest-first; notify oldest-first so the OS
+        // notification order matches completion order.
+        for entry in new_entries.into_iter().rev() {
             if let NotifyDecision::Show { title, body } = decide(self.notification_prefs, &entry) {
                 self.notifier.show(&title, &body);
             }
@@ -481,6 +502,103 @@ mod tests {
             app.deps.cfg.lock().api_base_url,
             Config::default().api_base_url,
             "editing the draft must not affect the live runtime config until Save succeeds"
+        );
+    }
+
+    fn completed_recent_job(id: &str) -> crate::runtime::RecentJob {
+        let now = chrono::Utc::now();
+        crate::runtime::RecentJob {
+            job_id: id.into(),
+            kind: crate::types::TaskKind::Image,
+            model: "synthetic".into(),
+            prompt: "p".into(),
+            outcome: crate::runtime::JobOutcome::Completed,
+            started_at: now,
+            finished_at: now,
+        }
+    }
+
+    /// Shared handle into a `CapturingNotifier`'s recorded
+    /// (title, body) pairs.
+    type Captured = Arc<Mutex<Vec<(String, String)>>>;
+
+    fn app_with_capturing_notifier(deps: AppDeps) -> (App, Captured) {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let notifier = Box::new(crate::ui::notifier::CapturingNotifier {
+            captured: captured.clone(),
+        });
+        let mut app = App::with_notifier(deps, notifier);
+        app.set_notification_prefs(NotificationPrefs {
+            on_completion: true,
+            on_failure: true,
+        });
+        (app, captured)
+    }
+
+    #[test]
+    fn drain_notifications_fires_for_each_new_completed_job() {
+        let deps = mock_deps();
+        let observers = deps.observers.clone();
+        let (mut app, captured) = app_with_capturing_notifier(deps);
+
+        crate::runtime::record_recent_job(&observers, completed_recent_job("a"));
+        crate::runtime::record_recent_job(&observers, completed_recent_job("b"));
+        app.drain_notifications();
+
+        assert_eq!(captured.lock().len(), 2);
+    }
+
+    #[test]
+    fn drain_notifications_is_idempotent_without_new_jobs() {
+        let deps = mock_deps();
+        let observers = deps.observers.clone();
+        let (mut app, captured) = app_with_capturing_notifier(deps);
+
+        crate::runtime::record_recent_job(&observers, completed_recent_job("a"));
+        app.drain_notifications();
+        app.drain_notifications();
+        app.drain_notifications();
+
+        assert_eq!(
+            captured.lock().len(),
+            1,
+            "re-draining with no new jobs must not re-notify"
+        );
+    }
+
+    #[test]
+    fn drain_notifications_fires_after_recent_jobs_ring_saturates() {
+        let deps = mock_deps();
+        let observers = deps.observers.clone();
+        let (mut app, captured) = app_with_capturing_notifier(deps);
+
+        // Fill the capped ring past `RECENT_JOBS_CAP` so its length
+        // pins at the cap and a length-based "added" comparison can no
+        // longer detect new arrivals.
+        for i in 0..(crate::runtime::RECENT_JOBS_CAP + 5) {
+            crate::runtime::record_recent_job(
+                &observers,
+                completed_recent_job(&format!("warm-{i}")),
+            );
+        }
+        app.drain_notifications();
+        captured.lock().clear();
+
+        // A brand-new job after saturation must still raise a
+        // notification — the regression this test guards.
+        crate::runtime::record_recent_job(&observers, completed_recent_job("after-saturation"));
+        app.drain_notifications();
+
+        let shown = captured.lock();
+        assert_eq!(
+            shown.len(),
+            1,
+            "a job completing after the ring saturates must still notify"
+        );
+        assert!(
+            shown[0].1.contains("image"),
+            "notification body should describe the new job, got: {:?}",
+            shown[0]
         );
     }
 }
