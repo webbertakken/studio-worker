@@ -3,8 +3,9 @@
 //!
 //! Every load/save emits a structured tracing breadcrumb so operators
 //! can tell from `journalctl` which file the worker actually consulted
-//! (and whether the file existed or was freshly bootstrapped with
-//! defaults).  The events deliberately omit the secret fields
+//! (and whether the file existed, was freshly bootstrapped with
+//! defaults, or failed to read/parse).  The events deliberately omit
+//! the secret fields
 //! (`auth_token`, `registration_secret`) so logs can be shipped
 //! off-box without leaking credentials.  See `tests/config_tracing.rs`
 //! for the regression contract.
@@ -183,9 +184,39 @@ pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
         );
         return Ok((cfg, path));
     }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let mut cfg: Config = toml::from_str(&text).with_context(|| "parsing config.toml")?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            // Mirror save()'s failure breadcrumb: an unreadable config
+            // is never silent.  The io error names the path/cause only
+            // (never file content), so it is safe to log verbatim.
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "load",
+                config_path = %path.display(),
+                error = %e,
+                "failed to read config file"
+            );
+            return Err(e).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let mut cfg: Config = match toml::from_str(&text) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            // Deliberately omit the parser detail: toml renders the
+            // offending source span, which can echo a secret value
+            // (e.g. an unterminated `auth_token = "...`).  The path +
+            // category keep the failure operator-visible without
+            // risking a credential leak in journalctl / Sentry.
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "load",
+                config_path = %path.display(),
+                "config file is not valid TOML"
+            );
+            return Err(e).context("parsing config.toml");
+        }
+    };
     cfg.models_root = expand_home(std::mem::take(&mut cfg.models_root));
     tracing::debug!(
         target: TRACE_TARGET,

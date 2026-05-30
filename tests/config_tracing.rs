@@ -80,6 +80,97 @@ fn load_emits_debug_with_source_existing_file_when_file_present() {
 }
 
 // ---------------------------------------------------------------------------
+// load() — read failure (e.g. unreadable file / wrong file type) leaves an
+// operator-visible WARN breadcrumb at the source, mirroring save().
+// Without it a worker that fails to read its config gives operators no
+// `studio_worker::config`-targeted event to filter on — only the
+// generic top-level error main() prints, which lacks the structured
+// `op`/`config_path` fields every other config event carries.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn load_emits_warn_event_when_read_fails() {
+    // A directory standing where the config file should be makes
+    // `read_to_string` fail without touching file permissions, so the
+    // test is portable and self-contained.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::create_dir(&path).unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let logs = capture(move || {
+        let res = config::load(Some(&path_str));
+        assert!(res.is_err(), "reading a directory as config must fail");
+    });
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"load\""),
+        "expected op=load, got: {logs}"
+    );
+    assert!(
+        logs.contains("config.toml"),
+        "expected the failing config_path in the log, got: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// load() — malformed TOML leaves an operator-visible WARN breadcrumb,
+// but deliberately omits the parser detail: toml renders the offending
+// source span, which can echo a secret value (see the secret-redaction
+// test below).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn load_emits_warn_event_when_parse_fails() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "this :: is = not = toml = :").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let logs = capture(move || {
+        let res = config::load(Some(&path_str));
+        assert!(res.is_err(), "malformed TOML must fail to load");
+    });
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"load\""),
+        "expected op=load, got: {logs}"
+    );
+    assert!(
+        logs.contains("config.toml"),
+        "expected the failing config_path in the log, got: {logs}"
+    );
+}
+
+#[test]
+fn load_failure_never_logs_secret_token_values() {
+    // An unterminated string on the `auth_token` line both fails to
+    // parse and carries a secret on the offending span.  The load
+    // breadcrumb must surface the failure without echoing that span,
+    // or operators shipping logs off-box would leak the credential.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "api_base_url = \"https://x.invalid\"\nauth_token = \"AUTH-SECRET-DO-NOT-LOG\n",
+    )
+    .unwrap();
+    let path_str = path.to_string_lossy().to_string();
+    let logs = capture(move || {
+        let res = config::load(Some(&path_str));
+        assert!(res.is_err(), "unterminated string must fail to parse");
+    });
+    assert!(
+        !logs.contains("AUTH-SECRET-DO-NOT-LOG"),
+        "auth_token leaked into the load-failure log: {logs}"
+    );
+    // Sanity: the failure breadcrumb fired, so the absence above isn't
+    // simply because no event was emitted.
+    assert!(
+        logs.contains("op=\"load\""),
+        "expected the load failure event to fire, got: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // save() — emits a breadcrumb so we can correlate state mutations with
 // the file that was written.
 // ---------------------------------------------------------------------------
