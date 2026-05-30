@@ -279,8 +279,42 @@ fn write_config(cfg: &Config, path: &Path) -> Result<usize> {
     }
     let text = toml::to_string_pretty(cfg).with_context(|| "serialising config")?;
     let bytes = text.len();
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    write_atomic(path, text.as_bytes())?;
     Ok(bytes)
+}
+
+/// Persist `bytes` to `path` atomically and owner-only.  The config
+/// carries the worker's identity and registration secrets
+/// (`auth_token`, `registration_secret`), so a plain `fs::write` is
+/// unsafe on two counts:
+///
+/// * **Durability**: an interrupted write (crash, power loss, full
+///   disk) truncates `path` to a half-written, unparseable file,
+///   wiping the worker's registration and forcing a fresh operator
+///   approval.  We stream into a temp file in the *same directory* (so
+///   the final step is a same-filesystem rename, which is atomic) and
+///   rename it over the target.  A failure leaves the previous config
+///   intact and drops the temp file.
+/// * **Confidentiality**: `fs::write` honours the umask and typically
+///   lands `0644`, exposing the secrets to every other local user.
+///   `tempfile` creates the temp file `0600` on Unix and `persist`
+///   keeps that mode through the rename.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating temp file in {}", dir.display()))?;
+    tmp.write_all(bytes)
+        .with_context(|| "writing temp config")?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| "flushing temp config to disk")?;
+    tmp.persist(path)
+        .map_err(|e| anyhow!("atomically replacing {}: {}", path.display(), e.error))?;
+    Ok(())
 }
 
 /// Wrap a Config in a mutex for use across the runtime.
@@ -445,6 +479,70 @@ mod tests {
             expanded.is_absolute() || expanded == Path::new("~"),
             "bare ~ expands to home (or stays put on weird boxes), got {}",
             expanded.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_config_owner_only_because_it_holds_secrets() {
+        // config.toml persists `auth_token` + `registration_secret`.
+        // A plain `fs::write` honours the umask and typically lands
+        // `0644`, exposing those credentials to every other local
+        // user.  The atomic temp-file write must leave the file
+        // owner-only (`0600`).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            auth_token: Some("super-secret-token".into()),
+            registration_secret: Some("reg-secret".into()),
+            ..Config::default()
+        };
+        save(&cfg, &path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "secrets-bearing config must not be group/world-accessible; got mode {mode:o}"
+        );
+    }
+
+    #[test]
+    fn save_atomically_replaces_existing_config_without_temp_litter() {
+        // A second save must fully replace the file (no stale fields
+        // from a longer previous version) and leave no temp-file
+        // siblings behind from the write-then-rename dance.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let big = Config {
+            api_base_url: "https://a-very-long-host-name.example.invalid/studio/".into(),
+            worker_id: Some("worker-with-a-longish-id-000000".into()),
+            ..Config::default()
+        };
+        save(&big, &path).unwrap();
+
+        let small = Config {
+            api_base_url: "https://x/".into(),
+            ..Config::default()
+        };
+        save(&small, &path).unwrap();
+
+        let (loaded, _) = load(Some(&path.to_string_lossy())).unwrap();
+        assert_eq!(loaded.api_base_url, "https://x/");
+        assert!(
+            loaded.worker_id.is_none(),
+            "a replacing save must not leave the previous worker_id behind"
+        );
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["config.toml".to_string()],
+            "atomic save must leave only the target file, found: {names:?}"
         );
     }
 }
