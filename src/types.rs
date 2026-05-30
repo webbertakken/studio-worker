@@ -55,6 +55,12 @@ pub struct ImageParams {
     /// task profile that declares the `initImage` capability.
     #[serde(default)]
     pub init_image_url: Option<String>,
+    /// HTTPS URL to a black/white inpaint mask (white = the region the
+    /// model may repaint). When set alongside `init_image_url`, the
+    /// worker downloads it and invokes `sd-cli --mask <path>` so only
+    /// the masked region changes. Wire-format key: `maskUrl`.
+    #[serde(default)]
+    pub mask_url: Option<String>,
     /// Denoise / noise-strength for i2i (0.0 = keep init image
     /// unchanged, 1.0 = full re-noise).  Maps to `sd-cli --strength`.
     #[serde(default)]

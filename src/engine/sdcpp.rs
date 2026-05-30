@@ -178,6 +178,20 @@ impl SdCppEngine {
             _ => None,
         };
 
+        // An inpaint mask only makes sense alongside an init image. Download it the same way so
+        // we can pass `sd-cli --mask <path>`; white pixels mark the region the model may repaint.
+        let mask_path = match (init_img_path.as_ref(), params.mask_url.as_deref()) {
+            (Some(_), Some(url)) if !url.is_empty() => {
+                let ext = init_image_extension(url);
+                let path = out_dir.join(format!("{stem}-mask.{ext}"));
+                download_file(url, &path)
+                    .with_context(|| format!("downloading mask {} -> {}", url, path.display()))?;
+                temp_files.push(path.clone());
+                Some(path)
+            }
+            _ => None,
+        };
+
         let args = build_sdcli_args(
             &params,
             source,
@@ -186,6 +200,7 @@ impl SdCppEngine {
             text_encoder,
             &out_path,
             init_img_path.as_deref(),
+            mask_path.as_deref(),
         );
         let mut cmd = Command::new(&self.sd_cli);
         cmd.args(&args);
@@ -484,6 +499,9 @@ struct ResolvedImageArgs {
 /// the caller resolves files / out-path / init-image-path, this
 /// function only assembles the flag list so it can be asserted in
 /// unit tests without spawning the binary.
+// Eight model-path + i2i components; grouping them adds indirection without
+// improving readability (mirrors the `#[allow]` already used in ws::session).
+#[allow(clippy::too_many_arguments)]
 fn build_sdcli_args(
     params: &ImageParams,
     source: &ModelSource,
@@ -492,6 +510,7 @@ fn build_sdcli_args(
     text_encoder: Option<&Path>,
     out_path: &Path,
     init_img_path: Option<&Path>,
+    mask_path: Option<&Path>,
 ) -> Vec<OsString> {
     let resolved = resolve_image_args(params, source);
     let mut args: Vec<OsString> = Vec::with_capacity(32);
@@ -523,6 +542,11 @@ fn build_sdcli_args(
         let strength = params.denoise.unwrap_or(0.75);
         args.push("--strength".into());
         args.push(strength.to_string().into());
+        // Mask-guided inpaint: only valid with an init image.
+        if let Some(mask) = mask_path {
+            args.push("--mask".into());
+            args.push(mask.into());
+        }
     }
     args.push("--cfg-scale".into());
     args.push(resolved.cfg_scale.to_string().into());
@@ -834,6 +858,7 @@ mod tests {
             Some(Path::new("/llm.gguf")),
             Path::new("/tmp/out.webp"),
             None,
+            None,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--diffusion-model").unwrap()], "/d.gguf");
@@ -870,6 +895,7 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
         );
         let s = args_to_strings(&args);
         assert_eq!(
@@ -894,6 +920,7 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
         );
         let s = args_to_strings(&args);
         assert!(!s.contains(&"--negative-prompt".to_string()));
@@ -915,10 +942,37 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
+            None,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--init-img").unwrap()], "/tmp/init.webp");
         assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.55");
+        // No mask supplied → no inpaint flag.
+        assert!(!s.contains(&"--mask".to_string()));
+    }
+
+    #[test]
+    fn build_sdcli_args_includes_mask_for_inpaint() {
+        let params = ImageParams {
+            prompt: "remove the tree".into(),
+            denoise: Some(0.8),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            Some(Path::new("/tmp/init.webp")),
+            Some(Path::new("/tmp/mask.png")),
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--init-img").unwrap()], "/tmp/init.webp");
+        assert_eq!(s[idx_after(&s, "--mask").unwrap()], "/tmp/mask.png");
+        assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.8");
     }
 
     #[test]
@@ -937,6 +991,7 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
+            None,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.75");
@@ -957,6 +1012,7 @@ mod tests {
             None,
             None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
         );
         let s = args_to_strings(&args);
@@ -979,6 +1035,7 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--sampling-method").unwrap()], "dpm++2m");
@@ -1000,6 +1057,7 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--steps").unwrap()], "30");
@@ -1020,6 +1078,7 @@ mod tests {
             None,
             None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
         );
         let s = args_to_strings(&args);
