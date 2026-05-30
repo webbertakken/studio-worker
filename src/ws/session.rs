@@ -408,8 +408,8 @@ async fn run_one_session(
         capabilities_for_heartbeat,
         sender.clone(),
         stop.clone(),
-        busy.clone(),
         paused.clone(),
+        observers.clone(),
         schedule,
     );
 
@@ -547,57 +547,33 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             &format!("rejecting offer {job_id}: worker is paused"),
             Some(job_id.clone()),
         );
-        let sender_for_reject = ctx.sender.clone();
-        let job_id_for_reject = job_id.clone();
-        let logs_for_reject = ctx.logs.clone();
-        let observers_for_reject = ctx.observers.clone();
-        tokio::spawn(async move {
-            let result = sender_for_reject
-                .send(&WorkerInbound::Reject {
-                    job_id: job_id_for_reject.clone(),
-                    reason: "worker paused by operator".to_string(),
-                })
-                .await;
-            if let Some((level, message)) =
-                offer_response_breadcrumb("reject", &job_id_for_reject, &result)
-            {
-                push_log_with_observers(
-                    &logs_for_reject,
-                    Some(&observers_for_reject),
-                    level,
-                    "ws",
-                    &message,
-                    Some(job_id_for_reject),
-                );
-            }
-        });
+        spawn_reject_offer(
+            ctx.sender.clone(),
+            ctx.logs.clone(),
+            ctx.observers.clone(),
+            job_id,
+            "worker paused by operator",
+        );
         return;
     }
-    // Send accept first so the server marks the offer consumed.
-    let sender_for_accept = ctx.sender.clone();
-    let job_id_for_accept = job_id.clone();
-    let logs_for_accept = ctx.logs.clone();
-    let observers_for_accept = ctx.observers.clone();
-    tokio::spawn(async move {
-        let result = sender_for_accept
-            .send(&WorkerInbound::Accept {
-                job_id: job_id_for_accept.clone(),
-            })
-            .await;
-        if let Some((level, message)) =
-            offer_response_breadcrumb("accept", &job_id_for_accept, &result)
-        {
-            push_log_with_observers(
-                &logs_for_accept,
-                Some(&observers_for_accept),
-                level,
-                "ws",
-                &message,
-                Some(job_id_for_accept),
-            );
-        }
-    });
-
+    if !try_reserve_worker(&ctx.busy) {
+        push_log_with_observers(
+            &ctx.logs,
+            Some(&ctx.observers),
+            "info",
+            "ws",
+            &format!("rejecting offer {job_id}: worker is already busy"),
+            Some(job_id.clone()),
+        );
+        spawn_reject_offer(
+            ctx.sender.clone(),
+            ctx.logs.clone(),
+            ctx.observers.clone(),
+            job_id,
+            "worker already has an in-flight job",
+        );
+        return;
+    }
     let job = claim.into_job_claim();
     let task_kind = job.task.kind();
     // The FULL prompt goes back to the studio (and to the engine).
@@ -611,17 +587,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     let prompt_preview = truncate_prompt(&full_prompt);
     let started_at = chrono::Utc::now();
 
-    // Surface the job to the UI's Jobs tab — bounded preview only.
-    *ctx.observers.current_job.lock() = Some(CurrentJob {
-        job_id: job_id.clone(),
-        kind: task_kind,
-        model: job.model.clone(),
-        prompt: prompt_preview.clone(),
-        started_at,
-    });
-
     let busy_flag = ctx.busy.clone();
-    busy_flag.store(true, Ordering::SeqCst);
     let logs_for_task = ctx.logs.clone();
     let observers_for_task = ctx.observers.clone();
     let sender_for_task = ctx.sender.clone();
@@ -630,6 +596,36 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     let worker_id = ctx.worker_id.clone();
     let auth_token = ctx.auth_token.clone();
     tokio::spawn(async move {
+        let accept_result = sender_for_task
+            .send(&WorkerInbound::Accept {
+                job_id: job_id.clone(),
+            })
+            .await;
+        if let Some((level, message)) = offer_response_breadcrumb("accept", &job_id, &accept_result)
+        {
+            push_log_with_observers(
+                &logs_for_task,
+                Some(&observers_for_task),
+                level,
+                "ws",
+                &message,
+                Some(job_id.clone()),
+            );
+        }
+        if accept_result.is_err() {
+            busy_flag.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        // Surface the job to the UI's Jobs tab — bounded preview only.
+        *observers_for_task.current_job.lock() = Some(CurrentJob {
+            job_id: job_id.clone(),
+            kind: task_kind,
+            model: job.model.clone(),
+            prompt: prompt_preview.clone(),
+            started_at,
+        });
+
         run_offered_job(
             sender_for_task,
             engine_for_task,
@@ -646,6 +642,31 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         )
         .await;
         busy_flag.store(false, Ordering::SeqCst);
+    });
+}
+
+fn try_reserve_worker(busy: &AtomicBool) -> bool {
+    busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+fn spawn_reject_offer(
+    sender: WsSender,
+    logs: Arc<Mutex<Vec<LogEntry>>>,
+    observers: WorkerObservers,
+    job_id: String,
+    reason: &'static str,
+) {
+    tokio::spawn(async move {
+        let result = sender
+            .send(&WorkerInbound::Reject {
+                job_id: job_id.clone(),
+                reason: reason.to_string(),
+            })
+            .await;
+        if let Some((level, message)) = offer_response_breadcrumb("reject", &job_id, &result) {
+            push_log_with_observers(&logs, Some(&observers), level, "ws", &message, Some(job_id));
+        }
     });
 }
 
@@ -907,8 +928,8 @@ fn spawn_heartbeat_pump(
     capabilities: WorkerCapabilities,
     sender: WsSender,
     stop: Arc<AtomicBool>,
-    busy: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    observers: WorkerObservers,
     schedule: SessionSchedule,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -924,11 +945,7 @@ fn spawn_heartbeat_pump(
             // current job id can change between heartbeats.
             let mut caps = capabilities.clone();
             caps.auto_enabled = !paused.load(Ordering::SeqCst);
-            let current_job_id = if busy.load(Ordering::SeqCst) {
-                Some("in-flight".to_string())
-            } else {
-                None
-            };
+            let current_job_id = heartbeat_current_job_id(&observers);
             if let Err(e) = sender
                 .send(&WorkerInbound::Heartbeat {
                     capabilities: caps,
@@ -941,6 +958,14 @@ fn spawn_heartbeat_pump(
             }
         }
     })
+}
+
+fn heartbeat_current_job_id(observers: &WorkerObservers) -> Option<String> {
+    observers
+        .current_job
+        .lock()
+        .as_ref()
+        .map(|job| job.job_id.clone())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1090,6 +1115,30 @@ mod tests {
         // successful accept / reject send must not add per-job noise.
         assert!(offer_response_breadcrumb("accept", "j-1", &Ok(())).is_none());
         assert!(offer_response_breadcrumb("reject", "j-2", &Ok(())).is_none());
+    }
+
+    #[test]
+    fn try_reserve_worker_only_allows_one_in_flight_job() {
+        let busy = AtomicBool::new(false);
+        assert!(try_reserve_worker(&busy));
+        assert!(!try_reserve_worker(&busy));
+    }
+
+    #[test]
+    fn heartbeat_current_job_id_uses_actual_job_id() {
+        let observers = WorkerObservers::default();
+        assert_eq!(heartbeat_current_job_id(&observers), None);
+        *observers.current_job.lock() = Some(CurrentJob {
+            job_id: "job-42".into(),
+            kind: crate::types::TaskKind::Image,
+            model: "synthetic".into(),
+            prompt: "prompt".into(),
+            started_at: chrono::Utc::now(),
+        });
+        assert_eq!(
+            heartbeat_current_job_id(&observers).as_deref(),
+            Some("job-42")
+        );
     }
 
     #[test]

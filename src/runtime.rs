@@ -152,10 +152,10 @@ pub const AUTO_UPDATE_SHUTDOWN_TICK: Duration = Duration::from_millis(250);
 /// reaching into `ws::session`.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Schedule for the auto-updater loop.  The WS session has its own
-/// `SessionSchedule` (see `ws::session`).
+/// Schedule for the long-running loops.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopSchedule {
+    pub ws_session: crate::ws::session::SessionSchedule,
     pub auto_update_tick: Duration,
     /// How often the idle wait between update checks re-polls the
     /// `stop` flag, so a shutdown request isn't deferred for a whole
@@ -166,6 +166,7 @@ pub struct LoopSchedule {
 impl Default for LoopSchedule {
     fn default() -> Self {
         Self {
+            ws_session: crate::ws::session::SessionSchedule::default(),
             auto_update_tick: AUTO_UPDATE_TICK,
             shutdown_tick: AUTO_UPDATE_SHUTDOWN_TICK,
         }
@@ -177,6 +178,7 @@ impl LoopSchedule {
     /// loop wrappers without blocking.
     pub fn fast_for_tests() -> Self {
         Self {
+            ws_session: crate::ws::session::SessionSchedule::fast_for_tests(),
             auto_update_tick: Duration::from_millis(1),
             shutdown_tick: Duration::from_millis(1),
         }
@@ -490,7 +492,6 @@ pub async fn run_loops(
     observers: WorkerObservers,
     schedule: LoopSchedule,
 ) -> Result<()> {
-    let session_schedule = crate::ws::session::SessionSchedule::default();
     let session = crate::ws::session::spawn_ws_session(
         cfg.clone(),
         stop.clone(),
@@ -498,7 +499,7 @@ pub async fn run_loops(
         busy.clone(),
         paused.clone(),
         observers.clone(),
-        session_schedule,
+        schedule.ws_session,
     );
     let auto_updater = spawn_auto_updater(
         cfg.clone(),
@@ -1164,6 +1165,7 @@ mod tests {
         let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
         let busy = Arc::new(AtomicBool::new(false));
         let schedule = LoopSchedule {
+            ws_session: crate::ws::session::SessionSchedule::fast_for_tests(),
             auto_update_tick: Duration::from_secs(3600),
             shutdown_tick: Duration::from_millis(1),
         };
