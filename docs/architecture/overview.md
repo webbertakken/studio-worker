@@ -663,8 +663,8 @@ file:
 - Linux: `systemd --user` unit at
   `~/.config/systemd/user/minis-studio-worker.service`
 - macOS: LaunchAgent plist at
-  `~/Library/LaunchAgents/gg.minis.minis-studio-worker.plist`
-- Windows: `schtasks /Create` XML template (`%APPDATA%\\minis-studio-worker\\task.xml`)
+  `~/Library/LaunchAgents/gg.minis.studio-worker.plist`
+- Windows: `schtasks /Create` XML template (`%APPDATA%\\minis-studio-worker\\minis-studio-worker.task.xml`)
   \u2014 written but **not registered**, since CreateTrigger needs
   the operator to confirm.
 
