@@ -153,6 +153,12 @@ impl SdCppEngine {
         );
         let out_path = out_dir.join(format!("{stem}.webp"));
 
+        // Own the scratch files from the moment their paths exist so
+        // every failure path (sd-cli error, unreadable output) cleans
+        // up instead of leaking them into the temp dir.
+        let mut temp_files = TempFileGuard::new();
+        temp_files.push(out_path.clone());
+
         // If the task carries an init image URL, stream it to a
         // tempfile so we can hand the path to `sd-cli --init-img`.
         // This is mandatory — the worker refuses i2i jobs whose
@@ -166,6 +172,7 @@ impl SdCppEngine {
                 download_file(url, &init_path).with_context(|| {
                     format!("downloading init image {} -> {}", url, init_path.display())
                 })?;
+                temp_files.push(init_path.clone());
                 Some(init_path)
             }
             _ => None,
@@ -218,10 +225,6 @@ impl SdCppEngine {
 
         let bytes = std::fs::read(&out_path)
             .with_context(|| format!("reading sd-cli output at {}", out_path.display()))?;
-        remove_temp_file(&out_path);
-        if let Some(p) = init_img_path.as_deref() {
-            remove_temp_file(p);
-        }
         info!(
             target: TRACE_TARGET,
             op = "dispatch",
@@ -299,6 +302,36 @@ fn remove_temp_file(path: &Path) {
                 error = %e,
                 "failed to remove temp file"
             );
+        }
+    }
+}
+
+/// RAII owner of a job's scratch files (the `sd-cli` output image and a
+/// downloaded init image).  Registering them up front means every exit
+/// path - the success return, an `sd-cli` non-zero exit, an unreadable
+/// output file, even a panic - removes them on drop instead of leaking
+/// them into the temp dir and slowly filling the worker's disk over a
+/// long-running session.  Removal is best-effort via [`remove_temp_file`],
+/// so a path that never materialised (job failed before `sd-cli` wrote
+/// anything) is silently tolerated.
+struct TempFileGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new() -> Self {
+        Self { paths: Vec::new() }
+    }
+
+    fn push(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            remove_temp_file(path);
         }
     }
 }
@@ -607,6 +640,42 @@ mod tests {
                 sampling_method: Some("euler".to_string()),
             },
         }
+    }
+
+    #[test]
+    fn temp_file_guard_removes_every_registered_file_on_drop() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.webp");
+        let init = dir.path().join("out-init.png");
+        std::fs::write(&out, b"image").unwrap();
+        std::fs::write(&init, b"init").unwrap();
+        {
+            let mut guard = TempFileGuard::new();
+            guard.push(out.clone());
+            guard.push(init.clone());
+            assert!(out.exists() && init.exists(), "files present before drop");
+        }
+        assert!(!out.exists(), "sd-cli output temp must be removed on drop");
+        assert!(!init.exists(), "init-image temp must be removed on drop");
+    }
+
+    #[test]
+    fn temp_file_guard_tolerates_a_file_that_never_materialised() {
+        // The output path is registered before sd-cli runs, so a job
+        // that fails before writing anything drops a guard pointing at
+        // a path that never existed.  That is the desired end state,
+        // not a cleanup warning.
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("never-written.webp");
+        let out = crate::test_support::capture(move || {
+            let mut guard = TempFileGuard::new();
+            guard.push(missing);
+            drop(guard);
+        });
+        assert!(
+            !out.contains("failed to remove temp file"),
+            "a never-created temp file must not warn on cleanup: {out:?}"
+        );
     }
 
     #[test]
