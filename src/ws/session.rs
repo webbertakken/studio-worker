@@ -28,7 +28,7 @@ use crate::runtime::{
     CurrentJob, JobOutcome, RecentJob, WorkerObservers,
 };
 use crate::types::{LogEntry, TaskResult, WorkerCapabilities};
-use crate::ws::client::{connect, WsClientError, WsSender};
+use crate::ws::client::{connect, WsClientError, WsResult, WsSender};
 use crate::ws::types::{HelloFrame, JobOfferClaim, WorkerInbound, WorkerOutbound};
 
 /// Tracing target used for every event emitted by the session.
@@ -549,25 +549,53 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         );
         let sender_for_reject = ctx.sender.clone();
         let job_id_for_reject = job_id.clone();
+        let logs_for_reject = ctx.logs.clone();
+        let observers_for_reject = ctx.observers.clone();
         tokio::spawn(async move {
-            let _ = sender_for_reject
+            let result = sender_for_reject
                 .send(&WorkerInbound::Reject {
-                    job_id: job_id_for_reject,
+                    job_id: job_id_for_reject.clone(),
                     reason: "worker paused by operator".to_string(),
                 })
                 .await;
+            if let Some((level, message)) =
+                offer_response_breadcrumb("reject", &job_id_for_reject, &result)
+            {
+                push_log_with_observers(
+                    &logs_for_reject,
+                    Some(&observers_for_reject),
+                    level,
+                    "ws",
+                    &message,
+                    Some(job_id_for_reject),
+                );
+            }
         });
         return;
     }
     // Send accept first so the server marks the offer consumed.
     let sender_for_accept = ctx.sender.clone();
     let job_id_for_accept = job_id.clone();
+    let logs_for_accept = ctx.logs.clone();
+    let observers_for_accept = ctx.observers.clone();
     tokio::spawn(async move {
-        let _ = sender_for_accept
+        let result = sender_for_accept
             .send(&WorkerInbound::Accept {
-                job_id: job_id_for_accept,
+                job_id: job_id_for_accept.clone(),
             })
             .await;
+        if let Some((level, message)) =
+            offer_response_breadcrumb("accept", &job_id_for_accept, &result)
+        {
+            push_log_with_observers(
+                &logs_for_accept,
+                Some(&observers_for_accept),
+                level,
+                "ws",
+                &message,
+                Some(job_id_for_accept),
+            );
+        }
     });
 
     let job = claim.into_job_claim();
@@ -983,9 +1011,74 @@ fn backoff_for(attempt: u32, schedule: SessionSchedule) -> Duration {
     Duration::from_millis(raw_ms.min(schedule.max_backoff_ms))
 }
 
+/// Decide whether a just-attempted offer-response send (accept /
+/// reject) warrants a session-level breadcrumb.
+///
+/// Returns `None` on success: the happy path is already implied by the
+/// surrounding "dispatched" / "rejecting offer: paused" breadcrumbs, so
+/// re-logging it would only add per-job noise.  Returns
+/// `Some(("error", …))` when the send failed — a dropped accept leaves
+/// the worker running a job the studio never marked accepted, and a
+/// dropped reject leaves the offer reserved on a paused worker until it
+/// times out.  The transport layer already logs the failure locally on
+/// `studio_worker::ws::client`, but only a session-level breadcrumb
+/// reaches the UI's Logs tab and the studio-shipped log view with the
+/// offending `job_id` attached.  Pure so the wording + level are
+/// unit-tested without a live WS sink.
+fn offer_response_breadcrumb(
+    label: &str,
+    job_id: &str,
+    result: &WsResult<()>,
+) -> Option<(&'static str, String)> {
+    match result {
+        Ok(()) => None,
+        Err(e) => Some((
+            "error",
+            format!("{label} send failed for offer {job_id}: {e}"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offer_response_breadcrumb_is_silent_on_success() {
+        // The happy path is already implied by the surrounding
+        // "dispatched" / "rejecting offer: paused" breadcrumbs, so a
+        // successful accept / reject send must not add per-job noise.
+        assert!(offer_response_breadcrumb("accept", "j-1", &Ok(())).is_none());
+        assert!(offer_response_breadcrumb("reject", "j-2", &Ok(())).is_none());
+    }
+
+    #[test]
+    fn offer_response_breadcrumb_reports_accept_send_failure() {
+        let (level, msg) =
+            offer_response_breadcrumb("accept", "j-1", &Err(WsClientError::ConnectionClosed))
+                .expect("a failed accept send must surface a breadcrumb");
+        assert_eq!(level, "error");
+        assert!(msg.contains("accept send failed"), "got: {msg}");
+        assert!(msg.contains("j-1"), "must name the job: {msg}");
+        assert!(
+            msg.contains("connection closed"),
+            "must carry the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn offer_response_breadcrumb_reports_reject_send_failure() {
+        let (level, msg) = offer_response_breadcrumb(
+            "reject",
+            "j-9",
+            &Err(WsClientError::Transport("sink gone".into())),
+        )
+        .expect("a failed reject send must surface a breadcrumb");
+        assert_eq!(level, "error");
+        assert!(msg.contains("reject send failed"), "got: {msg}");
+        assert!(msg.contains("j-9"), "must name the job: {msg}");
+        assert!(msg.contains("sink gone"), "must carry the cause: {msg}");
+    }
 
     #[test]
     fn backoff_grows_exponentially_until_cap() {
