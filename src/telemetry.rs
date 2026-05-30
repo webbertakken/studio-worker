@@ -149,6 +149,57 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::capture;
+
+    fn sample_config(dsn: &str) -> SentryConfig {
+        SentryConfig {
+            dsn: dsn.to_string(),
+            environment: "staging".into(),
+            release: "studio-worker@9.9.9".into(),
+            server_name: "rig-01".into(),
+        }
+    }
+
+    #[test]
+    fn build_client_options_carries_release_environment_and_server_name() {
+        let cfg = sample_config("https://abc123@o1.ingest.sentry.io/42");
+        let opts = build_client_options(&cfg).expect("a valid DSN must yield options");
+        assert!(opts.dsn.is_some(), "the parsed DSN must be attached");
+        assert_eq!(opts.release.as_deref(), Some("studio-worker@9.9.9"));
+        assert_eq!(opts.environment.as_deref(), Some("staging"));
+        assert_eq!(opts.server_name.as_deref(), Some("rig-01"));
+        // Performance tracing stays off on the worker — it already ships
+        // structured logs, so sampling traces would only add network
+        // traffic (see build_client_options).
+        assert!(
+            opts.traces_sample_rate.abs() < f32::EPSILON,
+            "traces_sample_rate must be disabled (0.0), got {}",
+            opts.traces_sample_rate
+        );
+    }
+
+    #[test]
+    fn build_client_options_rejects_invalid_dsn_and_warns() {
+        // A malformed DSN must disable telemetry with a breadcrumb —
+        // never panic the worker at startup (init() propagates the
+        // None via `?`).
+        let cfg = sample_config("not-a-valid-dsn");
+        let logs = capture(move || {
+            assert!(
+                build_client_options(&cfg).is_none(),
+                "an unparseable DSN must yield no options"
+            );
+        });
+        assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::telemetry"),
+            "expected telemetry target, got: {logs}"
+        );
+        assert!(
+            logs.contains("not a valid sentry DSN"),
+            "expected the invalid-DSN message, got: {logs}"
+        );
+    }
 
     #[test]
     fn from_env_inner_rejects_empty_string_after_trim() {
