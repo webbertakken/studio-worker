@@ -162,6 +162,7 @@ pub struct RealRunner;
 
 impl UpdateRunner for RealRunner {
     fn download(&self, url: &str, dest: &Path) -> Result<()> {
+        validate_installer_download_url(url)?;
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
             .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
@@ -217,6 +218,25 @@ impl UpdateRunner for RealRunner {
         }
         Ok(())
     }
+}
+
+fn validate_installer_download_url(raw: &str) -> Result<()> {
+    let url = url::Url::parse(raw).with_context(|| format!("invalid installer URL {raw:?}"))?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    if url.scheme() == "http" {
+        if let Some(host) = url.host_str() {
+            if host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+            {
+                return Ok(());
+            }
+        }
+    }
+    bail!("installer URL must use https (loopback http is allowed for tests): {raw}");
 }
 
 pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R) -> Result<()> {
@@ -506,6 +526,26 @@ mod tests {
         // A body longer than the declared length is just as corrupt as
         // a short one — reject both rather than run a bad installer.
         assert!(verify_download_len(120, Some(100)).is_err());
+    }
+
+    #[test]
+    fn validate_installer_download_url_allows_https() {
+        validate_installer_download_url("https://github.com/owner/repo/releases/download/x/i.sh")
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_installer_download_url_allows_loopback_http_for_tests() {
+        validate_installer_download_url("http://127.0.0.1:1234/i.sh").unwrap();
+        validate_installer_download_url("http://localhost:1234/i.sh").unwrap();
+    }
+
+    #[test]
+    fn validate_installer_download_url_rejects_remote_http() {
+        let err = validate_installer_download_url("http://example.com/i.sh")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https"), "got: {err}");
     }
 
     #[test]
