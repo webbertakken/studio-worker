@@ -306,7 +306,7 @@ impl App {
     }
 
     fn render_config(&mut self, ui: &mut egui::Ui) {
-        config_tab::render(
+        let saved = config_tab::render(
             ui,
             &mut self.config_draft,
             &self.deps.config_path,
@@ -315,7 +315,7 @@ impl App {
         // After Save the on-disk file is the new truth; mirror back to
         // the shared `Arc<Mutex<Config>>` so loops see new values on
         // the next tick.
-        {
+        if saved {
             let mut shared = self.deps.cfg.lock();
             *shared = self.config_draft.current.clone();
         }
@@ -466,5 +466,21 @@ mod tests {
                 app.render(ui);
             });
         }
+    }
+
+    #[test]
+    fn config_tab_does_not_publish_unsaved_edits_to_shared_config() {
+        let mut app = App::new(mock_deps());
+        app.config_draft.current.api_base_url = "https://unsaved.example".into();
+
+        egui::__run_test_ui(|ui| {
+            app.render_config(ui);
+        });
+
+        assert_eq!(
+            app.deps.cfg.lock().api_base_url,
+            Config::default().api_base_url,
+            "editing the draft must not affect the live runtime config until Save succeeds"
+        );
     }
 }

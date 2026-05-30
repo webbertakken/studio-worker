@@ -85,7 +85,8 @@ pub fn render(
     draft: &mut ConfigDraft,
     config_path: &Path,
     notification_prefs: &mut NotificationPrefs,
-) {
+) -> bool {
+    let mut saved = false;
     ui.heading("Configuration");
     ui.label(
         egui::RichText::new(format!("{}", config_path.display()))
@@ -182,7 +183,7 @@ pub fn render(
         let dirty = draft.dirty();
         let save = ui.add_enabled(dirty, egui::Button::new("Save"));
         if save.clicked() {
-            let _ = draft.save(config_path);
+            saved = draft.save(config_path).is_ok();
         }
         if ui.add_enabled(dirty, egui::Button::new("Reset")).clicked() {
             draft.reset();
@@ -197,6 +198,7 @@ pub fn render(
             );
         }
     });
+    saved
 }
 
 // ---------------------------------------------------------------------------
