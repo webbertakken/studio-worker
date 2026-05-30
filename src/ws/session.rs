@@ -737,13 +737,14 @@ async fn run_offered_job(
                         outcome = JobOutcome::Failed {
                             reason: msg.clone(),
                         };
-                        let _ = sender
+                        let fail_result = sender
                             .send(&WorkerInbound::Fail {
                                 job_id: job_id.clone(),
                                 error: msg,
                                 retryable: true,
                             })
                             .await;
+                        record_fail_send(&fail_result, &job_id, &logs, &observers);
                     } else {
                         push_log_with_observers(
                             &logs,
@@ -825,13 +826,14 @@ async fn run_offered_job(
             outcome = JobOutcome::Failed {
                 reason: e.to_string(),
             };
-            let _ = sender
+            let fail_result = sender
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
                     error: e.to_string(),
                     retryable: !is_unsupported_kind(&e),
                 })
                 .await;
+            record_fail_send(&fail_result, &job_id, &logs, &observers);
         }
         Err(e) => {
             push_log_with_observers(
@@ -845,13 +847,14 @@ async fn run_offered_job(
             outcome = JobOutcome::Failed {
                 reason: e.to_string(),
             };
-            let _ = sender
+            let fail_result = sender
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
                     error: e.to_string(),
                     retryable: true,
                 })
                 .await;
+            record_fail_send(&fail_result, &job_id, &logs, &observers);
         }
     }
 
@@ -1039,6 +1042,55 @@ fn offer_response_breadcrumb(
     }
 }
 
+/// Decide whether a just-attempted `Fail`-frame send warrants a
+/// session-level breadcrumb.
+///
+/// Returns `None` on success: the caller already logged the underlying
+/// job failure (the upload error, dispatch error, or panic), so a `Fail`
+/// frame that lands needs no second per-job line.  Returns
+/// `Some(("error", …))` when the send itself failed — a dropped `Fail`
+/// leaves the studio believing the job is still in flight (reserved on
+/// the session's `currentJob` slot) until it times out, with no local
+/// record that the notification never landed.  The transport layer logs
+/// the drop locally on `studio_worker::ws::client`, but only a
+/// session-level breadcrumb reaches the UI's Logs tab and the
+/// studio-shipped log view with the offending `job_id` attached.  Pure
+/// so the wording + level are unit-tested without a live WS sink.
+fn fail_send_breadcrumb(job_id: &str, result: &WsResult<()>) -> Option<(&'static str, String)> {
+    match result {
+        Ok(()) => None,
+        Err(e) => Some((
+            "error",
+            format!("failed to notify studio of job {job_id} failure: {e}"),
+        )),
+    }
+}
+
+/// Push a session-level breadcrumb when a `Fail`-frame send dropped.
+///
+/// Trivial glue over [`fail_send_breadcrumb`]: the three job-failure
+/// arms (upload error, dispatch error, dispatch panic) all notify the
+/// studio with a `Fail` frame and then call this, so a dropped
+/// notification is recorded with the `job_id` attached instead of being
+/// swallowed by `let _ = sender.send(...)`.
+fn record_fail_send(
+    result: &WsResult<()>,
+    job_id: &str,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    observers: &WorkerObservers,
+) {
+    if let Some((level, message)) = fail_send_breadcrumb(job_id, result) {
+        push_log_with_observers(
+            logs,
+            Some(observers),
+            level,
+            "ws",
+            &message,
+            Some(job_id.to_string()),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,6 +1129,36 @@ mod tests {
         assert_eq!(level, "error");
         assert!(msg.contains("reject send failed"), "got: {msg}");
         assert!(msg.contains("j-9"), "must name the job: {msg}");
+        assert!(msg.contains("sink gone"), "must carry the cause: {msg}");
+    }
+
+    #[test]
+    fn fail_send_breadcrumb_is_silent_on_success() {
+        // The underlying job failure (upload / dispatch / panic) is
+        // already logged by the caller, so a Fail-frame that lands must
+        // not add a second per-job line.
+        assert!(fail_send_breadcrumb("j-1", &Ok(())).is_none());
+    }
+
+    #[test]
+    fn fail_send_breadcrumb_reports_send_failure() {
+        let (level, msg) = fail_send_breadcrumb("j-7", &Err(WsClientError::ConnectionClosed))
+            .expect("a dropped Fail send must surface a breadcrumb");
+        assert_eq!(level, "error");
+        assert!(msg.contains("j-7"), "must name the job: {msg}");
+        assert!(
+            msg.contains("connection closed"),
+            "must carry the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn fail_send_breadcrumb_carries_transport_cause() {
+        let (level, msg) =
+            fail_send_breadcrumb("j-3", &Err(WsClientError::Transport("sink gone".into())))
+                .expect("a dropped Fail send must surface a breadcrumb");
+        assert_eq!(level, "error");
+        assert!(msg.contains("j-3"), "must name the job: {msg}");
         assert!(msg.contains("sink gone"), "must carry the cause: {msg}");
     }
 
