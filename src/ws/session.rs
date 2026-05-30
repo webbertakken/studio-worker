@@ -141,7 +141,12 @@ pub async fn spawn_ws_session(
         }
         waiting_for_creds_logged = false;
 
-        match run_one_session(&cfg, &stop, &logs, &busy, &paused, &observers, schedule).await {
+        let welcomed = AtomicBool::new(false);
+        match run_one_session(
+            &cfg, &stop, &logs, &busy, &paused, &observers, schedule, &welcomed,
+        )
+        .await
+        {
             Ok(SessionOutcome::Stopped) => return Ok(()),
             Ok(SessionOutcome::AuthFailed(reason)) => {
                 push_log_with_observers(
@@ -166,6 +171,12 @@ pub async fn spawn_ws_session(
                 return Err(anyhow!("ws fatal: {reason}"));
             }
             Ok(SessionOutcome::Disconnected) | Err(_) => {
+                // A session that successfully connected shouldn't count its later drop toward the
+                // connect-failure cap — only consecutive failures to connect should accumulate, so
+                // a long-lived worker isn't killed by transient mid-session disconnects.
+                if welcomed.load(Ordering::SeqCst) {
+                    attempt = 0;
+                }
                 attempt += 1;
                 if max_attempts > 0 && attempt > max_attempts {
                     push_log_with_observers(
@@ -288,6 +299,9 @@ fn has_credentials(cfg: &SharedConfig) -> bool {
 /// One end-to-end session attempt: connect, hello, run until shutdown
 /// or disconnect.
 #[cfg_attr(coverage_nightly, coverage(off))]
+// Eight collaborators (config + shared flags + observers + schedule + welcomed signal);
+// grouping them adds indirection without improving readability.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_session(
     cfg: &SharedConfig,
     stop: &Arc<AtomicBool>,
@@ -296,6 +310,7 @@ async fn run_one_session(
     paused: &Arc<AtomicBool>,
     observers: &WorkerObservers,
     schedule: SessionSchedule,
+    welcomed: &AtomicBool,
 ) -> Result<SessionOutcome> {
     let (api_base_url, worker_id, auth_token) = {
         let guard = cfg.lock();
@@ -381,7 +396,7 @@ async fn run_one_session(
     // session.
     let mut event_rx = event_rx;
     match wait_for_welcome(&mut event_rx, logs, observers).await {
-        WelcomeOutcome::Welcomed => {}
+        WelcomeOutcome::Welcomed => welcomed.store(true, Ordering::SeqCst),
         WelcomeOutcome::AuthFailed(reason) => {
             let _ = sender.close(1000, "auth failed").await;
             let _ = reader.await;
