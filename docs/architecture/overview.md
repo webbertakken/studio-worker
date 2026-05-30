@@ -111,9 +111,8 @@ The CLI surface from [`src/cli.rs`](../../src/cli.rs):
 |---|---|
 | `run` | Start the runtime: ensure registered, then the WS session + auto-updater |
 | `ui` (feature `ui`) | Same as `run` but with the egui window + tray + notifications |
-| `register` | Persist label / api-base-url / clear state.  **No HTTP** \u2014 the next `run`/`ui` actually auto-registers |
+| `register` | Persist api-base-url / clear state (`--reset`).  **No HTTP** \u2014 the next `run`/`ui` actually auto-registers |
 | `status` | Print config path, registration state, threshold, auto-update toggle |
-| `enable` / `disable` | Toggle `auto_enabled` (whether to claim new jobs) |
 | `set-threshold <gb>` | Update `vram_threshold_gb` |
 | `install-service` / `uninstall-service` | Per-OS service file (systemd / launchd / scheduled task) |
 | `config` | Dump the resolved config |
@@ -146,13 +145,13 @@ src/
 │
 ├── engine/           Pluggable inference backends.
 │   ├── mod.rs        Engine trait + dispatch / dispatch_with_source.  Always-on SyntheticEngine.
-│   ├── multi.rs      MultiEngine; routes by ModelSource.engine (or kind fallback).
+│   ├── multi.rs      MultiEngine; routes strictly by ModelSource.engine (no fallback).
 │   ├── sdcpp.rs      Real image inference via stable-diffusion.cpp subprocess.
 │   ├── llama.rs      (feature `llama`) llama-cpp-2 wrapper for LLM tasks.
 │   ├── whisper.rs    (feature `whisper`) whisper-rs wrapper for STT.
 │   ├── candle_image.rs (feature `image-candle`) candle-transformers SD pipeline.
-│   ├── video.rs      (feature `video`) ffmpeg-shaped video stand-in.
-│   └── tts.rs        (feature `tts`) Piper-style TTS stand-in.
+│   ├── video.rs      (feature `video`) animated-GIF video stand-in (no ffmpeg).
+│   └── tts.rs        (feature `tts`) pure-Rust formant-synth TTS stand-in.
 │
 ├── ws/               Replaces the four old polling loops with one WS session.
 │   ├── mod.rs        Re-exports.
@@ -347,6 +346,18 @@ pub trait Engine: Send + Sync {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> EngineCapabilities;
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult>;
+
+    // Dispatch with the offer's ModelSource attached.  Engines that
+    // need the download spec / CLI defaults (sdcpp) override it;
+    // engines that don't (synthetic) inherit this default.
+    fn dispatch_with_source(
+        &self,
+        model: &str,
+        task: Task,
+        _source: &ModelSource,
+    ) -> Result<TaskResult> {
+        self.dispatch(model, task)
+    }
 }
 ```
 
@@ -356,7 +367,7 @@ pub trait Engine: Send + Sync {
 - `Llm { json }` (OpenAI-shape `chat.completion`)
 - `AudioStt { json }` (whisper-shape segments)
 - `AudioTts { bytes, ext }` (wav)
-- `Video { bytes, ext }` (animated webp / mp4)
+- `Video { bytes, ext }` (animated webp from synthetic, gif from the `video` feature)
 
 Engines are no longer config-selectable.  `engine::build()` always
 returns a `MultiEngine` populated with every backend compiled into
