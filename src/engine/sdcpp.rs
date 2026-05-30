@@ -33,7 +33,7 @@ use crate::types::{ImageParams, ModelFileRole, ModelSource, Task, TaskKind, Task
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -100,7 +100,7 @@ impl SdCppEngine {
     fn ensure_files(&self, source: &ModelSource) -> Result<Vec<(ModelFileRole, PathBuf)>> {
         let mut out = Vec::with_capacity(source.files.len());
         for file in &source.files {
-            let local = self.models_root.join(&file.filename);
+            let local = model_cache_path(&self.models_root, &file.filename)?;
             if !local.is_file() {
                 download_file(&file.url, &local).with_context(|| {
                     format!(
@@ -550,6 +550,19 @@ fn which(bin: &str) -> Option<PathBuf> {
     None
 }
 
+fn model_cache_path(models_root: &Path, filename: &str) -> Result<PathBuf> {
+    let path = Path::new(filename);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None)
+            if !filename.contains('/') && !filename.contains('\\') =>
+        {
+            Ok(models_root.join(name))
+        }
+        _ => bail!("model filename must be a plain file name: {filename:?}"),
+    }
+}
+
 /// Pick an extension to use for the init-image tempfile that sd-cli's
 /// image loader can sniff.  Reads the trailing `.<ext>` from the URL's
 /// path (ignoring query + fragment).  Defaults to `webp` when no
@@ -661,6 +674,20 @@ mod tests {
             Some(Path::new("/v.safetensors"))
         );
         assert!(file_for_role(&files, ModelFileRole::TextEncoder).is_none());
+    }
+
+    #[test]
+    fn model_cache_path_accepts_plain_filenames_only() {
+        let root = Path::new("/models");
+        assert_eq!(
+            model_cache_path(root, "model.gguf").unwrap(),
+            PathBuf::from("/models/model.gguf")
+        );
+        assert!(model_cache_path(root, "../outside.gguf").is_err());
+        assert!(model_cache_path(root, "nested/model.gguf").is_err());
+        assert!(model_cache_path(root, "/tmp/model.gguf").is_err());
+        assert!(model_cache_path(root, r"nested\model.gguf").is_err());
+        assert!(model_cache_path(root, "").is_err());
     }
 
     #[test]
