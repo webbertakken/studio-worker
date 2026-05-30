@@ -281,10 +281,6 @@ impl Engine for SdCppEngine {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Verify a streamed download wrote exactly the body the server
-/// promised.  `expected` is the response's `Content-Length`; it's
-/// `None` for chunked transfers, where there's nothing to check and
-/// we accept whatever arrived (the behaviour before this guard).  A
 /// Best-effort removal of a temporary file (a per-job `sd-cli` output,
 /// an init image, or a half-written `.part` download).  Removal is
 /// non-fatal — the artefact has already been read or the job already
@@ -307,6 +303,10 @@ fn remove_temp_file(path: &Path) {
     }
 }
 
+/// Verify a streamed download wrote exactly the body the server
+/// promised.  `expected` is the response's `Content-Length`; it's
+/// `None` for chunked transfers, where there's nothing to check and
+/// we accept whatever arrived (the behaviour before this guard).  A
 /// mismatch in either direction means the download is truncated or
 /// corrupt, so we surface a clear error rather than cache a bad model.
 fn verify_download_len(copied: u64, expected: Option<u64>) -> Result<()> {
