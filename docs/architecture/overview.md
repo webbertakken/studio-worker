@@ -603,7 +603,12 @@ Every `auto_update_interval_secs` (default 30 min):
      a clean fit.
 
 The flow short-circuits when `auto_update_enabled = false` or when
-the worker is mid-job.  The `RealRunner::{download, run_installer}`
+the worker is mid-job.  Between checks the idle wait is stop-aware: it
+re-polls the shared `stop` flag every `AUTO_UPDATE_SHUTDOWN_TICK`
+(default 250 ms) via `wait_with_stop`, so a SIGTERM / SIGINT during the
+idle window stops the worker promptly instead of blocking
+`run_loops`' join for a whole `auto_update_tick`.  The
+`RealRunner::{download, run_installer}`
 + `restart_self` paths are tested through a fake `UpdateRunner`
 trait \u2014 they're excluded from the 90% coverage gate
 (`.cargo-llvm-cov.toml`).

@@ -141,6 +141,12 @@ pub fn push_recent_job_for_tests(observers: &WorkerObservers, job_id: &str) {
 }
 
 pub const AUTO_UPDATE_TICK: Duration = Duration::from_secs(60);
+/// Cadence at which the auto-updater's idle wait re-checks the `stop`
+/// flag.  Mirrors the WS session's shutdown tick so a SIGTERM / SIGINT
+/// landing during the (up to `AUTO_UPDATE_TICK`-long) idle window wakes
+/// the loop within ~250 ms instead of leaving `run_loops`' join blocked
+/// for a whole tick.
+pub const AUTO_UPDATE_SHUTDOWN_TICK: Duration = Duration::from_millis(250);
 /// Default WS heartbeat interval, re-exported here so the native UI
 /// (and any other downstream readers) get a stable constant without
 /// reaching into `ws::session`.
@@ -151,12 +157,17 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy)]
 pub struct LoopSchedule {
     pub auto_update_tick: Duration,
+    /// How often the idle wait between update checks re-polls the
+    /// `stop` flag, so a shutdown request isn't deferred for a whole
+    /// `auto_update_tick`.
+    pub shutdown_tick: Duration,
 }
 
 impl Default for LoopSchedule {
     fn default() -> Self {
         Self {
             auto_update_tick: AUTO_UPDATE_TICK,
+            shutdown_tick: AUTO_UPDATE_SHUTDOWN_TICK,
         }
     }
 }
@@ -167,6 +178,7 @@ impl LoopSchedule {
     pub fn fast_for_tests() -> Self {
         Self {
             auto_update_tick: Duration::from_millis(1),
+            shutdown_tick: Duration::from_millis(1),
         }
     }
 }
@@ -620,6 +632,23 @@ pub async fn auto_update_tick(
 //  `next_delay_for` lived here.  Their behaviour is now carried by the
 //  WS-driven tasks in `ws::session`.)
 
+/// Sleep up to `total`, re-checking `stop` every `tick` and returning
+/// the instant a shutdown is requested.  Keeps long idle waits (the
+/// auto-update tick here, reconnect backoff in the WS session)
+/// responsive to SIGTERM / SIGINT without busy-looping.  Shared by the
+/// runtime auto-updater and `ws::session`.
+pub(crate) async fn wait_with_stop(total: Duration, stop: &Arc<AtomicBool>, tick: Duration) {
+    let mut elapsed = Duration::ZERO;
+    while elapsed < total {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let next = tick.min(total - elapsed);
+        tokio::time::sleep(next).await;
+        elapsed += next;
+    }
+}
+
 pub fn spawn_auto_updater(
     cfg: SharedConfig,
     stop: Arc<AtomicBool>,
@@ -630,7 +659,14 @@ pub fn spawn_auto_updater(
     tokio::spawn(async move {
         let mut elapsed = Duration::from_secs(0);
         while !stop.load(Ordering::SeqCst) {
-            tokio::time::sleep(schedule.auto_update_tick).await;
+            // Stop-aware idle wait: a shutdown signal during this window
+            // wakes the loop within `schedule.shutdown_tick` instead of
+            // leaving `run_loops`' join() blocked for a full
+            // `auto_update_tick`.
+            wait_with_stop(schedule.auto_update_tick, &stop, schedule.shutdown_tick).await;
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
             elapsed += schedule.auto_update_tick;
             let snapshot = cfg.lock().clone();
             if elapsed < Duration::from_secs(snapshot.auto_update_interval_secs) {
@@ -1053,5 +1089,44 @@ mod tests {
         assert_eq!(decision, AutoUpdateDecision::SkippedBusy);
         let entries = logs.lock();
         assert!(entries.iter().any(|e| e.message.contains("busy on a job")));
+    }
+
+    #[tokio::test]
+    async fn wait_with_stop_short_circuits_when_already_stopped() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let start = std::time::Instant::now();
+        wait_with_stop(Duration::from_secs(60), &stop, Duration::from_millis(10)).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "an already-set stop must return without sleeping the full duration"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_updater_stops_promptly_during_idle_wait() {
+        // A huge auto_update_tick means a non-cancellable idle sleep
+        // would pin the JoinHandle — and thus `run_loops`' join() — for
+        // the whole tick after stop is set, defeating graceful
+        // shutdown.  The stop-aware wait must let the task finish well
+        // inside the tick.
+        let cfg = crate::config::shared(Config {
+            auto_update_enabled: false,
+            ..Config::default()
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        let busy = Arc::new(AtomicBool::new(false));
+        let schedule = LoopSchedule {
+            auto_update_tick: Duration::from_secs(3600),
+            shutdown_tick: Duration::from_millis(1),
+        };
+        let handle = spawn_auto_updater(cfg, stop.clone(), logs, busy, schedule);
+        // Let the loop reach its idle wait, then request shutdown.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stop.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_millis(250), handle)
+            .await
+            .expect("auto-updater did not observe stop promptly")
+            .expect("auto-updater task panicked");
     }
 }

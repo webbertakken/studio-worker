@@ -25,7 +25,7 @@ use crate::engine::Engine;
 use crate::http::ApiClient;
 use crate::runtime::{
     is_unsupported_kind, prompt_for, push_log_with_observers, record_recent_job, truncate_prompt,
-    CurrentJob, JobOutcome, RecentJob, WorkerObservers,
+    wait_with_stop, CurrentJob, JobOutcome, RecentJob, WorkerObservers,
 };
 use crate::types::{LogEntry, TaskResult, WorkerCapabilities};
 use crate::ws::client::{connect, WsClientError, WsResult, WsSender};
@@ -994,18 +994,6 @@ fn spawn_shutdown_observer(
             }
         }
     })
-}
-
-async fn wait_with_stop(total: Duration, stop: &Arc<AtomicBool>, tick: Duration) {
-    let mut elapsed = Duration::ZERO;
-    while elapsed < total {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        let next = tick.min(total - elapsed);
-        tokio::time::sleep(next).await;
-        elapsed += next;
-    }
 }
 
 fn backoff_for(attempt: u32, schedule: SessionSchedule) -> Duration {
