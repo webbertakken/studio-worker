@@ -743,14 +743,44 @@ async fn run_offered_job(
                     }
                 }
                 TaskResult::Llm { json } | TaskResult::AudioStt { json } => {
-                    let _ = sender
+                    // Mirror the binary path: branch on the send result
+                    // so a dropped `completeJson` frame is recorded as a
+                    // failure (never a false-positive `Completed`) and a
+                    // successful send leaves an explicit completion
+                    // breadcrumb in the logs + shipped studio logs,
+                    // symmetric with the binary path's "binary upload ok".
+                    match sender
                         .send(&WorkerInbound::CompleteJson {
                             job_id: job_id.clone(),
                             result: json,
                             prompt: Some(full_prompt.clone()),
                         })
-                        .await;
-                    outcome = JobOutcome::Completed;
+                        .await
+                    {
+                        Ok(()) => {
+                            push_log_with_observers(
+                                &logs,
+                                Some(&observers),
+                                "info",
+                                "ws",
+                                "json result sent",
+                                Some(job_id.clone()),
+                            );
+                            outcome = JobOutcome::Completed;
+                        }
+                        Err(e) => {
+                            let msg = format!("failed to send result: {e}");
+                            push_log_with_observers(
+                                &logs,
+                                Some(&observers),
+                                "error",
+                                "ws",
+                                &msg,
+                                Some(job_id.clone()),
+                            );
+                            outcome = JobOutcome::Failed { reason: msg };
+                        }
+                    }
                 }
             }
         }

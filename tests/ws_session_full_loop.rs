@@ -259,6 +259,98 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
 }
 
 #[tokio::test]
+async fn ws_session_logs_a_breadcrumb_when_json_result_is_sent() {
+    // The binary-output path already logs "binary upload ok" on a
+    // successful multipart upload.  The JSON (LLM / STT) path must be
+    // symmetric: a successfully sent `completeJson` frame has to leave
+    // an explicit completion breadcrumb so operators (and the studio's
+    // shipped logs) can tell a JSON job actually delivered its result,
+    // not just that it dispatched.
+    let (ws_addr, server_handle) = spawn_studio_ws().await;
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let shared = config::shared(cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
+    let busy = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    // `recent_logs` is *not* drained by the log shipper, so the
+    // completion breadcrumb stays inspectable after the run.
+    let observers = WorkerObservers::default();
+
+    let session_handle = tokio::spawn({
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let logs = logs.clone();
+        let busy = busy.clone();
+        let paused = paused.clone();
+        let observers = observers.clone();
+        async move {
+            spawn_ws_session(
+                shared,
+                stop,
+                logs,
+                busy,
+                paused,
+                observers,
+                SessionSchedule::fast_for_tests(),
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(TIMEOUT, server_handle)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked")
+        .expect("server returned err");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(5), session_handle)
+        .await
+        .expect("session loop timed out");
+
+    let json_completion = observers
+        .recent_logs
+        .lock()
+        .iter()
+        .filter(|e| e.message.contains("json result sent"))
+        .map(|e| (e.level.clone(), e.job_id.clone()))
+        .collect::<Vec<_>>();
+    // Both the LLM and the STT offer travel the JSON path, so both
+    // must leave an info-level breadcrumb tagged with their job id.
+    assert_eq!(
+        json_completion.len(),
+        2,
+        "expected a completion breadcrumb per JSON job, got {json_completion:?}"
+    );
+    assert!(
+        json_completion.iter().all(|(level, _)| level == "info"),
+        "json completion breadcrumbs must be info-level: {json_completion:?}"
+    );
+    assert!(
+        json_completion
+            .iter()
+            .any(|(_, job_id)| job_id.as_deref() == Some("job-llm")),
+        "missing breadcrumb for the LLM job: {json_completion:?}"
+    );
+    assert!(
+        json_completion
+            .iter()
+            .any(|(_, job_id)| job_id.as_deref() == Some("job-stt")),
+        "missing breadcrumb for the STT job: {json_completion:?}"
+    );
+}
+
+#[tokio::test]
 async fn ws_session_logs_advertised_capabilities_on_handshake() {
     let (ws_addr, server_handle) = spawn_handshake_only_ws().await;
 
