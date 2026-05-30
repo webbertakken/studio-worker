@@ -324,6 +324,68 @@ async fn real_runner_can_be_constructed() {
     let _ = update::RealRunner;
 }
 
+// ---------------------------------------------------------------------------
+// RealRunner::download — the live-network installer fetch.  These drive
+// the real reqwest::blocking path against a wiremock server so the
+// happy path and the truncated-download guard are both proven
+// end-to-end (not just the pure `verify_download_len` unit tests).
+//
+// reqwest::blocking panics if called from inside a tokio runtime, so
+// each download runs on a plain OS thread — the same pattern the
+// `check_*` tests above use for `update::check`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn real_runner_download_writes_body_when_length_matches() {
+    use studio_worker::update::{RealRunner, UpdateRunner};
+    let server = MockServer::start().await;
+    let body = b"#!/bin/sh\necho real installer\n".to_vec();
+    Mock::given(method("GET"))
+        .and(path("/installer.sh"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    let url = format!("{}/installer.sh", server.uri());
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("installer.sh");
+    let dest_for_thread = dest.clone();
+    std::thread::spawn(move || RealRunner.download(&url, &dest_for_thread))
+        .join()
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+}
+
+#[tokio::test]
+async fn real_runner_download_rejects_truncated_body() {
+    use studio_worker::update::{RealRunner, UpdateRunner};
+    let server = MockServer::start().await;
+    // Declare a Content-Length far larger than the body actually sent.
+    // reqwest sees the framed message end early and the download must
+    // not silently succeed — a half-written installer would then be
+    // executed.
+    Mock::given(method("GET"))
+        .and(path("/installer.sh"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "9999")
+                .set_body_bytes(b"too short".to_vec()),
+        )
+        .mount(&server)
+        .await;
+    let url = format!("{}/installer.sh", server.uri());
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("installer.sh");
+    let dest_for_thread = dest.clone();
+    let result = std::thread::spawn(move || RealRunner.download(&url, &dest_for_thread))
+        .join()
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "a truncated installer download must be rejected, not silently accepted"
+    );
+}
+
 #[tokio::test]
 async fn restart_argv_returns_current_exe() {
     let (bin, _args) = update::restart_argv();
