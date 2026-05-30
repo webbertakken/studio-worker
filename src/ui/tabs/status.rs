@@ -3,7 +3,10 @@
 //! hasn't registered yet, this tab shows the in-window Register form
 //! (fork #2 of plans/native-ui.md, default A).
 
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use chrono::{DateTime, Utc};
 use eframe::egui;
@@ -285,8 +288,7 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
             )
         };
         if ui.button(label).on_hover_text(hint).clicked() {
-            // fetch_xor returns the previous value; flipping it.
-            paused_flag.fetch_xor(true, std::sync::atomic::Ordering::SeqCst);
+            toggle_pause(paused_flag);
         }
     });
     ui.add_space(8.0);
@@ -329,6 +331,24 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
             };
             ui.end_row();
         });
+}
+
+/// Flip the operator pause flag and emit a structured breadcrumb, so a
+/// pause/resume from the Status tab's button is as visible in the logs
+/// (and the studio's shipped-log view) as the identical toggle from the
+/// tray menu (`ui::mod`).  Without it, pausing from the window left no
+/// trace while pausing from the tray did.  `fetch_xor` returns the
+/// previous value, so the new paused state is its negation.  Extracted
+/// from the button handler so the logging is unit-testable without an
+/// egui context.  Returns the new paused state.
+fn toggle_pause(paused_flag: &Arc<AtomicBool>) -> bool {
+    let now_paused = !paused_flag.fetch_xor(true, Ordering::SeqCst);
+    tracing::info!(
+        target: "studio_worker::ui::status",
+        paused = now_paused,
+        "pause toggled from status tab"
+    );
+    now_paused
 }
 
 #[cfg(test)]
@@ -546,5 +566,49 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 5, 25, 12, 0, 0).unwrap();
         let then = Utc.with_ymd_and_hms(2026, 5, 25, 12, 0, 5).unwrap();
         assert_eq!(format_age(now, then), "just now");
+    }
+
+    #[test]
+    fn toggle_pause_flips_flag_and_logs_both_directions() {
+        // The Status-tab Pause/Resume button must leave the same
+        // breadcrumb the tray-menu toggle does (`ui::mod`), otherwise a
+        // pause from the window is invisible in the shipped logs while
+        // the identical action from the tray is not.
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let out = crate::test_support::capture({
+            let flag = flag.clone();
+            move || assert!(toggle_pause(&flag), "first toggle must pause")
+        });
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "flag is paused after first toggle"
+        );
+        assert!(out.contains("INFO"), "expected INFO level, got: {out}");
+        assert!(
+            out.contains("studio_worker::ui::status"),
+            "expected the status target, got: {out}"
+        );
+        assert!(
+            out.contains("pause toggled from status tab"),
+            "expected the toggle message, got: {out}"
+        );
+        assert!(
+            out.contains("paused=true"),
+            "expected paused=true, got: {out}"
+        );
+
+        let out = crate::test_support::capture({
+            let flag = flag.clone();
+            move || assert!(!toggle_pause(&flag), "second toggle must resume")
+        });
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "flag is resumed after second toggle"
+        );
+        assert!(
+            out.contains("paused=false"),
+            "expected paused=false, got: {out}"
+        );
     }
 }
