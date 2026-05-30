@@ -809,12 +809,17 @@ pub fn push_log_with_observers(
         message: message.to_string(),
         job_id,
     };
+    // Carry the job id as a structured field so operators can pivot
+    // shipped studio logs / Sentry breadcrumbs on it. `Option<&str>`
+    // only records the field when `Some`, so jobless breadcrumbs stay
+    // free of a noisy empty `job_id`.
+    let job_id = entry.job_id.as_deref();
     if level == "error" {
-        tracing::error!(target: "studio_worker", "[{category}] {message}");
+        tracing::error!(target: "studio_worker", job_id, "[{category}] {message}");
     } else if level == "warn" {
-        tracing::warn!(target: "studio_worker", "[{category}] {message}");
+        tracing::warn!(target: "studio_worker", job_id, "[{category}] {message}");
     } else {
-        info!(target: "studio_worker", "[{category}] {message}");
+        info!(target: "studio_worker", job_id, "[{category}] {message}");
     }
     logs.lock().push(entry.clone());
     if let Some(o) = observers {
@@ -1025,6 +1030,48 @@ mod tests {
         assert_eq!(v[1].level, "warn");
         assert_eq!(v[1].job_id.as_deref(), Some("j-1"));
         assert_eq!(v[2].level, "error");
+    }
+
+    #[test]
+    fn push_log_emits_job_id_as_a_structured_tracing_field() {
+        // Operators correlating shipped studio logs / Sentry
+        // breadcrumbs by job need the job id as a *field*, not just
+        // buried in the message text, so `RUST_LOG` filters and Sentry
+        // tag search can pivot on it.
+        use crate::test_support::capture;
+        let logs = capture(|| {
+            let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+            push_log(
+                &logs,
+                "info",
+                "ws",
+                "binary upload ok",
+                Some("job-42".into()),
+            );
+        });
+        assert!(
+            logs.contains("job_id=\"job-42\""),
+            "expected structured job_id field, got: {logs}"
+        );
+        assert!(
+            logs.contains("[ws] binary upload ok"),
+            "expected the human-readable message to survive, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn push_log_omits_job_id_field_when_absent() {
+        // Jobless breadcrumbs (startup banners, heartbeats, auto-update
+        // ticks) must not gain a noisy empty `job_id` field.
+        use crate::test_support::capture;
+        let logs = capture(|| {
+            let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+            push_log(&logs, "info", "auto-update", "up to date", None);
+        });
+        assert!(
+            !logs.contains("job_id"),
+            "expected no job_id field for a jobless log, got: {logs}"
+        );
     }
 
     // --- async tick tests ---
