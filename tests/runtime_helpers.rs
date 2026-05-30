@@ -271,3 +271,29 @@ async fn run_cli_dispatches_check_update() {
     .await
     .unwrap();
 }
+
+// A build without the `ui` cargo feature must turn the `ui` subcommand
+// into a clear, actionable error rather than silently doing nothing or
+// panicking.  Gated to the default build: a `ui` build would actually
+// hand the main thread to eframe and never return.
+#[cfg(not(feature = "ui"))]
+#[tokio::test]
+async fn run_cli_ui_subcommand_errors_without_the_ui_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = write_config(dir.path(), "http://api.invalid", "http://feed.invalid");
+    let err = run_cli(cli::Cli {
+        config: Some(cfg_path.to_string_lossy().to_string()),
+        command: cli::Command::Ui,
+    })
+    .await
+    .expect_err("a non-ui build must reject the ui subcommand");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("without the `ui` cargo feature"),
+        "expected the missing-feature explanation, got: {msg}"
+    );
+    assert!(
+        msg.contains("--features ui"),
+        "expected the remediation hint, got: {msg}"
+    );
+}
