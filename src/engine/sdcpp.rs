@@ -137,7 +137,12 @@ impl SdCppEngine {
         source: &ModelSource,
     ) -> Result<TaskResult> {
         let files = self.ensure_files(source)?;
-        let diffusion_model = file_for_role(&files, ModelFileRole::DiffusionModel)
+        // A `diffusion-model` file is the standalone diffusion weights (sd-cli `--diffusion-model`,
+        // used with split vae/clip); a `model` file is a full checkpoint (sd-cli `-m`/`--model`).
+        // Prefer the explicit diffusion-model role; fall back to a full checkpoint.
+        let diffusion_only = file_for_role(&files, ModelFileRole::DiffusionModel);
+        let full_checkpoint = diffusion_only.is_none();
+        let diffusion_model = diffusion_only
             .or_else(|| file_for_role(&files, ModelFileRole::Model))
             .ok_or_else(|| anyhow!("modelSource has no diffusion-model / model file"))?;
         let vae = file_for_role(&files, ModelFileRole::Vae);
@@ -201,6 +206,7 @@ impl SdCppEngine {
             &out_path,
             init_img_path.as_deref(),
             mask_path.as_deref(),
+            full_checkpoint,
         );
         let mut cmd = Command::new(&self.sd_cli);
         cmd.args(&args);
@@ -511,11 +517,21 @@ fn build_sdcli_args(
     out_path: &Path,
     init_img_path: Option<&Path>,
     mask_path: Option<&Path>,
+    full_checkpoint: bool,
 ) -> Vec<OsString> {
     let resolved = resolve_image_args(params, source);
     let mut args: Vec<OsString> = Vec::with_capacity(32);
 
-    args.push("--diffusion-model".into());
+    // A full checkpoint loads via `-m`/`--model`; standalone diffusion weights via
+    // `--diffusion-model` (alongside split vae/clip files).
+    args.push(
+        if full_checkpoint {
+            "--model"
+        } else {
+            "--diffusion-model"
+        }
+        .into(),
+    );
     args.push(diffusion_model.into());
     if let Some(p) = vae {
         args.push("--vae".into());
@@ -859,6 +875,7 @@ mod tests {
             Path::new("/tmp/out.webp"),
             None,
             None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--diffusion-model").unwrap()], "/d.gguf");
@@ -896,6 +913,7 @@ mod tests {
             Path::new("/tmp/out.webp"),
             None,
             None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(
@@ -921,6 +939,7 @@ mod tests {
             Path::new("/tmp/out.webp"),
             None,
             None,
+            false,
         );
         let s = args_to_strings(&args);
         assert!(!s.contains(&"--negative-prompt".to_string()));
@@ -943,6 +962,7 @@ mod tests {
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
             None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--init-img").unwrap()], "/tmp/init.webp");
@@ -968,11 +988,39 @@ mod tests {
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
             Some(Path::new("/tmp/mask.png")),
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--init-img").unwrap()], "/tmp/init.webp");
         assert_eq!(s[idx_after(&s, "--mask").unwrap()], "/tmp/mask.png");
         assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.8");
+    }
+
+    #[test]
+    fn build_sdcli_args_uses_model_flag_for_full_checkpoint() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/checkpoint.safetensors"),
+            Some(Path::new("/v.safetensors")),
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            true,
+        );
+        let s = args_to_strings(&args);
+        // A full checkpoint loads via -m/--model, not --diffusion-model.
+        assert_eq!(
+            s[idx_after(&s, "--model").unwrap()],
+            "/checkpoint.safetensors"
+        );
+        assert!(!s.contains(&"--diffusion-model".to_string()));
     }
 
     #[test]
@@ -992,6 +1040,7 @@ mod tests {
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
             None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.75");
@@ -1014,6 +1063,7 @@ mod tests {
             Path::new("/tmp/out.webp"),
             None,
             None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--cfg-scale").unwrap()], "7.5");
@@ -1036,6 +1086,7 @@ mod tests {
             Path::new("/tmp/out.webp"),
             None,
             None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--sampling-method").unwrap()], "dpm++2m");
@@ -1058,6 +1109,7 @@ mod tests {
             Path::new("/tmp/out.webp"),
             None,
             None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--steps").unwrap()], "30");
@@ -1080,6 +1132,7 @@ mod tests {
             Path::new("/tmp/out.webp"),
             None,
             None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--seed").unwrap()], "42");
