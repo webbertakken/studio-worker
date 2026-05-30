@@ -156,6 +156,9 @@ weights, run with the matching feature):
 ## CI
 
 - `.github/workflows/checks.yml` — fmt + clippy + cargo check + tests.
+- `.github/workflows/audit.yml` — `cargo audit` advisory gate on
+  Cargo manifest changes + weekly cron; accepted informational
+  advisories live in `.cargo/audit.toml`.
 - `.github/workflows/build.yml` — matrix release build on every PR.
 - `.github/workflows/commit-lint.yml` — semantic PR title check.
 - `.github/workflows/lint-workflows.yml` — actionlint on workflow files.

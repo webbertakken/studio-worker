@@ -1,0 +1,42 @@
+name: Audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".cargo/audit.toml"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".cargo/audit.toml"
+      - ".github/workflows/audit.yml"
+  schedule:
+    # Weekly sweep so newly disclosed advisories are caught even when
+    # the lockfile has not changed.
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # `--deny warnings` promotes every advisory (vulnerability *and*
+      # informational) to a hard failure. Accepted informational
+      # advisories are listed in `.cargo/audit.toml`, so this only
+      # trips on something new that nobody has reviewed yet.
+      - name: Scan dependencies for security advisories
+        run: cargo audit --deny warnings
