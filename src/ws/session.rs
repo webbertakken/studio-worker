@@ -40,6 +40,11 @@ const SHUTDOWN_TICK: Duration = Duration::from_millis(250);
 const BASE_BACKOFF_MS: u64 = 1_000;
 const MAX_BACKOFF_MS: u64 = 30_000;
 const DEFAULT_RECONNECT_ATTEMPTS: u32 = 5;
+/// If no frame (not even a `heartbeatAck`) arrives from the studio within this window, treat the
+/// connection as dead and tear the session down. The studio acks every heartbeat (~5s), so a live
+/// connection always yields a frame well inside this budget; the only time it elapses is a
+/// half-open / dead-peer socket where the reader would otherwise block on `source.next()` forever.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Outcome of a single session attempt.  The reconnect loop decides
 /// whether to back off + retry based on the variant.
@@ -63,6 +68,8 @@ pub struct SessionSchedule {
     pub shutdown_tick: Duration,
     pub base_backoff_ms: u64,
     pub max_backoff_ms: u64,
+    /// Reader gives up + reports a disconnect if no server frame arrives within this window.
+    pub read_idle_timeout: Duration,
 }
 
 impl Default for SessionSchedule {
@@ -73,6 +80,7 @@ impl Default for SessionSchedule {
             shutdown_tick: SHUTDOWN_TICK,
             base_backoff_ms: BASE_BACKOFF_MS,
             max_backoff_ms: MAX_BACKOFF_MS,
+            read_idle_timeout: READ_IDLE_TIMEOUT,
         }
     }
 }
@@ -85,6 +93,9 @@ impl SessionSchedule {
             shutdown_tick: Duration::from_millis(5),
             base_backoff_ms: 1,
             max_backoff_ms: 10,
+            // Generous vs the 5ms heartbeat so the existing fast tests never trip it; the
+            // silent-connection test overrides this with a tiny value to exercise the timeout.
+            read_idle_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -384,7 +395,7 @@ async fn run_one_session(
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
     // Reader task: pump frames into the event channel.
-    let reader = spawn_reader(receiver, event_tx.clone());
+    let reader = spawn_reader(receiver, event_tx.clone(), schedule.read_idle_timeout);
 
     // Wait for the server's `Welcome` (or an error) before starting
     // the heartbeat / log-shipper pumps.  Without this gate, the
@@ -449,7 +460,16 @@ async fn run_one_session(
     };
     let outcome = run_dispatch_loop(ctx, event_rx).await;
 
-    // Best-effort graceful close + task drain.
+    // The session is ending (disconnect or shutdown). The heartbeat / log-shipper /
+    // shutdown-observer pumps only break on the *global* stop flag or a send failure, so on a
+    // silent-but-open socket — where heartbeat sends still succeed into the TCP buffer — they would
+    // loop forever and block this function from returning, which is exactly the post-job reconnect
+    // hang. Abort them so teardown is bounded regardless of socket state, then best-effort close +
+    // drain the aborted handles (await returns promptly with Cancelled).
+    reader.abort();
+    heartbeat.abort();
+    log_shipper.abort();
+    shutdown_observer.abort();
     let _ = sender.close(1000, "session ended").await;
     let _ = reader.await;
     let _ = heartbeat.await;
@@ -915,22 +935,35 @@ async fn run_offered_job(
 fn spawn_reader(
     mut receiver: crate::ws::client::WsReceiver,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
+    read_idle_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match receiver.recv().await {
-                Ok(Some(frame)) => {
+            // Bound the wait so a half-open / dead-peer socket can't block the reader forever.
+            // A live studio acks every heartbeat (~5s), so a frame always lands well inside the
+            // window; elapsing it means the connection is gone and the session must reconnect.
+            match tokio::time::timeout(read_idle_timeout, receiver.recv()).await {
+                Ok(Ok(Some(frame))) => {
                     if event_tx.send(SessionEvent::Frame(frame)).is_err() {
                         break;
                     }
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     let _ =
                         event_tx.send(SessionEvent::Disconnected(WsClientError::ConnectionClosed));
                     break;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = event_tx.send(SessionEvent::Disconnected(e));
+                    break;
+                }
+                Err(_elapsed) => {
+                    let _ = event_tx.send(SessionEvent::Disconnected(WsClientError::Transport(
+                        format!(
+                            "no frames from server for {:?}; treating connection as dead",
+                            read_idle_timeout
+                        ),
+                    )));
                     break;
                 }
             }
@@ -1222,6 +1255,7 @@ mod tests {
             heartbeat: Duration::from_secs(1),
             log_flush: Duration::from_secs(1),
             shutdown_tick: Duration::from_secs(1),
+            read_idle_timeout: Duration::from_secs(1),
         };
         assert_eq!(backoff_for(1, schedule), Duration::from_millis(100));
         assert_eq!(backoff_for(2, schedule), Duration::from_millis(200));

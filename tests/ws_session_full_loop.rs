@@ -174,6 +174,38 @@ async fn spawn_handshake_only_ws() -> (SocketAddr, tokio::task::JoinHandle<Resul
     (addr, handle)
 }
 
+/// A studio that completes the handshake then goes SILENT: it never acks heartbeats and never
+/// closes the socket. This is the half-open / dead-peer case that used to hang the worker forever
+/// (its reader blocks on `source.next()` and nothing tears the session down). After accepting the
+/// one connection it drops the listener so the worker's reconnect attempt fails fast (refused).
+async fn spawn_silent_after_welcome_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        // Refuse any further connection so the worker's reconnect fails immediately instead of
+        // hanging on a second silent upgrade.
+        drop(listener);
+        let mut ws = tokio_tungstenite::accept_hdr_async(stream, echo_subprotocol).await?;
+        let _hello = ws
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("hello missing"))??;
+        ws.send(Message::Text(
+            serde_json::to_string(
+                &json!({"type":"welcome","workerId":"w-test","serverTime":"now"}),
+            )?
+            .into(),
+        ))
+        .await?;
+        // Go silent: hold the connection open, never ack, never close.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(ws);
+        Ok(())
+    });
+    (addr, handle)
+}
+
 async fn collect_frames(
     ws: &mut WebSocketStream<TcpStream>,
     expected: &[&str],
@@ -347,6 +379,65 @@ async fn ws_session_logs_a_breadcrumb_when_json_result_is_sent() {
             .iter()
             .any(|(_, job_id)| job_id.as_deref() == Some("job-stt")),
         "missing breadcrumb for the STT job: {json_completion:?}"
+    );
+}
+
+#[tokio::test]
+async fn ws_session_recovers_from_a_silent_half_open_connection() {
+    // Regression: the worker used to hang forever when the studio went silent without closing the
+    // socket (post-job WS drops + half-open peers). The read-idle-timeout must detect the silence,
+    // tear the session down, and drive a reconnect — proven here by the session loop actually
+    // returning (it hits its 1-attempt cap on the refused reconnect) instead of blocking.
+    let (ws_addr, _server) = spawn_silent_after_welcome_ws().await;
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let shared = config::shared(cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
+    let busy = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    let observers = WorkerObservers::default();
+
+    // Tiny read-idle-timeout so the silent connection is detected fast.
+    let schedule = SessionSchedule {
+        read_idle_timeout: Duration::from_millis(300),
+        ..SessionSchedule::fast_for_tests()
+    };
+
+    let session_handle = tokio::spawn({
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let logs = logs.clone();
+        let busy = busy.clone();
+        let paused = paused.clone();
+        let observers = observers.clone();
+        async move { spawn_ws_session(shared, stop, logs, busy, paused, observers, schedule).await }
+    });
+
+    // Before the fix this times out: the worker blocks on the dead-but-open socket and the session
+    // loop never returns. After the fix the reader idle-times-out, reconnects (refused), hits the
+    // 1-attempt cap, and the loop returns Err within the window.
+    let outcome = tokio::time::timeout(Duration::from_secs(8), session_handle).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        outcome.is_ok(),
+        "session hung on a silent connection instead of detecting the read-idle-timeout"
+    );
+
+    assert!(
+        observers
+            .recent_logs
+            .lock()
+            .iter()
+            .any(|e| e.message.contains("reconnect attempt")),
+        "worker must log a reconnect attempt after the idle timeout"
     );
 }
 

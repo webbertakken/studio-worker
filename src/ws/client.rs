@@ -49,6 +49,11 @@ const TRACE_TARGET: &str = "studio_worker::ws::client";
 /// `/graphics` mount.
 const API_PREFIX: &str = "/graphics/api";
 
+/// Upper bound on a single connect attempt (TCP + TLS + WS upgrade). Without it a peer that accepts
+/// the socket but stalls the upgrade hangs the reconnect loop forever (no logs, no progress) — the
+/// connect-side twin of the read-idle-timeout on an established session.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Result wrapper for WS-client operations.
 pub type WsResult<T> = Result<T, WsClientError>;
 
@@ -128,7 +133,7 @@ fn build_connect_url(base_url: &str, worker_id: &str) -> WsResult<Url> {
 /// having to log it.
 pub async fn connect(base_url: &str, worker_id: &str, auth_token: &str) -> WsResult<WsClient> {
     let started = Instant::now();
-    let result = connect_inner(base_url, worker_id, auth_token).await;
+    let result = connect_inner(base_url, worker_id, auth_token, CONNECT_TIMEOUT).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match &result {
         Ok(_) => debug!(
@@ -150,7 +155,12 @@ pub async fn connect(base_url: &str, worker_id: &str, auth_token: &str) -> WsRes
     result
 }
 
-async fn connect_inner(base_url: &str, worker_id: &str, auth_token: &str) -> WsResult<WsClient> {
+async fn connect_inner(
+    base_url: &str,
+    worker_id: &str,
+    auth_token: &str,
+    connect_timeout: Duration,
+) -> WsResult<WsClient> {
     let url = build_connect_url(base_url, worker_id)?;
     debug!(
         target: TRACE_TARGET,
@@ -174,7 +184,19 @@ async fn connect_inner(base_url: &str, worker_id: &str, auth_token: &str) -> WsR
         HeaderValue::from_static(SUBPROTOCOL),
     );
 
-    let (stream, _response) = tokio_tungstenite::connect_async(request).await?;
+    let (stream, _response) = match tokio::time::timeout(
+        connect_timeout,
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            return Err(WsClientError::Transport(format!(
+                "connect timed out after {connect_timeout:?}"
+            )))
+        }
+    };
     let (sink, source) = stream.split();
     Ok(WsClient {
         sink,
@@ -739,6 +761,30 @@ mod tests {
         assert!(
             logs.contains("frame=\"accept\""),
             "expected frame label: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_times_out_against_a_stalling_upgrade() {
+        // A listener that accepts the TCP connection but never answers the WS upgrade. Without the
+        // connect timeout this blocks forever; with it, a transport error must surface fast.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await; // hold the socket, never upgrade
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let url = format!("http://{addr}/graphics/api");
+        let started = Instant::now();
+        let result = connect_inner(&url, "w", "tok", Duration::from_millis(150)).await;
+        assert!(
+            matches!(result, Err(WsClientError::Transport(_))),
+            "expected a transport timeout, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "connect must time out promptly, took {:?}",
+            started.elapsed()
         );
     }
 
