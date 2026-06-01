@@ -144,6 +144,68 @@ async fn spawn_studio_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) 
     (addr, handle)
 }
 
+/// Minimal studio server: accept the upgrade, read `hello`, reply
+/// `welcome`, then close.  Enough to drive the worker through the
+/// capability-advertising handshake without any job offers.
+async fn spawn_handshake_only_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut ws = tokio_tungstenite::accept_hdr_async(stream, echo_subprotocol).await?;
+        let hello = ws
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("hello missing"))??
+            .into_text()
+            .map_err(|_| anyhow::anyhow!("hello not text"))?;
+        let hello_json: serde_json::Value = serde_json::from_str(&hello)?;
+        assert_eq!(hello_json["type"], "hello");
+        ws.send(Message::Text(
+            serde_json::to_string(
+                &json!({"type":"welcome","workerId":"w-test","serverTime":"now"}),
+            )?
+            .into(),
+        ))
+        .await?;
+        ws.close(None).await?;
+        Ok(())
+    });
+    (addr, handle)
+}
+
+/// A studio that completes the handshake then goes SILENT: it never acks heartbeats and never
+/// closes the socket. This is the half-open / dead-peer case that used to hang the worker forever
+/// (its reader blocks on `source.next()` and nothing tears the session down). After accepting the
+/// one connection it drops the listener so the worker's reconnect attempt fails fast (refused).
+async fn spawn_silent_after_welcome_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        // Refuse any further connection so the worker's reconnect fails immediately instead of
+        // hanging on a second silent upgrade.
+        drop(listener);
+        let mut ws = tokio_tungstenite::accept_hdr_async(stream, echo_subprotocol).await?;
+        let _hello = ws
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("hello missing"))??;
+        ws.send(Message::Text(
+            serde_json::to_string(
+                &json!({"type":"welcome","workerId":"w-test","serverTime":"now"}),
+            )?
+            .into(),
+        ))
+        .await?;
+        // Go silent: hold the connection open, never ack, never close.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(ws);
+        Ok(())
+    });
+    (addr, handle)
+}
+
 async fn collect_frames(
     ws: &mut WebSocketStream<TcpStream>,
     expected: &[&str],
@@ -226,4 +288,228 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
     // returned Ok then every frame in the script reached the worker and
     // every expected reply (accept + completeJson per offer) flowed back.
     let _ = logs;
+}
+
+#[tokio::test]
+async fn ws_session_logs_a_breadcrumb_when_json_result_is_sent() {
+    // The binary-output path already logs "binary upload ok" on a
+    // successful multipart upload.  The JSON (LLM / STT) path must be
+    // symmetric: a successfully sent `completeJson` frame has to leave
+    // an explicit completion breadcrumb so operators (and the studio's
+    // shipped logs) can tell a JSON job actually delivered its result,
+    // not just that it dispatched.
+    let (ws_addr, server_handle) = spawn_studio_ws().await;
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let shared = config::shared(cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
+    let busy = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    // `recent_logs` is *not* drained by the log shipper, so the
+    // completion breadcrumb stays inspectable after the run.
+    let observers = WorkerObservers::default();
+
+    let session_handle = tokio::spawn({
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let logs = logs.clone();
+        let busy = busy.clone();
+        let paused = paused.clone();
+        let observers = observers.clone();
+        async move {
+            spawn_ws_session(
+                shared,
+                stop,
+                logs,
+                busy,
+                paused,
+                observers,
+                SessionSchedule::fast_for_tests(),
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(TIMEOUT, server_handle)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked")
+        .expect("server returned err");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(5), session_handle)
+        .await
+        .expect("session loop timed out");
+
+    let json_completion = observers
+        .recent_logs
+        .lock()
+        .iter()
+        .filter(|e| e.message.contains("json result sent"))
+        .map(|e| (e.level.clone(), e.job_id.clone()))
+        .collect::<Vec<_>>();
+    // Both the LLM and the STT offer travel the JSON path, so both
+    // must leave an info-level breadcrumb tagged with their job id.
+    assert_eq!(
+        json_completion.len(),
+        2,
+        "expected a completion breadcrumb per JSON job, got {json_completion:?}"
+    );
+    assert!(
+        json_completion.iter().all(|(level, _)| level == "info"),
+        "json completion breadcrumbs must be info-level: {json_completion:?}"
+    );
+    assert!(
+        json_completion
+            .iter()
+            .any(|(_, job_id)| job_id.as_deref() == Some("job-llm")),
+        "missing breadcrumb for the LLM job: {json_completion:?}"
+    );
+    assert!(
+        json_completion
+            .iter()
+            .any(|(_, job_id)| job_id.as_deref() == Some("job-stt")),
+        "missing breadcrumb for the STT job: {json_completion:?}"
+    );
+}
+
+#[tokio::test]
+async fn ws_session_recovers_from_a_silent_half_open_connection() {
+    // Regression: the worker used to hang forever when the studio went silent without closing the
+    // socket (post-job WS drops + half-open peers). The read-idle-timeout must detect the silence,
+    // tear the session down, and drive a reconnect — proven here by the session loop actually
+    // returning (it hits its 1-attempt cap on the refused reconnect) instead of blocking.
+    let (ws_addr, _server) = spawn_silent_after_welcome_ws().await;
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let shared = config::shared(cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
+    let busy = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    let observers = WorkerObservers::default();
+
+    // Tiny read-idle-timeout so the silent connection is detected fast.
+    let schedule = SessionSchedule {
+        read_idle_timeout: Duration::from_millis(300),
+        ..SessionSchedule::fast_for_tests()
+    };
+
+    let session_handle = tokio::spawn({
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let logs = logs.clone();
+        let busy = busy.clone();
+        let paused = paused.clone();
+        let observers = observers.clone();
+        async move { spawn_ws_session(shared, stop, logs, busy, paused, observers, schedule).await }
+    });
+
+    // Before the fix this times out: the worker blocks on the dead-but-open socket and the session
+    // loop never returns. After the fix the reader idle-times-out, reconnects (refused), hits the
+    // 1-attempt cap, and the loop returns Err within the window.
+    let outcome = tokio::time::timeout(Duration::from_secs(8), session_handle).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        outcome.is_ok(),
+        "session hung on a silent connection instead of detecting the read-idle-timeout"
+    );
+
+    assert!(
+        observers
+            .recent_logs
+            .lock()
+            .iter()
+            .any(|e| e.message.contains("reconnect attempt")),
+        "worker must log a reconnect attempt after the idle timeout"
+    );
+}
+
+#[tokio::test]
+async fn ws_session_logs_advertised_capabilities_on_handshake() {
+    let (ws_addr, server_handle) = spawn_handshake_only_ws().await;
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let shared = config::shared(cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
+    let busy = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    // The session pushes operator log lines through `recent_logs`,
+    // which — unlike `logs` — is *not* drained by the log shipper, so
+    // the capability summary stays inspectable after the run.
+    let observers = WorkerObservers::default();
+
+    let session_handle = tokio::spawn({
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let logs = logs.clone();
+        let busy = busy.clone();
+        let paused = paused.clone();
+        let observers = observers.clone();
+        async move {
+            spawn_ws_session(
+                shared,
+                stop,
+                logs,
+                busy,
+                paused,
+                observers,
+                SessionSchedule::fast_for_tests(),
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(TIMEOUT, server_handle)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked")
+        .expect("server returned err");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(5), session_handle)
+        .await
+        .expect("session loop timed out");
+
+    // The handshake must have recorded what the worker advertised: the
+    // engine, the served task kinds, and at least one model id.
+    let summary = observers
+        .recent_logs
+        .lock()
+        .iter()
+        .find(|e| e.message.contains("advertising engine="))
+        .map(|e| e.message.clone())
+        .expect("capability summary must be logged on the handshake");
+    assert!(summary.contains("kinds=["), "missing kinds: {summary}");
+    assert!(summary.contains("image"), "missing image kind: {summary}");
+    assert!(summary.contains("synthetic"), "missing model id: {summary}");
+    assert!(
+        summary.contains("auto_enabled=true"),
+        "unpaused worker must advertise auto_enabled=true: {summary}"
+    );
 }

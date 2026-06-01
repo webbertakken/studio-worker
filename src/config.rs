@@ -3,8 +3,9 @@
 //!
 //! Every load/save emits a structured tracing breadcrumb so operators
 //! can tell from `journalctl` which file the worker actually consulted
-//! (and whether the file existed or was freshly bootstrapped with
-//! defaults).  The events deliberately omit the secret fields
+//! (and whether the file existed, was freshly bootstrapped with
+//! defaults, or failed to read/parse).  The events deliberately omit
+//! the secret fields
 //! (`auth_token`, `registration_secret`) so logs can be shipped
 //! off-box without leaking credentials.  See `tests/config_tracing.rs`
 //! for the regression contract.
@@ -183,9 +184,39 @@ pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
         );
         return Ok((cfg, path));
     }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let mut cfg: Config = toml::from_str(&text).with_context(|| "parsing config.toml")?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            // Mirror save()'s failure breadcrumb: an unreadable config
+            // is never silent.  The io error names the path/cause only
+            // (never file content), so it is safe to log verbatim.
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "load",
+                config_path = %path.display(),
+                error = %e,
+                "failed to read config file"
+            );
+            return Err(e).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let mut cfg: Config = match toml::from_str(&text) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            // Deliberately omit the parser detail: toml renders the
+            // offending source span, which can echo a secret value
+            // (e.g. an unterminated `auth_token = "...`).  The path +
+            // category keep the failure operator-visible without
+            // risking a credential leak in journalctl / Sentry.
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "load",
+                config_path = %path.display(),
+                "config file is not valid TOML"
+            );
+            return Err(e).context("parsing config.toml");
+        }
+    };
     cfg.models_root = expand_home(std::mem::take(&mut cfg.models_root));
     tracing::debug!(
         target: TRACE_TARGET,
@@ -204,23 +235,85 @@ pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
 }
 
 pub fn save(cfg: &Config, path: &Path) -> Result<()> {
+    match write_config(cfg, path) {
+        Ok(bytes) => {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                op = "save",
+                config_path = %path.display(),
+                vram_threshold_gb = cfg.vram_threshold_gb,
+                auto_start = cfg.auto_start,
+                models_root = %cfg.models_root.display(),
+                bytes = bytes,
+                "persisted config to disk"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Log at the source so a failed persist is never silent,
+            // regardless of whether the caller logs the returned Err
+            // (the UI Save button discards it, the auto-register flow
+            // logs it with extra context).  `error` carries an
+            // IO / serialisation message + the path only — never the
+            // config's secret fields — so this stays log-shippable.
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "save",
+                config_path = %path.display(),
+                error = %e,
+                "failed to persist config to disk"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Side-effecting half of [`save`]: serialise + write, returning the
+/// byte count on success.  Split out so `save` can log a structured
+/// event on both the success and failure branch without duplicating
+/// the happy path.
+fn write_config(cfg: &Config, path: &Path) -> Result<usize> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(cfg).with_context(|| "serialising config")?;
     let bytes = text.len();
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-    tracing::debug!(
-        target: TRACE_TARGET,
-        op = "save",
-        config_path = %path.display(),
-        vram_threshold_gb = cfg.vram_threshold_gb,
-        auto_start = cfg.auto_start,
-        models_root = %cfg.models_root.display(),
-        bytes = bytes,
-        "persisted config to disk"
-    );
+    write_atomic(path, text.as_bytes())?;
+    Ok(bytes)
+}
+
+/// Persist `bytes` to `path` atomically and owner-only.  The config
+/// carries the worker's identity and registration secrets
+/// (`auth_token`, `registration_secret`), so a plain `fs::write` is
+/// unsafe on two counts:
+///
+/// * **Durability**: an interrupted write (crash, power loss, full
+///   disk) truncates `path` to a half-written, unparseable file,
+///   wiping the worker's registration and forcing a fresh operator
+///   approval.  We stream into a temp file in the *same directory* (so
+///   the final step is a same-filesystem rename, which is atomic) and
+///   rename it over the target.  A failure leaves the previous config
+///   intact and drops the temp file.
+/// * **Confidentiality**: `fs::write` honours the umask and typically
+///   lands `0644`, exposing the secrets to every other local user.
+///   `tempfile` creates the temp file `0600` on Unix and `persist`
+///   keeps that mode through the rename.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating temp file in {}", dir.display()))?;
+    tmp.write_all(bytes)
+        .with_context(|| "writing temp config")?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| "flushing temp config to disk")?;
+    tmp.persist(path)
+        .map_err(|e| anyhow!("atomically replacing {}: {}", path.display(), e.error))?;
     Ok(())
 }
 
@@ -386,6 +479,70 @@ mod tests {
             expanded.is_absolute() || expanded == Path::new("~"),
             "bare ~ expands to home (or stays put on weird boxes), got {}",
             expanded.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_config_owner_only_because_it_holds_secrets() {
+        // config.toml persists `auth_token` + `registration_secret`.
+        // A plain `fs::write` honours the umask and typically lands
+        // `0644`, exposing those credentials to every other local
+        // user.  The atomic temp-file write must leave the file
+        // owner-only (`0600`).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            auth_token: Some("super-secret-token".into()),
+            registration_secret: Some("reg-secret".into()),
+            ..Config::default()
+        };
+        save(&cfg, &path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "secrets-bearing config must not be group/world-accessible; got mode {mode:o}"
+        );
+    }
+
+    #[test]
+    fn save_atomically_replaces_existing_config_without_temp_litter() {
+        // A second save must fully replace the file (no stale fields
+        // from a longer previous version) and leave no temp-file
+        // siblings behind from the write-then-rename dance.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let big = Config {
+            api_base_url: "https://a-very-long-host-name.example.invalid/studio/".into(),
+            worker_id: Some("worker-with-a-longish-id-000000".into()),
+            ..Config::default()
+        };
+        save(&big, &path).unwrap();
+
+        let small = Config {
+            api_base_url: "https://x/".into(),
+            ..Config::default()
+        };
+        save(&small, &path).unwrap();
+
+        let (loaded, _) = load(Some(&path.to_string_lossy())).unwrap();
+        assert_eq!(loaded.api_base_url, "https://x/");
+        assert!(
+            loaded.worker_id.is_none(),
+            "a replacing save must not leave the previous worker_id behind"
+        );
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["config.toml".to_string()],
+            "atomic save must leave only the target file, found: {names:?}"
         );
     }
 }

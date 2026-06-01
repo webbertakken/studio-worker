@@ -126,6 +126,24 @@ pub fn resolve_installer_url(release: &GithubRelease) -> Option<&str> {
         .map(|a| a.browser_download_url.as_str())
 }
 
+/// Verify a streamed installer download wrote exactly the body the
+/// server promised.  `expected` is the response's `Content-Length`;
+/// it's `None` for chunked transfers, where there's nothing to check
+/// and we accept whatever arrived.  A mismatch means the download was
+/// truncated or corrupt — and because the very next step hands this
+/// file to `sh` / `powershell`, running a half-written installer is
+/// far more dangerous than failing the update and retrying on the next
+/// tick, so we surface a clear error instead of executing it.
+fn verify_download_len(copied: u64, expected: Option<u64>) -> Result<()> {
+    match expected {
+        Some(expected) if copied != expected => bail!(
+            "size mismatch: wrote {copied} bytes but the server declared \
+             Content-Length {expected} (installer download truncated or corrupt)"
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Apply an update by downloading the cargo-dist installer for the
 /// current platform and running it.
 pub fn apply(feed_url: &str, latest: &Version) -> Result<()> {
@@ -144,14 +162,25 @@ pub struct RealRunner;
 
 impl UpdateRunner for RealRunner {
     fn download(&self, url: &str, dest: &Path) -> Result<()> {
+        validate_installer_download_url(url)?;
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
             .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let started = Instant::now();
         let mut response = client.get(url).send()?.error_for_status()?;
+        // Capture the declared length (absent on chunked transfers)
+        // before streaming so a short read is caught below — the next
+        // step runs this file as a shell / PowerShell script.
+        let expected_len = response.content_length();
         let mut file = std::fs::File::create(dest)?;
         let bytes = std::io::copy(&mut response, &mut file)?;
+        // Reject a truncated / overlong download before `apply_with`
+        // hands the file to the installer runner.  Bailing here means
+        // `run_installer` never executes, and `apply_with`'s tempdir
+        // drop cleans up the partial file.
+        verify_download_len(bytes, expected_len)
+            .with_context(|| format!("downloading installer from {url}"))?;
         info!(
             target: TRACE_TARGET,
             url,
@@ -189,6 +218,25 @@ impl UpdateRunner for RealRunner {
         }
         Ok(())
     }
+}
+
+fn validate_installer_download_url(raw: &str) -> Result<()> {
+    let url = url::Url::parse(raw).with_context(|| format!("invalid installer URL {raw:?}"))?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    if url.scheme() == "http" {
+        if let Some(host) = url.host_str() {
+            if host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+            {
+                return Ok(());
+            }
+        }
+    }
+    bail!("installer URL must use https (loopback http is allowed for tests): {raw}");
 }
 
 pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R) -> Result<()> {
@@ -444,6 +492,60 @@ mod tests {
     fn resolve_installer_url_returns_none_when_missing() {
         let release = rel("v1.0.0", false, false, false);
         assert!(resolve_installer_url(&release).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_download_len — guards the installer download against a
+    // short read before the bytes are handed to `sh` / `powershell`.
+    // A truncated installer that runs is far worse than a failed
+    // update, so a Content-Length mismatch must surface as an error.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn verify_download_len_accepts_exact_match() {
+        assert!(verify_download_len(2048, Some(2048)).is_ok());
+    }
+
+    #[test]
+    fn verify_download_len_accepts_when_length_unknown() {
+        // Chunked transfers omit Content-Length; nothing to check, so
+        // we accept whatever streamed in (same as before this guard).
+        assert!(verify_download_len(123, None).is_ok());
+    }
+
+    #[test]
+    fn verify_download_len_rejects_truncated_installer() {
+        let err = verify_download_len(40, Some(100)).unwrap_err().to_string();
+        assert!(err.contains("size mismatch"), "got: {err}");
+        assert!(err.contains("40"), "got: {err}");
+        assert!(err.contains("100"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_download_len_rejects_overlong_installer() {
+        // A body longer than the declared length is just as corrupt as
+        // a short one — reject both rather than run a bad installer.
+        assert!(verify_download_len(120, Some(100)).is_err());
+    }
+
+    #[test]
+    fn validate_installer_download_url_allows_https() {
+        validate_installer_download_url("https://github.com/owner/repo/releases/download/x/i.sh")
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_installer_download_url_allows_loopback_http_for_tests() {
+        validate_installer_download_url("http://127.0.0.1:1234/i.sh").unwrap();
+        validate_installer_download_url("http://localhost:1234/i.sh").unwrap();
+    }
+
+    #[test]
+    fn validate_installer_download_url_rejects_remote_http() {
+        let err = validate_installer_download_url("http://example.com/i.sh")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https"), "got: {err}");
     }
 
     #[test]

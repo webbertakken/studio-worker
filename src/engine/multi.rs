@@ -130,6 +130,15 @@ impl Engine for MultiEngine {
                 return e.dispatch_with_source(model, task, source);
             }
         }
+        warn!(
+            target: TRACE_TARGET,
+            op = "pick",
+            kind = kind.as_str(),
+            model,
+            sub_engine = wanted,
+            r#match = "model-source",
+            "requested engine not compiled into this worker"
+        );
         bail!(
             "no `{}` engine compiled into this worker (model {} requires it)",
             wanted,
@@ -318,6 +327,37 @@ mod tests {
         assert!(
             err.contains("no `sdcpp` engine compiled"),
             "expected no-sdcpp-backend error, got: {err}"
+        );
+    }
+
+    /// The no-match path of `dispatch_with_source` must emit a
+    /// structured breadcrumb on the `studio_worker::engine::multi`
+    /// target, symmetric with `pick_for`'s no-match `warn!`.  Without
+    /// it, an operator filtering `RUST_LOG=studio_worker::engine::multi`
+    /// to trace routing would see "engine selected" events but never
+    /// the rejections, making a wrong-engine offer impossible to
+    /// diagnose from the routing breadcrumbs alone.
+    #[test]
+    fn dispatch_with_source_warns_when_wanted_engine_missing() {
+        let logs = crate::test_support::capture(|| {
+            let synth: Box<dyn Engine> = Box::new(SyntheticEngine::new());
+            let multi = MultiEngine::new(vec![synth]);
+            let source = sd_cpp_source();
+            let _ = multi.dispatch_with_source("some-real-flux-model", image_task(), &source);
+        });
+        assert!(logs.contains("WARN"), "expected WARN, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::engine::multi"),
+            "expected multi target, got: {logs}"
+        );
+        assert!(logs.contains("op=\"pick\""), "expected op field: {logs}");
+        assert!(
+            logs.contains("sdcpp"),
+            "expected wanted engine name in breadcrumb: {logs}"
+        );
+        assert!(
+            logs.contains("some-real-flux-model"),
+            "expected model id in breadcrumb: {logs}"
         );
     }
 

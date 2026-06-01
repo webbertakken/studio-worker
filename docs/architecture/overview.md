@@ -111,9 +111,8 @@ The CLI surface from [`src/cli.rs`](../../src/cli.rs):
 |---|---|
 | `run` | Start the runtime: ensure registered, then the WS session + auto-updater |
 | `ui` (feature `ui`) | Same as `run` but with the egui window + tray + notifications |
-| `register` | Persist label / api-base-url / clear state.  **No HTTP** \u2014 the next `run`/`ui` actually auto-registers |
+| `register` | Persist api-base-url / clear state (`--reset`).  **No HTTP** \u2014 the next `run`/`ui` actually auto-registers |
 | `status` | Print config path, registration state, threshold, auto-update toggle |
-| `enable` / `disable` | Toggle `auto_enabled` (whether to claim new jobs) |
 | `set-threshold <gb>` | Update `vram_threshold_gb` |
 | `install-service` / `uninstall-service` | Per-OS service file (systemd / launchd / scheduled task) |
 | `config` | Dump the resolved config |
@@ -139,19 +138,20 @@ src/
 │                     TaskResult, JobClaim, LogEntry, AutoRegisterRequest, RegisterStatus.
 ├── sys.rs            hostname/username/VRAM probe.
 ├── service.rs        Per-OS service file writers (systemd --user / launchd / schtasks XML).
+├── autostart.rs      Cross-OS "run in tray on login" toggle (logged; desktop UI calls it).
 ├── update.rs         GitHub release feed poll + installer script download + re-exec on success.
 ├── telemetry.rs      Sentry init (opt-in via SENTRY_DSN env var) + tracing-subscriber layer.
 ├── test_support.rs   #[doc(hidden)] tracing capture helper for integration tests.
 │
 ├── engine/           Pluggable inference backends.
 │   ├── mod.rs        Engine trait + dispatch / dispatch_with_source.  Always-on SyntheticEngine.
-│   ├── multi.rs      MultiEngine; routes by ModelSource.engine (or kind fallback).
+│   ├── multi.rs      MultiEngine; routes strictly by ModelSource.engine (no fallback).
 │   ├── sdcpp.rs      Real image inference via stable-diffusion.cpp subprocess.
 │   ├── llama.rs      (feature `llama`) llama-cpp-2 wrapper for LLM tasks.
 │   ├── whisper.rs    (feature `whisper`) whisper-rs wrapper for STT.
 │   ├── candle_image.rs (feature `image-candle`) candle-transformers SD pipeline.
-│   ├── video.rs      (feature `video`) ffmpeg-shaped video stand-in.
-│   └── tts.rs        (feature `tts`) Piper-style TTS stand-in.
+│   ├── video.rs      (feature `video`) animated-GIF video stand-in (no ffmpeg).
+│   └── tts.rs        (feature `tts`) pure-Rust formant-synth TTS stand-in.
 │
 ├── ws/               Replaces the four old polling loops with one WS session.
 │   ├── mod.rs        Re-exports.
@@ -172,8 +172,7 @@ src/
     │   ├── logs.rs   Level filter + free-text search + auto-scroll, windowed.
     │   └── about.rs  Version / sentry release / config path / Check for updates.
     ├── tray.rs       3-variant icon (idle/busy/disconnected), menu factory.
-    ├── notifier.rs   Trait + DesktopNotifier + per-event NotificationPrefs gate.
-    └── autostart.rs  Cross-OS \"run in tray on login\" toggle.
+    └── notifier.rs   Trait + DesktopNotifier + per-event NotificationPrefs gate.
 ```
 
 Pluggable engine backends are gated behind cargo features so the
@@ -248,7 +247,7 @@ Each `register-request` carries a full
 
 - `machineName`, `username` (host identity from `whoami`)
 - `agentVersion` (from `Cargo.toml`)
-- `engine` (synthetic / gradio / multi / llama / ...)
+- `engine` (`multi` — the dispatcher wrapping every compiled-in backend)
 - `vramTotalGb` (probed from `/proc/driver/nvidia/gpus` on Linux; 0 elsewhere)
 - `vramThresholdGb` (operator-set max GB per claim)
 - `autoEnabled`, `autoStart` (operator toggles)
@@ -347,6 +346,18 @@ pub trait Engine: Send + Sync {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> EngineCapabilities;
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult>;
+
+    // Dispatch with the offer's ModelSource attached.  Engines that
+    // need the download spec / CLI defaults (sdcpp) override it;
+    // engines that don't (synthetic) inherit this default.
+    fn dispatch_with_source(
+        &self,
+        model: &str,
+        task: Task,
+        _source: &ModelSource,
+    ) -> Result<TaskResult> {
+        self.dispatch(model, task)
+    }
 }
 ```
 
@@ -356,7 +367,7 @@ pub trait Engine: Send + Sync {
 - `Llm { json }` (OpenAI-shape `chat.completion`)
 - `AudioStt { json }` (whisper-shape segments)
 - `AudioTts { bytes, ext }` (wav)
-- `Video { bytes, ext }` (animated webp / mp4)
+- `Video { bytes, ext }` (animated webp from synthetic, gif from the `video` feature)
 
 Engines are no longer config-selectable.  `engine::build()` always
 returns a `MultiEngine` populated with every backend compiled into
@@ -603,7 +614,12 @@ Every `auto_update_interval_secs` (default 30 min):
      a clean fit.
 
 The flow short-circuits when `auto_update_enabled = false` or when
-the worker is mid-job.  The `RealRunner::{download, run_installer}`
+the worker is mid-job.  Between checks the idle wait is stop-aware: it
+re-polls the shared `stop` flag every `AUTO_UPDATE_SHUTDOWN_TICK`
+(default 250 ms) via `wait_with_stop`, so a SIGTERM / SIGINT during the
+idle window stops the worker promptly instead of blocking
+`run_loops`' join for a whole `auto_update_tick`.  The
+`RealRunner::{download, run_installer}`
 + `restart_self` paths are tested through a fake `UpdateRunner`
 trait \u2014 they're excluded from the 90% coverage gate
 (`.cargo-llvm-cov.toml`).
@@ -617,7 +633,11 @@ trait \u2014 they're excluded from the 90% coverage gate
   `RUST_LOG=studio_worker=debug` (or any of the per-target filters
   documented per module: `studio_worker::http`,
   `studio_worker::config`, `studio_worker::runtime`,
-  `studio_worker::ws::session`, etc.).
+  `studio_worker::ws::session`, `studio_worker::ws::client`, etc.).
+  The `studio_worker::ws::client` target carries transport-boundary
+  breadcrumbs (connect / recv / send / close) so a dropped frame or a
+  dead studio is never silent, even though the session discards recv
+  errors and fires `let _ = sender.send(...)`.
 - **Studio-side logs**: every tick of the worker pushes its log
   buffer over the WS LogBatch frame.  The studio drops them into the
   `workerLogs` D1 table; the dashboard's LogViewer renders them.
@@ -643,8 +663,8 @@ file:
 - Linux: `systemd --user` unit at
   `~/.config/systemd/user/minis-studio-worker.service`
 - macOS: LaunchAgent plist at
-  `~/Library/LaunchAgents/gg.minis.minis-studio-worker.plist`
-- Windows: `schtasks /Create` XML template (`%APPDATA%\\minis-studio-worker\\task.xml`)
+  `~/Library/LaunchAgents/gg.minis.studio-worker.plist`
+- Windows: `schtasks /Create` XML template (`%APPDATA%\\minis-studio-worker\\minis-studio-worker.task.xml`)
   \u2014 written but **not registered**, since CreateTrigger needs
   the operator to confirm.
 
@@ -654,8 +674,11 @@ under an `XDG_CONFIG_HOME` override.
 
 ### "Run in tray on login" (UI mode)
 
-[`src/ui/autostart.rs`](../../src/ui/autostart.rs).  Toggle in the
-Config tab's "Background mode" group.  Writes:
+[`src/autostart.rs`](../../src/autostart.rs) (always compiled, like
+`service.rs`; the desktop UI's Config tab is the only caller).  Toggle
+in the Config tab's "Background mode" group.  Each enable/disable emits
+a structured `tracing` event on target `studio_worker::autostart`.
+Writes:
 
 - Linux: `~/.config/autostart/studio-worker-ui.desktop`
 - macOS: `~/Library/LaunchAgents/gg.minis.studio-worker-ui.plist`

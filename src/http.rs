@@ -4,7 +4,10 @@
 //!
 //! - emits a structured `tracing` event on success (`debug`) and
 //!   failure (`warn`) so operators can see what the worker is talking
-//!   to without having to enable wire-level logging in reqwest, and
+//!   to without having to enable wire-level logging in reqwest
+//!   (`complete` also logs the upload byte size before the request so
+//!   the attempted payload size is visible even when it never finishes),
+//!   and
 //! - turns non-2xx responses into an `anyhow` error tagged with the
 //!   operation name so the existing log shipper messages stay legible.
 use crate::types::*;
@@ -34,7 +37,7 @@ impl ApiClient {
             .build()
             .context("building reqwest client")?;
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: normalize_base_url(&base_url)?,
             client,
         })
     }
@@ -143,14 +146,20 @@ impl ApiClient {
         prompt: &str,
         image: Vec<u8>,
     ) -> Result<()> {
-        let mime = match ext {
-            "png" => "image/png",
-            "webp" => "image/webp",
-            "wav" => "audio/wav",
-            "mp3" => "audio/mpeg",
-            "mp4" => "video/mp4",
-            _ => "application/octet-stream",
-        };
+        let mime = mime_for_ext(ext);
+        let bytes = image.len() as u64;
+        // Emitted before the (potentially slow or failing) upload so the
+        // attempted payload size is always in the operator's logs, even
+        // when the request itself never completes.
+        debug!(
+            target: TRACE_TARGET,
+            op = "complete",
+            job_id,
+            ext,
+            mime,
+            bytes,
+            "uploading job result"
+        );
         let part = reqwest::blocking::multipart::Part::bytes(image)
             .file_name(format!("{job_id}.{ext}"))
             .mime_str(mime)?;
@@ -168,5 +177,98 @@ impl ApiClient {
             .send()?;
         self.check("complete", &url, started, response)?;
         Ok(())
+    }
+}
+
+fn normalize_base_url(base_url: &str) -> Result<String> {
+    let mut url =
+        url::Url::parse(base_url).map_err(|e| anyhow!("invalid api_base_url {base_url:?}: {e}"))?;
+    url.set_query(None);
+    url.set_fragment(None);
+
+    let trimmed_path = url.path().trim_end_matches('/').to_string();
+    if trimmed_path.ends_with(API_PREFIX) {
+        let without_prefix = trimmed_path[..trimmed_path.len() - API_PREFIX.len()].to_string();
+        url.set_path(if without_prefix.is_empty() {
+            "/"
+        } else {
+            &without_prefix
+        });
+    }
+
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Map a binary output's file extension to the MIME type sent as the
+/// multipart `complete` upload's `Content-Type`.  Single source of
+/// truth: every engine that emits a `TaskResult` binary extension
+/// (synthetic image → `png`/`webp`, sd-cpp → `webp`, tts → `wav`,
+/// synthetic video → `webp`, the `video` feature → `gif`) routes
+/// through here, so a new extension can't silently drift into
+/// `application/octet-stream` and break the studio's stored
+/// content-type.
+pub fn mime_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mime_for_ext_maps_known_image_audio_video_types() {
+        assert_eq!(mime_for_ext("png"), "image/png");
+        assert_eq!(mime_for_ext("webp"), "image/webp");
+        assert_eq!(mime_for_ext("gif"), "image/gif");
+        assert_eq!(mime_for_ext("wav"), "audio/wav");
+        assert_eq!(mime_for_ext("mp3"), "audio/mpeg");
+        assert_eq!(mime_for_ext("mp4"), "video/mp4");
+    }
+
+    #[test]
+    fn mime_for_ext_falls_back_to_octet_stream_for_unknown() {
+        assert_eq!(mime_for_ext("bin"), "application/octet-stream");
+        assert_eq!(mime_for_ext(""), "application/octet-stream");
+    }
+
+    #[test]
+    fn normalize_base_url_strips_existing_graphics_api_prefix() {
+        let api = ApiClient::new("https://studio.example/graphics/api/".into()).unwrap();
+        assert_eq!(
+            api.url("/workers/register-request"),
+            "https://studio.example/graphics/api/workers/register-request"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_preserves_outer_mount_path() {
+        let api = ApiClient::new("https://studio.example/custom/graphics/api".into()).unwrap();
+        assert_eq!(
+            api.url("/workers/register-request"),
+            "https://studio.example/custom/graphics/api/workers/register-request"
+        );
+    }
+
+    #[test]
+    fn mime_for_ext_covers_every_extension_engines_emit() {
+        // Lock the contract: each binary extension an engine actually
+        // emits must resolve to a real MIME type, never the
+        // octet-stream fallback.  `gif` is the one the `video`
+        // feature produces and that regressed before this guard.
+        for ext in ["png", "webp", "gif", "wav"] {
+            assert_ne!(
+                mime_for_ext(ext),
+                "application/octet-stream",
+                "engine output extension {ext:?} must map to a real MIME type"
+            );
+        }
     }
 }

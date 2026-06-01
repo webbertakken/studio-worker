@@ -86,6 +86,16 @@ fn install_once() {
 /// trade-off.
 pub fn capture<F: FnOnce() + Send + 'static>(f: F) -> String {
     install_once();
+    // Re-evaluate every registered callsite against the now-installed
+    // global subscriber before running the closure.  A callsite first
+    // hit by a *parallel* test in the narrow window around the
+    // one-time subscriber install can have its Interest cached as
+    // `never`, which then silently drops the very event we're trying
+    // to capture — an empty buffer, order-dependent flake (see
+    // LESSONS_LEARNED).  `rebuild_interest_cache()` is idempotent and
+    // cheap, so calling it per capture closes the race for every
+    // caller, not only the one that wins the install.
+    tracing::callsite::rebuild_interest_cache();
     std::thread::spawn(move || {
         BUF.with(|b| b.borrow_mut().clear());
         f();

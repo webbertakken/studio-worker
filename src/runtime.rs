@@ -23,7 +23,7 @@ use std::{
     },
     time::Duration,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Tracing target for runtime-level events (startup, state mutations).
 /// Stable so operators can filter with `RUST_LOG=studio_worker::runtime=debug`.
@@ -141,22 +141,34 @@ pub fn push_recent_job_for_tests(observers: &WorkerObservers, job_id: &str) {
 }
 
 pub const AUTO_UPDATE_TICK: Duration = Duration::from_secs(60);
+/// Cadence at which the auto-updater's idle wait re-checks the `stop`
+/// flag.  Mirrors the WS session's shutdown tick so a SIGTERM / SIGINT
+/// landing during the (up to `AUTO_UPDATE_TICK`-long) idle window wakes
+/// the loop within ~250 ms instead of leaving `run_loops`' join blocked
+/// for a whole tick.
+pub const AUTO_UPDATE_SHUTDOWN_TICK: Duration = Duration::from_millis(250);
 /// Default WS heartbeat interval, re-exported here so the native UI
 /// (and any other downstream readers) get a stable constant without
 /// reaching into `ws::session`.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Schedule for the auto-updater loop.  The WS session has its own
-/// `SessionSchedule` (see `ws::session`).
+/// Schedule for the long-running loops.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopSchedule {
+    pub ws_session: crate::ws::session::SessionSchedule,
     pub auto_update_tick: Duration,
+    /// How often the idle wait between update checks re-polls the
+    /// `stop` flag, so a shutdown request isn't deferred for a whole
+    /// `auto_update_tick`.
+    pub shutdown_tick: Duration,
 }
 
 impl Default for LoopSchedule {
     fn default() -> Self {
         Self {
+            ws_session: crate::ws::session::SessionSchedule::default(),
             auto_update_tick: AUTO_UPDATE_TICK,
+            shutdown_tick: AUTO_UPDATE_SHUTDOWN_TICK,
         }
     }
 }
@@ -166,7 +178,9 @@ impl LoopSchedule {
     /// loop wrappers without blocking.
     pub fn fast_for_tests() -> Self {
         Self {
+            ws_session: crate::ws::session::SessionSchedule::fast_for_tests(),
             auto_update_tick: Duration::from_millis(1),
+            shutdown_tick: Duration::from_millis(1),
         }
     }
 }
@@ -340,8 +354,8 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
 
     let stop_clone = stop.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        stop_clone.store(true, Ordering::SeqCst);
+        let signal = wait_for_shutdown_signal().await;
+        request_shutdown(&stop_clone, signal);
     });
 
     // Block on auto-register until the operator approves (or rejects).
@@ -358,6 +372,67 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
         LoopSchedule::default(),
     )
     .await
+}
+
+/// Flip the `stop` flag and emit a shutdown breadcrumb so an operator
+/// tailing the journal sees a clean stop, mirroring
+/// [`log_startup_banner`].  Pulled out of the signal task so the
+/// shutdown decision is unit-testable without delivering a real OS
+/// signal.  `signal` names whatever woke us (e.g. `"SIGTERM"`).
+pub fn request_shutdown(stop: &AtomicBool, signal: &str) {
+    let already_stopping = stop.swap(true, Ordering::SeqCst);
+    info!(
+        target: TRACE_TARGET,
+        op = "shutdown",
+        signal,
+        already_stopping,
+        "shutdown signal received; stopping worker gracefully"
+    );
+}
+
+/// Block until the OS asks the worker to stop, returning the name of
+/// the signal that fired.
+///
+/// On Unix we wait on **both** SIGINT (interactive Ctrl-C) and SIGTERM.
+/// SIGTERM is the signal `systemctl stop` / `launchctl unload` / host
+/// shutdown deliver by default, and the worker ships as a `Type=simple`
+/// systemd unit (see `service::render_service`).  Listening for Ctrl-C
+/// alone meant the service manager's stop never reached the graceful
+/// path: the WS session was killed mid-`close`, the studio saw an
+/// abrupt disconnect, and the final log batch never flushed.  If the
+/// SIGTERM handler can't be installed we degrade to Ctrl-C only rather
+/// than abort the shutdown task.
+///
+/// On non-Unix we wait on Ctrl-C, which tokio maps to the console
+/// Ctrl-C / close events.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "shutdown",
+                    error = %e,
+                    "could not install SIGTERM handler; falling back to Ctrl-C only"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                return "SIGINT";
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl-c"
+    }
 }
 
 /// Loop auto_register::tick on a 30s cadence until `worker_id` +
@@ -417,7 +492,6 @@ pub async fn run_loops(
     observers: WorkerObservers,
     schedule: LoopSchedule,
 ) -> Result<()> {
-    let session_schedule = crate::ws::session::SessionSchedule::default();
     let session = crate::ws::session::spawn_ws_session(
         cfg.clone(),
         stop.clone(),
@@ -425,7 +499,7 @@ pub async fn run_loops(
         busy.clone(),
         paused.clone(),
         observers.clone(),
-        session_schedule,
+        schedule.ws_session,
     );
     let auto_updater = spawn_auto_updater(
         cfg.clone(),
@@ -559,6 +633,23 @@ pub async fn auto_update_tick(
 //  `next_delay_for` lived here.  Their behaviour is now carried by the
 //  WS-driven tasks in `ws::session`.)
 
+/// Sleep up to `total`, re-checking `stop` every `tick` and returning
+/// the instant a shutdown is requested.  Keeps long idle waits (the
+/// auto-update tick here, reconnect backoff in the WS session)
+/// responsive to SIGTERM / SIGINT without busy-looping.  Shared by the
+/// runtime auto-updater and `ws::session`.
+pub(crate) async fn wait_with_stop(total: Duration, stop: &Arc<AtomicBool>, tick: Duration) {
+    let mut elapsed = Duration::ZERO;
+    while elapsed < total {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let next = tick.min(total - elapsed);
+        tokio::time::sleep(next).await;
+        elapsed += next;
+    }
+}
+
 pub fn spawn_auto_updater(
     cfg: SharedConfig,
     stop: Arc<AtomicBool>,
@@ -569,7 +660,14 @@ pub fn spawn_auto_updater(
     tokio::spawn(async move {
         let mut elapsed = Duration::from_secs(0);
         while !stop.load(Ordering::SeqCst) {
-            tokio::time::sleep(schedule.auto_update_tick).await;
+            // Stop-aware idle wait: a shutdown signal during this window
+            // wakes the loop within `schedule.shutdown_tick` instead of
+            // leaving `run_loops`' join() blocked for a full
+            // `auto_update_tick`.
+            wait_with_stop(schedule.auto_update_tick, &stop, schedule.shutdown_tick).await;
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
             elapsed += schedule.auto_update_tick;
             let snapshot = cfg.lock().clone();
             if elapsed < Duration::from_secs(snapshot.auto_update_interval_secs) {
@@ -653,6 +751,35 @@ pub fn build_capabilities_with(
     }
 }
 
+/// One-line, operator-facing summary of what this worker advertises to
+/// the studio on the WS handshake.  Logged once per session attempt so
+/// the worker's own logs (and the studio's shipped-log view) record
+/// exactly which task kinds, models, and VRAM budget were offered — the
+/// missing complement to [`log_startup_banner`], which only covers the
+/// loaded config.  Without it, an operator chasing "why won't my worker
+/// claim image jobs" has no record of what the worker told the studio
+/// it could do.  Pure so the formatting is unit-tested without a live
+/// session.
+pub fn summarize_capabilities(caps: &WorkerCapabilities) -> String {
+    let kinds = caps
+        .task_kinds
+        .iter()
+        .map(|k| k.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "advertising engine={}, vram={:.1}/{:.1}GB threshold, auto_enabled={}, \
+         kinds=[{}], {} model(s)=[{}]",
+        caps.engine,
+        caps.vram_total_gb,
+        caps.vram_threshold_gb,
+        caps.auto_enabled,
+        kinds,
+        caps.supported_models.len(),
+        caps.supported_models.join(", "),
+    )
+}
+
 pub fn push_log(
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     level: &str,
@@ -683,12 +810,17 @@ pub fn push_log_with_observers(
         message: message.to_string(),
         job_id,
     };
+    // Carry the job id as a structured field so operators can pivot
+    // shipped studio logs / Sentry breadcrumbs on it. `Option<&str>`
+    // only records the field when `Some`, so jobless breadcrumbs stay
+    // free of a noisy empty `job_id`.
+    let job_id = entry.job_id.as_deref();
     if level == "error" {
-        tracing::error!(target: "studio_worker", "[{category}] {message}");
+        tracing::error!(target: "studio_worker", job_id, "[{category}] {message}");
     } else if level == "warn" {
-        tracing::warn!(target: "studio_worker", "[{category}] {message}");
+        tracing::warn!(target: "studio_worker", job_id, "[{category}] {message}");
     } else {
-        info!(target: "studio_worker", "[{category}] {message}");
+        info!(target: "studio_worker", job_id, "[{category}] {message}");
     }
     logs.lock().push(entry.clone());
     if let Some(o) = observers {
@@ -725,6 +857,52 @@ mod tests {
         let engine = SyntheticEngine::new();
         let paused_caps = build_capabilities_with(&cfg, &engine, false);
         assert!(!paused_caps.auto_enabled);
+    }
+
+    #[test]
+    fn summarize_capabilities_lists_engine_kinds_models_vram_and_pause_state() {
+        let cfg = Config {
+            vram_threshold_gb: 6.0,
+            ..Config::default()
+        };
+        let engine = SyntheticEngine::new();
+        let caps = build_capabilities_with(&cfg, &engine, true);
+        let summary = summarize_capabilities(&caps);
+        // Engine name + every advertised kind is present.
+        assert!(summary.contains("engine=synthetic"), "got: {summary}");
+        for kind in &caps.task_kinds {
+            assert!(
+                summary.contains(kind.as_str()),
+                "missing kind {} in: {summary}",
+                kind.as_str()
+            );
+        }
+        // Model count + an actual advertised model id are present.
+        assert!(
+            summary.contains(&format!("{} model(s)", caps.supported_models.len())),
+            "missing model count in: {summary}"
+        );
+        assert!(
+            summary.contains("synthetic"),
+            "missing model id in: {summary}"
+        );
+        // VRAM budget (total/threshold) + unpaused state are visible.
+        assert!(
+            summary.contains("6.0"),
+            "missing vram threshold in: {summary}"
+        );
+        assert!(summary.contains("auto_enabled=true"), "got: {summary}");
+    }
+
+    #[test]
+    fn summarize_capabilities_reflects_paused_state() {
+        let cfg = Config::default();
+        let engine = SyntheticEngine::new();
+        let caps = build_capabilities_with(&cfg, &engine, false);
+        assert!(
+            summarize_capabilities(&caps).contains("auto_enabled=false"),
+            "paused worker must advertise auto_enabled=false"
+        );
     }
 
     #[test]
@@ -855,7 +1033,87 @@ mod tests {
         assert_eq!(v[2].level, "error");
     }
 
+    #[test]
+    fn push_log_emits_job_id_as_a_structured_tracing_field() {
+        // Operators correlating shipped studio logs / Sentry
+        // breadcrumbs by job need the job id as a *field*, not just
+        // buried in the message text, so `RUST_LOG` filters and Sentry
+        // tag search can pivot on it.
+        use crate::test_support::capture;
+        let logs = capture(|| {
+            let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+            push_log(
+                &logs,
+                "info",
+                "ws",
+                "binary upload ok",
+                Some("job-42".into()),
+            );
+        });
+        assert!(
+            logs.contains("job_id=\"job-42\""),
+            "expected structured job_id field, got: {logs}"
+        );
+        assert!(
+            logs.contains("[ws] binary upload ok"),
+            "expected the human-readable message to survive, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn push_log_omits_job_id_field_when_absent() {
+        // Jobless breadcrumbs (startup banners, heartbeats, auto-update
+        // ticks) must not gain a noisy empty `job_id` field.
+        use crate::test_support::capture;
+        let logs = capture(|| {
+            let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+            push_log(&logs, "info", "auto-update", "up to date", None);
+        });
+        assert!(
+            !logs.contains("job_id"),
+            "expected no job_id field for a jobless log, got: {logs}"
+        );
+    }
+
     // --- async tick tests ---
+
+    #[test]
+    fn request_shutdown_sets_the_stop_flag() {
+        let stop = AtomicBool::new(false);
+        request_shutdown(&stop, "SIGTERM");
+        assert!(stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn request_shutdown_reconfirms_when_already_stopping() {
+        // A second signal (or a race with another shutdown path) must
+        // not panic or clear the flag — it just re-confirms the stop.
+        let stop = AtomicBool::new(true);
+        request_shutdown(&stop, "SIGINT");
+        assert!(stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn request_shutdown_emits_a_named_shutdown_breadcrumb() {
+        use crate::test_support::capture;
+        let logs = capture(|| {
+            let stop = AtomicBool::new(false);
+            request_shutdown(&stop, "SIGTERM");
+        });
+        assert!(logs.contains("INFO"), "expected INFO event, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::runtime"),
+            "expected runtime target, got: {logs}"
+        );
+        assert!(
+            logs.contains("op=\"shutdown\""),
+            "expected op field, got: {logs}"
+        );
+        assert!(
+            logs.contains("signal=\"SIGTERM\""),
+            "expected signal field, got: {logs}"
+        );
+    }
 
     #[tokio::test]
     async fn auto_update_tick_disabled_when_flag_off() {
@@ -879,5 +1137,45 @@ mod tests {
         assert_eq!(decision, AutoUpdateDecision::SkippedBusy);
         let entries = logs.lock();
         assert!(entries.iter().any(|e| e.message.contains("busy on a job")));
+    }
+
+    #[tokio::test]
+    async fn wait_with_stop_short_circuits_when_already_stopped() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let start = std::time::Instant::now();
+        wait_with_stop(Duration::from_secs(60), &stop, Duration::from_millis(10)).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "an already-set stop must return without sleeping the full duration"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_updater_stops_promptly_during_idle_wait() {
+        // A huge auto_update_tick means a non-cancellable idle sleep
+        // would pin the JoinHandle — and thus `run_loops`' join() — for
+        // the whole tick after stop is set, defeating graceful
+        // shutdown.  The stop-aware wait must let the task finish well
+        // inside the tick.
+        let cfg = crate::config::shared(Config {
+            auto_update_enabled: false,
+            ..Config::default()
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        let busy = Arc::new(AtomicBool::new(false));
+        let schedule = LoopSchedule {
+            ws_session: crate::ws::session::SessionSchedule::fast_for_tests(),
+            auto_update_tick: Duration::from_secs(3600),
+            shutdown_tick: Duration::from_millis(1),
+        };
+        let handle = spawn_auto_updater(cfg, stop.clone(), logs, busy, schedule);
+        // Let the loop reach its idle wait, then request shutdown.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stop.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_millis(250), handle)
+            .await
+            .expect("auto-updater did not observe stop promptly")
+            .expect("auto-updater task panicked");
     }
 }

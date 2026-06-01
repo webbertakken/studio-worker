@@ -272,7 +272,13 @@ async fn poll_existing(
                 snap.registration_secret = None;
                 let snapshot = snap.clone();
                 drop(snap);
-                let _ = config::save(&snapshot, config_path);
+                if let Err(e) = config::save(&snapshot, config_path) {
+                    tracing::warn!(
+                        target: "studio_worker::auto_register",
+                        config_path = %config_path.display(),
+                        "failed to persist cleared request state after stale 404; the stale request id stays on disk until the next successful save: {e}"
+                    );
+                }
             }
             *observers.lock() = RegistrationState::Pristine;
             RegistrationState::Pristine
@@ -297,7 +303,13 @@ async fn poll_existing(
                 snap.registration_secret = None;
                 let snapshot = snap.clone();
                 drop(snap);
-                let _ = config::save(&snapshot, config_path);
+                if let Err(e) = config::save(&snapshot, config_path) {
+                    tracing::error!(
+                        target: "studio_worker::auto_register",
+                        config_path = %config_path.display(),
+                        "failed to persist approved credentials; this session is registered in memory but the worker will re-register from scratch on the next restart: {e}"
+                    );
+                }
             }
             *observers.lock() = RegistrationState::Approved;
             RegistrationState::Approved
@@ -309,7 +321,13 @@ async fn poll_existing(
                 snap.registration_secret = None;
                 let snapshot = snap.clone();
                 drop(snap);
-                let _ = config::save(&snapshot, config_path);
+                if let Err(e) = config::save(&snapshot, config_path) {
+                    tracing::warn!(
+                        target: "studio_worker::auto_register",
+                        config_path = %config_path.display(),
+                        "failed to persist cleared request state after rejection; the stale request id stays on disk until the next successful save: {e}"
+                    );
+                }
             }
             let state = RegistrationState::Rejected { reason };
             *observers.lock() = state.clone();
@@ -337,7 +355,7 @@ fn build_payload(
 fn new_uuid() -> String {
     // UUIDv4-ish without pulling in the `uuid` crate: 16 random bytes
     // formatted as 8-4-4-4-12.
-    let bytes: [u8; 16] = rand_bytes_16();
+    let bytes: [u8; 16] = rand_bytes::<16>();
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!(
         "{}-{}-{}-{}-{}",
@@ -351,7 +369,7 @@ fn new_uuid() -> String {
 
 fn new_secret_hex() -> String {
     // 32 bytes of randomness = 64 hex chars (256 bits of entropy).
-    let bytes: [u8; 32] = rand_bytes_32();
+    let bytes: [u8; 32] = rand_bytes::<32>();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -362,70 +380,27 @@ fn sha256_hex(input: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// Randomness without pulling `rand` into the dep tree: read straight
-// from `/dev/urandom` on unix, BCryptGenRandom on windows.  Falls
-// back to a SHA-256-mixed timestamp if both fail (well below the
-// security bar but better than a panic on startup).
-
-#[cfg(unix)]
-fn rand_bytes_16() -> [u8; 16] {
-    rand_bytes::<16>()
-}
-
-#[cfg(unix)]
-fn rand_bytes_32() -> [u8; 32] {
-    rand_bytes::<32>()
-}
-
-#[cfg(unix)]
+/// Fill `N` bytes from the OS cryptographically-secure RNG via the
+/// `getrandom` crate (`getrandom(2)` / `/dev/urandom` on Linux,
+/// `getentropy` on macOS, `BCryptGenRandom` on Windows).  Used for
+/// the install id and the registration secret, both of which must be
+/// unpredictable: an attacker who could guess the secret could claim
+/// another box's pending registration.
+///
+/// Panics if the OS entropy source is unavailable.  That only happens
+/// on a fundamentally broken platform, and failing loudly (the panic
+/// is captured by Sentry) is the right call — minting a guessable
+/// secret from a timestamp would be worse than a clean crash.
+///
+/// This used to hand-roll a `/dev/urandom` read on unix and silently
+/// fall back to a SHA-256-mixed timestamp on Windows (and on any I/O
+/// error), which left the Windows secret predictable.  `getrandom` is
+/// a tiny syscall wrapper already in the dep tree, so the whole
+/// per-OS dance collapses into one secure, testable path.
 fn rand_bytes<const N: usize>() -> [u8; N] {
-    use std::io::Read;
     let mut buf = [0u8; N];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(&mut buf).is_ok() {
-            return buf;
-        }
-    }
-    fallback_bytes(&mut buf);
+    getrandom::fill(&mut buf).expect("OS entropy source (getrandom) unavailable");
     buf
-}
-
-#[cfg(windows)]
-fn rand_bytes_16() -> [u8; 16] {
-    let mut buf = [0u8; 16];
-    fallback_bytes(&mut buf);
-    buf
-}
-
-#[cfg(windows)]
-fn rand_bytes_32() -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    fallback_bytes(&mut buf);
-    buf
-}
-
-fn fallback_bytes(buf: &mut [u8]) {
-    // Last-resort: mix nanoseconds with a counter through SHA-256.
-    // Good enough to avoid collisions in tests + dev; unix/macos
-    // primary path uses /dev/urandom which is cryptographically
-    // strong.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut counter: u64 = 0;
-    let mut offset = 0;
-    while offset < buf.len() {
-        let mut hasher = Sha256::new();
-        hasher.update(nanos.to_le_bytes());
-        hasher.update(counter.to_le_bytes());
-        let digest = hasher.finalize();
-        let take = (buf.len() - offset).min(digest.len());
-        buf[offset..offset + take].copy_from_slice(&digest[..take]);
-        offset += take;
-        counter += 1;
-    }
 }
 
 #[cfg(test)]
@@ -464,5 +439,43 @@ mod tests {
         assert_eq!(sha256_hex("abc"), sha256_hex("abc"));
         assert_ne!(sha256_hex("abc"), sha256_hex("abd"));
         assert_eq!(sha256_hex("").len(), 64);
+    }
+
+    // ---------------------------------------------------------------
+    // Entropy primitive.  `rand_bytes` is the single source for the
+    // install id + registration secret on every platform, so these
+    // also cover the formerly-untested Windows path (which used to
+    // route through a predictable timestamp fallback).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn rand_bytes_are_distinct_across_many_calls() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for _ in 0..2_000 {
+            assert!(
+                seen.insert(rand_bytes::<32>()),
+                "rand_bytes produced a duplicate 32-byte value"
+            );
+        }
+    }
+
+    #[test]
+    fn rand_bytes_cover_every_bit_position() {
+        // OR + AND across many samples: a stuck or constant source
+        // would leave a bit position never set (an OR-zero) or never
+        // cleared (an AND-one).  An OS CSPRNG flips every one of the
+        // 256 bits within a handful of samples.
+        let mut ever_set = [0u8; 32];
+        let mut ever_clear = [0xffu8; 32];
+        for _ in 0..256 {
+            let b = rand_bytes::<32>();
+            for i in 0..32 {
+                ever_set[i] |= b[i];
+                ever_clear[i] &= b[i];
+            }
+        }
+        assert_eq!(ever_set, [0xffu8; 32], "a bit position was never set");
+        assert_eq!(ever_clear, [0u8; 32], "a bit position was never cleared");
     }
 }

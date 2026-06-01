@@ -172,6 +172,14 @@ fn render_prompt(messages: &[ChatMessage]) -> String {
     out
 }
 
+/// Whether a prompt of `prompt_tokens` plus a `max_tokens` generation
+/// budget overflows the context window `n_ctx` (the KV-cache size).
+/// Pure so the over-budget guard is unit-tested without a loaded model.
+/// Saturating arithmetic keeps a pathological `max_tokens` from wrapping.
+fn exceeds_context_window(prompt_tokens: usize, max_tokens: u32, n_ctx: u32) -> bool {
+    prompt_tokens.saturating_add(max_tokens as usize) > n_ctx as usize
+}
+
 fn run_generation(
     model: &LlamaModel,
     backend: &LlamaBackend,
@@ -194,11 +202,23 @@ fn run_generation(
         bail!("prompt tokenised to zero tokens");
     }
 
-    let n_kv_req = tokens.len() as i32 + max_tokens as i32;
-    let max_batch = ctx.n_batch() as i32;
-    if n_kv_req > max_batch {
-        // Trim if the prompt + budget exceeds our batch — caller can
-        // raise n_ctx for longer chats.
+    // A prompt plus its generation budget larger than the context
+    // window overflows the KV cache: later decode steps run past what
+    // this context was sized for and the output silently truncates.
+    // We deliberately don't trim the prompt here (that would mangle the
+    // operator's input) — instead we surface the condition so "why was
+    // my long chat cut off" is answerable from the logs.  Raise n_ctx
+    // for longer chats.
+    if exceeds_context_window(tokens.len(), max_tokens, ctx_size.get()) {
+        warn!(
+            target: TRACE_TARGET,
+            op = "generate",
+            prompt_tokens = tokens.len(),
+            max_tokens,
+            n_ctx = ctx_size.get(),
+            "prompt + max_tokens exceeds the context window; output may be \
+             truncated — raise n_ctx for longer chats"
+        );
     }
 
     let mut batch = LlamaBatch::new(2048, 1);
@@ -351,6 +371,30 @@ impl Engine for LlamaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exceeds_context_window_false_when_within_window() {
+        // 100 prompt + 50 budget = 150 <= 2048.
+        assert!(!exceeds_context_window(100, 50, 2048));
+    }
+
+    #[test]
+    fn exceeds_context_window_true_when_over_window() {
+        // 2000 prompt + 100 budget = 2100 > 2048.
+        assert!(exceeds_context_window(2000, 100, 2048));
+    }
+
+    #[test]
+    fn exceeds_context_window_false_at_exact_window() {
+        // Filling the window exactly is not yet an overflow.
+        assert!(!exceeds_context_window(1998, 50, 2048));
+    }
+
+    #[test]
+    fn exceeds_context_window_saturates_on_huge_budget() {
+        // A pathological max_tokens must not wrap to a small sum.
+        assert!(exceeds_context_window(1, u32::MAX, 2048));
+    }
 
     #[test]
     fn render_prompt_concatenates_messages_with_assistant_marker() {

@@ -25,10 +25,10 @@ use crate::engine::Engine;
 use crate::http::ApiClient;
 use crate::runtime::{
     is_unsupported_kind, prompt_for, push_log_with_observers, record_recent_job, truncate_prompt,
-    CurrentJob, JobOutcome, RecentJob, WorkerObservers,
+    wait_with_stop, CurrentJob, JobOutcome, RecentJob, WorkerObservers,
 };
 use crate::types::{LogEntry, TaskResult, WorkerCapabilities};
-use crate::ws::client::{connect, WsClientError, WsSender};
+use crate::ws::client::{connect, WsClientError, WsResult, WsSender};
 use crate::ws::types::{HelloFrame, JobOfferClaim, WorkerInbound, WorkerOutbound};
 
 /// Tracing target used for every event emitted by the session.
@@ -40,6 +40,11 @@ const SHUTDOWN_TICK: Duration = Duration::from_millis(250);
 const BASE_BACKOFF_MS: u64 = 1_000;
 const MAX_BACKOFF_MS: u64 = 30_000;
 const DEFAULT_RECONNECT_ATTEMPTS: u32 = 5;
+/// If no frame (not even a `heartbeatAck`) arrives from the studio within this window, treat the
+/// connection as dead and tear the session down. The studio acks every heartbeat (~5s), so a live
+/// connection always yields a frame well inside this budget; the only time it elapses is a
+/// half-open / dead-peer socket where the reader would otherwise block on `source.next()` forever.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Outcome of a single session attempt.  The reconnect loop decides
 /// whether to back off + retry based on the variant.
@@ -63,6 +68,8 @@ pub struct SessionSchedule {
     pub shutdown_tick: Duration,
     pub base_backoff_ms: u64,
     pub max_backoff_ms: u64,
+    /// Reader gives up + reports a disconnect if no server frame arrives within this window.
+    pub read_idle_timeout: Duration,
 }
 
 impl Default for SessionSchedule {
@@ -73,6 +80,7 @@ impl Default for SessionSchedule {
             shutdown_tick: SHUTDOWN_TICK,
             base_backoff_ms: BASE_BACKOFF_MS,
             max_backoff_ms: MAX_BACKOFF_MS,
+            read_idle_timeout: READ_IDLE_TIMEOUT,
         }
     }
 }
@@ -85,6 +93,9 @@ impl SessionSchedule {
             shutdown_tick: Duration::from_millis(5),
             base_backoff_ms: 1,
             max_backoff_ms: 10,
+            // Generous vs the 5ms heartbeat so the existing fast tests never trip it; the
+            // silent-connection test overrides this with a tiny value to exercise the timeout.
+            read_idle_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -141,7 +152,12 @@ pub async fn spawn_ws_session(
         }
         waiting_for_creds_logged = false;
 
-        match run_one_session(&cfg, &stop, &logs, &busy, &paused, &observers, schedule).await {
+        let welcomed = AtomicBool::new(false);
+        match run_one_session(
+            &cfg, &stop, &logs, &busy, &paused, &observers, schedule, &welcomed,
+        )
+        .await
+        {
             Ok(SessionOutcome::Stopped) => return Ok(()),
             Ok(SessionOutcome::AuthFailed(reason)) => {
                 push_log_with_observers(
@@ -166,6 +182,12 @@ pub async fn spawn_ws_session(
                 return Err(anyhow!("ws fatal: {reason}"));
             }
             Ok(SessionOutcome::Disconnected) | Err(_) => {
+                // A session that successfully connected shouldn't count its later drop toward the
+                // connect-failure cap — only consecutive failures to connect should accumulate, so
+                // a long-lived worker isn't killed by transient mid-session disconnects.
+                if welcomed.load(Ordering::SeqCst) {
+                    attempt = 0;
+                }
                 attempt += 1;
                 if max_attempts > 0 && attempt > max_attempts {
                     push_log_with_observers(
@@ -288,6 +310,9 @@ fn has_credentials(cfg: &SharedConfig) -> bool {
 /// One end-to-end session attempt: connect, hello, run until shutdown
 /// or disconnect.
 #[cfg_attr(coverage_nightly, coverage(off))]
+// Eight collaborators (config + shared flags + observers + schedule + welcomed signal);
+// grouping them adds indirection without improving readability.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_session(
     cfg: &SharedConfig,
     stop: &Arc<AtomicBool>,
@@ -296,6 +321,7 @@ async fn run_one_session(
     paused: &Arc<AtomicBool>,
     observers: &WorkerObservers,
     schedule: SessionSchedule,
+    welcomed: &AtomicBool,
 ) -> Result<SessionOutcome> {
     let (api_base_url, worker_id, auth_token) = {
         let guard = cfg.lock();
@@ -345,6 +371,18 @@ async fn run_one_session(
         &*engine,
         !paused.load(Ordering::SeqCst),
     );
+    // Record exactly what we're about to advertise so the worker's logs
+    // (and the studio's shipped-log view) show the offered kinds /
+    // models / VRAM budget — otherwise the handshake is opaque and
+    // "why won't it claim X jobs" can't be answered from the logs.
+    push_log_with_observers(
+        logs,
+        Some(observers),
+        "info",
+        "ws",
+        &crate::runtime::summarize_capabilities(&capabilities),
+        None,
+    );
     sender
         .send(&WorkerInbound::Hello(HelloFrame {
             auth_token: auth_token.clone(),
@@ -357,7 +395,7 @@ async fn run_one_session(
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
 
     // Reader task: pump frames into the event channel.
-    let reader = spawn_reader(receiver, event_tx.clone());
+    let reader = spawn_reader(receiver, event_tx.clone(), schedule.read_idle_timeout);
 
     // Wait for the server's `Welcome` (or an error) before starting
     // the heartbeat / log-shipper pumps.  Without this gate, the
@@ -369,7 +407,7 @@ async fn run_one_session(
     // session.
     let mut event_rx = event_rx;
     match wait_for_welcome(&mut event_rx, logs, observers).await {
-        WelcomeOutcome::Welcomed => {}
+        WelcomeOutcome::Welcomed => welcomed.store(true, Ordering::SeqCst),
         WelcomeOutcome::AuthFailed(reason) => {
             let _ = sender.close(1000, "auth failed").await;
             let _ = reader.await;
@@ -396,8 +434,8 @@ async fn run_one_session(
         capabilities_for_heartbeat,
         sender.clone(),
         stop.clone(),
-        busy.clone(),
         paused.clone(),
+        observers.clone(),
         schedule,
     );
 
@@ -422,7 +460,16 @@ async fn run_one_session(
     };
     let outcome = run_dispatch_loop(ctx, event_rx).await;
 
-    // Best-effort graceful close + task drain.
+    // The session is ending (disconnect or shutdown). The heartbeat / log-shipper /
+    // shutdown-observer pumps only break on the *global* stop flag or a send failure, so on a
+    // silent-but-open socket — where heartbeat sends still succeed into the TCP buffer — they would
+    // loop forever and block this function from returning, which is exactly the post-job reconnect
+    // hang. Abort them so teardown is bounded regardless of socket state, then best-effort close +
+    // drain the aborted handles (await returns promptly with Cancelled).
+    reader.abort();
+    heartbeat.abort();
+    log_shipper.abort();
+    shutdown_observer.abort();
     let _ = sender.close(1000, "session ended").await;
     let _ = reader.await;
     let _ = heartbeat.await;
@@ -535,29 +582,33 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             &format!("rejecting offer {job_id}: worker is paused"),
             Some(job_id.clone()),
         );
-        let sender_for_reject = ctx.sender.clone();
-        let job_id_for_reject = job_id.clone();
-        tokio::spawn(async move {
-            let _ = sender_for_reject
-                .send(&WorkerInbound::Reject {
-                    job_id: job_id_for_reject,
-                    reason: "worker paused by operator".to_string(),
-                })
-                .await;
-        });
+        spawn_reject_offer(
+            ctx.sender.clone(),
+            ctx.logs.clone(),
+            ctx.observers.clone(),
+            job_id,
+            "worker paused by operator",
+        );
         return;
     }
-    // Send accept first so the server marks the offer consumed.
-    let sender_for_accept = ctx.sender.clone();
-    let job_id_for_accept = job_id.clone();
-    tokio::spawn(async move {
-        let _ = sender_for_accept
-            .send(&WorkerInbound::Accept {
-                job_id: job_id_for_accept,
-            })
-            .await;
-    });
-
+    if !try_reserve_worker(&ctx.busy) {
+        push_log_with_observers(
+            &ctx.logs,
+            Some(&ctx.observers),
+            "info",
+            "ws",
+            &format!("rejecting offer {job_id}: worker is already busy"),
+            Some(job_id.clone()),
+        );
+        spawn_reject_offer(
+            ctx.sender.clone(),
+            ctx.logs.clone(),
+            ctx.observers.clone(),
+            job_id,
+            "worker already has an in-flight job",
+        );
+        return;
+    }
     let job = claim.into_job_claim();
     let task_kind = job.task.kind();
     // The FULL prompt goes back to the studio (and to the engine).
@@ -571,17 +622,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     let prompt_preview = truncate_prompt(&full_prompt);
     let started_at = chrono::Utc::now();
 
-    // Surface the job to the UI's Jobs tab — bounded preview only.
-    *ctx.observers.current_job.lock() = Some(CurrentJob {
-        job_id: job_id.clone(),
-        kind: task_kind,
-        model: job.model.clone(),
-        prompt: prompt_preview.clone(),
-        started_at,
-    });
-
     let busy_flag = ctx.busy.clone();
-    busy_flag.store(true, Ordering::SeqCst);
     let logs_for_task = ctx.logs.clone();
     let observers_for_task = ctx.observers.clone();
     let sender_for_task = ctx.sender.clone();
@@ -590,6 +631,36 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     let worker_id = ctx.worker_id.clone();
     let auth_token = ctx.auth_token.clone();
     tokio::spawn(async move {
+        let accept_result = sender_for_task
+            .send(&WorkerInbound::Accept {
+                job_id: job_id.clone(),
+            })
+            .await;
+        if let Some((level, message)) = offer_response_breadcrumb("accept", &job_id, &accept_result)
+        {
+            push_log_with_observers(
+                &logs_for_task,
+                Some(&observers_for_task),
+                level,
+                "ws",
+                &message,
+                Some(job_id.clone()),
+            );
+        }
+        if accept_result.is_err() {
+            busy_flag.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        // Surface the job to the UI's Jobs tab — bounded preview only.
+        *observers_for_task.current_job.lock() = Some(CurrentJob {
+            job_id: job_id.clone(),
+            kind: task_kind,
+            model: job.model.clone(),
+            prompt: prompt_preview.clone(),
+            started_at,
+        });
+
         run_offered_job(
             sender_for_task,
             engine_for_task,
@@ -606,6 +677,31 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         )
         .await;
         busy_flag.store(false, Ordering::SeqCst);
+    });
+}
+
+fn try_reserve_worker(busy: &AtomicBool) -> bool {
+    busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+fn spawn_reject_offer(
+    sender: WsSender,
+    logs: Arc<Mutex<Vec<LogEntry>>>,
+    observers: WorkerObservers,
+    job_id: String,
+    reason: &'static str,
+) {
+    tokio::spawn(async move {
+        let result = sender
+            .send(&WorkerInbound::Reject {
+                job_id: job_id.clone(),
+                reason: reason.to_string(),
+            })
+            .await;
+        if let Some((level, message)) = offer_response_breadcrumb("reject", &job_id, &result) {
+            push_log_with_observers(&logs, Some(&observers), level, "ws", &message, Some(job_id));
+        }
     });
 }
 
@@ -697,13 +793,14 @@ async fn run_offered_job(
                         outcome = JobOutcome::Failed {
                             reason: msg.clone(),
                         };
-                        let _ = sender
+                        let fail_result = sender
                             .send(&WorkerInbound::Fail {
                                 job_id: job_id.clone(),
                                 error: msg,
                                 retryable: true,
                             })
                             .await;
+                        record_fail_send(&fail_result, &job_id, &logs, &observers);
                     } else {
                         push_log_with_observers(
                             &logs,
@@ -731,14 +828,44 @@ async fn run_offered_job(
                     }
                 }
                 TaskResult::Llm { json } | TaskResult::AudioStt { json } => {
-                    let _ = sender
+                    // Mirror the binary path: branch on the send result
+                    // so a dropped `completeJson` frame is recorded as a
+                    // failure (never a false-positive `Completed`) and a
+                    // successful send leaves an explicit completion
+                    // breadcrumb in the logs + shipped studio logs,
+                    // symmetric with the binary path's "binary upload ok".
+                    match sender
                         .send(&WorkerInbound::CompleteJson {
                             job_id: job_id.clone(),
                             result: json,
                             prompt: Some(full_prompt.clone()),
                         })
-                        .await;
-                    outcome = JobOutcome::Completed;
+                        .await
+                    {
+                        Ok(()) => {
+                            push_log_with_observers(
+                                &logs,
+                                Some(&observers),
+                                "info",
+                                "ws",
+                                "json result sent",
+                                Some(job_id.clone()),
+                            );
+                            outcome = JobOutcome::Completed;
+                        }
+                        Err(e) => {
+                            let msg = format!("failed to send result: {e}");
+                            push_log_with_observers(
+                                &logs,
+                                Some(&observers),
+                                "error",
+                                "ws",
+                                &msg,
+                                Some(job_id.clone()),
+                            );
+                            outcome = JobOutcome::Failed { reason: msg };
+                        }
+                    }
                 }
             }
         }
@@ -755,13 +882,14 @@ async fn run_offered_job(
             outcome = JobOutcome::Failed {
                 reason: e.to_string(),
             };
-            let _ = sender
+            let fail_result = sender
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
                     error: e.to_string(),
                     retryable: !is_unsupported_kind(&e),
                 })
                 .await;
+            record_fail_send(&fail_result, &job_id, &logs, &observers);
         }
         Err(e) => {
             push_log_with_observers(
@@ -775,13 +903,14 @@ async fn run_offered_job(
             outcome = JobOutcome::Failed {
                 reason: e.to_string(),
             };
-            let _ = sender
+            let fail_result = sender
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
                     error: e.to_string(),
                     retryable: true,
                 })
                 .await;
+            record_fail_send(&fail_result, &job_id, &logs, &observers);
         }
     }
 
@@ -806,22 +935,35 @@ async fn run_offered_job(
 fn spawn_reader(
     mut receiver: crate::ws::client::WsReceiver,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
+    read_idle_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match receiver.recv().await {
-                Ok(Some(frame)) => {
+            // Bound the wait so a half-open / dead-peer socket can't block the reader forever.
+            // A live studio acks every heartbeat (~5s), so a frame always lands well inside the
+            // window; elapsing it means the connection is gone and the session must reconnect.
+            match tokio::time::timeout(read_idle_timeout, receiver.recv()).await {
+                Ok(Ok(Some(frame))) => {
                     if event_tx.send(SessionEvent::Frame(frame)).is_err() {
                         break;
                     }
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     let _ =
                         event_tx.send(SessionEvent::Disconnected(WsClientError::ConnectionClosed));
                     break;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = event_tx.send(SessionEvent::Disconnected(e));
+                    break;
+                }
+                Err(_elapsed) => {
+                    let _ = event_tx.send(SessionEvent::Disconnected(WsClientError::Transport(
+                        format!(
+                            "no frames from server for {:?}; treating connection as dead",
+                            read_idle_timeout
+                        ),
+                    )));
                     break;
                 }
             }
@@ -834,8 +976,8 @@ fn spawn_heartbeat_pump(
     capabilities: WorkerCapabilities,
     sender: WsSender,
     stop: Arc<AtomicBool>,
-    busy: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    observers: WorkerObservers,
     schedule: SessionSchedule,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -851,11 +993,7 @@ fn spawn_heartbeat_pump(
             // current job id can change between heartbeats.
             let mut caps = capabilities.clone();
             caps.auto_enabled = !paused.load(Ordering::SeqCst);
-            let current_job_id = if busy.load(Ordering::SeqCst) {
-                Some("in-flight".to_string())
-            } else {
-                None
-            };
+            let current_job_id = heartbeat_current_job_id(&observers);
             if let Err(e) = sender
                 .send(&WorkerInbound::Heartbeat {
                     capabilities: caps,
@@ -868,6 +1006,14 @@ fn spawn_heartbeat_pump(
             }
         }
     })
+}
+
+fn heartbeat_current_job_id(observers: &WorkerObservers) -> Option<String> {
+    observers
+        .current_job
+        .lock()
+        .as_ref()
+        .map(|job| job.job_id.clone())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -923,27 +1069,183 @@ fn spawn_shutdown_observer(
     })
 }
 
-async fn wait_with_stop(total: Duration, stop: &Arc<AtomicBool>, tick: Duration) {
-    let mut elapsed = Duration::ZERO;
-    while elapsed < total {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        let next = tick.min(total - elapsed);
-        tokio::time::sleep(next).await;
-        elapsed += next;
-    }
-}
-
 fn backoff_for(attempt: u32, schedule: SessionSchedule) -> Duration {
     let factor = 2u64.saturating_pow(attempt.saturating_sub(1));
     let raw_ms = schedule.base_backoff_ms.saturating_mul(factor);
     Duration::from_millis(raw_ms.min(schedule.max_backoff_ms))
 }
 
+/// Decide whether a just-attempted offer-response send (accept /
+/// reject) warrants a session-level breadcrumb.
+///
+/// Returns `None` on success: the happy path is already implied by the
+/// surrounding "dispatched" / "rejecting offer: paused" breadcrumbs, so
+/// re-logging it would only add per-job noise.  Returns
+/// `Some(("error", …))` when the send failed — a dropped accept leaves
+/// the worker running a job the studio never marked accepted, and a
+/// dropped reject leaves the offer reserved on a paused worker until it
+/// times out.  The transport layer already logs the failure locally on
+/// `studio_worker::ws::client`, but only a session-level breadcrumb
+/// reaches the UI's Logs tab and the studio-shipped log view with the
+/// offending `job_id` attached.  Pure so the wording + level are
+/// unit-tested without a live WS sink.
+fn offer_response_breadcrumb(
+    label: &str,
+    job_id: &str,
+    result: &WsResult<()>,
+) -> Option<(&'static str, String)> {
+    match result {
+        Ok(()) => None,
+        Err(e) => Some((
+            "error",
+            format!("{label} send failed for offer {job_id}: {e}"),
+        )),
+    }
+}
+
+/// Decide whether a just-attempted `Fail`-frame send warrants a
+/// session-level breadcrumb.
+///
+/// Returns `None` on success: the caller already logged the underlying
+/// job failure (the upload error, dispatch error, or panic), so a `Fail`
+/// frame that lands needs no second per-job line.  Returns
+/// `Some(("error", …))` when the send itself failed — a dropped `Fail`
+/// leaves the studio believing the job is still in flight (reserved on
+/// the session's `currentJob` slot) until it times out, with no local
+/// record that the notification never landed.  The transport layer logs
+/// the drop locally on `studio_worker::ws::client`, but only a
+/// session-level breadcrumb reaches the UI's Logs tab and the
+/// studio-shipped log view with the offending `job_id` attached.  Pure
+/// so the wording + level are unit-tested without a live WS sink.
+fn fail_send_breadcrumb(job_id: &str, result: &WsResult<()>) -> Option<(&'static str, String)> {
+    match result {
+        Ok(()) => None,
+        Err(e) => Some((
+            "error",
+            format!("failed to notify studio of job {job_id} failure: {e}"),
+        )),
+    }
+}
+
+/// Push a session-level breadcrumb when a `Fail`-frame send dropped.
+///
+/// Trivial glue over [`fail_send_breadcrumb`]: the three job-failure
+/// arms (upload error, dispatch error, dispatch panic) all notify the
+/// studio with a `Fail` frame and then call this, so a dropped
+/// notification is recorded with the `job_id` attached instead of being
+/// swallowed by `let _ = sender.send(...)`.
+fn record_fail_send(
+    result: &WsResult<()>,
+    job_id: &str,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    observers: &WorkerObservers,
+) {
+    if let Some((level, message)) = fail_send_breadcrumb(job_id, result) {
+        push_log_with_observers(
+            logs,
+            Some(observers),
+            level,
+            "ws",
+            &message,
+            Some(job_id.to_string()),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offer_response_breadcrumb_is_silent_on_success() {
+        // The happy path is already implied by the surrounding
+        // "dispatched" / "rejecting offer: paused" breadcrumbs, so a
+        // successful accept / reject send must not add per-job noise.
+        assert!(offer_response_breadcrumb("accept", "j-1", &Ok(())).is_none());
+        assert!(offer_response_breadcrumb("reject", "j-2", &Ok(())).is_none());
+    }
+
+    #[test]
+    fn try_reserve_worker_only_allows_one_in_flight_job() {
+        let busy = AtomicBool::new(false);
+        assert!(try_reserve_worker(&busy));
+        assert!(!try_reserve_worker(&busy));
+    }
+
+    #[test]
+    fn heartbeat_current_job_id_uses_actual_job_id() {
+        let observers = WorkerObservers::default();
+        assert_eq!(heartbeat_current_job_id(&observers), None);
+        *observers.current_job.lock() = Some(CurrentJob {
+            job_id: "job-42".into(),
+            kind: crate::types::TaskKind::Image,
+            model: "synthetic".into(),
+            prompt: "prompt".into(),
+            started_at: chrono::Utc::now(),
+        });
+        assert_eq!(
+            heartbeat_current_job_id(&observers).as_deref(),
+            Some("job-42")
+        );
+    }
+
+    #[test]
+    fn offer_response_breadcrumb_reports_accept_send_failure() {
+        let (level, msg) =
+            offer_response_breadcrumb("accept", "j-1", &Err(WsClientError::ConnectionClosed))
+                .expect("a failed accept send must surface a breadcrumb");
+        assert_eq!(level, "error");
+        assert!(msg.contains("accept send failed"), "got: {msg}");
+        assert!(msg.contains("j-1"), "must name the job: {msg}");
+        assert!(
+            msg.contains("connection closed"),
+            "must carry the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn offer_response_breadcrumb_reports_reject_send_failure() {
+        let (level, msg) = offer_response_breadcrumb(
+            "reject",
+            "j-9",
+            &Err(WsClientError::Transport("sink gone".into())),
+        )
+        .expect("a failed reject send must surface a breadcrumb");
+        assert_eq!(level, "error");
+        assert!(msg.contains("reject send failed"), "got: {msg}");
+        assert!(msg.contains("j-9"), "must name the job: {msg}");
+        assert!(msg.contains("sink gone"), "must carry the cause: {msg}");
+    }
+
+    #[test]
+    fn fail_send_breadcrumb_is_silent_on_success() {
+        // The underlying job failure (upload / dispatch / panic) is
+        // already logged by the caller, so a Fail-frame that lands must
+        // not add a second per-job line.
+        assert!(fail_send_breadcrumb("j-1", &Ok(())).is_none());
+    }
+
+    #[test]
+    fn fail_send_breadcrumb_reports_send_failure() {
+        let (level, msg) = fail_send_breadcrumb("j-7", &Err(WsClientError::ConnectionClosed))
+            .expect("a dropped Fail send must surface a breadcrumb");
+        assert_eq!(level, "error");
+        assert!(msg.contains("j-7"), "must name the job: {msg}");
+        assert!(
+            msg.contains("connection closed"),
+            "must carry the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn fail_send_breadcrumb_carries_transport_cause() {
+        let (level, msg) =
+            fail_send_breadcrumb("j-3", &Err(WsClientError::Transport("sink gone".into())))
+                .expect("a dropped Fail send must surface a breadcrumb");
+        assert_eq!(level, "error");
+        assert!(msg.contains("j-3"), "must name the job: {msg}");
+        assert!(msg.contains("sink gone"), "must carry the cause: {msg}");
+    }
 
     #[test]
     fn backoff_grows_exponentially_until_cap() {
@@ -953,6 +1255,7 @@ mod tests {
             heartbeat: Duration::from_secs(1),
             log_flush: Duration::from_secs(1),
             shutdown_tick: Duration::from_secs(1),
+            read_idle_timeout: Duration::from_secs(1),
         };
         assert_eq!(backoff_for(1, schedule), Duration::from_millis(100));
         assert_eq!(backoff_for(2, schedule), Duration::from_millis(200));

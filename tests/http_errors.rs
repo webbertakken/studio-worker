@@ -97,6 +97,56 @@ async fn complete_for_unknown_ext_falls_back_to_octet_stream() {
     });
 }
 
+#[tokio::test]
+async fn complete_logs_upload_byte_size() {
+    // The multipart `complete` route is the only path that ships the
+    // (potentially large) binary result.  Operators debugging slow or
+    // failed result delivery need to see how many bytes the worker
+    // tried to upload, so `complete` emits the payload size before the
+    // fallible request regardless of its outcome.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/w/jobs/j/complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })))
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let logs = captured_logs_for(move || {
+        let api = ApiClient::new(uri).unwrap();
+        api.complete("w", "t", "j", "webp", "p", vec![1, 2, 3, 4, 5])
+            .unwrap();
+    });
+    assert!(
+        logs.contains("op=\"complete\""),
+        "expected complete op field: {logs}"
+    );
+    assert!(
+        logs.contains("bytes=5"),
+        "expected upload byte-size field, got: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn complete_logs_upload_byte_size_even_on_failure() {
+    // The pre-upload breadcrumb fires before the request, so a failed
+    // upload still leaves the attempted payload size in the logs.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/w/jobs/j/complete"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let logs = captured_logs_for(move || {
+        let api = ApiClient::new(uri).unwrap();
+        let _ = api.complete("w", "t", "j", "webp", "p", vec![1, 2, 3, 4, 5, 6, 7]);
+    });
+    assert!(
+        logs.contains("bytes=7"),
+        "expected attempted upload byte-size field on failure, got: {logs}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tracing emission — every HTTP call leaves an operator-visible
 // breadcrumb (debug on success, warn on failure) with endpoint, status,

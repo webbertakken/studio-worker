@@ -4,6 +4,7 @@
 //! tooling) can drive the contract without going through the CLI.
 
 pub mod auto_register;
+pub mod autostart;
 pub mod cli;
 pub mod config;
 pub mod engine;
@@ -28,9 +29,29 @@ pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// crate name.  Matches what `sentry::release_name!()` would expand to.
 pub const RELEASE_NAME: &str = concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION"));
 
+/// Tracing target for CLI lifecycle events.  Stable so operators can
+/// filter with `RUST_LOG=studio_worker::cli=info`.
+const CLI_TRACE_TARGET: &str = "studio_worker::cli";
+
+/// Emit a single startup breadcrumb naming the agent version and the
+/// subcommand about to run.  With no `SENTRY_DSN` set (the default),
+/// nothing else anchors "which version started, running what" in
+/// `journalctl` — which matters most right after an auto-update
+/// re-execs the binary or a service manager restarts the unit.
+fn log_cli_startup(command: &cli::Command) {
+    tracing::info!(
+        target: CLI_TRACE_TARGET,
+        op = "startup",
+        version = AGENT_VERSION,
+        command = command.name(),
+        "studio-worker starting"
+    );
+}
+
 /// Dispatch table for the CLI subcommands.  Lives in the library so we
 /// can drive it from tests without invoking the binary.
 pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {
+    log_cli_startup(&args.command);
     match args.command {
         cli::Command::Run => runtime::run(args.config.as_deref()).await,
         cli::Command::Register {
@@ -68,4 +89,32 @@ async fn run_ui(_config_path: Option<&str>) -> anyhow::Result<()> {
          Reinstall with `cargo install studio-worker --features ui` (or use the \
          desktop installer from the releases page) to enable the native UI."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::capture;
+
+    #[test]
+    fn startup_breadcrumb_names_version_and_command() {
+        let logs = capture(|| log_cli_startup(&cli::Command::Run));
+        assert!(logs.contains("INFO"), "expected INFO event, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::cli"),
+            "expected the cli target, got: {logs}"
+        );
+        assert!(
+            logs.contains("op=\"startup\""),
+            "expected op=startup, got: {logs}"
+        );
+        assert!(
+            logs.contains("command=\"run\""),
+            "expected command field, got: {logs}"
+        );
+        assert!(
+            logs.contains(AGENT_VERSION),
+            "expected agent version, got: {logs}"
+        );
+    }
 }

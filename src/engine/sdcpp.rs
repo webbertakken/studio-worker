@@ -15,9 +15,12 @@
 //! ~/models/<filename2>
 //! \u2026
 //! ```
-//! Files are downloaded on first use (HEAD-checked length so we don't
-//! re-download something that's already there) and re-used across
-//! every subsequent job that names them.
+//! Files are downloaded on first use - skipped when already present
+//! under `cfg.models_root`.  The streamed body is checked against the
+//! server's `Content-Length` so a truncated download is rejected and
+//! cleaned up instead of being renamed into place as a corrupt model
+//! that every later job would fail to load.  Cached files are re-used
+//! across every subsequent job that names them.
 //!
 //! The engine self-registers only when `sd-cli` is present on the box
 //! (either at `$STUDIO_WORKER_SD_CLI`, or `~/.local/bin/sd-cli`, or on
@@ -30,7 +33,7 @@ use crate::types::{ImageParams, ModelFileRole, ModelSource, Task, TaskKind, Task
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -97,7 +100,7 @@ impl SdCppEngine {
     fn ensure_files(&self, source: &ModelSource) -> Result<Vec<(ModelFileRole, PathBuf)>> {
         let mut out = Vec::with_capacity(source.files.len());
         for file in &source.files {
-            let local = self.models_root.join(&file.filename);
+            let local = model_cache_path(&self.models_root, &file.filename)?;
             if !local.is_file() {
                 download_file(&file.url, &local).with_context(|| {
                     format!(
@@ -134,7 +137,12 @@ impl SdCppEngine {
         source: &ModelSource,
     ) -> Result<TaskResult> {
         let files = self.ensure_files(source)?;
-        let diffusion_model = file_for_role(&files, ModelFileRole::DiffusionModel)
+        // A `diffusion-model` file is the standalone diffusion weights (sd-cli `--diffusion-model`,
+        // used with split vae/clip); a `model` file is a full checkpoint (sd-cli `-m`/`--model`).
+        // Prefer the explicit diffusion-model role; fall back to a full checkpoint.
+        let diffusion_only = file_for_role(&files, ModelFileRole::DiffusionModel);
+        let full_checkpoint = diffusion_only.is_none();
+        let diffusion_model = diffusion_only
             .or_else(|| file_for_role(&files, ModelFileRole::Model))
             .ok_or_else(|| anyhow!("modelSource has no diffusion-model / model file"))?;
         let vae = file_for_role(&files, ModelFileRole::Vae);
@@ -150,6 +158,12 @@ impl SdCppEngine {
         );
         let out_path = out_dir.join(format!("{stem}.webp"));
 
+        // Own the scratch files from the moment their paths exist so
+        // every failure path (sd-cli error, unreadable output) cleans
+        // up instead of leaking them into the temp dir.
+        let mut temp_files = TempFileGuard::new();
+        temp_files.push(out_path.clone());
+
         // If the task carries an init image URL, stream it to a
         // tempfile so we can hand the path to `sd-cli --init-img`.
         // This is mandatory — the worker refuses i2i jobs whose
@@ -163,7 +177,22 @@ impl SdCppEngine {
                 download_file(url, &init_path).with_context(|| {
                     format!("downloading init image {} -> {}", url, init_path.display())
                 })?;
+                temp_files.push(init_path.clone());
                 Some(init_path)
+            }
+            _ => None,
+        };
+
+        // An inpaint mask only makes sense alongside an init image. Download it the same way so
+        // we can pass `sd-cli --mask <path>`; white pixels mark the region the model may repaint.
+        let mask_path = match (init_img_path.as_ref(), params.mask_url.as_deref()) {
+            (Some(_), Some(url)) if !url.is_empty() => {
+                let ext = init_image_extension(url);
+                let path = out_dir.join(format!("{stem}-mask.{ext}"));
+                download_file(url, &path)
+                    .with_context(|| format!("downloading mask {} -> {}", url, path.display()))?;
+                temp_files.push(path.clone());
+                Some(path)
             }
             _ => None,
         };
@@ -176,6 +205,8 @@ impl SdCppEngine {
             text_encoder,
             &out_path,
             init_img_path.as_deref(),
+            mask_path.as_deref(),
+            full_checkpoint,
         );
         let mut cmd = Command::new(&self.sd_cli);
         cmd.args(&args);
@@ -215,10 +246,6 @@ impl SdCppEngine {
 
         let bytes = std::fs::read(&out_path)
             .with_context(|| format!("reading sd-cli output at {}", out_path.display()))?;
-        let _ = std::fs::remove_file(&out_path);
-        if let Some(p) = init_img_path.as_deref() {
-            let _ = std::fs::remove_file(p);
-        }
         info!(
             target: TRACE_TARGET,
             op = "dispatch",
@@ -278,6 +305,74 @@ impl Engine for SdCppEngine {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Best-effort removal of a temporary file (a per-job `sd-cli` output,
+/// an init image, or a half-written `.part` download).  Removal is
+/// non-fatal — the artefact has already been read or the job already
+/// failed — but a remove that keeps failing silently leaks temp files
+/// and can quietly fill the worker's disk over a long-running session,
+/// so we surface the failure instead of swallowing it.  A `NotFound`
+/// is the desired end state (something already cleaned it up), so it's
+/// not logged.
+fn remove_temp_file(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                target: TRACE_TARGET,
+                op = "cleanup",
+                path = %path.display(),
+                error = %e,
+                "failed to remove temp file"
+            );
+        }
+    }
+}
+
+/// RAII owner of a job's scratch files (the `sd-cli` output image and a
+/// downloaded init image).  Registering them up front means every exit
+/// path - the success return, an `sd-cli` non-zero exit, an unreadable
+/// output file, even a panic - removes them on drop instead of leaking
+/// them into the temp dir and slowly filling the worker's disk over a
+/// long-running session.  Removal is best-effort via [`remove_temp_file`],
+/// so a path that never materialised (job failed before `sd-cli` wrote
+/// anything) is silently tolerated.
+struct TempFileGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new() -> Self {
+        Self { paths: Vec::new() }
+    }
+
+    fn push(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            remove_temp_file(path);
+        }
+    }
+}
+
+/// Verify a streamed download wrote exactly the body the server
+/// promised.  `expected` is the response's `Content-Length`; it's
+/// `None` for chunked transfers, where there's nothing to check and
+/// we accept whatever arrived (the behaviour before this guard).  A
+/// mismatch in either direction means the download is truncated or
+/// corrupt, so we surface a clear error rather than cache a bad model.
+fn verify_download_len(copied: u64, expected: Option<u64>) -> Result<()> {
+    match expected {
+        Some(expected) if copied != expected => bail!(
+            "size mismatch: wrote {copied} bytes but the server declared \
+             Content-Length {expected} (download truncated or corrupt)"
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn file_for_role(files: &[(ModelFileRole, PathBuf)], role: ModelFileRole) -> Option<&Path> {
     files
         .iter()
@@ -313,10 +408,26 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
     if !response.status().is_success() {
         bail!("GET {url} -> {}", response.status());
     }
+    // The server's Content-Length (absent on chunked transfers) is what
+    // lets us catch a short read before committing the file.
+    let expected_len = response.content_length();
     let mut file =
         std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-    let bytes = std::io::copy(&mut response, &mut file).context("streaming body")?;
+    let copied = std::io::copy(&mut response, &mut file);
+    // Close the handle before any remove / rename so the cleanup path
+    // works on Windows, where an open file can't be unlinked.
     drop(file);
+    let bytes = match copied {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            remove_temp_file(&part);
+            return Err(e).context("streaming body");
+        }
+    };
+    if let Err(e) = verify_download_len(bytes, expected_len) {
+        remove_temp_file(&part);
+        return Err(e).with_context(|| format!("downloading {url}"));
+    }
     std::fs::rename(&part, dest)
         .with_context(|| format!("renaming {} -> {}", part.display(), dest.display()))?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -394,6 +505,9 @@ struct ResolvedImageArgs {
 /// the caller resolves files / out-path / init-image-path, this
 /// function only assembles the flag list so it can be asserted in
 /// unit tests without spawning the binary.
+// Eight model-path + i2i components; grouping them adds indirection without
+// improving readability (mirrors the `#[allow]` already used in ws::session).
+#[allow(clippy::too_many_arguments)]
 fn build_sdcli_args(
     params: &ImageParams,
     source: &ModelSource,
@@ -402,11 +516,22 @@ fn build_sdcli_args(
     text_encoder: Option<&Path>,
     out_path: &Path,
     init_img_path: Option<&Path>,
+    mask_path: Option<&Path>,
+    full_checkpoint: bool,
 ) -> Vec<OsString> {
     let resolved = resolve_image_args(params, source);
     let mut args: Vec<OsString> = Vec::with_capacity(32);
 
-    args.push("--diffusion-model".into());
+    // A full checkpoint loads via `-m`/`--model`; standalone diffusion weights via
+    // `--diffusion-model` (alongside split vae/clip files).
+    args.push(
+        if full_checkpoint {
+            "--model"
+        } else {
+            "--diffusion-model"
+        }
+        .into(),
+    );
     args.push(diffusion_model.into());
     if let Some(p) = vae {
         args.push("--vae".into());
@@ -433,6 +558,11 @@ fn build_sdcli_args(
         let strength = params.denoise.unwrap_or(0.75);
         args.push("--strength".into());
         args.push(strength.to_string().into());
+        // Mask-guided inpaint: only valid with an init image.
+        if let Some(mask) = mask_path {
+            args.push("--mask".into());
+            args.push(mask.into());
+        }
     }
     args.push("--cfg-scale".into());
     args.push(resolved.cfg_scale.to_string().into());
@@ -493,6 +623,19 @@ fn which(bin: &str) -> Option<PathBuf> {
     None
 }
 
+fn model_cache_path(models_root: &Path, filename: &str) -> Result<PathBuf> {
+    let path = Path::new(filename);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None)
+            if !filename.contains('/') && !filename.contains('\\') =>
+        {
+            Ok(models_root.join(name))
+        }
+        _ => bail!("model filename must be a plain file name: {filename:?}"),
+    }
+}
+
 /// Pick an extension to use for the init-image tempfile that sd-cli's
 /// image loader can sniff.  Reads the trailing `.<ext>` from the URL's
 /// path (ignoring query + fragment).  Defaults to `webp` when no
@@ -540,6 +683,92 @@ mod tests {
     }
 
     #[test]
+    fn temp_file_guard_removes_every_registered_file_on_drop() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.webp");
+        let init = dir.path().join("out-init.png");
+        std::fs::write(&out, b"image").unwrap();
+        std::fs::write(&init, b"init").unwrap();
+        {
+            let mut guard = TempFileGuard::new();
+            guard.push(out.clone());
+            guard.push(init.clone());
+            assert!(out.exists() && init.exists(), "files present before drop");
+        }
+        assert!(!out.exists(), "sd-cli output temp must be removed on drop");
+        assert!(!init.exists(), "init-image temp must be removed on drop");
+    }
+
+    #[test]
+    fn temp_file_guard_tolerates_a_file_that_never_materialised() {
+        // The output path is registered before sd-cli runs, so a job
+        // that fails before writing anything drops a guard pointing at
+        // a path that never existed.  That is the desired end state,
+        // not a cleanup warning.
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("never-written.webp");
+        let out = crate::test_support::capture(move || {
+            let mut guard = TempFileGuard::new();
+            guard.push(missing);
+            drop(guard);
+        });
+        assert!(
+            !out.contains("failed to remove temp file"),
+            "a never-created temp file must not warn on cleanup: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_temp_file_deletes_an_existing_file_quietly() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("artefact.webp");
+        std::fs::write(&f, b"bytes").unwrap();
+        let out = crate::test_support::capture({
+            let f = f.clone();
+            move || remove_temp_file(&f)
+        });
+        assert!(!f.exists(), "file should be gone after cleanup");
+        assert!(
+            !out.contains("failed to remove temp file"),
+            "the success path must not warn: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_temp_file_ignores_an_already_missing_file() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("never-existed.webp");
+        let out = crate::test_support::capture(move || remove_temp_file(&missing));
+        assert!(
+            !out.contains("failed to remove temp file"),
+            "a not-found file is the desired end state, not a warning: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_temp_file_surfaces_a_failed_removal() {
+        // Pointing the helper at a directory makes `remove_file` fail
+        // on every platform (it refuses to unlink a dir): the closest
+        // portable stand-in for a locked / permission-denied temp file.
+        let dir = tempdir().unwrap();
+        let stubborn = dir.path().join("subdir");
+        std::fs::create_dir(&stubborn).unwrap();
+        let out = crate::test_support::capture(move || remove_temp_file(&stubborn));
+        assert!(
+            out.contains("failed to remove temp file"),
+            "a failed removal must surface in the logs: {out:?}"
+        );
+        assert!(
+            out.contains("subdir"),
+            "the warning must name the offending path: {out:?}"
+        );
+        assert!(
+            out.contains("cleanup"),
+            "the warning should tag the cleanup op: {out:?}"
+        );
+    }
+
+    #[test]
     fn file_for_role_picks_matching_file() {
         let files = vec![
             (ModelFileRole::DiffusionModel, PathBuf::from("/d.gguf")),
@@ -554,6 +783,20 @@ mod tests {
             Some(Path::new("/v.safetensors"))
         );
         assert!(file_for_role(&files, ModelFileRole::TextEncoder).is_none());
+    }
+
+    #[test]
+    fn model_cache_path_accepts_plain_filenames_only() {
+        let root = Path::new("/models");
+        assert_eq!(
+            model_cache_path(root, "model.gguf").unwrap(),
+            PathBuf::from("/models/model.gguf")
+        );
+        assert!(model_cache_path(root, "../outside.gguf").is_err());
+        assert!(model_cache_path(root, "nested/model.gguf").is_err());
+        assert!(model_cache_path(root, "/tmp/model.gguf").is_err());
+        assert!(model_cache_path(root, r"nested\model.gguf").is_err());
+        assert!(model_cache_path(root, "").is_err());
     }
 
     #[test]
@@ -631,6 +874,8 @@ mod tests {
             Some(Path::new("/llm.gguf")),
             Path::new("/tmp/out.webp"),
             None,
+            None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--diffusion-model").unwrap()], "/d.gguf");
@@ -667,6 +912,8 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(
@@ -691,6 +938,8 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
+            false,
         );
         let s = args_to_strings(&args);
         assert!(!s.contains(&"--negative-prompt".to_string()));
@@ -712,10 +961,66 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
+            None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--init-img").unwrap()], "/tmp/init.webp");
         assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.55");
+        // No mask supplied → no inpaint flag.
+        assert!(!s.contains(&"--mask".to_string()));
+    }
+
+    #[test]
+    fn build_sdcli_args_includes_mask_for_inpaint() {
+        let params = ImageParams {
+            prompt: "remove the tree".into(),
+            denoise: Some(0.8),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            Some(Path::new("/tmp/init.webp")),
+            Some(Path::new("/tmp/mask.png")),
+            false,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--init-img").unwrap()], "/tmp/init.webp");
+        assert_eq!(s[idx_after(&s, "--mask").unwrap()], "/tmp/mask.png");
+        assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.8");
+    }
+
+    #[test]
+    fn build_sdcli_args_uses_model_flag_for_full_checkpoint() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/checkpoint.safetensors"),
+            Some(Path::new("/v.safetensors")),
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            true,
+        );
+        let s = args_to_strings(&args);
+        // A full checkpoint loads via -m/--model, not --diffusion-model.
+        assert_eq!(
+            s[idx_after(&s, "--model").unwrap()],
+            "/checkpoint.safetensors"
+        );
+        assert!(!s.contains(&"--diffusion-model".to_string()));
     }
 
     #[test]
@@ -734,6 +1039,8 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
+            None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.75");
@@ -755,6 +1062,8 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--cfg-scale").unwrap()], "7.5");
@@ -776,6 +1085,8 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--sampling-method").unwrap()], "dpm++2m");
@@ -797,6 +1108,8 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--steps").unwrap()], "30");
@@ -818,6 +1131,8 @@ mod tests {
             None,
             Path::new("/tmp/out.webp"),
             None,
+            None,
+            false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--seed").unwrap()], "42");
@@ -852,5 +1167,32 @@ mod tests {
             "webp"
         );
         assert_eq!(init_image_extension("https://x/y/no-ext"), "webp");
+    }
+
+    #[test]
+    fn verify_download_len_accepts_exact_match() {
+        assert!(verify_download_len(2_700_000_000, Some(2_700_000_000)).is_ok());
+    }
+
+    #[test]
+    fn verify_download_len_accepts_when_length_unknown() {
+        // Chunked transfers omit Content-Length; we can't check, so we
+        // accept whatever streamed in (same as before this guard).
+        assert!(verify_download_len(123, None).is_ok());
+    }
+
+    #[test]
+    fn verify_download_len_rejects_truncated_download() {
+        let err = verify_download_len(40, Some(100)).unwrap_err().to_string();
+        assert!(err.contains("size mismatch"), "got: {err}");
+        assert!(err.contains("40"), "got: {err}");
+        assert!(err.contains("100"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_download_len_rejects_overlong_download() {
+        // A body longer than the declared length is just as corrupt as a
+        // short one - reject both rather than caching a bad model.
+        assert!(verify_download_len(120, Some(100)).is_err());
     }
 }

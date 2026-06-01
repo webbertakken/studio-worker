@@ -6,7 +6,6 @@
 //! egui / eframe / tray-icon / notify-rust + their system libs.
 
 pub mod app;
-pub mod autostart;
 pub mod notifier;
 pub mod tab;
 pub mod tabs;
@@ -110,11 +109,19 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         tokio: handle,
     };
 
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([960.0, 720.0])
+        .with_min_inner_size([640.0, 480.0])
+        .with_title("studio-worker");
+    // In development, open on the left monitor instead of the
+    // primary screen.  Override with STUDIO_WORKER_WINDOW_POS="x,y".
+    if let Some([x, y]) =
+        dev_window_position(std::env::var("STUDIO_WORKER_WINDOW_POS").ok().as_deref())
+    {
+        viewport = viewport.with_position([x, y]);
+    }
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 720.0])
-            .with_min_inner_size([640.0, 480.0])
-            .with_title("studio-worker"),
+        viewport,
         ..Default::default()
     };
 
@@ -224,6 +231,10 @@ fn install_tray(
         let rx = MenuEvent::receiver();
         while let Ok(event) = rx.recv() {
             if event.id == open_for_thread {
+                tracing::info!(
+                    target: "studio_worker::ui::tray",
+                    "open window requested from tray menu"
+                );
                 ctx_clone.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
                 ctx_clone.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
             } else if event.id == toggle_for_thread {
@@ -234,6 +245,10 @@ fn install_tray(
                     "pause toggled from tray menu"
                 );
             } else if event.id == quit_for_thread {
+                tracing::info!(
+                    target: "studio_worker::ui::tray",
+                    "quit requested from tray menu; stopping worker"
+                );
                 quit_requested.store(true, std::sync::atomic::Ordering::SeqCst);
                 ctx_clone.request_repaint();
             }
@@ -335,4 +350,64 @@ fn spawn_tray_thread(
         builder = builder.with_icon(i);
     }
     builder.build().ok()
+}
+
+/// Decide where to place the window on launch.
+///
+/// - An explicit `STUDIO_WORKER_WINDOW_POS="x,y"` always wins (any build).
+/// - Otherwise, debug builds default to the left monitor's top-left so
+///   the window opens on the left screen during development.
+/// - Release builds return `None`, letting the window manager decide.
+fn dev_window_position(env: Option<&str>) -> Option<[f32; 2]> {
+    if let Some(raw) = env {
+        let mut parts = raw.split(',').map(str::trim);
+        if let (Some(x), Some(y), None) = (parts.next(), parts.next(), parts.next()) {
+            if let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>()) {
+                return Some([x, y]);
+            }
+        }
+        return None;
+    }
+    // The left monitor sits at the X11 root origin; a small inset keeps
+    // the title bar clear of the screen edge.  Release builds defer to
+    // the window manager.
+    #[cfg(debug_assertions)]
+    let default = Some([48.0, 48.0]);
+    #[cfg(not(debug_assertions))]
+    let default = None;
+    default
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dev_window_position;
+
+    #[test]
+    fn parses_explicit_position_override() {
+        assert_eq!(dev_window_position(Some("100,200")), Some([100.0, 200.0]));
+    }
+
+    #[test]
+    fn trims_whitespace_around_coords() {
+        assert_eq!(dev_window_position(Some(" 10 , 20 ")), Some([10.0, 20.0]));
+    }
+
+    #[test]
+    fn rejects_malformed_override() {
+        assert_eq!(dev_window_position(Some("not-a-pos")), None);
+        assert_eq!(dev_window_position(Some("1,2,3")), None);
+        assert_eq!(dev_window_position(Some("1")), None);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn defaults_to_left_screen_in_debug() {
+        assert_eq!(dev_window_position(None), Some([48.0, 48.0]));
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn defers_to_wm_in_release() {
+        assert_eq!(dev_window_position(None), None);
+    }
 }

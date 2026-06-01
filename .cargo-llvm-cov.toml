@@ -5,6 +5,9 @@
 #
 # Functions excluded via `#[cfg_attr(coverage_nightly, coverage(off))]`:
 # - `update::restart_self` (calls execvp, never returns).
+# - `runtime::wait_for_shutdown_signal` — waits on real SIGINT/SIGTERM
+#   (or Ctrl-C off-Unix); the flag-flip + log it drives lives in the
+#   unit-tested `runtime::request_shutdown`.
 # - `update::RealRunner::{download, run_installer}` (real network/exec).
 # - `service::default_unit_dir` cross-platform variants only one of
 #   which compiles per host.

@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/webbertakken/studio-worker"
 homepage = "https://github.com/webbertakken/studio-worker"
 readme = "README.md"
-keywords = ["studio", "image-generation", "worker", "gradio"]
+keywords = ["studio", "image-generation", "worker", "inference"]
 categories = ["command-line-utilities"]
 
 [[bin]]
@@ -27,6 +27,10 @@ hostname = "0.4"
 whoami = "1.5"
 sha2 = "0.10"
 hex = "0.4"
+# OS CSPRNG for the install id + registration secret.  Tiny syscall
+# wrapper (getrandom(2) / BCryptGenRandom / getentropy), not the full
+# `rand` crate; already in the tree transitively via rustls + sentry.
+getrandom = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 directories = "5.0"
 tracing = "0.1"
@@ -35,10 +39,8 @@ sentry = "0.48"
 sentry-tracing = "0.48"
 parking_lot = "0.12"
 url = "2.5"
-base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
 hound = "3.5.1"
-mp4 = "0.14.0"
 semver = "1.0.28"
 tempfile = "3"
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

@@ -10,9 +10,10 @@ use parking_lot::Mutex;
 
 use crate::runtime::{JobOutcome, RecentJob};
 
-/// Pair of toggles read out of `Config` (Phase 6 surfaces them in the
-/// Config tab; for now we hold them on the App and persist via the
-/// same draft path as everything else).
+/// Per-event desktop-notification toggles.  Surfaced in the Config
+/// tab and held on the `App` for the current session only.  They are
+/// not part of the persisted `Config`, so they reset to off on each
+/// restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NotificationPrefs {
     pub on_completion: bool,
@@ -34,23 +35,51 @@ impl Notifier for CapturingNotifier {
     }
 }
 
+/// Tracing target for desktop-notification events.  Stable so
+/// operators can filter with
+/// `RUST_LOG=studio_worker::ui::notifier=debug`.
+const TRACE_TARGET: &str = "studio_worker::ui::notifier";
+
+/// Emit a structured breadcrumb for a desktop-notification attempt.
+/// Pulled out of [`DesktopNotifier::show`] so both branches are
+/// observable AND unit-testable without a real D-Bus / WinRT /
+/// NSUserNotification round-trip.  Success logs at `debug` so an
+/// operator can confirm the notifier actually fired; failure logs at
+/// `warn` with a structured `error` field, matching the rest of the
+/// worker's logging convention (the old inline call swallowed the
+/// success case entirely and string-interpolated the error).
+fn log_show_outcome(title: &str, result: Result<(), String>) {
+    match result {
+        Ok(()) => tracing::debug!(
+            target: TRACE_TARGET,
+            op = "show",
+            title = %title,
+            "desktop notification shown"
+        ),
+        Err(e) => tracing::warn!(
+            target: TRACE_TARGET,
+            op = "show",
+            title = %title,
+            error = %e,
+            "desktop notification failed"
+        ),
+    }
+}
+
 #[cfg(feature = "ui")]
 pub struct DesktopNotifier;
 
 #[cfg(feature = "ui")]
 impl Notifier for DesktopNotifier {
     fn show(&self, title: &str, body: &str) {
-        if let Err(e) = notify_rust::Notification::new()
+        let result = notify_rust::Notification::new()
             .summary(title)
             .body(body)
             .appname("studio-worker")
             .show()
-        {
-            tracing::warn!(
-                target: "studio_worker::ui::notifier",
-                "notification failed: {e}"
-            );
-        }
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        log_show_outcome(title, result);
     }
 }
 
@@ -157,5 +186,52 @@ mod tests {
         let captured = n.captured.lock();
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[1], ("t2".into(), "b2".into()));
+    }
+
+    // -----------------------------------------------------------------
+    // log_show_outcome — the structured breadcrumb the real
+    // `DesktopNotifier` emits.  Without these, a desktop notification
+    // that silently fails (no D-Bus session on a headless box) or one
+    // that fired correctly leaves no operator-visible trail, and the
+    // logging diverges from the rest of the worker's `target` / `op` /
+    // `error` convention.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn log_show_outcome_emits_debug_breadcrumb_on_success() {
+        let logs = crate::test_support::capture(|| {
+            log_show_outcome("studio-worker \u{2014} job completed", Ok(()));
+        });
+        assert!(logs.contains("DEBUG"), "expected DEBUG level, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::ui::notifier"),
+            "expected notifier target, got: {logs}"
+        );
+        assert!(logs.contains("op=\"show\""), "expected op field: {logs}");
+        assert!(
+            logs.contains("desktop notification shown"),
+            "expected success message: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_show_outcome_emits_warn_with_structured_error_on_failure() {
+        let logs = crate::test_support::capture(|| {
+            log_show_outcome(
+                "studio-worker \u{2014} job failed",
+                Err("no d-bus session".into()),
+            );
+        });
+        assert!(logs.contains("WARN"), "expected WARN level, got: {logs}");
+        // `error = %e` renders via Display (no quotes), matching the
+        // worker's `error = %e` logging convention.
+        assert!(
+            logs.contains("error=no d-bus session"),
+            "expected structured error field, got: {logs}"
+        );
+        assert!(
+            logs.contains("desktop notification failed"),
+            "expected failure message: {logs}"
+        );
     }
 }

@@ -13,7 +13,8 @@ use eframe::egui;
 
 use crate::config::{self, default_models_root, Config};
 
-use super::super::{autostart, notifier::NotificationPrefs};
+use super::super::notifier::NotificationPrefs;
+use crate::autostart;
 
 /// Buffer the user is editing.  `dirty` is true when any field
 /// differs from `original`; Save / Reset clear it.
@@ -22,6 +23,11 @@ pub struct ConfigDraft {
     pub current: Config,
     pub original: Config,
     pub last_save_error: Option<String>,
+    /// Last autostart-toggle failure, surfaced next to the toggle so
+    /// the operator sees why it did not stick (the checkbox otherwise
+    /// silently reverts on the next frame because `is_enabled()`
+    /// re-reads disk).
+    pub autostart_error: Option<String>,
 }
 
 impl ConfigDraft {
@@ -30,6 +36,7 @@ impl ConfigDraft {
             current: cfg.clone(),
             original: cfg.clone(),
             last_save_error: None,
+            autostart_error: None,
         }
     }
 
@@ -55,6 +62,7 @@ impl ConfigDraft {
     pub fn reset(&mut self) {
         self.current = self.original.clone();
         self.last_save_error = None;
+        self.autostart_error = None;
     }
 }
 
@@ -77,7 +85,8 @@ pub fn render(
     draft: &mut ConfigDraft,
     config_path: &Path,
     notification_prefs: &mut NotificationPrefs,
-) {
+) -> bool {
+    let mut saved = false;
     ui.heading("Configuration");
     ui.label(
         egui::RichText::new(format!("{}", config_path.display()))
@@ -151,13 +160,22 @@ pub fn render(
         ui.end_row();
     });
     if autostart_enabled != prev_autostart {
-        if let Ok(exe) = std::env::current_exe() {
-            if autostart_enabled {
-                let _ = autostart::enable(&exe);
-            } else {
-                let _ = autostart::disable();
-            }
-        }
+        let outcome = match std::env::current_exe() {
+            Ok(exe) if autostart_enabled => autostart::enable(&exe),
+            Ok(_) => autostart::disable(),
+            Err(e) => Err(anyhow::anyhow!("cannot resolve current executable: {e}")),
+        };
+        // `autostart::enable`/`disable` already emit a structured
+        // tracing event; surface any failure in the UI too so the
+        // operator sees why the toggle did not stick instead of it
+        // silently reverting on the next frame.
+        draft.autostart_error = outcome.err().map(|e| format!("{e}"));
+    }
+    if let Some(err) = &draft.autostart_error {
+        ui.colored_label(
+            egui::Color32::LIGHT_RED,
+            format!("could not change autostart: {err}"),
+        );
     }
 
     ui.add_space(12.0);
@@ -165,7 +183,7 @@ pub fn render(
         let dirty = draft.dirty();
         let save = ui.add_enabled(dirty, egui::Button::new("Save"));
         if save.clicked() {
-            let _ = draft.save(config_path);
+            saved = draft.save(config_path).is_ok();
         }
         if ui.add_enabled(dirty, egui::Button::new("Reset")).clicked() {
             draft.reset();
@@ -180,6 +198,7 @@ pub fn render(
             );
         }
     });
+    saved
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +329,15 @@ mod tests {
         draft.reset();
         assert!((draft.current.vram_threshold_gb - cfg.vram_threshold_gb).abs() < f32::EPSILON);
         assert!(!draft.dirty());
+    }
+
+    #[test]
+    fn reset_clears_autostart_error() {
+        let cfg = Config::default();
+        let mut draft = ConfigDraft::from(&cfg);
+        draft.autostart_error = Some("boom".into());
+        draft.reset();
+        assert!(draft.autostart_error.is_none());
     }
 
     #[test]

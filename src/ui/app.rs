@@ -31,6 +31,24 @@ use super::{
     tray::{self, TrayVariant},
 };
 
+/// Tracing target for App-level lifecycle + tray events.  Stable so
+/// operators can filter with `RUST_LOG=studio_worker::ui::app=info`.
+const TRACE_TARGET: &str = "studio_worker::ui::app";
+
+/// Emit a structured breadcrumb when the tray health indicator flips
+/// between idle / busy / disconnected.  Pulled out of
+/// [`App::refresh_tray_variant`] so it is unit-testable without
+/// constructing a (non-`Send`) `App` + a real OS tray.
+fn log_tray_variant_change(from: TrayVariant, to: TrayVariant) {
+    tracing::info!(
+        target: TRACE_TARGET,
+        op = "tray_variant",
+        from = ?from,
+        to = ?to,
+        "tray status indicator changed"
+    );
+}
+
 /// Everything `App` needs to render and act on the world.
 pub struct AppDeps {
     pub cfg: SharedConfig,
@@ -54,7 +72,12 @@ pub struct App {
     log_filter: LogFilter,
     about_state: AboutState,
     vram_total_gb: f32,
-    last_seen_recent_count: usize,
+    /// Identity (`job_id` + `finished_at`) of the newest recent-job we
+    /// have already raised a notification for.  Tracking identity
+    /// rather than ring length means a saturated, capped
+    /// `recent_jobs` ring (whose length pins at `RECENT_JOBS_CAP`)
+    /// can't make new arrivals invisible.
+    last_notified: Option<(String, chrono::DateTime<chrono::Utc>)>,
     notifier: Box<dyn Notifier + Send + Sync>,
     notification_prefs: NotificationPrefs,
     tray_variant: TrayVariant,
@@ -92,7 +115,7 @@ impl App {
             log_filter: LogFilter::default(),
             about_state: AboutState::default(),
             vram_total_gb,
-            last_seen_recent_count: 0,
+            last_notified: None,
             notifier,
             notification_prefs: NotificationPrefs::default(),
             tray_variant: TrayVariant::Disconnected,
@@ -137,16 +160,32 @@ impl App {
     /// Process any new entries in the recent-jobs ring and emit
     /// notifications according to current prefs.  Idempotent.
     pub fn drain_notifications(&mut self) {
+        // `record_recent_job` pushes newest-first, so walk from the
+        // front collecting every entry newer than the last one we
+        // notified on (identified by `job_id` + `finished_at`).  This
+        // stays correct even once the capped ring saturates and its
+        // length stops changing.
         let new_entries: Vec<_> = {
             let ring = self.deps.observers.recent_jobs.lock();
-            if ring.len() == self.last_seen_recent_count {
-                return;
+            let mut collected = Vec::new();
+            for entry in ring.iter() {
+                if self
+                    .last_notified
+                    .as_ref()
+                    .is_some_and(|(id, ts)| entry.job_id == *id && entry.finished_at == *ts)
+                {
+                    break;
+                }
+                collected.push(entry.clone());
             }
-            let added = ring.len().saturating_sub(self.last_seen_recent_count);
-            self.last_seen_recent_count = ring.len();
-            ring.iter().take(added).rev().cloned().collect()
+            collected
         };
-        for entry in new_entries {
+        if let Some(newest) = new_entries.first() {
+            self.last_notified = Some((newest.job_id.clone(), newest.finished_at));
+        }
+        // `collected` is newest-first; notify oldest-first so the OS
+        // notification order matches completion order.
+        for entry in new_entries.into_iter().rev() {
             if let NotifyDecision::Show { title, body } = decide(self.notification_prefs, &entry) {
                 self.notifier.show(&title, &body);
             }
@@ -160,12 +199,39 @@ impl App {
         let hb = self.deps.observers.last_heartbeat.lock().clone();
         let v = tray::derive_variant(busy, hb.as_ref(), HEARTBEAT_INTERVAL);
         if v != self.tray_variant {
+            log_tray_variant_change(self.tray_variant, v);
             if let Some(state) = self.tray_state.as_mut() {
                 if let Some(icon) = state.icon.as_ref() {
-                    if let Ok(new_icon) = tray_icon::Icon::from_rgba(v.rgba_16(), 16, 16) {
-                        let _ = icon.set_icon(Some(new_icon));
+                    // Surface tray-update failures instead of swallowing
+                    // them with `let _ =`: a failed `set_icon` leaves a
+                    // stale health indicator and the operator would be
+                    // misled with zero diagnostics.
+                    match tray_icon::Icon::from_rgba(v.rgba_16(), 16, 16) {
+                        Ok(new_icon) => {
+                            if let Err(e) = icon.set_icon(Some(new_icon)) {
+                                tracing::warn!(
+                                    target: TRACE_TARGET,
+                                    op = "tray_variant",
+                                    error = %e,
+                                    "failed to update tray icon"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            target: TRACE_TARGET,
+                            op = "tray_variant",
+                            error = %e,
+                            "failed to build tray icon image"
+                        ),
                     }
-                    let _ = icon.set_tooltip(Some(v.tooltip()));
+                    if let Err(e) = icon.set_tooltip(Some(v.tooltip())) {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            op = "tray_variant",
+                            error = %e,
+                            "failed to update tray tooltip"
+                        );
+                    }
                 }
                 state.current_variant = v;
             }
@@ -220,6 +286,11 @@ impl App {
                 .quit_requested
                 .load(std::sync::atomic::Ordering::SeqCst)
         {
+            tracing::info!(
+                target: TRACE_TARGET,
+                op = "hide_to_tray",
+                "window close intercepted; hiding to tray (worker keeps running)"
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -256,7 +327,7 @@ impl App {
     }
 
     fn render_config(&mut self, ui: &mut egui::Ui) {
-        config_tab::render(
+        let saved = config_tab::render(
             ui,
             &mut self.config_draft,
             &self.deps.config_path,
@@ -265,7 +336,7 @@ impl App {
         // After Save the on-disk file is the new truth; mirror back to
         // the shared `Arc<Mutex<Config>>` so loops see new values on
         // the next tick.
-        {
+        if saved {
             let mut shared = self.deps.cfg.lock();
             *shared = self.config_draft.current.clone();
         }
@@ -362,6 +433,28 @@ mod tests {
     }
 
     #[test]
+    fn log_tray_variant_change_emits_structured_transition() {
+        use crate::test_support::capture;
+        let logs = capture(|| {
+            super::log_tray_variant_change(TrayVariant::Disconnected, TrayVariant::Busy);
+        });
+        assert!(logs.contains("INFO"), "expected INFO event, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::ui::app"),
+            "expected app target, got: {logs}"
+        );
+        assert!(
+            logs.contains("op=\"tray_variant\""),
+            "expected op field: {logs}"
+        );
+        assert!(
+            logs.contains("from=Disconnected"),
+            "expected from field: {logs}"
+        );
+        assert!(logs.contains("to=Busy"), "expected to field: {logs}");
+    }
+
+    #[test]
     fn new_defaults_to_status_tab() {
         let app = App::new(mock_deps());
         assert_eq!(app.current_tab(), Tab::Status);
@@ -394,5 +487,118 @@ mod tests {
                 app.render(ui);
             });
         }
+    }
+
+    #[test]
+    fn config_tab_does_not_publish_unsaved_edits_to_shared_config() {
+        let mut app = App::new(mock_deps());
+        app.config_draft.current.api_base_url = "https://unsaved.example".into();
+
+        egui::__run_test_ui(|ui| {
+            app.render_config(ui);
+        });
+
+        assert_eq!(
+            app.deps.cfg.lock().api_base_url,
+            Config::default().api_base_url,
+            "editing the draft must not affect the live runtime config until Save succeeds"
+        );
+    }
+
+    fn completed_recent_job(id: &str) -> crate::runtime::RecentJob {
+        let now = chrono::Utc::now();
+        crate::runtime::RecentJob {
+            job_id: id.into(),
+            kind: crate::types::TaskKind::Image,
+            model: "synthetic".into(),
+            prompt: "p".into(),
+            outcome: crate::runtime::JobOutcome::Completed,
+            started_at: now,
+            finished_at: now,
+        }
+    }
+
+    /// Shared handle into a `CapturingNotifier`'s recorded
+    /// (title, body) pairs.
+    type Captured = Arc<Mutex<Vec<(String, String)>>>;
+
+    fn app_with_capturing_notifier(deps: AppDeps) -> (App, Captured) {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let notifier = Box::new(crate::ui::notifier::CapturingNotifier {
+            captured: captured.clone(),
+        });
+        let mut app = App::with_notifier(deps, notifier);
+        app.set_notification_prefs(NotificationPrefs {
+            on_completion: true,
+            on_failure: true,
+        });
+        (app, captured)
+    }
+
+    #[test]
+    fn drain_notifications_fires_for_each_new_completed_job() {
+        let deps = mock_deps();
+        let observers = deps.observers.clone();
+        let (mut app, captured) = app_with_capturing_notifier(deps);
+
+        crate::runtime::record_recent_job(&observers, completed_recent_job("a"));
+        crate::runtime::record_recent_job(&observers, completed_recent_job("b"));
+        app.drain_notifications();
+
+        assert_eq!(captured.lock().len(), 2);
+    }
+
+    #[test]
+    fn drain_notifications_is_idempotent_without_new_jobs() {
+        let deps = mock_deps();
+        let observers = deps.observers.clone();
+        let (mut app, captured) = app_with_capturing_notifier(deps);
+
+        crate::runtime::record_recent_job(&observers, completed_recent_job("a"));
+        app.drain_notifications();
+        app.drain_notifications();
+        app.drain_notifications();
+
+        assert_eq!(
+            captured.lock().len(),
+            1,
+            "re-draining with no new jobs must not re-notify"
+        );
+    }
+
+    #[test]
+    fn drain_notifications_fires_after_recent_jobs_ring_saturates() {
+        let deps = mock_deps();
+        let observers = deps.observers.clone();
+        let (mut app, captured) = app_with_capturing_notifier(deps);
+
+        // Fill the capped ring past `RECENT_JOBS_CAP` so its length
+        // pins at the cap and a length-based "added" comparison can no
+        // longer detect new arrivals.
+        for i in 0..(crate::runtime::RECENT_JOBS_CAP + 5) {
+            crate::runtime::record_recent_job(
+                &observers,
+                completed_recent_job(&format!("warm-{i}")),
+            );
+        }
+        app.drain_notifications();
+        captured.lock().clear();
+
+        // A brand-new job after saturation must still raise a
+        // notification — the regression this test guards.
+        crate::runtime::record_recent_job(&observers, completed_recent_job("after-saturation"));
+        app.drain_notifications();
+
+        let shown = captured.lock();
+        assert_eq!(
+            shown.len(),
+            1,
+            "a job completing after the ring saturates must still notify"
+        );
+        assert!(
+            shown[0].1.contains("image"),
+            "notification body should describe the new job, got: {:?}",
+            shown[0]
+        );
     }
 }

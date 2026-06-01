@@ -10,8 +10,15 @@
 //!  - serialise `WorkerInbound` to JSON text frames and parse
 //!    `WorkerOutbound` from incoming frames
 //!  - clean shutdown via `WsClient::close()`
+//!  - emit structured `tracing` breadcrumbs (target
+//!    `studio_worker::ws::client`) at the transport boundary so
+//!    connect / recv / send failures are never silent.  The session
+//!    discards recv errors in its generic `Disconnected(_)` arm and
+//!    fires `let _ = sender.send(...)` for accept / reject / fail /
+//!    completeJson, so this layer is the only place those faults can
+//!    surface.  Mirrors the `studio_worker::http` breadcrumb contract.
 use std::convert::TryFrom;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::sync::Arc;
 
@@ -25,15 +32,27 @@ use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
 use tokio_tungstenite::tungstenite::{Error as TError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::ws::types::{WorkerInbound, WorkerOutbound};
 
 pub const SUBPROTOCOL: &str = "studio-worker-v1";
+
+/// Tracing target used for every event emitted by the WS client.
+/// Stable so operators can filter with
+/// `RUST_LOG=studio_worker::ws::client=debug` without enabling
+/// wire-level tungstenite logging.
+const TRACE_TARGET: &str = "studio_worker::ws::client";
 /// Mirrors the same prefix the HTTP `ApiClient` mounts under.  Stays
 /// single-sourced with the API's Hono `basePath('/api')` + outer
 /// `/graphics` mount.
 const API_PREFIX: &str = "/graphics/api";
+
+/// Upper bound on a single connect attempt (TCP + TLS + WS upgrade). Without it a peer that accepts
+/// the socket but stalls the upgrade hangs the reconnect loop forever (no logs, no progress) — the
+/// connect-side twin of the read-idle-timeout on an established session.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Result wrapper for WS-client operations.
 pub type WsResult<T> = Result<T, WsClientError>;
@@ -108,8 +127,48 @@ fn build_connect_url(base_url: &str, worker_id: &str) -> WsResult<Url> {
 
 /// Establish the WebSocket session.  Sends the upgrade with the bearer
 /// token + sub-protocol header and returns a ready-to-use client.
+///
+/// Emits a `debug` breadcrumb on success and a `warn` on failure so a
+/// dead studio, bad DNS, or TLS fault is visible without the caller
+/// having to log it.
 pub async fn connect(base_url: &str, worker_id: &str, auth_token: &str) -> WsResult<WsClient> {
+    let started = Instant::now();
+    let result = connect_inner(base_url, worker_id, auth_token, CONNECT_TIMEOUT).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => debug!(
+            target: TRACE_TARGET,
+            op = "connect",
+            worker_id,
+            elapsed_ms,
+            "websocket established"
+        ),
+        Err(e) => warn!(
+            target: TRACE_TARGET,
+            op = "connect",
+            worker_id,
+            elapsed_ms,
+            error = %e,
+            "websocket connect failed"
+        ),
+    }
+    result
+}
+
+async fn connect_inner(
+    base_url: &str,
+    worker_id: &str,
+    auth_token: &str,
+    connect_timeout: Duration,
+) -> WsResult<WsClient> {
     let url = build_connect_url(base_url, worker_id)?;
+    debug!(
+        target: TRACE_TARGET,
+        op = "connect",
+        worker_id,
+        url = %url,
+        "opening websocket"
+    );
     let mut request = url
         .as_str()
         .into_client_request()
@@ -125,7 +184,19 @@ pub async fn connect(base_url: &str, worker_id: &str, auth_token: &str) -> WsRes
         HeaderValue::from_static(SUBPROTOCOL),
     );
 
-    let (stream, _response) = tokio_tungstenite::connect_async(request).await?;
+    let (stream, _response) = match tokio::time::timeout(
+        connect_timeout,
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            return Err(WsClientError::Transport(format!(
+                "connect timed out after {connect_timeout:?}"
+            )))
+        }
+    };
     let (sink, source) = stream.split();
     Ok(WsClient {
         sink,
@@ -174,26 +245,35 @@ pub struct WsSender {
 
 impl WsSender {
     pub async fn send(&self, frame: &WorkerInbound) -> WsResult<()> {
-        let text =
-            serde_json::to_string(frame).map_err(|e| WsClientError::Protocol(e.to_string()))?;
+        let text = serde_json::to_string(frame).map_err(|e| {
+            let err = WsClientError::Protocol(e.to_string());
+            log_send_error(frame, &err);
+            err
+        })?;
         let mut guard = self.sink.lock().await;
-        guard
-            .send(Message::Text(text.into()))
-            .await
-            .map_err(WsClientError::from)
+        guard.send(Message::Text(text.into())).await.map_err(|e| {
+            let err = WsClientError::from(e);
+            log_send_error(frame, &err);
+            err
+        })
     }
 
     pub async fn close(&self, code: u16, reason: &str) -> WsResult<()> {
+        debug!(target: TRACE_TARGET, op = "close", code, reason, "closing websocket");
         let frame = CloseFrame {
             code: CloseCode::from(code),
             reason: reason.to_owned().into(),
         };
         let mut guard = self.sink.lock().await;
-        let _ = tokio::time::timeout(
+        if tokio::time::timeout(
             Duration::from_secs(5),
             guard.send(Message::Close(Some(frame))),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            warn!(target: TRACE_TARGET, op = "close", code, "timed out sending close frame");
+        }
         Ok(())
     }
 }
@@ -214,26 +294,18 @@ impl WsReceiver {
             return Ok(None);
         }
         while let Some(item) = self.source.next().await {
-            match item {
-                Ok(Message::Text(text)) => {
-                    let frame: WorkerOutbound = serde_json::from_str(&text)
-                        .map_err(|e| WsClientError::Protocol(e.to_string()))?;
-                    return Ok(Some(frame));
-                }
-                Ok(Message::Binary(_)) => {
-                    return Err(WsClientError::Protocol(
-                        "unexpected binary frame".to_string(),
-                    ));
-                }
-                Ok(Message::Close(frame)) => {
+            match classify_incoming(item) {
+                RecvStep::Yield(frame) => return Ok(Some(frame)),
+                RecvStep::Skip => continue,
+                RecvStep::Fail(e) => return Err(e),
+                RecvStep::Closed(e) => {
                     self.closed = true;
-                    return Err(close_frame_to_error(frame));
+                    return Err(e);
                 }
-                Ok(_) => continue,
-                Err(e) => return Err(WsClientError::from(e)),
             }
         }
         self.closed = true;
+        debug!(target: TRACE_TARGET, op = "recv", "stream ended (no close frame)");
         Ok(None)
     }
 }
@@ -249,12 +321,19 @@ impl std::fmt::Debug for WsClient {
 impl WsClient {
     /// Send a typed inbound frame as a JSON text frame.
     pub async fn send(&mut self, frame: &WorkerInbound) -> WsResult<()> {
-        let text =
-            serde_json::to_string(frame).map_err(|e| WsClientError::Protocol(e.to_string()))?;
+        let text = serde_json::to_string(frame).map_err(|e| {
+            let err = WsClientError::Protocol(e.to_string());
+            log_send_error(frame, &err);
+            err
+        })?;
         self.sink
             .send(Message::Text(text.into()))
             .await
-            .map_err(WsClientError::from)
+            .map_err(|e| {
+                let err = WsClientError::from(e);
+                log_send_error(frame, &err);
+                err
+            })
     }
 
     /// Receive the next typed outbound frame.  Returns `Ok(None)` on
@@ -266,26 +345,18 @@ impl WsClient {
             return Ok(None);
         }
         while let Some(item) = self.source.next().await {
-            match item {
-                Ok(Message::Text(text)) => {
-                    let frame: WorkerOutbound = serde_json::from_str(&text)
-                        .map_err(|e| WsClientError::Protocol(e.to_string()))?;
-                    return Ok(Some(frame));
-                }
-                Ok(Message::Binary(_)) => {
-                    return Err(WsClientError::Protocol(
-                        "unexpected binary frame".to_string(),
-                    ));
-                }
-                Ok(Message::Close(frame)) => {
+            match classify_incoming(item) {
+                RecvStep::Yield(frame) => return Ok(Some(frame)),
+                RecvStep::Skip => continue,
+                RecvStep::Fail(e) => return Err(e),
+                RecvStep::Closed(e) => {
                     self.closed = true;
-                    return Err(close_frame_to_error(frame));
+                    return Err(e);
                 }
-                Ok(_) => continue, // ping/pong/empty — keep reading
-                Err(e) => return Err(WsClientError::from(e)),
             }
         }
         self.closed = true;
+        debug!(target: TRACE_TARGET, op = "recv", "stream ended (no close frame)");
         Ok(None)
     }
 
@@ -295,17 +366,133 @@ impl WsClient {
             return Ok(());
         }
         self.closed = true;
+        debug!(target: TRACE_TARGET, op = "close", code, reason, "closing websocket");
         let frame = CloseFrame {
             code: CloseCode::from(code),
             reason: reason.to_owned().into(),
         };
         // Wrap in a short timeout so a stuck peer can't hang shutdown.
-        let _ = tokio::time::timeout(
+        if tokio::time::timeout(
             Duration::from_secs(5),
             self.sink.send(Message::Close(Some(frame))),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            warn!(target: TRACE_TARGET, op = "close", code, "timed out sending close frame");
+        }
         Ok(())
+    }
+}
+
+/// Human-readable label for an inbound frame, used in send-failure
+/// breadcrumbs so operators can tell a dropped `accept` from a dropped
+/// `heartbeat`.
+fn frame_label(frame: &WorkerInbound) -> &'static str {
+    match frame {
+        WorkerInbound::Hello(_) => "hello",
+        WorkerInbound::Heartbeat { .. } => "heartbeat",
+        WorkerInbound::Accept { .. } => "accept",
+        WorkerInbound::Reject { .. } => "reject",
+        WorkerInbound::CompleteJson { .. } => "completeJson",
+        WorkerInbound::Fail { .. } => "fail",
+        WorkerInbound::LogBatch { .. } => "logBatch",
+        WorkerInbound::ReadyForMore => "readyForMore",
+    }
+}
+
+/// Log a failed frame send.  Callers (the session) routinely fire
+/// `let _ = sender.send(...)`, so without this a dropped `accept` /
+/// `fail` / `completeJson` would vanish without trace.
+fn log_send_error(frame: &WorkerInbound, err: &WsClientError) {
+    warn!(
+        target: TRACE_TARGET,
+        op = "send",
+        frame = frame_label(frame),
+        error = %err,
+        "failed to send frame"
+    );
+}
+
+/// Interpretation of a single raw WS message during `recv`.  Splitting
+/// this out keeps the two `recv` loops (split + non-split) identical
+/// and routes every error / close through one logging site.
+enum RecvStep {
+    /// Decoded application frame to hand back to the caller.
+    Yield(WorkerOutbound),
+    /// Control / empty frame (ping / pong) — keep reading.
+    Skip,
+    /// Error to surface without latching the receiver closed.
+    Fail(WsClientError),
+    /// Server sent a close frame — latch closed, then surface the error.
+    Closed(WsClientError),
+}
+
+/// Classify one incoming message, emitting a tracing breadcrumb for
+/// every failure / close so transport faults are never silent.
+fn classify_incoming(item: Result<Message, TError>) -> RecvStep {
+    match item {
+        Ok(Message::Text(text)) => match serde_json::from_str::<WorkerOutbound>(&text) {
+            Ok(frame) => RecvStep::Yield(frame),
+            Err(e) => {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "recv",
+                    error = %e,
+                    "dropping unparseable text frame"
+                );
+                RecvStep::Fail(WsClientError::Protocol(e.to_string()))
+            }
+        },
+        Ok(Message::Binary(_)) => {
+            warn!(
+                target: TRACE_TARGET,
+                op = "recv",
+                "rejecting unexpected binary frame"
+            );
+            RecvStep::Fail(WsClientError::Protocol(
+                "unexpected binary frame".to_string(),
+            ))
+        }
+        Ok(Message::Close(frame)) => {
+            let err = close_frame_to_error(frame);
+            match &err {
+                WsClientError::AuthFailed { reason } => warn!(
+                    target: TRACE_TARGET,
+                    op = "recv",
+                    reason = %reason,
+                    "server closed connection: auth failed"
+                ),
+                _ => debug!(
+                    target: TRACE_TARGET,
+                    op = "recv",
+                    "server closed connection"
+                ),
+            }
+            RecvStep::Closed(err)
+        }
+        // ping / pong / empty — keep reading.
+        Ok(_) => RecvStep::Skip,
+        Err(e) => {
+            let mapped = WsClientError::from(e);
+            match &mapped {
+                // A clean close surfaces here as ConnectionClosed on
+                // some transports; keep it at debug to avoid noise on
+                // expected reconnect churn.
+                WsClientError::ConnectionClosed => debug!(
+                    target: TRACE_TARGET,
+                    op = "recv",
+                    "connection closed by peer"
+                ),
+                other => warn!(
+                    target: TRACE_TARGET,
+                    op = "recv",
+                    error = %other,
+                    "transport error while reading frame"
+                ),
+            }
+            RecvStep::Fail(mapped)
+        }
     }
 }
 
@@ -395,5 +582,233 @@ mod tests {
         let inner = TError::AlreadyClosed;
         let mapped: WsClientError = inner.into();
         assert!(matches!(mapped, WsClientError::ConnectionClosed));
+    }
+
+    // -----------------------------------------------------------------
+    // Structured tracing breadcrumbs.  The transport layer must never
+    // swallow a failure silently: callers (the session) discard recv
+    // errors in their generic `Disconnected(_)` arm and use
+    // `let _ = sender.send(...)` for accept/reject/fail/completeJson,
+    // so the only place those faults can surface is here.  Mirrors the
+    // `studio_worker::http` breadcrumb contract.
+    // -----------------------------------------------------------------
+    use crate::test_support::capture;
+
+    #[test]
+    fn classify_rejects_binary_frame_with_warn() {
+        let logs = capture(|| {
+            let step = classify_incoming(Ok(Message::Binary(vec![1, 2, 3].into())));
+            assert!(matches!(step, RecvStep::Fail(WsClientError::Protocol(_))));
+        });
+        assert!(logs.contains("WARN"), "expected WARN, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::ws::client"),
+            "expected target, got: {logs}"
+        );
+        assert!(logs.contains("op=\"recv\""), "expected op field: {logs}");
+        assert!(logs.contains("binary"), "expected reason: {logs}");
+    }
+
+    #[test]
+    fn classify_warns_on_unparseable_text_frame() {
+        let logs = capture(|| {
+            let step = classify_incoming(Ok(Message::Text("not json".into())));
+            assert!(matches!(step, RecvStep::Fail(WsClientError::Protocol(_))));
+        });
+        assert!(logs.contains("WARN"), "expected WARN, got: {logs}");
+        assert!(logs.contains("op=\"recv\""), "expected op field: {logs}");
+    }
+
+    #[test]
+    fn classify_warns_on_4001_close_frame() {
+        let logs = capture(|| {
+            let frame = CloseFrame {
+                code: CloseCode::Library(4001),
+                reason: "invalid auth token".into(),
+            };
+            let step = classify_incoming(Ok(Message::Close(Some(frame))));
+            assert!(matches!(
+                step,
+                RecvStep::Closed(WsClientError::AuthFailed { .. })
+            ));
+        });
+        assert!(logs.contains("WARN"), "expected WARN, got: {logs}");
+        assert!(logs.contains("auth failed"), "expected reason: {logs}");
+    }
+
+    #[test]
+    fn classify_debug_logs_on_normal_close_frame() {
+        let logs = capture(|| {
+            let frame = CloseFrame {
+                code: CloseCode::Normal,
+                reason: "bye".into(),
+            };
+            let step = classify_incoming(Ok(Message::Close(Some(frame))));
+            assert!(matches!(
+                step,
+                RecvStep::Closed(WsClientError::ConnectionClosed)
+            ));
+        });
+        assert!(logs.contains("DEBUG"), "expected DEBUG, got: {logs}");
+        assert!(!logs.contains("WARN"), "normal close must not warn: {logs}");
+        assert!(logs.contains("server closed"), "expected message: {logs}");
+    }
+
+    #[test]
+    fn classify_yields_valid_frame_without_warning() {
+        let logs = capture(|| {
+            let json = serde_json::json!({ "type": "heartbeatAck" }).to_string();
+            let step = classify_incoming(Ok(Message::Text(json.into())));
+            assert!(matches!(
+                step,
+                RecvStep::Yield(WorkerOutbound::HeartbeatAck)
+            ));
+        });
+        assert!(
+            !logs.contains("WARN"),
+            "a valid frame should not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn classify_skips_control_frames() {
+        assert!(matches!(
+            classify_incoming(Ok(Message::Ping(Vec::new().into()))),
+            RecvStep::Skip
+        ));
+        assert!(matches!(
+            classify_incoming(Ok(Message::Pong(Vec::new().into()))),
+            RecvStep::Skip
+        ));
+    }
+
+    #[test]
+    fn frame_label_names_every_inbound_variant() {
+        use crate::types::WorkerCapabilities;
+        let caps = WorkerCapabilities {
+            machine_name: String::new(),
+            username: String::new(),
+            agent_version: String::new(),
+            engine: String::new(),
+            vram_total_gb: 0.0,
+            vram_threshold_gb: 0.0,
+            auto_enabled: false,
+            auto_start: false,
+            supported_models: vec![],
+            task_kinds: vec![],
+            supported_models_per_kind: Default::default(),
+        };
+        assert_eq!(
+            frame_label(&WorkerInbound::Hello(crate::ws::types::HelloFrame {
+                auth_token: String::new(),
+                capabilities: caps.clone(),
+            })),
+            "hello"
+        );
+        assert_eq!(
+            frame_label(&WorkerInbound::Heartbeat {
+                capabilities: caps,
+                current_job_id: None,
+            }),
+            "heartbeat"
+        );
+        assert_eq!(
+            frame_label(&WorkerInbound::Accept { job_id: "j".into() }),
+            "accept"
+        );
+        assert_eq!(
+            frame_label(&WorkerInbound::Reject {
+                job_id: "j".into(),
+                reason: "r".into(),
+            }),
+            "reject"
+        );
+        assert_eq!(
+            frame_label(&WorkerInbound::CompleteJson {
+                job_id: "j".into(),
+                result: serde_json::Value::Null,
+                prompt: None,
+            }),
+            "completeJson"
+        );
+        assert_eq!(
+            frame_label(&WorkerInbound::Fail {
+                job_id: "j".into(),
+                error: "e".into(),
+                retryable: true,
+            }),
+            "fail"
+        );
+        assert_eq!(
+            frame_label(&WorkerInbound::LogBatch { entries: vec![] }),
+            "logBatch"
+        );
+        assert_eq!(frame_label(&WorkerInbound::ReadyForMore), "readyForMore");
+    }
+
+    #[test]
+    fn send_error_logs_warn_with_frame_label() {
+        let logs = capture(|| {
+            log_send_error(
+                &WorkerInbound::Accept {
+                    job_id: "j-1".into(),
+                },
+                &WsClientError::ConnectionClosed,
+            );
+        });
+        assert!(logs.contains("WARN"), "expected WARN, got: {logs}");
+        assert!(logs.contains("op=\"send\""), "expected op field: {logs}");
+        assert!(
+            logs.contains("frame=\"accept\""),
+            "expected frame label: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_times_out_against_a_stalling_upgrade() {
+        // A listener that accepts the TCP connection but never answers the WS upgrade. Without the
+        // connect timeout this blocks forever; with it, a transport error must surface fast.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await; // hold the socket, never upgrade
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let url = format!("http://{addr}/graphics/api");
+        let started = Instant::now();
+        let result = connect_inner(&url, "w", "tok", Duration::from_millis(150)).await;
+        assert!(
+            matches!(result, Err(WsClientError::Transport(_))),
+            "expected a transport timeout, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "connect must time out promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn connect_failure_logs_warn_breadcrumb() {
+        // Port 1 has nothing listening, so the upgrade fails fast with
+        // a transport error.  No server required — deterministic.
+        let logs = capture(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt.block_on(connect("http://127.0.0.1:1/graphics/api", "w-err", "tok"));
+            assert!(result.is_err(), "connect to a dead port should fail");
+        });
+        assert!(logs.contains("WARN"), "expected WARN, got: {logs}");
+        assert!(logs.contains("op=\"connect\""), "expected op field: {logs}");
+        assert!(
+            logs.contains("websocket connect failed"),
+            "expected message: {logs}"
+        );
+        assert!(
+            logs.contains("worker_id=\"w-err\""),
+            "expected worker_id field: {logs}"
+        );
     }
 }

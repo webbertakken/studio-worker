@@ -15,11 +15,32 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Tracing target for the synthetic engine.  Stable so operators can
 /// filter with `RUST_LOG=studio_worker::engine::synthetic=debug`.
 const TRACE_TARGET_SYNTHETIC: &str = "studio_worker::engine::synthetic";
+
+/// Tracing target for engine-roster (build-time) events.  Stable so
+/// operators can filter with `RUST_LOG=studio_worker::engine=info`.
+const TRACE_TARGET_BUILD: &str = "studio_worker::engine";
+
+/// Emit a one-line breadcrumb naming the backends this worker will
+/// route across.  Lets an operator confirm from the logs which engines
+/// actually registered — e.g. whether the sdcpp backend self-registered
+/// or was skipped for a missing `sd-cli` — instead of inferring it from
+/// the advertised model list.  Split out from [`build`] so the
+/// breadcrumb's shape is unit-tested against a controlled roster.
+fn log_engine_roster(engines: &[Box<dyn Engine>]) {
+    let names: Vec<&str> = engines.iter().map(|e| e.name()).collect();
+    info!(
+        target: TRACE_TARGET_BUILD,
+        op = "build",
+        engine_count = names.len(),
+        engines = %names.join(","),
+        "engine roster assembled"
+    );
+}
 
 /// What a single engine is able to do.
 #[derive(Debug, Clone, Default)]
@@ -123,6 +144,7 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
         v
     };
 
+    log_engine_roster(&engines);
     Ok(Box::new(multi::MultiEngine::new(engines)))
 }
 
@@ -532,6 +554,56 @@ mod tests {
         }
         assert!(caps.supports(TaskKind::Image, "synthetic"));
         assert!(caps.supports(TaskKind::Llm, "synthetic"));
+    }
+
+    #[test]
+    fn build_emits_engine_roster_breadcrumb() {
+        // build() is the single place that decides which backends this
+        // worker will route across.  Without a roster breadcrumb an
+        // operator debugging "why won't it serve my real model?" can't
+        // tell from the logs whether the expected engine registered or
+        // was skipped.  Environment-tolerant: the synthetic engine is
+        // always last, so we assert on it without pinning the count
+        // (sdcpp self-registers only when `sd-cli` + models are present).
+        let logs = crate::test_support::capture(|| {
+            let cfg = crate::config::Config::default();
+            let _ = build(&cfg).unwrap();
+        });
+        assert!(
+            logs.contains("studio_worker::engine"),
+            "expected engine target, got: {logs}"
+        );
+        assert!(logs.contains("op=\"build\""), "expected op=build: {logs}");
+        assert!(
+            logs.contains("engine roster assembled"),
+            "expected roster message: {logs}"
+        );
+        assert!(
+            logs.contains("synthetic"),
+            "expected synthetic in the roster: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_engine_roster_reports_count_and_comma_joined_names() {
+        // Deterministic, environment-independent contract for the
+        // breadcrumb's shape: a count field plus the engine names
+        // comma-joined in roster order.
+        let logs = crate::test_support::capture(|| {
+            let engines: Vec<Box<dyn Engine>> = vec![
+                Box::new(SyntheticEngine::new()),
+                Box::new(SyntheticEngine::new()),
+            ];
+            log_engine_roster(&engines);
+        });
+        assert!(
+            logs.contains("engine_count=2"),
+            "expected engine_count=2, got: {logs}"
+        );
+        assert!(
+            logs.contains("engines=synthetic,synthetic"),
+            "expected comma-joined names, got: {logs}"
+        );
     }
 
     #[test]
