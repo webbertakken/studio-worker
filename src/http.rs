@@ -4,7 +4,10 @@
 //!
 //! - emits a structured `tracing` event on success (`debug`) and
 //!   failure (`warn`) so operators can see what the worker is talking
-//!   to without having to enable wire-level logging in reqwest, and
+//!   to without having to enable wire-level logging in reqwest
+//!   (`complete` also logs the upload byte size before the request so
+//!   the attempted payload size is visible even when it never finishes),
+//!   and
 //! - turns non-2xx responses into an `anyhow` error tagged with the
 //!   operation name so the existing log shipper messages stay legible.
 use crate::types::*;
@@ -144,6 +147,19 @@ impl ApiClient {
         image: Vec<u8>,
     ) -> Result<()> {
         let mime = mime_for_ext(ext);
+        let bytes = image.len() as u64;
+        // Emitted before the (potentially slow or failing) upload so the
+        // attempted payload size is always in the operator's logs, even
+        // when the request itself never completes.
+        debug!(
+            target: TRACE_TARGET,
+            op = "complete",
+            job_id,
+            ext,
+            mime,
+            bytes,
+            "uploading job result"
+        );
         let part = reqwest::blocking::multipart::Part::bytes(image)
             .file_name(format!("{job_id}.{ext}"))
             .mime_str(mime)?;
