@@ -1,0 +1,101 @@
+name: sd-cli prebuilt (gap platforms)
+
+# Builds stable-diffusion.cpp `sd-cli` for the platforms leejet doesn't
+# prebuild, so the worker can auto-provision them like any other target.
+# Currently that's Linux aarch64 (Vulkan) — macOS Intel rides upstream's
+# universal2 Darwin binary, and every other target has an upstream build.
+#
+# Manual-only: the sd.cpp ref is pinned in the worker
+# (`DEFAULT_RELEASE_TAG`) and changes rarely, and ARM runners cost
+# minutes, so we publish on demand rather than per-push.  The resulting
+# `sdcpp-prebuilt-<ref>` release is what `sd_provision::download_url`
+# points aarch64 Linux at.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sd_ref:
+        description: "Upstream stable-diffusion.cpp release tag (master-<n>-<sha>)"
+        required: true
+        default: "master-669-2d40a8b"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-arm:
+    name: Build sd-cli (Linux aarch64, Vulkan)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Derive ref + sha
+        id: ref
+        run: |
+          set -euo pipefail
+          REF='${{ github.event.inputs.sd_ref }}'
+          SHA="${REF##*-}"
+          {
+            echo "ref=$REF"
+            echo "sha=$SHA"
+            echo "tag=sdcpp-prebuilt-$REF"
+            echo "zip=sd-master-$SHA-bin-Linux-aarch64-vulkan.zip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git zip \
+            libvulkan-dev glslc spirv-headers
+
+      - name: Clone stable-diffusion.cpp at the pinned commit
+        run: |
+          set -euo pipefail
+          git clone https://github.com/leejet/stable-diffusion.cpp sdcpp
+          cd sdcpp
+          git checkout '${{ steps.ref.outputs.sha }}'
+          git submodule update --init --recursive
+
+      - name: Build (Vulkan, shared lib)
+        run: |
+          set -euo pipefail
+          cmake -S sdcpp -B sdcpp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_VULKAN=ON
+          cmake --build sdcpp/build --config Release --target sd-cli
+
+      - name: Smoke test (binary links + loads)
+        run: |
+          set -euo pipefail
+          ls -la sdcpp/build/bin
+          LD_LIBRARY_PATH="$PWD/sdcpp/build/bin" sdcpp/build/bin/sd-cli --help | head -3
+
+      - name: Package zip (upstream layout, flat)
+        id: pack
+        run: |
+          set -euo pipefail
+          cp sdcpp/ggml/LICENSE sdcpp/build/bin/ggml.txt
+          cp sdcpp/LICENSE sdcpp/build/bin/stable-diffusion.cpp.txt
+          # Only the files the worker needs: the CLI + its shared lib +
+          # licences.  `zip -j` flattens, mirroring upstream's archives.
+          zip -j '${{ steps.ref.outputs.zip }}' \
+            sdcpp/build/bin/sd-cli \
+            sdcpp/build/bin/libstable-diffusion.so \
+            sdcpp/build/bin/ggml.txt \
+            sdcpp/build/bin/stable-diffusion.cpp.txt
+          unzip -l '${{ steps.ref.outputs.zip }}'
+
+      - name: Publish to the prebuilt release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.ref.outputs.tag }}'
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "Self-hosted stable-diffusion.cpp prebuilts for platforms upstream does not ship (sd.cpp @ ${{ steps.ref.outputs.sha }}). Consumed by studio-worker's sd-cli auto-provisioner." \
+              --prerelease
+          fi
+          gh release upload "$TAG" '${{ steps.ref.outputs.zip }}' --clobber

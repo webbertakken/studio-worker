@@ -66,6 +66,11 @@ tempfile = "3"
 # sentry-backtrace) — no native libs, keeps `cargo install` on a bare
 # box working.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# Probe the Vulkan loader (libvulkan.so.1 / vulkan-1.dll) at runtime so a
+# missing GPU runtime surfaces an actionable message instead of a
+# cryptic sd-cli linker crash.  Tiny dlopen/LoadLibrary wrapper, no
+# native libs.
+libloading = "0.8"
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # Direct rustls dep so we can call `crypto::ring::default_provider`.
 # rustls 0.23 stopped auto-picking a CryptoProvider from cargo

@@ -152,6 +152,20 @@ impl SdCppEngine {
         // we touch model files, so a missing binary fails fast with the
         // provisioning error rather than after a multi-GB weight pull.
         let sd_cli = self.ensure_sd_cli()?;
+        // Preflight the GPU runtime next: a missing Vulkan loader can't be
+        // auto-provisioned (it ships with the driver / a system package),
+        // so surface the actionable remedy now instead of after a
+        // multi-GB weight pull and a cryptic sd-cli crash.
+        if let Err(e) = sd_provision::vulkan_runtime_status() {
+            warn!(
+                target: TRACE_TARGET,
+                op = "preflight",
+                model,
+                error = %e,
+                "GPU runtime missing; refusing image job"
+            );
+            return Err(e);
+        }
         let files = self.ensure_files(source)?;
         // A `diffusion-model` file is the standalone diffusion weights (sd-cli `--diffusion-model`,
         // used with split vae/clip); a `model` file is a full checkpoint (sd-cli `-m`/`--model`).
