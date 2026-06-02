@@ -450,9 +450,8 @@ impl Engine for LlamaEngine {
             })?
         } else {
             let resolved = self.ensure_model_files(source)?;
-            pick_gguf(&resolved).ok_or_else(|| {
-                anyhow!("llama modelSource for `{model}` contained no .gguf file")
-            })?
+            pick_gguf(&resolved)
+                .ok_or_else(|| anyhow!("llama modelSource for `{model}` contained no .gguf file"))?
         };
         self.run_llm(model, &path, llm)
     }

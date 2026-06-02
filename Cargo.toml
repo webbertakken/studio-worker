@@ -105,8 +105,10 @@ tray-icon = { version = "0.24", optional = true }
 ksni = { version = "0.3", optional = true }
 
 # Real autostart-on-login on Windows is an HKCU \Run registry value.
+# winreg is a tiny pure-FFI wrapper over advapi32 (always present on
+# Windows), so it's a plain target dep — no feature gate, no system libs.
 [target.'cfg(target_os = "windows")'.dependencies]
-winreg = { version = "0.52", optional = true }
+winreg = "0.52"
 
 [features]
 # UI on by default: `cargo install studio-worker` is windowed + tray and
@@ -133,8 +135,6 @@ ui = [
     # Per-OS tray backends (cargo activates the dep only on its target).
     "dep:tray-icon",
     "dep:ksni",
-    # Real Windows autostart registry entry.
-    "dep:winreg",
 ]
 # Convenience bundles.  llama and whisper both statically link ggml.cpp,
 # which currently can't coexist in the same binary on Linux (duplicate

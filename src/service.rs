@@ -161,7 +161,28 @@ impl ServiceOps for RealOps {
             enable.args(["--user", "enable", "--now", SERVICE_FILENAME]);
             run_step("activate", "enable-now", enable).is_success()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            // Load the LaunchAgent so it runs now and at every login.
+            let mut load = Command::new("launchctl");
+            load.args(["load", "-w", unit_path.to_string_lossy().as_ref()]);
+            run_step("activate", "launchctl-load", load).is_success()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Register the scheduled task from the XML we just wrote.
+            let mut create = Command::new("schtasks");
+            create.args([
+                "/Create",
+                "/XML",
+                unit_path.to_string_lossy().as_ref(),
+                "/TN",
+                "MinisStudioWorker",
+                "/F",
+            ]);
+            run_step("activate", "schtasks-create", create).is_success()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
             false
         }

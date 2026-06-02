@@ -90,14 +90,17 @@ packaged" errors.
 
 ## Phase 3 — auto-start on login, all platforms
 
-- [ ] Windows autostart: real HKCU `...\\Run` registry entry (winreg),
-      not just a marker file; `is_enabled`/enable/disable round-trip.
-- [ ] First-run: when `auto_start` is true and no service/autostart is
-      present, install the per-OS autostart artefact automatically.
-- [ ] Service install: register on Windows (schtasks /Create) + macOS
-      (launchctl load) instead of only writing the unit file.
-- [ ] Tests for each platform path (path-injected, no real OS mutation).
-- [ ] Commit.
+- [x] Windows autostart: real HKCU Run registry value via winreg (no
+      console flash / admin / COM), replacing the marker file;
+      enable/disable/is_enabled round-trip test gated to Windows.
+- [x] First-run: `ui::run` reconciles autostart with `auto_start` via the
+      pure `autostart::launch_sync_action` (enable / disable / noop),
+      unit-tested for all four combinations.
+- [x] Service install now registers the unit on macOS (launchctl load)
+      + Windows (schtasks /Create) too, matching Linux's systemctl.
+- [x] Tests: file backend round-trip + pure decision helpers green
+      (441 tests, 0 failures); winreg path compiles on Windows.
+- [x] Commit Phase 3.
 
 ## Phase 4 — release pipeline & CI for every platform
 

@@ -32,6 +32,11 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     let (cfg, path) = config::load(config_path)?;
     runtime::log_startup_banner(&cfg, &path);
 
+    // Honour `auto_start`: make the tray UI come back on login without
+    // the operator having to toggle anything.  Best-effort and
+    // idempotent — a failure is logged, never fatal.
+    sync_autostart_on_launch(cfg.auto_start);
+
     let cfg = config::shared(cfg);
     let stop = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
@@ -172,6 +177,42 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     // Signal loops to wind down once the window closes.
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
+}
+
+/// Reconcile the on-login autostart entry with the configured
+/// `auto_start` at UI launch.  The decision is the pure
+/// [`autostart::launch_sync_action`]; this only performs the chosen
+/// side effect and logs the outcome.
+fn sync_autostart_on_launch(auto_start: bool) {
+    use crate::autostart::{self, AutostartSync};
+    match autostart::launch_sync_action(auto_start, autostart::is_enabled()) {
+        AutostartSync::Enable => match std::env::current_exe() {
+            Ok(exe) => {
+                if let Err(e) = autostart::enable(&exe) {
+                    tracing::warn!(
+                        target: "studio_worker::ui",
+                        error = %e,
+                        "could not enable autostart-on-login"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "studio_worker::ui",
+                error = %e,
+                "could not resolve current exe to enable autostart-on-login"
+            ),
+        },
+        AutostartSync::Disable => {
+            if let Err(e) = autostart::disable() {
+                tracing::warn!(
+                    target: "studio_worker::ui",
+                    error = %e,
+                    "could not disable stale autostart-on-login"
+                );
+            }
+        }
+        AutostartSync::Noop => {}
+    }
 }
 
 /// Decide where to place the window on launch.
