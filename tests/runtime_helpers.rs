@@ -293,7 +293,7 @@ async fn run_cli_ui_subcommand_errors_without_the_ui_feature() {
         "expected the missing-feature explanation, got: {msg}"
     );
     assert!(
-        msg.contains("--features ui"),
+        msg.contains("cargo install studio-worker"),
         "expected the remediation hint, got: {msg}"
     );
 }

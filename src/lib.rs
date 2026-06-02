@@ -85,9 +85,10 @@ async fn run_ui(config_path: Option<&str>) -> anyhow::Result<()> {
 #[cfg(not(feature = "ui"))]
 async fn run_ui(_config_path: Option<&str>) -> anyhow::Result<()> {
     anyhow::bail!(
-        "this build of studio-worker was compiled without the `ui` cargo feature.\n\
-         Reinstall with `cargo install studio-worker --features ui` (or use the \
-         desktop installer from the releases page) to enable the native UI."
+        "this build of studio-worker was compiled without the `ui` cargo feature \
+         (it is on by default \u{2014} you built with `--no-default-features`).\n\
+         Reinstall with `cargo install studio-worker` (UI is the default), or use \
+         the desktop installer from the releases page, to enable the native UI."
     )
 }
 
