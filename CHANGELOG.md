@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.2...studio-worker-v0.4.3) (2026-06-02)
+
+
+### Bug Fixes
+
+* **update:** parse component-prefixed release tags ([#34](https://github.com/webbertakken/studio-worker/issues/34)) ([1d00d43](https://github.com/webbertakken/studio-worker/commit/1d00d4312fa32aeac8ede442bff3e0f7f7702733))
+
 ## [0.4.2](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.1...studio-worker-v0.4.2) (2026-06-02)
 
 
