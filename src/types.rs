@@ -61,6 +61,15 @@ pub struct ImageParams {
     /// the masked region changes. Wire-format key: `maskUrl`.
     #[serde(default)]
     pub mask_url: Option<String>,
+    /// HTTPS URL to a reference image for instruction-edit models
+    /// (e.g. Qwen-Image-Edit / Flux Kontext).  When set, the worker
+    /// downloads it and invokes `sd-cli -r <path>` (reference mode)
+    /// instead of the `--init-img`/`--strength`/`--mask` img2img path:
+    /// the model regenerates the whole image from the reference per the
+    /// instruction prompt; per-region clipping happens in the studio
+    /// composite. Wire-format key: `refImageUrl`.
+    #[serde(default)]
+    pub ref_image_url: Option<String>,
     /// Denoise / noise-strength for i2i (0.0 = keep init image
     /// unchanged, 1.0 = full re-noise).  Maps to `sd-cli --strength`.
     #[serde(default)]
@@ -366,6 +375,10 @@ pub struct HeartbeatRequest {
 pub enum ModelFileRole {
     DiffusionModel,
     TextEncoder,
+    /// Vision tower / mmproj for a multimodal text encoder (e.g.
+    /// Qwen2.5-VL ViT). Maps to `sd-cli --llm_vision`; required by
+    /// instruction-edit models that condition on the reference image.
+    TextEncoderVision,
     Vae,
     Lora,
     Model,
@@ -389,7 +402,7 @@ pub struct ModelFile {
     pub approx_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCliDefaults {
     pub cfg_scale: f32,
@@ -398,6 +411,15 @@ pub struct ModelCliDefaults {
     pub height: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling_method: Option<String>,
+    /// `--flow-shift` for Flow models (SD3.x / WAN / Qwen-Image). Model-level constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_shift: Option<f32>,
+    /// `--qwen-image-zero-cond-t` — mandatory for Qwen-Image edit quality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_cond_t: Option<bool>,
+    /// `--offload-to-cpu` — keep weights in RAM, stream to VRAM, so a large model fits a small card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offload_to_cpu: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

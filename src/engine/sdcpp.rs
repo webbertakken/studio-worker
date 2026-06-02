@@ -143,6 +143,7 @@ impl SdCppEngine {
             .ok_or_else(|| anyhow!("modelSource has no diffusion-model / model file"))?;
         let vae = file_for_role(&files, ModelFileRole::Vae);
         let text_encoder = file_for_role(&files, ModelFileRole::TextEncoder);
+        let text_encoder_vision = file_for_role(&files, ModelFileRole::TextEncoderVision);
 
         let out_dir = std::env::temp_dir().join("studio-worker-sdcpp");
         std::fs::create_dir_all(&out_dir)
@@ -179,14 +180,31 @@ impl SdCppEngine {
             _ => None,
         };
 
-        // An inpaint mask only makes sense alongside an init image. Download it the same way so
-        // we can pass `sd-cli --mask <path>`; white pixels mark the region the model may repaint.
-        let mask_path = match (init_img_path.as_ref(), params.mask_url.as_deref()) {
-            (Some(_), Some(url)) if !url.is_empty() => {
+        // A mask constrains the edit region — valid alongside either an init image (img2img
+        // inpaint) or a reference image (instruction edit). Download it whenever a base image is
+        // present and a mask URL was supplied; white pixels mark the region the model may change.
+        let has_base = init_img_path.is_some() || params.ref_image_url.as_deref().is_some();
+        let mask_path = match (has_base, params.mask_url.as_deref()) {
+            (true, Some(url)) if !url.is_empty() => {
                 let ext = init_image_extension(url);
                 let path = out_dir.join(format!("{stem}-mask.{ext}"));
                 download::download_file(url, &path)
                     .with_context(|| format!("downloading mask {} -> {}", url, path.display()))?;
+                temp_files.push(path.clone());
+                Some(path)
+            }
+            _ => None,
+        };
+
+        // Reference image for instruction-edit models (`sd-cli -r`). Downloaded like the init image;
+        // when present the arg builder uses reference mode instead of the img2img/mask path.
+        let ref_img_path = match params.ref_image_url.as_deref() {
+            Some(url) if !url.is_empty() => {
+                let ext = init_image_extension(url);
+                let path = out_dir.join(format!("{stem}-ref.{ext}"));
+                download::download_file(url, &path).with_context(|| {
+                    format!("downloading reference image {} -> {}", url, path.display())
+                })?;
                 temp_files.push(path.clone());
                 Some(path)
             }
@@ -199,9 +217,11 @@ impl SdCppEngine {
             diffusion_model,
             vae,
             text_encoder,
+            text_encoder_vision,
             &out_path,
             init_img_path.as_deref(),
             mask_path.as_deref(),
+            ref_img_path.as_deref(),
             full_checkpoint,
         );
         let mut cmd = Command::new(&self.sd_cli);
@@ -431,9 +451,11 @@ fn build_sdcli_args(
     diffusion_model: &Path,
     vae: Option<&Path>,
     text_encoder: Option<&Path>,
+    text_encoder_vision: Option<&Path>,
     out_path: &Path,
     init_img_path: Option<&Path>,
     mask_path: Option<&Path>,
+    ref_img_path: Option<&Path>,
     full_checkpoint: bool,
 ) -> Vec<OsString> {
     let resolved = resolve_image_args(params, source);
@@ -458,6 +480,10 @@ fn build_sdcli_args(
         args.push("--llm".into());
         args.push(p.into());
     }
+    if let Some(p) = text_encoder_vision {
+        args.push("--llm_vision".into());
+        args.push(p.into());
+    }
     args.push("-p".into());
     args.push((&params.prompt as &str).into());
     if let Some(neg) = params.negative_prompt.as_deref() {
@@ -466,7 +492,19 @@ fn build_sdcli_args(
             args.push(neg.into());
         }
     }
-    if let Some(init) = init_img_path {
+    if let Some(reference) = ref_img_path {
+        // Reference / instruction-edit mode (Qwen-Image-Edit, Flux Kontext): the model regenerates
+        // the image from the reference per the prompt. Mutually exclusive with the `--init-img`
+        // img2img path. A `--mask` is honoured here too: it constrains the edit to the masked
+        // region (white = editable) and leaves the rest, so the studio can place the edit inside
+        // the author's drawn shape. No `--strength` (that's an img2img-only knob).
+        args.push("-r".into());
+        args.push(reference.into());
+        if let Some(mask) = mask_path {
+            args.push("--mask".into());
+            args.push(mask.into());
+        }
+    } else if let Some(init) = init_img_path {
         args.push("--init-img".into());
         args.push(init.into());
         // `--strength` only makes sense alongside an init image
@@ -498,6 +536,18 @@ fn build_sdcli_args(
     if let Some(method) = resolved.sampling_method.as_deref() {
         args.push("--sampling-method".into());
         args.push(method.into());
+    }
+    // Flow / instruction-edit model flags (model-level constants from the registry). Only emitted
+    // when the model declares them, so SDXL-style models are unaffected.
+    if let Some(shift) = source.cli_defaults.flow_shift {
+        args.push("--flow-shift".into());
+        args.push(shift.to_string().into());
+    }
+    if source.cli_defaults.zero_cond_t == Some(true) {
+        args.push("--qwen-image-zero-cond-t".into());
+    }
+    if source.cli_defaults.offload_to_cpu == Some(true) {
+        args.push("--offload-to-cpu".into());
     }
     // VRAM-saving flags that are safe on every box.
     args.push("--diffusion-fa".into());
@@ -598,6 +648,7 @@ mod tests {
                 width: 1024,
                 height: 1024,
                 sampling_method: Some("euler".to_string()),
+                ..Default::default()
             },
         }
     }
@@ -778,7 +829,9 @@ mod tests {
             Path::new("/d.gguf"),
             Some(Path::new("/v.safetensors")),
             Some(Path::new("/llm.gguf")),
+            None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
             None,
             false,
@@ -816,7 +869,9 @@ mod tests {
             Path::new("/d.gguf"),
             None,
             None,
+            None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
             None,
             false,
@@ -842,7 +897,9 @@ mod tests {
             Path::new("/d.gguf"),
             None,
             None,
+            None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
             None,
             false,
@@ -865,8 +922,10 @@ mod tests {
             Path::new("/d.gguf"),
             None,
             None,
+            None,
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
+            None,
             None,
             false,
         );
@@ -891,9 +950,11 @@ mod tests {
             Path::new("/d.gguf"),
             None,
             None,
+            None,
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
             Some(Path::new("/tmp/mask.png")),
+            None,
             false,
         );
         let s = args_to_strings(&args);
@@ -915,7 +976,9 @@ mod tests {
             Path::new("/checkpoint.safetensors"),
             Some(Path::new("/v.safetensors")),
             None,
+            None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
             None,
             true,
@@ -943,8 +1006,10 @@ mod tests {
             Path::new("/d.gguf"),
             None,
             None,
+            None,
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
+            None,
             None,
             false,
         );
@@ -966,7 +1031,9 @@ mod tests {
             Path::new("/d.gguf"),
             None,
             None,
+            None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
             None,
             false,
@@ -989,7 +1056,9 @@ mod tests {
             Path::new("/d.gguf"),
             None,
             None,
+            None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
             None,
             false,
@@ -1012,7 +1081,9 @@ mod tests {
             Path::new("/d.gguf"),
             None,
             None,
+            None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
             None,
             false,
@@ -1035,13 +1106,97 @@ mod tests {
             Path::new("/d.gguf"),
             None,
             None,
+            None,
             Path::new("/tmp/out.webp"),
+            None,
             None,
             None,
             false,
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--seed").unwrap()], "42");
+    }
+
+    /// A model source carrying the Qwen-Image-Edit flow flags.
+    fn qwen_edit_source() -> ModelSource {
+        ModelSource {
+            engine: ModelEngine::SdCpp,
+            files: vec![],
+            cli_defaults: ModelCliDefaults {
+                cfg_scale: 4.0,
+                steps: 20,
+                width: 1024,
+                height: 1024,
+                sampling_method: Some("euler".to_string()),
+                flow_shift: Some(3.0),
+                zero_cond_t: Some(true),
+                offload_to_cpu: Some(true),
+            },
+        }
+    }
+
+    #[test]
+    fn build_sdcli_args_reference_mode_for_instruction_edit() {
+        let params = ImageParams {
+            prompt: "add a red beach ball".into(),
+            denoise: Some(0.9),
+            ..Default::default()
+        };
+        let source = qwen_edit_source();
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/qwen.gguf"),
+            Some(Path::new("/vae.safetensors")),
+            Some(Path::new("/llm.gguf")),
+            Some(Path::new("/mmproj.gguf")),
+            Path::new("/tmp/out.webp"),
+            None,
+            Some(Path::new("/tmp/mask.png")),
+            Some(Path::new("/tmp/ref.webp")),
+            false,
+        );
+        let s = args_to_strings(&args);
+        // Reference mode: `-r` set, a `--mask` constrains the edit region, and the img2img-only
+        // `--init-img` / `--strength` flags are suppressed.
+        assert_eq!(s[idx_after(&s, "-r").unwrap()], "/tmp/ref.webp");
+        assert_eq!(s[idx_after(&s, "--mask").unwrap()], "/tmp/mask.png");
+        assert!(!s.contains(&"--init-img".to_string()));
+        assert!(!s.contains(&"--strength".to_string()));
+        // Vision encoder + Qwen flow flags emitted.
+        assert_eq!(s[idx_after(&s, "--llm_vision").unwrap()], "/mmproj.gguf");
+        assert_eq!(s[idx_after(&s, "--flow-shift").unwrap()], "3");
+        assert!(s.contains(&"--qwen-image-zero-cond-t".to_string()));
+        assert!(s.contains(&"--offload-to-cpu".to_string()));
+    }
+
+    #[test]
+    fn build_sdcli_args_omits_qwen_flags_for_plain_model() {
+        let params = ImageParams {
+            prompt: "hi".into(),
+            ..Default::default()
+        };
+        // fake_source has no flow_shift / zero_cond_t / offload_to_cpu.
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            None,
+            false,
+        );
+        let s = args_to_strings(&args);
+        assert!(!s.contains(&"--flow-shift".to_string()));
+        assert!(!s.contains(&"--qwen-image-zero-cond-t".to_string()));
+        assert!(!s.contains(&"--offload-to-cpu".to_string()));
+        assert!(!s.contains(&"--llm_vision".to_string()));
+        assert!(!s.contains(&"-r".to_string()));
     }
 
     #[test]
