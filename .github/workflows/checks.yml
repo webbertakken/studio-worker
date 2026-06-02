@@ -40,6 +40,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # The all-backends / stt-backend builds static-link candle +
+      # whisper + llama (ggml), whose object files + the cache tarball
+      # exhaust the runner's ~14 GB free disk.  Reclaim the ~25 GB of
+      # preinstalled tooling we never use so the heavy matrix legs (and
+      # their cache-save post-step) have headroom.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
