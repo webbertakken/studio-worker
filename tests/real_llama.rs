@@ -4,7 +4,7 @@
 //! Skipped by default — set `RUN_REAL_ENGINE_TESTS=1` to enable.  When
 //! the model is already cached at `<models>/llm/<id>.gguf`, the
 //! download is skipped and the test runs offline.
-#![cfg(feature = "llama")]
+#![cfg(all(feature = "llama", not(target_os = "windows")))]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
