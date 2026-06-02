@@ -73,7 +73,9 @@ impl EngineCapabilities {
 #[cfg(feature = "image-candle")]
 pub mod candle_image;
 pub mod download;
-#[cfg(feature = "llama")]
+// llama-cpp-2 doesn't link on Windows MSVC (see Cargo.toml), so the
+// `llama` feature is a no-op there even when enabled via `--features all`.
+#[cfg(all(feature = "llama", not(target_os = "windows")))]
 pub mod llama;
 pub mod multi;
 pub mod sdcpp;
@@ -121,7 +123,7 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
     #[allow(clippy::vec_init_then_push)]
     let engines: Vec<Box<dyn Engine>> = {
         let mut v: Vec<Box<dyn Engine>> = Vec::new();
-        #[cfg(feature = "llama")]
+        #[cfg(all(feature = "llama", not(target_os = "windows")))]
         v.push(Box::new(llama::LlamaEngine::new(cfg.models_root.clone())?));
         #[cfg(feature = "whisper")]
         v.push(Box::new(whisper::WhisperEngine::new(

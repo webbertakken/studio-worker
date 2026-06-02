@@ -3,23 +3,3 @@
 # `CARGO_BUILD_JOBS=N`.
 [build]
 jobs = 2
-
-# Force the static MSVC C runtime for Windows builds so the in-process
-# llama.cpp (`llama` feature) links.  llama-cpp-sys-2 builds llama.cpp via
-# cmake (which defaults to the dynamic CRT) plus a `cc`-compiled wrapper;
-# Rust links the dynamic CRT by default.  In a release/LTO build these
-# disagree, producing `LNK2038: RuntimeLibrary mismatch (MT vs MD)` and a
-# pile of unresolved `__imp_*` CRT symbols.  Pinning Rust to the static
-# CRT here, together with `LLAMA_STATIC_CRT=1` (see `[env]`), makes
-# cmake + the cc wrapper + Rust all use the static CRT, so everything
-# agrees.  This only affects builds *in this repo* (CI / cargo-dist);
-# a downstream `cargo install studio-worker` is unaffected.
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
-
-[env]
-# Tell llama-cpp-sys-2 to build llama.cpp against the static MSVC CRT to
-# match `+crt-static` above.  A no-op on non-MSVC targets (the cmake
-# crate only applies it when generating for MSVC), so it is safe to set
-# globally.
-LLAMA_STATIC_CRT = "1"

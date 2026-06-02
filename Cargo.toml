@@ -71,10 +71,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 thiserror = "2"
 # Real-engine deps; each behind its own cargo feature so the default
-# build stays small and CI stays fast.
-llama-cpp-2 = { version = "0.1.124", optional = true, default-features = false }
+# build stays small and CI stays fast.  (`llama-cpp-2` is Windows-gated
+# below — see the note there.)
 whisper-rs = { version = "0.14", optional = true, default-features = false }
-encoding_rs = { version = "0.8", optional = true }
 candle-core = { version = "0.10.2", optional = true }
 candle-nn = { version = "0.10.2", optional = true }
 candle-transformers = { version = "0.10.2", optional = true }
@@ -109,6 +108,18 @@ ksni = { version = "0.3", optional = true }
 # Windows), so it's a plain target dep — no feature gate, no system libs.
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
+
+# In-process llama.cpp LLM — gated OFF Windows.  llama-cpp-2 0.1.x builds
+# llama.cpp via cmake (which links the dynamic MSVC CRT and ignores
+# CMAKE_MSVC_RUNTIME_LIBRARY), while the cc wrapper + Rust use the static
+# CRT, so a release/LTO link fails with LNK2038 RuntimeLibrary mismatch +
+# unresolved __imp_* CRT symbols.  Until that's fixable upstream, Windows
+# release binaries ship without the in-process LLM (image via sd-cli +
+# the other modalities still work); Linux + macOS keep it.  The `llama`
+# feature's `dep:` edges below are simply inactive on Windows.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+llama-cpp-2 = { version = "0.1.124", optional = true, default-features = false }
+encoding_rs = { version = "0.8", optional = true }
 
 [features]
 # UI on by default: `cargo install studio-worker` is windowed + tray and
