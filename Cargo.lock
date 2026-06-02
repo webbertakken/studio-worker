@@ -5680,6 +5680,7 @@ dependencies = [
  "hound",
  "image",
  "ksni",
+ "libloading 0.8.9",
  "llama-cpp-2",
  "notify-rust",
  "parking_lot",

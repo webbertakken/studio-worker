@@ -59,6 +59,74 @@ fn library_name() -> &'static str {
     }
 }
 
+/// The Vulkan loader the prebuilt sd-cli links against, per OS.
+/// `None` on macOS, where the build targets Metal and no Vulkan loader
+/// is involved.
+fn vulkan_loader_name() -> Option<&'static str> {
+    if cfg!(target_os = "windows") {
+        Some("vulkan-1.dll")
+    } else if cfg!(target_os = "macos") {
+        None
+    } else {
+        Some("libvulkan.so.1")
+    }
+}
+
+/// Per-OS remedy for a missing Vulkan loader.  We can't auto-provision
+/// it: it ships with the GPU driver (Windows) or a system package +
+/// driver (Linux), neither of which we can install unattended.
+fn vulkan_remedy() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "install/update your GPU driver (NVIDIA, AMD, or Intel) — it ships \
+         the Vulkan runtime (vulkan-1.dll)"
+    } else {
+        "install the Vulkan loader + a GPU driver, e.g. on Debian/Ubuntu \
+         `sudo apt install libvulkan1 mesa-vulkan-drivers` (plus the \
+         vendor driver for NVIDIA/AMD); verify with `vulkaninfo --summary`"
+    }
+}
+
+/// Whether the Vulkan loader can actually be loaded by the dynamic
+/// linker.  Uses the same `dlopen`/`LoadLibrary` mechanism sd-cli
+/// relies on, so a true result means sd-cli will find the loader too.
+/// Always `true` on macOS (Metal, no Vulkan).  Excluded from coverage:
+/// the outcome is host-GPU-dependent and unstable across CI runners.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn vulkan_loader_loads() -> bool {
+    match vulkan_loader_name() {
+        None => true,
+        Some(name) => unsafe { libloading::Library::new(name).is_ok() },
+    }
+}
+
+/// Preflight the GPU runtime sd-cli needs.  Returns a clear, actionable
+/// error when the Vulkan loader is absent so the operator sees exactly
+/// what to install instead of a cryptic sd-cli linker/instance crash.
+/// `probe` is injected so the decision + message are unit-testable
+/// without depending on the host's GPU stack.
+fn vulkan_runtime_status_with(loader_loads: bool) -> Result<()> {
+    let Some(loader) = vulkan_loader_name() else {
+        return Ok(()); // macOS / Metal: nothing to check.
+    };
+    if loader_loads {
+        return Ok(());
+    }
+    bail!(
+        "Vulkan runtime not available: the loader `{loader}` could not be \
+         loaded, so stable-diffusion.cpp cannot run on the GPU. We cannot \
+         auto-provision it — {}.",
+        vulkan_remedy()
+    )
+}
+
+/// Live preflight: probes the real loader.  Excluded from coverage for
+/// the same host-dependent reason as [`vulkan_loader_loads`]; the
+/// decision logic is covered via [`vulkan_runtime_status_with`].
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn vulkan_runtime_status() -> Result<()> {
+    vulkan_runtime_status_with(vulkan_loader_loads())
+}
+
 /// The release tag to provision — env override or the pinned default.
 fn release_tag() -> String {
     std::env::var(RELEASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASE_TAG.to_string())
@@ -73,14 +141,31 @@ fn sha_from_tag(tag: &str) -> Result<&str> {
     }
 }
 
-/// Platform asset suffix (the part between `bin-` and `.zip`).  Vulkan
-/// is the universal GPU backend — one build serves NVIDIA, AMD and
-/// Intel — so we pick it for every supported target.
-fn asset_suffix(os: &str, arch: &str) -> Result<&'static str> {
+/// Where a platform's prebuilt zip is hosted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssetSource {
+    /// leejet/stable-diffusion.cpp's own releases.
+    Upstream,
+    /// Our own releases — platforms upstream doesn't prebuild
+    /// (currently Linux aarch64), built by `sdcpp-prebuilt.yml` at the
+    /// same sd.cpp commit.
+    SelfHosted,
+}
+
+/// Pick the prebuilt for a target: its host and the asset suffix (the
+/// part between `bin-` and `.zip`).  Vulkan is the universal GPU
+/// backend (one build serves NVIDIA / AMD / Intel); macOS ships a
+/// universal2 Metal binary, so Intel + Apple-Silicon share one asset.
+fn asset_plan(os: &str, arch: &str) -> Result<(AssetSource, &'static str)> {
+    use AssetSource::*;
     match (os, arch) {
-        ("windows", "x86_64") => Ok("win-vulkan-x64"),
-        ("linux", "x86_64") => Ok("Linux-Ubuntu-24.04-x86_64-vulkan"),
-        ("macos", "aarch64") => Ok("Darwin-macOS-15.7.7-arm64"),
+        ("windows", "x86_64") => Ok((Upstream, "win-vulkan-x64")),
+        ("linux", "x86_64") => Ok((Upstream, "Linux-Ubuntu-24.04-x86_64-vulkan")),
+        // The upstream Darwin build is a universal2 binary (x86_64 +
+        // arm64), so Intel Macs use the very same asset.
+        ("macos", "aarch64") | ("macos", "x86_64") => Ok((Upstream, "Darwin-macOS-15.7.7-arm64")),
+        // Upstream has no aarch64 Linux build; we publish our own.
+        ("linux", "aarch64") => Ok((SelfHosted, "Linux-aarch64-vulkan")),
         _ => bail!(
             "no prebuilt stable-diffusion.cpp binary for {os}/{arch}; \
              install sd-cli manually — see docs/operations/sd-cli-install.md"
@@ -88,19 +173,32 @@ fn asset_suffix(os: &str, arch: &str) -> Result<&'static str> {
     }
 }
 
-/// Build the asset filename for `tag` on `os`/`arch`.
-fn asset_name(tag: &str, os: &str, arch: &str) -> Result<String> {
-    let sha = sha_from_tag(tag)?;
-    let suffix = asset_suffix(os, arch)?;
-    Ok(format!("sd-master-{sha}-bin-{suffix}.zip"))
+/// Build the asset filename for `sha` + `suffix` (upstream's naming
+/// convention, which our self-hosted builds mirror).
+fn asset_name(sha: &str, suffix: &str) -> String {
+    format!("sd-master-{sha}-bin-{suffix}.zip")
 }
 
-/// The full release-download URL for `tag` on `os`/`arch`.
+/// Our release tag holding the self-hosted prebuilts for `upstream_tag`.
+fn self_hosted_tag(upstream_tag: &str) -> String {
+    format!("sdcpp-prebuilt-{upstream_tag}")
+}
+
+/// The full release-download URL for `tag` on `os`/`arch`, routed to
+/// upstream or our own releases depending on the platform.
 fn download_url(tag: &str, os: &str, arch: &str) -> Result<String> {
-    let asset = asset_name(tag, os, arch)?;
-    Ok(format!(
-        "https://github.com/leejet/stable-diffusion.cpp/releases/download/{tag}/{asset}"
-    ))
+    let sha = sha_from_tag(tag)?;
+    let (source, suffix) = asset_plan(os, arch)?;
+    let asset = asset_name(sha, suffix);
+    Ok(match source {
+        AssetSource::Upstream => format!(
+            "https://github.com/leejet/stable-diffusion.cpp/releases/download/{tag}/{asset}"
+        ),
+        AssetSource::SelfHosted => format!(
+            "https://github.com/webbertakken/studio-worker/releases/download/{}/{asset}",
+            self_hosted_tag(tag)
+        ),
+    })
 }
 
 /// Resolve the zip URL to fetch: the `STUDIO_WORKER_SDCPP_URL`
@@ -336,50 +434,87 @@ mod tests {
     }
 
     #[test]
-    fn asset_suffix_picks_vulkan_for_supported_targets() {
-        assert_eq!(asset_suffix("windows", "x86_64").unwrap(), "win-vulkan-x64");
+    fn asset_plan_picks_vulkan_or_universal_for_supported_targets() {
+        use AssetSource::*;
         assert_eq!(
-            asset_suffix("linux", "x86_64").unwrap(),
-            "Linux-Ubuntu-24.04-x86_64-vulkan"
+            asset_plan("windows", "x86_64").unwrap(),
+            (Upstream, "win-vulkan-x64")
         );
         assert_eq!(
-            asset_suffix("macos", "aarch64").unwrap(),
-            "Darwin-macOS-15.7.7-arm64"
+            asset_plan("linux", "x86_64").unwrap(),
+            (Upstream, "Linux-Ubuntu-24.04-x86_64-vulkan")
+        );
+        assert_eq!(
+            asset_plan("macos", "aarch64").unwrap(),
+            (Upstream, "Darwin-macOS-15.7.7-arm64")
         );
     }
 
     #[test]
-    fn asset_suffix_rejects_unsupported_targets_with_guidance() {
-        let err = asset_suffix("linux", "aarch64").unwrap_err().to_string();
+    fn asset_plan_makes_intel_mac_and_arm_linux_first_class() {
+        use AssetSource::*;
+        // Intel Macs ride the upstream universal2 Darwin binary.
+        assert_eq!(
+            asset_plan("macos", "x86_64").unwrap(),
+            (Upstream, "Darwin-macOS-15.7.7-arm64")
+        );
+        // aarch64 Linux has no upstream build, so we self-host one.
+        assert_eq!(
+            asset_plan("linux", "aarch64").unwrap(),
+            (SelfHosted, "Linux-aarch64-vulkan")
+        );
+    }
+
+    #[test]
+    fn asset_plan_rejects_unsupported_targets_with_guidance() {
+        let err = asset_plan("freebsd", "x86_64").unwrap_err().to_string();
         assert!(err.contains("no prebuilt"), "got: {err}");
         assert!(
             err.contains("sd-cli-install.md"),
             "points to the doc: {err}"
         );
-        assert!(asset_suffix("freebsd", "x86_64").is_err());
-        assert!(asset_suffix("macos", "x86_64").is_err());
+        assert!(asset_plan("windows", "aarch64").is_err());
     }
 
     #[test]
     fn asset_name_embeds_sha_and_platform() {
         assert_eq!(
-            asset_name("master-669-2d40a8b", "windows", "x86_64").unwrap(),
+            asset_name("2d40a8b", "win-vulkan-x64"),
             "sd-master-2d40a8b-bin-win-vulkan-x64.zip"
         );
         assert_eq!(
-            asset_name("master-669-2d40a8b", "linux", "x86_64").unwrap(),
-            "sd-master-2d40a8b-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip"
+            asset_name("2d40a8b", "Linux-aarch64-vulkan"),
+            "sd-master-2d40a8b-bin-Linux-aarch64-vulkan.zip"
         );
     }
 
     #[test]
-    fn download_url_targets_the_upstream_release() {
+    fn download_url_targets_upstream_for_covered_platforms() {
         let url = download_url("master-669-2d40a8b", "windows", "x86_64").unwrap();
         let expected = concat!(
             "https://github.com/leejet/stable-diffusion.cpp/releases/download/",
             "master-669-2d40a8b/sd-master-2d40a8b-bin-win-vulkan-x64.zip"
         );
         assert_eq!(url, expected);
+    }
+
+    #[test]
+    fn download_url_targets_our_release_for_arm_linux() {
+        let url = download_url("master-669-2d40a8b", "linux", "aarch64").unwrap();
+        let expected = concat!(
+            "https://github.com/webbertakken/studio-worker/releases/download/",
+            "sdcpp-prebuilt-master-669-2d40a8b/",
+            "sd-master-2d40a8b-bin-Linux-aarch64-vulkan.zip"
+        );
+        assert_eq!(url, expected);
+    }
+
+    #[test]
+    fn download_url_uses_universal_darwin_asset_for_intel_mac() {
+        let arm = download_url("master-669-2d40a8b", "macos", "aarch64").unwrap();
+        let intel = download_url("master-669-2d40a8b", "macos", "x86_64").unwrap();
+        assert_eq!(arm, intel, "Intel Macs use the same universal2 asset");
+        assert!(intel.contains("Darwin-macOS-15.7.7-arm64"), "got: {intel}");
     }
 
     #[test]
@@ -477,6 +612,37 @@ mod tests {
         let (var, env_dir) = library_path_env(&sd_cli).expect("sibling lib resolved");
         assert!(var == "LD_LIBRARY_PATH" || var == "DYLD_LIBRARY_PATH");
         assert_eq!(env_dir, dir.path());
+    }
+
+    #[test]
+    fn vulkan_status_ok_when_loader_loads() {
+        // macOS short-circuits to Ok regardless; elsewhere a loadable
+        // loader is Ok.
+        assert!(vulkan_runtime_status_with(true).is_ok());
+    }
+
+    #[test]
+    fn vulkan_status_errors_with_actionable_remedy_when_missing() {
+        let result = vulkan_runtime_status_with(false);
+        if cfg!(target_os = "macos") {
+            // Metal build: there is no Vulkan loader to miss.
+            assert!(result.is_ok());
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("Vulkan runtime"), "got: {err}");
+            assert!(
+                err.contains("auto-provision"),
+                "must say we can't auto-provision it: {err}"
+            );
+            // The remedy names the concrete fix for this OS.
+            if cfg!(target_os = "windows") {
+                assert!(err.contains("vulkan-1.dll"), "got: {err}");
+                assert!(err.contains("GPU driver"), "got: {err}");
+            } else {
+                assert!(err.contains("libvulkan1"), "got: {err}");
+                assert!(err.contains("vulkaninfo"), "got: {err}");
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
