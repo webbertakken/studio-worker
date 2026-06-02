@@ -179,5 +179,21 @@ targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
 ]
+# Release binaries ship the full backend set so the install-script path
+# is turnkey: UI (default) + in-process llama.cpp LLM + media engines.
+# whisper is excluded — it static-links a second ggml that clashes with
+# llama's; image stays sd-cli (subprocess) to avoid the same clash.
+features = ["llama", "video", "tts"]
 # PR checks run plan-only to catch issues early
 pr-run-mode = "plan"
+
+# System build deps cargo-dist installs on the release runners.
+# llama-cpp-2 builds llama.cpp via cmake + a C/C++ toolchain.
+[workspace.metadata.dist.dependencies.apt]
+cmake = '*'
+
+[workspace.metadata.dist.dependencies.homebrew]
+cmake = '*'
+
+[workspace.metadata.dist.dependencies.chocolatey]
+cmake = '*'

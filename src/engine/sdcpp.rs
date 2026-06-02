@@ -28,12 +28,13 @@
 //! at all so it skips registration and the multi engine falls through
 //! to synthetic for any kind it doesn't have a real backend for.
 
+use crate::engine::download;
 use crate::engine::{Engine, EngineCapabilities};
 use crate::types::{ImageParams, ModelFileRole, ModelSource, Task, TaskKind, TaskResult};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -45,10 +46,6 @@ const TRACE_TARGET: &str = "studio_worker::engine::sdcpp";
 /// schedule so 20 wastes time; we honour `ModelSource.cliDefaults.steps`
 /// instead.  Only used as the very last fallback.
 const STEPS_FALLBACK: u32 = 8;
-
-/// HTTP client timeout per request \u2014 the GGUF download is up to a few
-/// GiB so a 30-minute ceiling is generous.
-const DOWNLOAD_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Worker-side engine that drives `sd-cli` per job.
 pub struct SdCppEngine {
@@ -62,7 +59,24 @@ impl SdCppEngine {
     /// need to pre-stage anything.
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn try_new(models_root: &Path) -> Option<Self> {
-        let sd_cli = resolve_sd_cli()?;
+        let Some(sd_cli) = resolve_sd_cli(models_root) else {
+            // Image jobs need sd-cli; without it the engine must NOT
+            // register (claiming image jobs it can't run is worse than
+            // not claiming).  Log why, with the remedy, so an operator
+            // wondering "why won't my worker take image jobs" can tell
+            // from the journal instead of from silence.
+            info!(
+                target: TRACE_TARGET,
+                op = "register",
+                models_root = %models_root.display(),
+                sd_cli_name = sd_cli_binary_name(),
+                "sd-cli not found (checked $STUDIO_WORKER_SD_CLI, \
+                 <models_root>/bin, ~/.local/bin, and $PATH); real image \
+                 generation is disabled on this worker until it is \
+                 installed — see docs/operations/sd-cli-install.md"
+            );
+            return None;
+        };
         if let Err(e) = std::fs::create_dir_all(models_root) {
             warn!(
                 target: TRACE_TARGET,
@@ -100,25 +114,7 @@ impl SdCppEngine {
     fn ensure_files(&self, source: &ModelSource) -> Result<Vec<(ModelFileRole, PathBuf)>> {
         let mut out = Vec::with_capacity(source.files.len());
         for file in &source.files {
-            let local = model_cache_path(&self.models_root, &file.filename)?;
-            if !local.is_file() {
-                download_file(&file.url, &local).with_context(|| {
-                    format!(
-                        "downloading {} ({}) -> {}",
-                        file.filename,
-                        file.url,
-                        local.display()
-                    )
-                })?;
-            } else {
-                debug!(
-                    target: TRACE_TARGET,
-                    op = "ensure_file",
-                    filename = %file.filename,
-                    path = %local.display(),
-                    "cached"
-                );
-            }
+            let local = download::ensure_file(&self.models_root, &file.filename, &file.url)?;
             out.push((file.role, local));
         }
         Ok(out)
@@ -174,7 +170,7 @@ impl SdCppEngine {
             Some(url) if !url.is_empty() => {
                 let ext = init_image_extension(url);
                 let init_path = out_dir.join(format!("{stem}-init.{ext}"));
-                download_file(url, &init_path).with_context(|| {
+                download::download_file(url, &init_path).with_context(|| {
                     format!("downloading init image {} -> {}", url, init_path.display())
                 })?;
                 temp_files.push(init_path.clone());
@@ -189,7 +185,7 @@ impl SdCppEngine {
             (Some(_), Some(url)) if !url.is_empty() => {
                 let ext = init_image_extension(url);
                 let path = out_dir.join(format!("{stem}-mask.{ext}"));
-                download_file(url, &path)
+                download::download_file(url, &path)
                     .with_context(|| format!("downloading mask {} -> {}", url, path.display()))?;
                 temp_files.push(path.clone());
                 Some(path)
@@ -357,90 +353,11 @@ impl Drop for TempFileGuard {
     }
 }
 
-/// Verify a streamed download wrote exactly the body the server
-/// promised.  `expected` is the response's `Content-Length`; it's
-/// `None` for chunked transfers, where there's nothing to check and
-/// we accept whatever arrived (the behaviour before this guard).  A
-/// mismatch in either direction means the download is truncated or
-/// corrupt, so we surface a clear error rather than cache a bad model.
-fn verify_download_len(copied: u64, expected: Option<u64>) -> Result<()> {
-    match expected {
-        Some(expected) if copied != expected => bail!(
-            "size mismatch: wrote {copied} bytes but the server declared \
-             Content-Length {expected} (download truncated or corrupt)"
-        ),
-        _ => Ok(()),
-    }
-}
-
 fn file_for_role(files: &[(ModelFileRole, PathBuf)], role: ModelFileRole) -> Option<&Path> {
     files
         .iter()
         .find(|(r, _)| *r == role)
         .map(|(_, p)| p.as_path())
-}
-
-/// Stream `url` into `dest` (atomic via a `.part` rename so a killed
-/// download doesn't leave a half-written file on disk).
-///
-/// Excluded from coverage: requires real network + filesystem (and
-/// a 5GB download per model on the happy path).  Exercised
-/// end-to-end via the live dev loop.
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn download_file(url: &str, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let part = dest.with_extension("part");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
-        .build()?;
-    info!(
-        target: TRACE_TARGET,
-        op = "download",
-        url,
-        dest = %dest.display(),
-        "starting"
-    );
-    let started = Instant::now();
-    let mut response = client.get(url).send().context("GET")?;
-    if !response.status().is_success() {
-        bail!("GET {url} -> {}", response.status());
-    }
-    // The server's Content-Length (absent on chunked transfers) is what
-    // lets us catch a short read before committing the file.
-    let expected_len = response.content_length();
-    let mut file =
-        std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-    let copied = std::io::copy(&mut response, &mut file);
-    // Close the handle before any remove / rename so the cleanup path
-    // works on Windows, where an open file can't be unlinked.
-    drop(file);
-    let bytes = match copied {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            remove_temp_file(&part);
-            return Err(e).context("streaming body");
-        }
-    };
-    if let Err(e) = verify_download_len(bytes, expected_len) {
-        remove_temp_file(&part);
-        return Err(e).with_context(|| format!("downloading {url}"));
-    }
-    std::fs::rename(&part, dest)
-        .with_context(|| format!("renaming {} -> {}", part.display(), dest.display()))?;
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    info!(
-        target: TRACE_TARGET,
-        op = "download",
-        url,
-        dest = %dest.display(),
-        bytes,
-        elapsed_ms,
-        "done"
-    );
-    Ok(())
 }
 
 /// Resolve final per-job width / height / steps / cfg / sampler /
@@ -587,26 +504,42 @@ fn build_sdcli_args(
     args
 }
 
-/// Look up `sd-cli` in env override -> `~/.local/bin` -> `$PATH`.
-/// Look for the `sd-cli` binary on the box.  Excluded from coverage:
-/// touches `$STUDIO_WORKER_SD_CLI`, `~/.local/bin/sd-cli`, and `$PATH`
-/// in order — only one of which matches at a time per host, and CI
-/// doesn't ship `sd-cli` at all.
+/// Platform binary name for stable-diffusion.cpp's CLI.
+fn sd_cli_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "sd-cli.exe"
+    } else {
+        "sd-cli"
+    }
+}
+
+/// Look up `sd-cli` in env override -> `<models_root>/bin` ->
+/// `~/.local/bin` -> `$PATH`.  The `<models_root>/bin` slot is where a
+/// self-provisioned binary lands, so an operator (or a future
+/// auto-provisioner) can drop it next to the cached models and have the
+/// worker pick it up with no PATH fiddling.  Excluded from coverage:
+/// touches several host paths only one of which matches per host, and
+/// CI doesn't ship `sd-cli` at all.
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn resolve_sd_cli() -> Option<PathBuf> {
+fn resolve_sd_cli(models_root: &Path) -> Option<PathBuf> {
+    let bin = sd_cli_binary_name();
     if let Ok(p) = std::env::var("STUDIO_WORKER_SD_CLI") {
         let path = PathBuf::from(p);
         if path.is_file() {
             return Some(path);
         }
     }
+    let in_models = models_root.join("bin").join(bin);
+    if in_models.is_file() {
+        return Some(in_models);
+    }
     if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home).join(".local/bin/sd-cli");
+        let candidate = PathBuf::from(home).join(".local/bin").join(bin);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
-    which("sd-cli")
+    which(bin)
 }
 
 /// `$PATH` lookup for a bare binary name.  Excluded from coverage
@@ -621,19 +554,6 @@ fn which(bin: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn model_cache_path(models_root: &Path, filename: &str) -> Result<PathBuf> {
-    let path = Path::new(filename);
-    let mut components = path.components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(name)), None)
-            if !filename.contains('/') && !filename.contains('\\') =>
-        {
-            Ok(models_root.join(name))
-        }
-        _ => bail!("model filename must be a plain file name: {filename:?}"),
-    }
 }
 
 /// Pick an extension to use for the init-image tempfile that sd-cli's
@@ -783,20 +703,6 @@ mod tests {
             Some(Path::new("/v.safetensors"))
         );
         assert!(file_for_role(&files, ModelFileRole::TextEncoder).is_none());
-    }
-
-    #[test]
-    fn model_cache_path_accepts_plain_filenames_only() {
-        let root = Path::new("/models");
-        assert_eq!(
-            model_cache_path(root, "model.gguf").unwrap(),
-            PathBuf::from("/models/model.gguf")
-        );
-        assert!(model_cache_path(root, "../outside.gguf").is_err());
-        assert!(model_cache_path(root, "nested/model.gguf").is_err());
-        assert!(model_cache_path(root, "/tmp/model.gguf").is_err());
-        assert!(model_cache_path(root, r"nested\model.gguf").is_err());
-        assert!(model_cache_path(root, "").is_err());
     }
 
     #[test]
@@ -1167,32 +1073,5 @@ mod tests {
             "webp"
         );
         assert_eq!(init_image_extension("https://x/y/no-ext"), "webp");
-    }
-
-    #[test]
-    fn verify_download_len_accepts_exact_match() {
-        assert!(verify_download_len(2_700_000_000, Some(2_700_000_000)).is_ok());
-    }
-
-    #[test]
-    fn verify_download_len_accepts_when_length_unknown() {
-        // Chunked transfers omit Content-Length; we can't check, so we
-        // accept whatever streamed in (same as before this guard).
-        assert!(verify_download_len(123, None).is_ok());
-    }
-
-    #[test]
-    fn verify_download_len_rejects_truncated_download() {
-        let err = verify_download_len(40, Some(100)).unwrap_err().to_string();
-        assert!(err.contains("size mismatch"), "got: {err}");
-        assert!(err.contains("40"), "got: {err}");
-        assert!(err.contains("100"), "got: {err}");
-    }
-
-    #[test]
-    fn verify_download_len_rejects_overlong_download() {
-        // A body longer than the declared length is just as corrupt as a
-        // short one - reject both rather than caching a bad model.
-        assert!(verify_download_len(120, Some(100)).is_err());
     }
 }

@@ -66,20 +66,27 @@ packaged" errors.
 
 ## Phase 2 — backends packaged, models auto-download (verify build/tests)
 
-- [ ] Add an `all` convenience feature = ui + llama + image-candle +
+- [x] Add an `all` convenience feature = ui + llama + image-candle +
       video + tts (the fully-loaded source build).
-- [ ] cargo-dist `[workspace.metadata.dist] features = [...]` so release
-      binaries ship llama + media (no whisper — ggml clash).
-- [ ] llama engine: download GGUF files from `ModelSource` on demand
-      (today it only reads local `<root>/llm/*.gguf`); cache + validate
-      length; route `LlamaCpp` offers correctly.
-- [ ] Improve "no engine compiled" errors to name the install-script
+- [x] cargo-dist `[workspace.metadata.dist] features = [llama, video,
+      tts]` + cmake system dep so release binaries ship llama + media
+      (no whisper — ggml clash; image stays sd-cli subprocess).
+- [x] Shared `engine::download` module (cache + length-verify + path
+      traversal guard); sdcpp refactored onto it.
+- [x] llama engine: download GGUF from `ModelSource` on demand via the
+      shared module, advertise the `llama-cpp:*` wildcard (mirrors
+      sd-cpp) so a fresh worker is claimable; `pick_gguf`/`as_llm` pure
+      helpers, unit-tested.
+- [x] Improve "no engine compiled" errors to name the install-script
       remedy (operator-actionable, no silent fallback).
-- [ ] sd-cli provisioning: resolve `<models_root>/bin/sd-cli`, add a
-      configurable `sd_cli_url`, auto-download + chmod on first image
-      job when absent; actionable error otherwise.
-- [ ] Engine-roster + capability tests for the new default feature set.
-- [ ] Commit.
+- [x] sd-cli resolution: also check `<models_root>/bin`, `.exe` on
+      Windows, and log an actionable skip when absent (no silent
+      no-image worker).
+- [x] Verified: `--features all` clippy-clean + llama tests (12);
+      default fmt/clippy/test (274+) green.
+- [ ] Commit Phase 2.
+- [ ] (Deferred) sd-cli auto-download from a configured URL: needs a
+      known-good per-platform binary source I can't validate here.
 
 ## Phase 3 — auto-start on login, all platforms
 

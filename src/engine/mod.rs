@@ -72,6 +72,7 @@ impl EngineCapabilities {
 
 #[cfg(feature = "image-candle")]
 pub mod candle_image;
+pub mod download;
 #[cfg(feature = "llama")]
 pub mod llama;
 pub mod multi;
