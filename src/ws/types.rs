@@ -185,6 +185,7 @@ mod tests {
                 width: 1024,
                 height: 1024,
                 sampling_method: None,
+                ..Default::default()
             },
         }
     }

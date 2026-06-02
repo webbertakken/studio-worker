@@ -310,6 +310,7 @@ mod tests {
                 width: 1024,
                 height: 1024,
                 sampling_method: None,
+                ..Default::default()
             },
         }
     }
@@ -380,6 +381,7 @@ mod tests {
                 width: 1024,
                 height: 1024,
                 sampling_method: None,
+                ..Default::default()
             },
         };
         let result = multi
