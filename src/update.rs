@@ -73,10 +73,19 @@ pub fn parse_releases(text: &str) -> Result<Vec<GithubRelease>> {
     Ok(vec![single])
 }
 
-/// Parse the version from a release tag.  Accepts both `1.2.3` and
-/// `v1.2.3`.
+/// Parse the version from a release tag.  Accepts a bare `1.2.3`, a
+/// `v1.2.3`, and the component-prefixed tags release-please / cargo-dist
+/// actually push for this repo (`studio-worker-v1.2.3`).  Tries the
+/// most-permissive forms in order and returns the first that parses, so
+/// a prerelease suffix (`...-rc.1`) survives — only the `<component>-v`
+/// prefix is stripped, never the version's own `-`.
 pub fn parse_tag(tag: &str) -> Option<Version> {
-    Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()
+    let candidates = [
+        tag,
+        tag.strip_prefix('v').unwrap_or(tag),
+        tag.rsplit_once("-v").map(|(_, v)| v).unwrap_or(tag),
+    ];
+    candidates.iter().find_map(|c| Version::parse(c).ok())
 }
 
 /// Compare the local version against the feed and decide whether to
@@ -371,6 +380,45 @@ mod tests {
         assert_eq!(parse_tag("v1.2.3"), Some(Version::new(1, 2, 3)));
         assert_eq!(parse_tag("1.2.3"), Some(Version::new(1, 2, 3)));
         assert!(parse_tag("garbage").is_none());
+    }
+
+    #[test]
+    fn parse_tag_accepts_component_prefixed_release_tags() {
+        // release-please / cargo-dist tag the repo as
+        // `studio-worker-v<semver>`; the updater must read the version
+        // out of that or it never sees a newer release (the bug that
+        // made `check for updates` always say "up to date").
+        assert_eq!(
+            parse_tag("studio-worker-v0.4.2"),
+            Some(Version::new(0, 4, 2))
+        );
+        assert_eq!(
+            parse_tag("studio-worker-v1.10.0"),
+            Some(Version::new(1, 10, 0))
+        );
+        // Prerelease suffix survives (the version's own `-` is not the
+        // component separator).
+        assert_eq!(
+            parse_tag("studio-worker-v0.5.0-rc.1"),
+            Version::parse("0.5.0-rc.1").ok()
+        );
+    }
+
+    #[test]
+    fn decide_detects_newer_with_component_prefixed_tags() {
+        // The exact shape of the live feed: `studio-worker-v*` tags.
+        let releases = vec![
+            rel("studio-worker-v0.4.1", false, false, true),
+            rel("studio-worker-v0.4.2", false, false, true),
+        ];
+        let outcome = decide(&releases, &Version::new(0, 4, 1), false);
+        assert_eq!(
+            outcome,
+            CheckOutcome::NewerAvailable {
+                current: Version::new(0, 4, 1),
+                latest: Version::new(0, 4, 2),
+            }
+        );
     }
 
     #[test]

@@ -82,6 +82,38 @@ async fn check_reports_newer_available() {
 }
 
 #[tokio::test]
+async fn check_reports_newer_with_live_component_prefixed_tags() {
+    // Regression: the live GitHub feed tags releases `studio-worker-v*`
+    // (release-please / cargo-dist), not bare `v*`.  The updater must
+    // read the version out of that shape or `check for updates` always
+    // reports "up to date" even when a newer build is published.
+    let server = MockServer::start().await;
+    let body = serde_json::json!([
+        release("studio-worker-v0.4.1", false, false),
+        release("studio-worker-v0.4.2", false, false),
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let feed = format!("{}/releases", server.uri());
+    let current = Version::new(0, 4, 1);
+    let outcome = std::thread::spawn(move || update::check(&feed, &current, false))
+        .join()
+        .unwrap()
+        .unwrap();
+    match outcome {
+        update::CheckOutcome::NewerAvailable { current, latest } => {
+            assert_eq!(current, Version::new(0, 4, 1));
+            assert_eq!(latest, Version::new(0, 4, 2));
+        }
+        other => panic!("unexpected: {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn check_skips_prereleases_by_default() {
     let server = MockServer::start().await;
     let body = serde_json::json!([
@@ -166,6 +198,11 @@ async fn parse_tag_strips_v_prefix() {
     assert_eq!(update::parse_tag("v1.2.3"), Some(Version::new(1, 2, 3)));
     assert_eq!(update::parse_tag("1.2.3"), Some(Version::new(1, 2, 3)));
     assert_eq!(update::parse_tag("garbage"), None);
+    // The component-prefixed shape the repo actually ships.
+    assert_eq!(
+        update::parse_tag("studio-worker-v0.4.2"),
+        Some(Version::new(0, 4, 2))
+    );
 }
 
 #[tokio::test]
