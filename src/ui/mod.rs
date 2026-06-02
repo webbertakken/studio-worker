@@ -10,6 +10,7 @@ pub mod notifier;
 pub mod tab;
 pub mod tabs;
 pub mod tray;
+pub mod tray_host;
 
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
@@ -106,7 +107,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         observers: observers.clone(),
         stop: stop.clone(),
         config_path: path,
-        tokio: handle,
+        tokio: handle.clone(),
     };
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
@@ -129,6 +130,9 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     // the current paused state; start with the live value so the
     // first render is correct.
     let initial_paused = paused.load(std::sync::atomic::Ordering::SeqCst);
+    // The Linux (ksni) tray backend runs on the tokio runtime; hand it
+    // a runtime handle so it can spawn its zbus service.
+    let tokio_for_tray = handle.clone();
 
     eframe::run_native(
         "studio-worker",
@@ -143,20 +147,23 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
             );
             let quit_handle = app.quit_requested_handle();
 
-            // Best-effort tray icon.  On Linux without a running
-            // app-indicator host (e.g. an X session with no system
-            // tray) `build()` returns Err; we keep the UI usable
-            // without a tray rather than aborting startup.
-            let tray_state = install_tray(
+            // Best-effort tray.  Linux uses ksni (pure Rust); macOS /
+            // Windows use tray-icon.  Either may be unavailable (no
+            // StatusNotifier host, no system tray) — the window UI keeps
+            // working without it rather than aborting startup.
+            let tray_handle = tray_host::install(
                 cc.egui_ctx.clone(),
                 paused.clone(),
                 quit_handle,
+                tokio_for_tray,
                 initial_paused,
             );
             // Stash the tray inside the App so it lives as long as the
             // event loop (dropping it removes the icon).
             let mut app = app;
-            app.attach_tray(tray_state);
+            if let Some(tray) = tray_handle {
+                app.attach_tray(tray);
+            }
             Ok(Box::new(app))
         }),
     )
@@ -165,191 +172,6 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     // Signal loops to wind down once the window closes.
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
-}
-
-/// State the App keeps for the lifetime of the tray.  The tray icon
-/// must be retained — dropping it removes the icon from the system
-/// bar.
-pub struct TrayState {
-    pub icon: Option<tray_icon::TrayIcon>,
-    pub current_variant: tray::TrayVariant,
-    pub menu_ids: TrayMenuIds,
-}
-
-#[derive(Debug, Clone)]
-pub struct TrayMenuIds {
-    pub open_window: tray_icon::menu::MenuId,
-    pub toggle_auto: tray_icon::menu::MenuId,
-    pub quit: tray_icon::menu::MenuId,
-}
-
-fn install_tray(
-    ctx: eframe::egui::Context,
-    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    quit_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    initial_paused: bool,
-) -> TrayState {
-    use tray_icon::menu::{MenuEvent, MenuId};
-
-    let open_id = MenuId::new(tray::menu_ids::OPEN_WINDOW);
-    let toggle_id = MenuId::new(tray::menu_ids::TOGGLE_AUTO);
-    let quit_id = MenuId::new(tray::menu_ids::QUIT);
-
-    // Linux: tray-icon's AppIndicator backend needs GTK initialised on
-    // the same thread that runs its main loop.  We spawn a dedicated
-    // thread for that, build the TrayIcon there, and let it run
-    // `gtk::main()` until process shutdown.  The TrayIcon handle
-    // stays in that thread's stack; updating the icon variant from
-    // the main thread would race so we skip that for now (variant
-    // changes still drive the in-window Status badge).
-    //
-    // macOS / Windows: tray-icon must be built on the main thread
-    // that owns the winit event loop.  We do that inline.
-    let labels = tray::menu_labels(initial_paused);
-    let open_label = labels.open_window;
-    let toggle_label = labels.toggle_auto.clone();
-    let quit_label = labels.quit;
-
-    let tray_holder = spawn_tray_thread(
-        open_id.clone(),
-        toggle_id.clone(),
-        quit_id.clone(),
-        open_label,
-        toggle_label,
-        quit_label,
-    );
-
-    // Forward muda menu events to the app via the channels the tray
-    // icon crate exposes globally.  Poll on a background thread to
-    // request a repaint and route the click.
-    let ctx_clone = ctx.clone();
-    let paused_clone = paused.clone();
-    let open_for_thread = open_id.clone();
-    let toggle_for_thread = toggle_id.clone();
-    let quit_for_thread = quit_id.clone();
-    std::thread::spawn(move || {
-        let rx = MenuEvent::receiver();
-        while let Ok(event) = rx.recv() {
-            if event.id == open_for_thread {
-                tracing::info!(
-                    target: "studio_worker::ui::tray",
-                    "open window requested from tray menu"
-                );
-                ctx_clone.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(true));
-                ctx_clone.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
-            } else if event.id == toggle_for_thread {
-                let was_paused = paused_clone.fetch_xor(true, std::sync::atomic::Ordering::SeqCst);
-                tracing::info!(
-                    target: "studio_worker::ui::tray",
-                    paused = !was_paused,
-                    "pause toggled from tray menu"
-                );
-            } else if event.id == quit_for_thread {
-                tracing::info!(
-                    target: "studio_worker::ui::tray",
-                    "quit requested from tray menu; stopping worker"
-                );
-                quit_requested.store(true, std::sync::atomic::Ordering::SeqCst);
-                ctx_clone.request_repaint();
-            }
-            ctx_clone.request_repaint();
-        }
-    });
-
-    TrayState {
-        icon: tray_holder,
-        current_variant: tray::TrayVariant::Disconnected,
-        menu_ids: TrayMenuIds {
-            open_window: open_id,
-            toggle_auto: toggle_id,
-            quit: quit_id,
-        },
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn spawn_tray_thread(
-    open_id: tray_icon::menu::MenuId,
-    toggle_id: tray_icon::menu::MenuId,
-    quit_id: tray_icon::menu::MenuId,
-    open_label: &'static str,
-    toggle_label: String,
-    quit_label: &'static str,
-) -> Option<tray_icon::TrayIcon> {
-    use tray_icon::menu::{Menu, MenuItem};
-    use tray_icon::{Icon, TrayIconBuilder};
-
-    std::thread::spawn(move || {
-        if let Err(e) = gtk::init() {
-            tracing::warn!(
-                target: "studio_worker::ui::tray",
-                "gtk init failed: {e}"
-            );
-            return;
-        }
-        let menu = Menu::new();
-        let open_item = MenuItem::with_id(open_id, open_label, true, None);
-        let toggle_item = MenuItem::with_id(toggle_id, &toggle_label, true, None);
-        let quit_item = MenuItem::with_id(quit_id, quit_label, true, None);
-        let _ = menu.append(&open_item);
-        let _ = menu.append(&toggle_item);
-        let _ = menu.append(&quit_item);
-        let variant = tray::TrayVariant::Disconnected;
-        let icon = Icon::from_rgba(variant.rgba_16(), 16, 16).ok();
-        let mut builder = TrayIconBuilder::new()
-            .with_tooltip(variant.tooltip())
-            .with_menu(Box::new(menu));
-        if let Some(i) = icon {
-            builder = builder.with_icon(i);
-        }
-        let _tray = match builder.build() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(
-                    target: "studio_worker::ui::tray",
-                    "tray build failed: {e}"
-                );
-                return;
-            }
-        };
-        // Block this thread on gtk's main loop so the tray stays
-        // alive + AppIndicator events get serviced.
-        gtk::main();
-    });
-    // Linux: handle stays on the gtk thread; the main thread can't
-    // mutate the icon (would race).  We track variant changes for
-    // the in-window status badge instead.
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn spawn_tray_thread(
-    open_id: tray_icon::menu::MenuId,
-    toggle_id: tray_icon::menu::MenuId,
-    quit_id: tray_icon::menu::MenuId,
-    open_label: &'static str,
-    toggle_label: String,
-    quit_label: &'static str,
-) -> Option<tray_icon::TrayIcon> {
-    use tray_icon::menu::{Menu, MenuItem};
-    use tray_icon::{Icon, TrayIconBuilder};
-
-    let menu = Menu::new();
-    let open_item = MenuItem::with_id(open_id, open_label, true, None);
-    let toggle_item = MenuItem::with_id(toggle_id, &toggle_label, true, None);
-    let quit_item = MenuItem::with_id(quit_id, quit_label, true, None);
-    let _ = menu.append(&open_item);
-    let _ = menu.append(&toggle_item);
-    let _ = menu.append(&quit_item);
-    let variant = tray::TrayVariant::Disconnected;
-    let icon = Icon::from_rgba(variant.rgba_16(), 16, 16).ok();
-    let mut builder = TrayIconBuilder::new()
-        .with_tooltip(variant.tooltip())
-        .with_menu(Box::new(menu));
-    if let Some(i) = icon {
-        builder = builder.with_icon(i);
-    }
-    builder.build().ok()
 }
 
 /// Decide where to place the window on launch.

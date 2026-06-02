@@ -21,7 +21,18 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
+# rustls instead of the default native-tls so a source build needs no
+# OpenSSL dev headers on Linux (`cargo install studio-worker` must work
+# on a bare box).  webpki-roots ships a baked CA bundle so we don't
+# depend on the host trust store either.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "multipart",
+    "rustls-tls-webpki-roots",
+    "charset",
+    "http2",
+] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 hostname = "0.4"
 whoami = "1.5"
@@ -35,7 +46,14 @@ image = { version = "0.25", default-features = false, features = ["png", "webp"]
 directories = "5.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sentry = "0.48"
+# rustls transport so Sentry doesn't drag OpenSSL into the build either.
+sentry = { version = "0.48", default-features = false, features = [
+    "backtrace",
+    "contexts",
+    "panic",
+    "reqwest",
+    "rustls",
+] }
 sentry-tracing = "0.48"
 parking_lot = "0.12"
 url = "2.5"
@@ -72,17 +90,28 @@ eframe = { version = "0.34", optional = true, default-features = false, features
     "wayland",
     "x11",
 ] }
-tray-icon = { version = "0.24", optional = true }
 notify-rust = { version = "4", optional = true }
 rfd = { version = "0.15", optional = true, default-features = false, features = ["xdg-portal", "tokio"] }
-# tray-icon on Linux needs gtk::init() called on the same thread that
-# runs its event loop; pulling gtk in directly is the cleanest way to
-# call into that.  Non-Linux targets don't need it.
+
+# System tray, split per-OS so the Linux build stays free of GTK / cairo
+# / appindicator (the pkg-config pain that broke `cargo install` on a
+# bare box):
+#   * macOS / Windows use `tray-icon` (native APIs, zero system deps).
+#   * Linux uses `ksni` (pure-Rust StatusNotifierItem over zbus, no GTK).
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tray-icon = { version = "0.24", optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
-gtk = { version = "0.18", optional = true }
+ksni = { version = "0.3", optional = true }
+
+# Real autostart-on-login on Windows is an HKCU \Run registry value.
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = { version = "0.52", optional = true }
 
 [features]
-default = []
+# UI on by default: `cargo install studio-worker` is windowed + tray and
+# builds on a bare Linux box (rustls, no GTK, dlopen GL — no pkg-config).
+default = ["ui"]
 llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
 whisper = ["dep:whisper-rs"]
 image-candle = [
@@ -99,16 +128,24 @@ tts = []
 ui = [
     "dep:egui",
     "dep:eframe",
-    "dep:tray-icon",
     "dep:notify-rust",
-    "dep:gtk",
     "dep:rfd",
+    # Per-OS tray backends (cargo activates the dep only on its target).
+    "dep:tray-icon",
+    "dep:ksni",
+    # Real Windows autostart registry entry.
+    "dep:winreg",
 ]
 # Convenience bundles.  llama and whisper both statically link ggml.cpp,
 # which currently can't coexist in the same binary on Linux (duplicate
 # symbols).  Pick one bundle per build.
 all-engines-llm = ["llama", "image-candle", "video", "tts"]
 all-engines-stt = ["whisper", "image-candle", "video", "tts"]
+# Fully-loaded source build: UI + every backend that can coexist in one
+# binary (llama in-process + candle image + media).  whisper is excluded
+# — it static-links a second ggml that clashes with llama's.  This is the
+# feature set the cargo-dist release binaries are built with.
+all = ["ui", "llama", "image-candle", "video", "tts"]
 
 [dev-dependencies]
 wiremock = "0.6"
