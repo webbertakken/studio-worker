@@ -79,6 +79,8 @@ pub mod download;
 #[cfg(all(feature = "llama", not(target_os = "windows")))]
 pub mod llama;
 pub mod multi;
+#[cfg(feature = "image-onnx")]
+pub mod onnx;
 pub mod sd_provision;
 pub mod sdcpp;
 #[cfg(feature = "tts")]
@@ -133,6 +135,14 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
         )));
         #[cfg(feature = "image-candle")]
         v.push(Box::new(candle_image::CandleImageEngine::new()));
+        // ONNX-runtime image engine (LaMa object removal).  Registered
+        // ahead of sdcpp so onnx-engine model offers route here; the
+        // model file (a single .onnx) is downloaded on first use into
+        // `<models_root>`.
+        #[cfg(feature = "image-onnx")]
+        v.push(Box::new(onnx::OnnxImageEngine::new(
+            cfg.models_root.clone(),
+        )));
         #[cfg(feature = "video")]
         v.push(Box::new(video::VideoEngine::new()));
         #[cfg(feature = "tts")]

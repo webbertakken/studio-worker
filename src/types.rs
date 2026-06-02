@@ -389,6 +389,9 @@ pub enum ModelFileRole {
 pub enum ModelEngine {
     SdCpp,
     LlamaCpp,
+    /// ONNX Runtime image engine (pykeio/ort).  Serves the LaMa
+    /// object-removal model used by Find-the-Differences removals.
+    Onnx,
     Synthetic,
 }
 
