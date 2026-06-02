@@ -182,6 +182,7 @@ Repo secrets required:
 
 ## Rules
 
+- For this repo feel free to push, make PRs and merge them at will.
 - Public repo — never commit secrets, internal URLs, or non-public
   customer identifiers.
 - All tests must run in GitHub Actions free-tier — no GPU, no real
