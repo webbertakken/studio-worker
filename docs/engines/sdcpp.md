@@ -60,17 +60,45 @@ download on demand.
 Implemented in [`src/engine/sd_provision.rs`](../../src/engine/sd_provision.rs).
 On the first image job with no resolvable `sd-cli`, the engine:
 
-1. Downloads the pinned upstream release zip for this platform - the
-   **Vulkan** build (universal across NVIDIA / AMD / Intel, ~37 MB):
-   `win-vulkan-x64` / `Linux-Ubuntu-24.04-x86_64-vulkan` /
-   `Darwin-macOS-15.7.7-arm64`.
-2. Extracts `sd-cli`(`.exe`), `sd-server`, and the shared library
+1. Downloads the pinned prebuilt zip for this platform (see the matrix
+   below), routed to upstream or our own release via `AssetSource`.
+2. Extracts `sd-cli`(`.exe`) + the shared library
    (`stable-diffusion.dll` / `libstable-diffusion.so` / `.dylib`)
    flat into `<models_root>/bin/` (the path-free slot the resolver
    prefers).  Flattening to bare file names also defuses zip-slip.
 3. On Linux / macOS the per-job `Command` gets `LD_LIBRARY_PATH` /
    `DYLD_LIBRARY_PATH` pointed at that dir so the loader finds the
    sibling library; Windows resolves sibling DLLs automatically.
+
+### Platform matrix
+
+Every release target can auto-provision out of the box:
+
+| Target | Backend | Asset source |
+|---|---|---|
+| Windows x64 | Vulkan | upstream `win-vulkan-x64` |
+| Linux x64 | Vulkan | upstream `Linux-Ubuntu-24.04-x86_64-vulkan` |
+| macOS arm64 | Metal | upstream `Darwin-macOS-15.7.7-arm64` |
+| macOS x64 (Intel) | Metal | upstream `Darwin-…-arm64` — it's a **universal2** binary |
+| Linux arm64 | Vulkan | **our** `sdcpp-prebuilt-<ref>` release (see below) |
+
+Upstream ships no aarch64-Linux build, so
+[`.github/workflows/sdcpp-prebuilt.yml`](../../.github/workflows/sdcpp-prebuilt.yml)
+builds `sd-cli` (Vulkan, shared lib) on a native `ubuntu-24.04-arm`
+runner at the same pinned sd.cpp commit, smoke-tests it, and publishes a
+`sdcpp-prebuilt-<ref>` release the provisioner downloads from.  Re-run
+it (manual dispatch) whenever `DEFAULT_RELEASE_TAG` is bumped.
+
+### GPU runtime requirement (Vulkan)
+
+The Vulkan builds need the Vulkan **loader** on the box:
+`libvulkan.so.1` (Linux) or `vulkan-1.dll` (Windows).  Windows GPU
+drivers ship it; on Linux install `libvulkan1` + a GPU driver.  We can't
+auto-provision it (it comes with the driver / a system package), so the
+engine **preflights** the loader (via `dlopen`/`LoadLibrary`) before
+spawning sd-cli and, when it's missing, fails the job with the exact
+remedy instead of a cryptic sd-cli crash.  macOS uses Metal, so no
+Vulkan loader is involved there.
 
 Overrides:
 
@@ -80,9 +108,8 @@ Overrides:
 | `STUDIO_WORKER_SDCPP_RELEASE` | A `master-<n>-<sha>` tag to fetch instead of the pinned default |
 | `STUDIO_WORKER_SDCPP_URL` | A full zip URL (air-gapped mirror / tests); skips tag + asset resolution |
 
-Unsupported targets (e.g. Linux arm64, Intel macOS) have no prebuilt
-asset; provisioning errors with a pointer to the manual
-[install playbook](../operations/sd-cli-install.md).
+Targets with no prebuilt at all (e.g. Windows arm64) error with a
+pointer to the manual [install playbook](../operations/sd-cli-install.md).
 
 There is **no** pre-staged model registry on the worker any more.
 The legacy `with_builtin(models_root)` returned a hardcoded

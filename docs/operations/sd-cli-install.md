@@ -13,10 +13,15 @@ there.  A fresh worker - Linux, macOS arm64, or Windows - serves real
 image jobs out of the box with no manual step.  See
 [auto-provisioning](../engines/sdcpp.md#auto-provisioning).
 
+Every release target auto-provisions out of the box — Windows x64,
+Linux x64, macOS arm64 and **Intel** (the upstream Darwin binary is
+universal2), and Linux **arm64** (we build + host that one ourselves;
+see [auto-provisioning](../engines/sdcpp.md#auto-provisioning)).
+
 Use this playbook only when you want to **override** the auto-
 provisioned binary: a CUDA build for maximum NVIDIA throughput, a
-from-source build, an air-gapped mirror, or an unsupported target
-(Linux arm64, Intel macOS) that has no prebuilt Vulkan asset.
+from-source build, an air-gapped mirror, or a target with no prebuilt
+at all (e.g. Windows arm64).
 
 The binary is not bundled into our release artefacts on purpose:
 sd-cpp's pre-built matrix (CUDA / Vulkan / ROCm / Metal / CPU)
@@ -99,6 +104,17 @@ sd-cli -h | head -1
 Pin the URL to a specific `master-N-<sha>` build so re-runs are
 reproducible.  The latest URL is fine for first install; for
 unattended re-installation pick a sha from a known-good release.
+
+## GPU runtime (Vulkan loader)
+
+The Vulkan builds need the Vulkan **loader** present: `libvulkan.so.1`
+(Linux) or `vulkan-1.dll` (Windows).  We can't auto-provision it — it
+ships with the GPU driver (Windows) or a system package + driver
+(Linux).  The engine preflights it and, when missing, fails the job
+with the remedy: on Debian/Ubuntu `sudo apt install libvulkan1
+mesa-vulkan-drivers` (plus the NVIDIA/AMD vendor driver), then verify
+with `vulkaninfo --summary`.  macOS uses Metal — no Vulkan loader
+needed.
 
 ## Resolution order (worker side)
 
