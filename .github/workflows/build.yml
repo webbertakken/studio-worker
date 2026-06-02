@@ -45,10 +45,12 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
   # Validate the fully-loaded release feature set (UI + in-process
-  # llama.cpp + candle image + media) compiles natively on macOS and
+  # llama.cpp + candle image + media) builds natively on macOS and
   # Windows — the two platforms whose llama.cpp build can't be checked
-  # from the Linux dev box.  Linux is already covered by checks.yml's
-  # `all-backends` matrix entry, so it's omitted here to save minutes.
+  # from the Linux dev box.  Built in **release profile** so it links the
+  # same way cargo-dist's release does (the Windows MSVC CRT mismatch in
+  # llama.cpp only surfaces in a release/LTO link, not a dev build).
+  # Linux is already covered by checks.yml's `all-backends` entry.
   build-all-backends:
     name: All backends (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -74,5 +76,5 @@ jobs:
       - name: Ensure cmake
         run: cmake --version
 
-      - name: Build with all backends
-        run: cargo build --features all
+      - name: Build with all backends (release)
+        run: cargo build --release --features all
