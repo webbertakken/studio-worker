@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.1](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.0...studio-worker-v0.4.1) (2026-06-02)
+
+
+### Bug Fixes
+
+* **build:** gate in-process llama.cpp off Windows so the release binaries link (UI + image + media still ship on Windows; Linux/macOS keep the LLM) ([#30](https://github.com/webbertakken/studio-worker/issues/30)) ([d3e446a](https://github.com/webbertakken/studio-worker/commit/d3e446a))
+
+
+### Continuous Integration
+
+* publish to crates.io on release tags so `cargo install studio-worker` tracks the latest release ([#29](https://github.com/webbertakken/studio-worker/issues/29)) ([82f90ed](https://github.com/webbertakken/studio-worker/commit/82f90ed))
+
+## [0.4.0](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.3.0...studio-worker-v0.4.0) (2026-06-02)
+
+
+### Features
+
+* all platforms work out of the box: UI on by default, GTK-free Linux build (rustls + ksni), packaged backends + model auto-download, real Windows autostart ([#25](https://github.com/webbertakken/studio-worker/issues/25)) ([d40600f](https://github.com/webbertakken/studio-worker/commit/d40600f))
+* reference/EDIT mode for instruction editors ([#26](https://github.com/webbertakken/studio-worker/issues/26)) ([e6b6abf](https://github.com/webbertakken/studio-worker/commit/e6b6abf))
+
+
+### Bug Fixes
+
+* **http:** log upload byte size on complete ([#24](https://github.com/webbertakken/studio-worker/issues/24)) ([08846b1](https://github.com/webbertakken/studio-worker/commit/08846b1))
+
 ## [0.3.0](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.2.1...studio-worker-v0.3.0) (2026-05-29)
 
 
