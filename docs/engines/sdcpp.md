@@ -35,19 +35,54 @@ cost; see [Performance](#performance) below).
 
 ## Engine registration
 
-`SdCppEngine::try_new(&cfg.models_root)` runs on every
-`engine::build()`.  It:
+`SdCppEngine::new(&cfg.models_root)` runs on every `engine::build()`
+and **always registers** - it touches no filesystem and never fails.
+Capabilities advertise the image kind with a single sentinel model
+name `"sd-cpp:*"` for informational purposes; selection on the studio
+side is kind-based, not model-based.
 
-1. Resolves `sd-cli` via `$STUDIO_WORKER_SD_CLI` \u2192 `~/.local/bin/sd-cli`
-   \u2192 `$PATH`.  Returns `None` if the binary isn't on the box \u2014 the
-   worker still boots, just without an sd-cpp engine; the studio
-   sees a worker advertising the image kind only if some OTHER image
-   engine compiled in (e.g. `image-candle` feature).
-2. Ensures `cfg.models_root` exists (`std::fs::create_dir_all`).
-3. Returns `Some(SdCppEngine)`.  Capabilities advertise the image
-   kind with a single sentinel model name `"sd-cpp:*"` for
-   informational purposes; selection on the studio side is
-   kind-based, not model-based.
+`sd-cli` is resolved lazily on the **first image job** (cached for the
+worker's lifetime) via `ensure_sd_cli`:
+
+1. A path cached from a previous job (if still a file).
+2. `$STUDIO_WORKER_SD_CLI` -> `<models_root>/bin/sd-cli` ->
+   `~/.local/bin/sd-cli` -> `$PATH` - any operator install wins.
+3. **Auto-provision**: if nothing resolves, download the platform's
+   prebuilt stable-diffusion.cpp Vulkan build and extract it into
+   `<models_root>/bin/` (see [auto-provisioning](#auto-provisioning)).
+
+So a fresh worker - including a Windows prod install - serves real
+image jobs out of the box: the binary and the model weights both
+download on demand.
+
+## Auto-provisioning
+
+Implemented in [`src/engine/sd_provision.rs`](../../src/engine/sd_provision.rs).
+On the first image job with no resolvable `sd-cli`, the engine:
+
+1. Downloads the pinned upstream release zip for this platform - the
+   **Vulkan** build (universal across NVIDIA / AMD / Intel, ~37 MB):
+   `win-vulkan-x64` / `Linux-Ubuntu-24.04-x86_64-vulkan` /
+   `Darwin-macOS-15.7.7-arm64`.
+2. Extracts `sd-cli`(`.exe`), `sd-server`, and the shared library
+   (`stable-diffusion.dll` / `libstable-diffusion.so` / `.dylib`)
+   flat into `<models_root>/bin/` (the path-free slot the resolver
+   prefers).  Flattening to bare file names also defuses zip-slip.
+3. On Linux / macOS the per-job `Command` gets `LD_LIBRARY_PATH` /
+   `DYLD_LIBRARY_PATH` pointed at that dir so the loader finds the
+   sibling library; Windows resolves sibling DLLs automatically.
+
+Overrides:
+
+| Env | Effect |
+|---|---|
+| `STUDIO_WORKER_SD_CLI` | Absolute path to an existing binary; skips provisioning |
+| `STUDIO_WORKER_SDCPP_RELEASE` | A `master-<n>-<sha>` tag to fetch instead of the pinned default |
+| `STUDIO_WORKER_SDCPP_URL` | A full zip URL (air-gapped mirror / tests); skips tag + asset resolution |
+
+Unsupported targets (e.g. Linux arm64, Intel macOS) have no prebuilt
+asset; provisioning errors with a pointer to the manual
+[install playbook](../operations/sd-cli-install.md).
 
 There is **no** pre-staged model registry on the worker any more.
 The legacy `with_builtin(models_root)` returned a hardcoded

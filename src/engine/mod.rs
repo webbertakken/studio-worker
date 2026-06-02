@@ -27,9 +27,10 @@ const TRACE_TARGET_BUILD: &str = "studio_worker::engine";
 
 /// Emit a one-line breadcrumb naming the backends this worker will
 /// route across.  Lets an operator confirm from the logs which engines
-/// actually registered — e.g. whether the sdcpp backend self-registered
-/// or was skipped for a missing `sd-cli` — instead of inferring it from
-/// the advertised model list.  Split out from [`build`] so the
+/// actually registered — e.g. which optional cargo-feature backends
+/// (llama / whisper / candle / video / tts) compiled in — instead of
+/// inferring it from the advertised model list.  (sdcpp + synthetic
+/// always register; sdcpp auto-provisions `sd-cli` on first use.)  Split out from [`build`] so the
 /// breadcrumb's shape is unit-tested against a controlled roster.
 fn log_engine_roster(engines: &[Box<dyn Engine>]) {
     let names: Vec<&str> = engines.iter().map(|e| e.name()).collect();
@@ -78,6 +79,7 @@ pub mod download;
 #[cfg(all(feature = "llama", not(target_os = "windows")))]
 pub mod llama;
 pub mod multi;
+pub mod sd_provision;
 pub mod sdcpp;
 #[cfg(feature = "tts")]
 pub mod tts;
@@ -135,14 +137,12 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
         v.push(Box::new(video::VideoEngine::new()));
         #[cfg(feature = "tts")]
         v.push(Box::new(tts::TtsEngine::new()));
-        // stable-diffusion.cpp-backed image engine.  Self-registers
-        // only when both the `sd-cli` binary is on the box AND at
-        // least one model's component files are present under
-        // `cfg.models_root`.  Skipped silently otherwise so CI builds
-        // (no sd-cli, no models) stay green.
-        if let Some(eng) = sdcpp::SdCppEngine::try_new(&cfg.models_root) {
-            v.push(Box::new(eng));
-        }
+        // stable-diffusion.cpp-backed image engine.  Registers
+        // unconditionally now: `sd-cli` is auto-provisioned into
+        // `<models_root>/bin/` on the first image job when it isn't
+        // already resolvable, so a fresh worker serves real image jobs
+        // out of the box.
+        v.push(Box::new(sdcpp::SdCppEngine::new(&cfg.models_root)));
         v.push(Box::new(SyntheticEngine::new()));
         v
     };
@@ -566,8 +566,7 @@ mod tests {
         // operator debugging "why won't it serve my real model?" can't
         // tell from the logs whether the expected engine registered or
         // was skipped.  Environment-tolerant: the synthetic engine is
-        // always last, so we assert on it without pinning the count
-        // (sdcpp self-registers only when `sd-cli` + models are present).
+        // always last, so we assert on it without pinning the count.
         let logs = crate::test_support::capture(|| {
             let cfg = crate::config::Config::default();
             let _ = build(&cfg).unwrap();

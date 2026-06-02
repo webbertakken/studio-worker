@@ -426,9 +426,8 @@ async fn run_one_session(
 
     // Heartbeat task.  Reuse the engine we already built for the
     // Hello frame instead of rebuilding it on every heartbeat —
-    // rebuilding fires every engine's `try_new` / registration log
-    // every 5s, floods the logs, and (for real engines like sd-cpp)
-    // walks the disk to re-check model presence.
+    // rebuilding fires every engine's registration log every 5s and
+    // floods the logs.
     let capabilities_for_heartbeat = capabilities.clone();
     let heartbeat = spawn_heartbeat_pump(
         capabilities_for_heartbeat,
