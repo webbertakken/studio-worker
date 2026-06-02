@@ -37,22 +37,26 @@ CI.
 - **tokio-tungstenite** (rustls-tls-webpki-roots) — WebSocket session to the
   studio `WorkerConnections` Durable Object; carries every worker-side
   frame except the multipart `complete` upload
-- **reqwest** (blocking) — HTTP client for the surviving `/register` +
-  multipart `/complete` routes
+- **reqwest** (blocking, rustls) — HTTP client for the surviving
+  `/register` + multipart `/complete` routes and model downloads. rustls
+  (not native-tls) so a source build needs no OpenSSL.
+- **sentry** (rustls transport) — opt-in error reporting, also OpenSSL-free.
 - **futures-util** — sink/stream combinators for the WS split
 - **thiserror** — typed errors on the WS client surface
 - **serde / serde_json / toml** — wire-format + config persistence
 - **image** — encode synthetic WEBP/PNG output
 - **wiremock** — test-only mock HTTP server for integration tests
 - **tracing / tracing-subscriber** — structured logging
-- **egui / eframe** (`ui` feature, off by default) — native desktop
+- **egui / eframe** (`ui` feature, **on by default**) — native desktop
   UI with tab shell, in-window register form, live job + heartbeat
-  view, full config editor, log tail, manual update check
-- **tray-icon / notify-rust** (`ui` feature, off by default) — system
-  tray icon with Open / Pause-Resume / Quit menu + opt-in OS-native
-  desktop notifications on job completion / failure
-- **gtk** (`ui` feature, Linux only) — needed for `gtk::init()` on a
-  dedicated thread so the tray's AppIndicator backend works
+  view, full config editor, log tail, manual update check. glow/dlopen
+  GL so the build needs no pkg-config / GTK.
+- **notify-rust** (`ui`) — OS-native desktop notifications (zbus on
+  Linux, pure Rust; no libdbus).
+- **System tray** (`ui`): **ksni** (pure-Rust StatusNotifierItem) on
+  Linux — no GTK; **tray-icon** (native) on macOS / Windows. Abstracted
+  by `src/ui/tray_host.rs`.
+- **winreg** (Windows only) — real HKCU `…\Run` autostart entry.
 
 ## Project layout
 
@@ -70,11 +74,14 @@ CI.
   `sentry-tracing` layer.  Off unless `SENTRY_DSN` is set.
 - `src/update.rs` — auto-update: poll GitHub Releases, download
   cargo-dist's installer on a newer semver, re-exec into it.
-- `src/autostart.rs` — per-OS autostart-on-login artefacts for the
-  tray UI (`.desktop` / LaunchAgent / `%LOCALAPPDATA%` marker).
+- `src/autostart.rs` — per-OS autostart-on-login: Linux `.desktop`,
+  macOS LaunchAgent, Windows HKCU `…\Run` registry value (winreg).
+  `ui::run` reconciles it with `auto_start` on launch.
 - `src/engine/` — pluggable inference engines (`SyntheticEngine` +
   `MultiEngine` dispatcher, `SdCppEngine`, plus feature-gated `llama`
-  / `whisper` / `image-candle` / `video` / `tts` backends).
+  / `whisper` / `image-candle` / `video` / `tts` backends). Shared
+  on-demand model provisioning lives in `src/engine/download.rs`
+  (cache + Content-Length verify + path-traversal guard).
 - `src/http.rs` — `ApiClient` wrapping the surviving HTTP routes
   (`register` + multipart `complete`).
 - `src/runtime.rs` — CLI helpers + auto-updater loop.  The session
@@ -137,6 +144,8 @@ Engines + multi-modal:
   synthetic engine + decoders.
 - `tests/engine_tracing.rs` — every engine emits tracing on dispatch
   and on its key failure paths.
+- `tests/engine_download.rs` — the shared model downloader against a
+  wiremock server (happy path, non-2xx, cache reuse).
 
 Telemetry + host-probe tracing:
 

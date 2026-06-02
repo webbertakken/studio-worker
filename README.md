@@ -45,20 +45,24 @@ what the unattended CI suite uses.  Real high-performance backends
 feature flags and are deferred to a follow-up iteration (the trait,
 contract, and dispatch are already in place).
 
-## Desktop UI (optional)
+## Desktop UI (on by default)
 
-The worker also ships a native desktop window built on `egui`/`eframe`
-that surfaces every config knob, the live job in flight, the
-recent-jobs history, the rolling log tail, and a system-tray icon
-with Open / Pause-Resume / Quit.  Disabled by default so the headless
-`cargo install` + the systemd / launchd service path stay free of GL
-/ winit / dbus / GTK deps.
+The worker ships a native desktop window built on `egui`/`eframe` that
+surfaces every config knob, the live job in flight, the recent-jobs
+history, the rolling log tail, and a system-tray icon with Open /
+Pause-Resume / Quit.  It is **on by default** — `cargo install
+studio-worker` gives you the windowed worker, and `studio-worker ui`
+launches it.
 
-Enable with the `ui` cargo feature:
+The UI build is free of GTK: the window uses `eframe`/`glow` (OpenGL via
+dlopen), notifications use `notify-rust` (pure-Rust zbus on Linux), and
+the system tray uses `ksni` (pure-Rust StatusNotifierItem) on Linux and
+the native `tray-icon` APIs on macOS / Windows.  So a source build needs
+**no `pkg-config`, no `-dev` packages, and no OpenSSL** (reqwest +
+sentry use rustls).  Headless rigs can still opt out:
 
 ```bash
-cargo install studio-worker --features ui
-studio-worker ui
+cargo install studio-worker --no-default-features   # service / `run` only
 ```
 
 Five tabs:
@@ -87,39 +91,18 @@ For an autostart-on-login workflow, tick the **Run in tray on login**
 toggle on the Config tab (writes `~/.config/autostart/studio-worker-ui.desktop`
 on Linux, a LaunchAgent plist on macOS, a marker file on Windows).
 
-### Linux build-time deps
+### Build-time deps
 
-The tray + notifications stack pulls in GTK + D-Bus.  On a fresh
-Ubuntu / Debian box install:
+None for the UI itself on any platform — that's the point of the
+GTK-free stack above (no `pkg-config`, no `cairo`/`gtk` `-dev`
+packages, no OpenSSL).  A standard Rust toolchain is enough.
 
-```bash
-sudo apt-get install -y \
-  libgtk-3-dev \
-  libdbus-1-dev \
-  libxdo-dev \
-  libayatana-appindicator3-dev
-```
-
-For the unattended `ui` builds in CI the same packages are installed
-by `.github/workflows/checks.yml` before `cargo test --features ui`.
-No extra deps are required on macOS / Windows.
-
-#### If you have Linuxbrew installed
-
-Linuxbrew ships its own `pkg-config` ahead of the system one on
-`PATH`.  Its default search path doesn't include
-`/usr/lib/x86_64-linux-gnu/pkgconfig`, so the GTK `.pc` files
-installed by `apt` above are invisible and the build dies with
-`Package cairo was not found`.  Either point `pkg-config` at the
-system paths for the install:
-
-```bash
-PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
-  cargo install studio-worker --features ui
-```
-
-or put `/usr/bin` ahead of Linuxbrew on `PATH` so the system
-`pkgconf` wins.  Pure-apt boxes without Linuxbrew don't need this.
+The **all-backends** build (`--features all`, used for the release
+binaries) additionally compiles `llama.cpp` in-process, which needs
+`cmake` + a C/C++ toolchain.  The release runners install `cmake`
+automatically (cargo-dist system dependency); for a local
+`cargo install studio-worker --features all` make sure `cmake` and a
+C++ compiler are on `PATH`.
 
 ## Quick install
 
@@ -139,8 +122,17 @@ irm https://github.com/webbertakken/studio-worker/releases/latest/download/studi
 ### From cargo
 
 ```bash
-cargo install studio-worker
+cargo install studio-worker              # windowed UI by default
+cargo install studio-worker --features all   # + in-process llama.cpp + media (needs cmake)
+cargo install studio-worker --no-default-features  # headless service build
 ```
+
+The **install script is the turnkey path**: its pre-built binaries
+already bundle the UI **and** every backend (in-process llama.cpp LLM +
+media engines), auto-start on login, auto-update, and auto-download
+models on demand — nothing else to install.  `cargo install
+studio-worker` from source is UI-first but ships only the synthetic
+engine unless you add `--features all` (which needs a C/C++ toolchain).
 
 Each release ships pre-built binaries for:
 
@@ -194,7 +186,7 @@ studio-worker register --reset
 | Subcommand           | Purpose                                                         |
 | -------------------- | --------------------------------------------------------------- |
 | `run`                | Auto-register if needed, then hold the WS session + auto-update loop. |
-| `ui` (feature `ui`)  | Same as `run` plus the desktop window + tray + notifications.   |
+| `ui` (default)       | Same as `run` plus the desktop window + tray + notifications. Built unless installed with `--no-default-features`. |
 | `register`           | Persist `--label` / `--api-base-url`; `--reset` clears local state. |
 | `status`             | Print the local config + registration state.                    |
 | `install-service`    | Install the auto-start OS service.                              |
@@ -290,9 +282,23 @@ incoming job to the first backend that supports its `(kind, model)` pair
   subprocess.  Self-registers only when the `sd-cli` binary and at least
   one model's files are present under `models_root`.  See
   [`docs/engines/sdcpp.md`](docs/engines/sdcpp.md).
-- **feature-gated heavyweights** — `llama`, `whisper`, `image-candle`,
-  `video`, `tts` drop in via the same trait when their cargo feature is
-  enabled.
+- **`llama`** — real LLM inference via `llama.cpp` linked in-process
+  (`llama-cpp-2`).  Shipped in the release binaries (and any
+  `--features all` / `--features llama` build); downloads the GGUF named
+  by the offer's `ModelSource` into `<models_root>/llm/` on demand and
+  advertises the `llama-cpp:*` wildcard so a fresh worker is claimable.
+- **feature-gated heavyweights** — `whisper` (STT), `image-candle`
+  (pure-Rust SD), `video`, `tts` drop in via the same trait when their
+  cargo feature is enabled.  `whisper` and `llama` each static-link
+  their own `ggml`, which can't coexist in one binary, so `whisper`
+  ships in its own bundle (`all-engines-stt`); the all-backends release
+  pairs `llama` (in-process) with `sd-cli` (subprocess) to sidestep the
+  clash.
+
+When the studio offers a model whose engine isn't compiled into the
+worker, the job fails loudly with an actionable message (install the
+all-backends release, or rebuild with `--features all`) rather than
+silently producing placeholder bytes.
 
 ### Adding a real engine
 
@@ -369,18 +375,25 @@ purely for error/crash visibility.
 ## Development
 
 ```bash
-cargo test           # 169 unit + integration tests
+cargo test                              # default (UI) build
+cargo test --no-default-features        # headless core
+cargo test --features all               # + llama.cpp + candle (needs cmake)
 cargo clippy --tests -- -D warnings
 cargo fmt --check
-cargo llvm-cov --workspace \
-  --ignore-filename-regex 'src/main\.rs$' \
+# Coverage gates the headless core (UI rendering isn't unit-testable):
+cargo llvm-cov --workspace --no-default-features \
+  --ignore-filename-regex 'src/main\.rs$|src/engine/sdcpp\.rs$|src/ws/session\.rs$' \
   --summary-only
 ```
 
-Coverage CI enforces **≥ 90% line coverage**; current is **93.45%**.
+Coverage CI enforces **≥ 90% line coverage** on the headless core.
 Truly-untestable bits excluded from the gate:
 
 - `src/main.rs` — the CLI bootstrap (all logic lives in `lib.rs`).
+- `src/engine/sdcpp.rs`, `src/ws/session.rs` — subprocess / live-socket
+  paths exercised by the dev loop, not unit tests.
+- the `ui` feature (egui rendering + OS tray glue) — not unit-testable;
+  excluded by gating coverage on `--no-default-features`.
 - `update::RealRunner::{download, run_installer}` — real network +
   process spawn (tested through the `UpdateRunner` trait with a fake).
 - `update::restart_self` — calls `execvp`, never returns.

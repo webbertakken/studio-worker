@@ -30,14 +30,16 @@ Wrapper script:
 #!/usr/bin/env bash
 set -euo pipefail
 cd /home/webber/Repositories/studio-worker
-export PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
 export RUST_LOG="${RUST_LOG:-studio_worker=debug,info}"
 export RUST_BACKTRACE=1
 export DISPLAY="${DISPLAY:-:0}"
 exec cargo watch \
   --why -w src -w Cargo.toml -w Cargo.lock -i target \
-  -x 'run --features ui -- ui'
+  -x 'run -- ui'
 ```
+
+(The UI is the default build now — no `--features ui` and no
+`PKG_CONFIG_PATH` dance: the GTK-free stack needs neither.)
 
 `cargo-watch` rebuilds + restarts the worker on every source change.
 Great for iterating on Rust code.  **Terrible** for letting a
@@ -57,7 +59,6 @@ Wrapper script:
 #!/usr/bin/env bash
 set -euo pipefail
 cd /home/webber/Repositories/studio-worker
-export PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
 export RUST_LOG="${RUST_LOG:-studio_worker=info,warn}"
 export RUST_BACKTRACE=1
 export DISPLAY="${DISPLAY:-:0}"
@@ -65,7 +66,7 @@ exec ./target/debug/studio-worker ui
 ```
 
 No `cargo watch`.  Runs the binary you've already built with
-`cargo build --features ui`.  Source-tree edits don't restart it.
+`cargo build` (UI is default).  Source-tree edits don't restart it.
 This is what you want when:
 
 - You need the worker to complete a multi-hour batch (e.g. the
@@ -87,10 +88,12 @@ This is what you want when:
   `pgrep -af`, `kill <pid>` directly.
 - **`PKG_CONFIG_PATH` on Linuxbrew machines**.  If `/home/linuxbrew/.linuxbrew/bin/pkg-config`
   is first on PATH it can't see system `.pc` files (cairo, gtk-3),
-  and `cargo build --features ui` fails.  Export
-  `PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig`
-  before invoking cargo \u2014 the wrappers above do that.
-- **DISPLAY**.  The `ui` feature needs an X server.  Export
+  and the UI build fails.  This is no longer needed — the UI stack is
+  GTK-free (eframe/glow via dlopen, ksni tray, rustls), so the
+  Linuxbrew `pkg-config` ordering doesn't matter.  For the in-process
+  llama.cpp backend (`--features all`) you only need `cmake` + a C/C++
+  compiler on PATH.
+- **DISPLAY**.  The UI needs an X server.  Export
   `DISPLAY=:0` (or your session's display).  Headless workers run
   `studio-worker run` instead of `ui`; same wrapper minus the
   `ui` arg and the DISPLAY export.

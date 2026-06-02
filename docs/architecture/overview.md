@@ -577,12 +577,14 @@ Closing the window hides to the tray; loops keep running.  Quit comes
 from the tray menu (signals `stop`, awaits in-flight job up to ~5s,
 then exits).
 
-**Linux specifics**: tray-icon's AppIndicator backend panics if
-constructed from the eframe main thread.  We spawn a dedicated thread
-that calls `gtk::init()` + `gtk::main()` and constructs the
-TrayIcon inside it; menu events come back through muda's global
-`MenuEvent::receiver()` channel.  Documented in
-[`LESSONS_LEARNED.md`](../../LESSONS_LEARNED.md).
+**Per-OS backends** ([`src/ui/tray_host.rs`](../../src/ui/tray_host.rs)):
+Linux uses **ksni** (pure-Rust StatusNotifierItem over zbus) so the
+build needs no GTK; the tray runs on the tokio runtime and the menu
+`activate` callbacks drive the shared `paused` / `quit` flags + an
+egui repaint.  macOS / Windows use **tray-icon** (native APIs), built
+on the eframe main thread, with menu events arriving through muda's
+global `MenuEvent::receiver()` channel.  Either backend is
+best-effort — the window UI works without a tray.
 
 ### Notifications
 
