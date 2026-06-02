@@ -29,9 +29,11 @@
 //! to synthetic for any kind it doesn't have a real backend for.
 
 use crate::engine::download;
+use crate::engine::sd_provision;
 use crate::engine::{Engine, EngineCapabilities};
 use crate::types::{ImageParams, ModelFileRole, ModelSource, Task, TaskKind, TaskResult};
 use anyhow::{anyhow, bail, Context, Result};
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -48,63 +50,77 @@ const TRACE_TARGET: &str = "studio_worker::engine::sdcpp";
 const STEPS_FALLBACK: u32 = 8;
 
 /// Worker-side engine that drives `sd-cli` per job.
+///
+/// `sd-cli` is resolved lazily on the first image job and cached: an
+/// operator install (env / PATH / `~/.local/bin`) wins, otherwise the
+/// binary is auto-provisioned into `<models_root>/bin/`.  The `Mutex`
+/// serialises that one-time resolution so two concurrent jobs can't
+/// race the download.
 pub struct SdCppEngine {
-    sd_cli: PathBuf,
+    sd_cli: Mutex<Option<PathBuf>>,
     models_root: PathBuf,
 }
 
 impl SdCppEngine {
-    /// Try to build the engine; returns `None` if `sd-cli` isn't on
-    /// the box.  The model files come in on the offer so we don't
-    /// need to pre-stage anything.
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn try_new(models_root: &Path) -> Option<Self> {
-        let Some(sd_cli) = resolve_sd_cli(models_root) else {
-            // Image jobs need sd-cli; without it the engine must NOT
-            // register (claiming image jobs it can't run is worse than
-            // not claiming).  Log why, with the remedy, so an operator
-            // wondering "why won't my worker take image jobs" can tell
-            // from the journal instead of from silence.
-            info!(
-                target: TRACE_TARGET,
-                op = "register",
-                models_root = %models_root.display(),
-                sd_cli_name = sd_cli_binary_name(),
-                "sd-cli not found (checked $STUDIO_WORKER_SD_CLI, \
-                 <models_root>/bin, ~/.local/bin, and $PATH); real image \
-                 generation is disabled on this worker until it is \
-                 installed — see docs/operations/sd-cli-install.md"
-            );
-            return None;
-        };
-        if let Err(e) = std::fs::create_dir_all(models_root) {
-            warn!(
-                target: TRACE_TARGET,
-                models_root = %models_root.display(),
-                error = %e,
-                "could not create models_root; skipping sdcpp registration"
-            );
-            return None;
-        }
+    /// Build the engine.  Always registers: `sd-cli` is resolved (and
+    /// provisioned into `<models_root>/bin/` if missing) lazily on the
+    /// first image job, so the engine serves real image work even on a
+    /// box that has never had a stable-diffusion.cpp build installed.
+    /// `models_root` is created on demand by the provisioner / model
+    /// downloader, so registration touches no filesystem.
+    pub fn new(models_root: &Path) -> Self {
         info!(
             target: TRACE_TARGET,
-            sd_cli = %sd_cli.display(),
+            op = "register",
             models_root = %models_root.display(),
-            "sdcpp engine registered"
+            sd_cli_name = sd_provision::binary_name(),
+            "sdcpp engine registered (sd-cli resolved/provisioned on first image job)"
         );
-        Some(Self {
-            sd_cli,
+        Self {
+            sd_cli: Mutex::new(None),
             models_root: models_root.to_path_buf(),
-        })
+        }
     }
 
-    /// For tests: build with explicit paths (bypasses sd-cli lookup).
+    /// For tests: build with explicit paths (bypasses sd-cli lookup +
+    /// provisioning by seeding the resolved-path cache).
     #[cfg(test)]
     pub fn with_paths(sd_cli: PathBuf, models_root: PathBuf) -> Self {
         Self {
-            sd_cli,
+            sd_cli: Mutex::new(Some(sd_cli)),
             models_root,
         }
+    }
+
+    /// Resolve the `sd-cli` binary, provisioning it on first use.
+    /// Resolution order (operator installs win): a cached path from a
+    /// previous job, then env / `<models_root>/bin` / `~/.local/bin` /
+    /// `$PATH`, then an auto-provisioned download into
+    /// `<models_root>/bin/`.  The result is cached for the worker's
+    /// lifetime.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn ensure_sd_cli(&self) -> Result<PathBuf> {
+        let mut guard = self.sd_cli.lock();
+        if let Some(p) = guard.as_ref() {
+            if p.is_file() {
+                return Ok(p.clone());
+            }
+        }
+        let resolved = match resolve_sd_cli(&self.models_root) {
+            Some(p) => {
+                info!(
+                    target: TRACE_TARGET,
+                    op = "resolve",
+                    sd_cli = %p.display(),
+                    "using existing sd-cli"
+                );
+                p
+            }
+            None => sd_provision::provision(&self.models_root)
+                .context("auto-provisioning sd-cli (stable-diffusion.cpp)")?,
+        };
+        *guard = Some(resolved.clone());
+        Ok(resolved)
     }
 
     /// Ensure each file in `source.files` is present under
@@ -132,6 +148,10 @@ impl SdCppEngine {
         params: ImageParams,
         source: &ModelSource,
     ) -> Result<TaskResult> {
+        // Resolve (provisioning on first use) the sd-cli binary before
+        // we touch model files, so a missing binary fails fast with the
+        // provisioning error rather than after a multi-GB weight pull.
+        let sd_cli = self.ensure_sd_cli()?;
         let files = self.ensure_files(source)?;
         // A `diffusion-model` file is the standalone diffusion weights (sd-cli `--diffusion-model`,
         // used with split vae/clip); a `model` file is a full checkpoint (sd-cli `-m`/`--model`).
@@ -224,13 +244,14 @@ impl SdCppEngine {
             ref_img_path.as_deref(),
             full_checkpoint,
         );
-        let mut cmd = Command::new(&self.sd_cli);
+        let mut cmd = Command::new(&sd_cli);
         cmd.args(&args);
+        apply_library_path(&mut cmd, &sd_cli);
 
         debug!(
             target: TRACE_TARGET,
             op = "spawn",
-            sd_cli = %self.sd_cli.display(),
+            sd_cli = %sd_cli.display(),
             model,
             i2i = init_img_path.is_some(),
             arg_count = args.len(),
@@ -240,7 +261,7 @@ impl SdCppEngine {
         let started = Instant::now();
         let output = cmd
             .output()
-            .with_context(|| format!("running {}", self.sd_cli.display()))?;
+            .with_context(|| format!("running {}", sd_cli.display()))?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -554,25 +575,40 @@ fn build_sdcli_args(
     args
 }
 
-/// Platform binary name for stable-diffusion.cpp's CLI.
-fn sd_cli_binary_name() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "sd-cli.exe"
-    } else {
-        "sd-cli"
-    }
+/// Point the per-job `Command`'s dynamic linker at the shared library
+/// that ships next to an auto-provisioned `sd-cli` (Linux / macOS).
+/// No-op on Windows (sibling DLLs resolve automatically) and when the
+/// resolved binary has no sibling library (operator wrapper-script
+/// installs manage their own load path).  Prepends to any inherited
+/// value so a pre-set `LD_LIBRARY_PATH` isn't clobbered.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn apply_library_path(cmd: &mut Command, sd_cli: &Path) {
+    let Some((var, dir)) = sd_provision::library_path_env(sd_cli) else {
+        return;
+    };
+    let value = match std::env::var_os(var) {
+        Some(existing) => {
+            let mut paths = vec![dir.clone()];
+            paths.extend(std::env::split_paths(&existing));
+            // `join_paths` only fails if a path contains the platform
+            // separator; fall back to our dir alone, the entry that
+            // matters for finding the sibling library.
+            std::env::join_paths(paths).unwrap_or_else(|_| dir.into_os_string())
+        }
+        None => dir.into_os_string(),
+    };
+    cmd.env(var, value);
 }
 
 /// Look up `sd-cli` in env override -> `<models_root>/bin` ->
 /// `~/.local/bin` -> `$PATH`.  The `<models_root>/bin` slot is where a
-/// self-provisioned binary lands, so an operator (or a future
-/// auto-provisioner) can drop it next to the cached models and have the
-/// worker pick it up with no PATH fiddling.  Excluded from coverage:
-/// touches several host paths only one of which matches per host, and
-/// CI doesn't ship `sd-cli` at all.
+/// self-provisioned binary lands, so the auto-provisioner can drop it
+/// next to the cached models and have the worker pick it up with no
+/// PATH fiddling.  Excluded from coverage: touches several host paths
+/// only one of which matches per host, and CI doesn't ship `sd-cli`.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn resolve_sd_cli(models_root: &Path) -> Option<PathBuf> {
-    let bin = sd_cli_binary_name();
+    let bin = sd_provision::binary_name();
     if let Ok(p) = std::env::var("STUDIO_WORKER_SD_CLI") {
         let path = PathBuf::from(p);
         if path.is_file() {

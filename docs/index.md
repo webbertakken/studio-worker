@@ -27,14 +27,14 @@ top-level [`README.md`](../README.md).  For active plans, see
 ## Engines
 
 - [sd-cpp engine](engines/sdcpp.md) — real image inference via
-  `stable-diffusion.cpp` as a subprocess.  Per-offer downloads,
-  cached in `cfg.models_root`.
+  `stable-diffusion.cpp` as a subprocess.  Auto-provisions `sd-cli`
+  and downloads model weights on demand, cached in `cfg.models_root`.
 
 ## Operations
 
-- [Installing sd-cli](operations/sd-cli-install.md) — playbook for
-  staging the `stable-diffusion.cpp` binary that the sdcpp engine
-  drives.
+- [Installing sd-cli](operations/sd-cli-install.md) — the worker
+  auto-provisions `sd-cli`; this is the override / manual-install
+  playbook (CUDA build, air-gapped mirror, unsupported targets).
 - [Dev loop (PM2 + cargo-watch)](operations/dev-loop.md) — the two
   flavours of dev process and when to use each.
 - [Job-state recovery](operations/recovery.md) — D1 reset SQL for

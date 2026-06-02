@@ -1,15 +1,28 @@
 # Installing sd-cli (stable-diffusion.cpp)
 
 The [`sdcpp`](../engines/sdcpp.md) engine subprocess-invokes
-`sd-cli` per image job.  This page is the playbook for getting that
-binary on a worker box.  Linux x86_64 + NVIDIA GPU assumed; macOS
-arm64 + Windows builds also exist upstream.
+`sd-cli` per image job.
+
+## You usually don't need this page
+
+The worker **auto-provisions** `sd-cli` on the first image job: if no
+binary is resolvable it downloads the platform's prebuilt
+stable-diffusion.cpp **Vulkan** build (~37 MB, universal across
+NVIDIA / AMD / Intel) into `<models_root>/bin/` and runs it from
+there.  A fresh worker - Linux, macOS arm64, or Windows - serves real
+image jobs out of the box with no manual step.  See
+[auto-provisioning](../engines/sdcpp.md#auto-provisioning).
+
+Use this playbook only when you want to **override** the auto-
+provisioned binary: a CUDA build for maximum NVIDIA throughput, a
+from-source build, an air-gapped mirror, or an unsupported target
+(Linux arm64, Intel macOS) that has no prebuilt Vulkan asset.
 
 The binary is not bundled into our release artefacts on purpose:
 sd-cpp's pre-built matrix (CUDA / Vulkan / ROCm / Metal / CPU)
-already covers the platforms we care about, and bundling would
-either ship a 30+ MB binary in every release or fragment the
-matrix.  The operator installs it once per machine.
+already covers the platforms we care about, bundling would either
+ship a 30+ MB binary in every release or fragment the matrix, and the
+worker fetches the right one on demand anyway.
 
 ## What to install
 
@@ -89,19 +102,28 @@ unattended re-installation pick a sha from a known-good release.
 
 ## Resolution order (worker side)
 
-The engine looks in this order:
+On the first image job the engine resolves `sd-cli` in this order:
 
 1. `$STUDIO_WORKER_SD_CLI` env var (absolute path; operator override)
-2. `<models_root>/bin/sd-cli` — drop the binary next to the cached
-   models (default `~/models/bin/sd-cli`) for a PATH-free install
+2. `<models_root>/bin/sd-cli` - where the auto-provisioner installs,
+   and where you can drop your own binary (default `~/models/bin/`)
+   for a PATH-free override
 3. `~/.local/bin/sd-cli` (matches the playbook above)
 4. `sd-cli` on `$PATH`
 
-If none of those resolve, `SdCppEngine::try_new` returns `None`, logs an
-actionable `INFO` breadcrumb (naming every path it checked + this doc),
-and the engine doesn't register itself — the worker still boots and
-serves every other modality, it just won't claim real image jobs until
-`sd-cli` is present (on Windows the binary is `sd-cli.exe`).
+If none resolve, the engine **auto-provisions** into
+`<models_root>/bin/` (download + extract the platform Vulkan build),
+then runs it.  Provisioning can be steered with:
+
+- `STUDIO_WORKER_SDCPP_RELEASE` - a `master-<n>-<sha>` upstream tag to
+  fetch instead of the pinned default
+- `STUDIO_WORKER_SDCPP_URL` - a full zip URL (air-gapped mirror) that
+  skips tag + asset resolution
+
+Provisioning only fails on a target with no prebuilt Vulkan asset
+(Linux arm64, Intel macOS) or with no network; the error names the
+missing asset and points back here (on Windows the binary is
+`sd-cli.exe`).
 
 ## Verifying the install
 
