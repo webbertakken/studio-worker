@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.1...studio-worker-v0.4.2) (2026-06-02)
+
+
+### Features
+
+* auto-provision sd-cli for image gen ([#32](https://github.com/webbertakken/studio-worker/issues/32)) ([5b8e5db](https://github.com/webbertakken/studio-worker/commit/5b8e5dbdaabdbeeabe9571099f8bb16be1cbd55c))
+
 ## [0.4.1](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.0...studio-worker-v0.4.1) (2026-06-02)
 
 
