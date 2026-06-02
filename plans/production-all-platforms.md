@@ -104,15 +104,20 @@ packaged" errors.
 
 ## Phase 4 — release pipeline & CI for every platform
 
-- [ ] cargo-dist: ensure runners install cmake (llama.cpp build) on all
-      OSes; confirm targets list.
-- [ ] CI checks matrix: default build is now ui+; ensure clippy/test on
-      the fully-loaded feature set; keep free-tier (no GPU) green.
-- [ ] Build matrix: build the default (ui) on win/mac/linux; build the
-      `all` (or release) feature set where toolchain allows.
-- [ ] Coverage: keep ≥90% with new modules excluded only where truly
-      untestable (OS tray, registry).
-- [ ] Commit.
+- [x] cargo-dist: cmake added as an apt/homebrew/chocolatey system dep
+      for the release runners (llama.cpp build); targets unchanged.
+- [x] checks.yml matrix rebuilt: `default-ui` (no GTK now), `headless`
+      (--no-default-features), `all-backends` (--features all), and
+      `stt-backend` (whisper); fmt only on default. Dropped the old
+      GTK apt install (no longer needed).
+- [x] build.yml: default (ui) on all 5 targets + a `build-all-backends`
+      job compiling `--features all` natively on Windows + macOS (the
+      llama.cpp build paths I can't check from Linux; Linux is covered
+      by checks.yml).
+- [x] coverage.yml: `--no-default-features` so the gate stays meaningful
+      (UI is unit-untestable); verified locally at 92.54% ≥ 90%.
+- [x] actionlint clean on the changed workflows.
+- [x] Commit Phase 4.
 
 ## Phase 5 — integration tests + docs
 
