@@ -92,12 +92,16 @@ unattended re-installation pick a sha from a known-good release.
 The engine looks in this order:
 
 1. `$STUDIO_WORKER_SD_CLI` env var (absolute path; operator override)
-2. `~/.local/bin/sd-cli` (matches the playbook above)
-3. `sd-cli` on `$PATH`
+2. `<models_root>/bin/sd-cli` — drop the binary next to the cached
+   models (default `~/models/bin/sd-cli`) for a PATH-free install
+3. `~/.local/bin/sd-cli` (matches the playbook above)
+4. `sd-cli` on `$PATH`
 
-If none of those resolve, `SdCppEngine::try_new` returns `None` and
-the engine doesn't register itself \u2014 the worker still boots with
-synthetic.
+If none of those resolve, `SdCppEngine::try_new` returns `None`, logs an
+actionable `INFO` breadcrumb (naming every path it checked + this doc),
+and the engine doesn't register itself — the worker still boots and
+serves every other modality, it just won't claim real image jobs until
+`sd-cli` is present (on Windows the binary is `sd-cli.exe`).
 
 ## Verifying the install
 
