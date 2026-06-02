@@ -89,6 +89,10 @@ jobs:
       - name: Publish to the prebuilt release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The job never checks out this repo (it only clones sd.cpp),
+          # so point `gh` at the repo explicitly instead of relying on a
+          # git remote in the cwd.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG='${{ steps.ref.outputs.tag }}'
