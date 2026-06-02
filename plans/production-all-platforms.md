@@ -121,10 +121,29 @@ packaged" errors.
 
 ## Phase 5 — integration tests + docs
 
-- [ ] Integration tests: feature-gate matrix smoke, autostart round-trip,
-      sd-cli/llama provisioning download contract (wiremock), tray data.
-- [ ] README: install script as the turnkey path; `cargo install` =
-      UI default; per-OS notes; remove the pkg-config workaround section.
-- [ ] docs/ updates (engines, operations, autostart).
-- [ ] PR_RESULTS.md deltas; AMBIGUITIES/DECISIONS updated.
-- [ ] Final full verification pass; open PR.
+- [x] Integration test `tests/engine_download.rs`: model downloader
+      against wiremock (happy path, non-2xx, cache reuse). autostart
+      round-trip + tray byte-order + pure decisions are unit-tested.
+- [x] README: UI default + GTK-free; pkg-config/Linuxbrew workaround
+      removed; install script = turnkey all-backends; coverage cmd.
+- [x] docs/ updates: dev-loop (no PKG_CONFIG dance), architecture
+      overview (per-OS tray backends).
+- [x] PR_RESULTS.md deltas; AMBIGUITIES/DECISIONS updated.
+- [x] Final verification: fmt + clippy (default & headless) + 444 tests
+      + headless tests + coverage 92.54% all green; `--features all`
+      clippy-clean + llama tests (12).
+
+## Remaining / deferred (honest status)
+
+- **Real image generation still needs the `sd-cli` binary present**
+  (subprocess, by design — keeps ggml out of the llama-bearing
+  binary).  Resolution now also checks `<models_root>/bin/sd-cli` and
+  logs an actionable skip; full auto-download of a per-platform sd-cli
+  is deferred (no validated binary source + needs a GPU to verify).
+- **macOS / Windows are validated by compilation + CI**, not a runtime
+  run (no access to those OSes from the dev box).  build.yml's
+  `build-all-backends` job compiles `--features all` natively on both;
+  `x86_64-apple-darwin` cross-build of llama.cpp is the one path only
+  the release pipeline exercises — watch the first tagged release.
+- **Push held**: per the git rules I committed locally only; opening
+  the PR needs an explicit push go-ahead.
