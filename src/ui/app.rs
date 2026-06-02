@@ -82,7 +82,7 @@ pub struct App {
     notification_prefs: NotificationPrefs,
     tray_variant: TrayVariant,
     quit_requested: Arc<std::sync::atomic::AtomicBool>,
-    tray_state: Option<super::TrayState>,
+    tray: Option<super::tray_host::TrayHandle>,
 }
 
 impl App {
@@ -120,7 +120,7 @@ impl App {
             notification_prefs: NotificationPrefs::default(),
             tray_variant: TrayVariant::Disconnected,
             quit_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            tray_state: None,
+            tray: None,
         }
     }
 
@@ -128,8 +128,8 @@ impl App {
         self.registration.clone()
     }
 
-    pub fn attach_tray(&mut self, tray: super::TrayState) {
-        self.tray_state = Some(tray);
+    pub fn attach_tray(&mut self, tray: super::tray_host::TrayHandle) {
+        self.tray = Some(tray);
     }
 
     pub fn quit_requested_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
@@ -200,40 +200,11 @@ impl App {
         let v = tray::derive_variant(busy, hb.as_ref(), HEARTBEAT_INTERVAL);
         if v != self.tray_variant {
             log_tray_variant_change(self.tray_variant, v);
-            if let Some(state) = self.tray_state.as_mut() {
-                if let Some(icon) = state.icon.as_ref() {
-                    // Surface tray-update failures instead of swallowing
-                    // them with `let _ =`: a failed `set_icon` leaves a
-                    // stale health indicator and the operator would be
-                    // misled with zero diagnostics.
-                    match tray_icon::Icon::from_rgba(v.rgba_16(), 16, 16) {
-                        Ok(new_icon) => {
-                            if let Err(e) = icon.set_icon(Some(new_icon)) {
-                                tracing::warn!(
-                                    target: TRACE_TARGET,
-                                    op = "tray_variant",
-                                    error = %e,
-                                    "failed to update tray icon"
-                                );
-                            }
-                        }
-                        Err(e) => tracing::warn!(
-                            target: TRACE_TARGET,
-                            op = "tray_variant",
-                            error = %e,
-                            "failed to build tray icon image"
-                        ),
-                    }
-                    if let Err(e) = icon.set_tooltip(Some(v.tooltip())) {
-                        tracing::warn!(
-                            target: TRACE_TARGET,
-                            op = "tray_variant",
-                            error = %e,
-                            "failed to update tray tooltip"
-                        );
-                    }
-                }
-                state.current_variant = v;
+            // Push the new health colour + tooltip to the OS tray.  The
+            // per-platform backend (ksni on Linux, tray-icon on
+            // mac/win) surfaces its own failures; here we just forward.
+            if let Some(tray) = self.tray.as_mut() {
+                tray.set_variant(v);
             }
         }
         self.tray_variant = v;

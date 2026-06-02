@@ -140,7 +140,10 @@ impl Engine for MultiEngine {
             "requested engine not compiled into this worker"
         );
         bail!(
-            "no `{}` engine compiled into this worker (model {} requires it)",
+            "no `{}` engine compiled into this worker (model `{}` requires it). \
+             Install the all-backends release build from \
+             https://github.com/webbertakken/studio-worker/releases/latest, \
+             or rebuild from source with `cargo install studio-worker --features all`.",
             wanted,
             model
         );

@@ -263,51 +263,76 @@ fn run_generation(
     Ok(out)
 }
 
-impl Engine for LlamaEngine {
-    fn name(&self) -> &'static str {
-        "llama"
-    }
+/// Sentinel the studio's claim filter recognises as "any llama-cpp
+/// model is fine" — mirrors the `sd-cpp:*` wildcard the image engine
+/// advertises.  The model files arrive on the offer's `ModelSource`, so
+/// the worker doesn't have to enumerate model ids up front; this lets a
+/// freshly-installed worker claim llama jobs and download the GGUF on
+/// demand.
+const LLAMA_MODEL_WILDCARD: &str = "llama-cpp:*";
 
-    fn capabilities(&self) -> EngineCapabilities {
-        let models: Vec<String> = self.list_models().into_iter().map(|(s, _)| s).collect();
-        let mut map: BTreeMap<TaskKind, Vec<String>> = BTreeMap::new();
-        map.insert(TaskKind::Llm, models);
-        EngineCapabilities {
-            supported_models_per_kind: map,
-        }
-    }
+fn is_gguf(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false)
+}
 
-    fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
-        let kind = task.kind();
-        let llm = match task {
-            Task::Llm(p) => p,
-            other => {
-                warn!(
-                    target: TRACE_TARGET,
-                    op = "dispatch",
-                    kind = kind.as_str(),
-                    model,
-                    "unsupported task kind"
-                );
-                bail!("llama engine cannot serve {} tasks", other.kind().as_str());
-            }
-        };
-        let path = self.resolve_path(model).ok_or_else(|| {
+/// Pick the GGUF to load from a set of downloaded model files: prefer
+/// the explicit `Model`-role file, else the first `.gguf`.  Pure so the
+/// selection contract is unit-tested without a download.
+fn pick_gguf(files: &[(ModelFileRole, PathBuf)]) -> Option<PathBuf> {
+    files
+        .iter()
+        .find(|(role, path)| matches!(role, ModelFileRole::Model) && is_gguf(path))
+        .or_else(|| files.iter().find(|(_, path)| is_gguf(path)))
+        .map(|(_, path)| path.clone())
+}
+
+/// Extract the LLM params from a task, rejecting any other kind with the
+/// `cannot serve <kind>` shape the studio's claim loop recognises.
+fn as_llm(task: Task, model: &str) -> Result<LlmParams> {
+    match task {
+        Task::Llm(p) => Ok(p),
+        other => {
             warn!(
                 target: TRACE_TARGET,
                 op = "dispatch",
+                kind = other.kind().as_str(),
                 model,
-                models_root = %self.llm_dir().display(),
-                "model not found"
+                "unsupported task kind"
             );
-            anyhow!("model `{model}` not found in {}", self.llm_dir().display())
-        })?;
-        let loaded = self.load_or_get(model, &path)?;
+            bail!("llama engine cannot serve {} tasks", other.kind().as_str())
+        }
+    }
+}
+
+impl LlamaEngine {
+    /// Download every file the studio listed on the offer into
+    /// `<root>/llm/`, returning the resolved (role, path) pairs.  Cached
+    /// files are reused; a truncated download is rejected by the shared
+    /// downloader rather than cached as a corrupt model.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn ensure_model_files(&self, source: &ModelSource) -> Result<Vec<(ModelFileRole, PathBuf)>> {
+        let dir = self.llm_dir();
+        let mut out = Vec::with_capacity(source.files.len());
+        for file in &source.files {
+            let local = crate::engine::download::ensure_file(&dir, &file.filename, &file.url)?;
+            out.push((file.role, local));
+        }
+        Ok(out)
+    }
+
+    /// Load `path` (caching it) and run one chat completion, returning
+    /// `chat.completion`-shaped JSON.  Shared by the plain `dispatch`
+    /// (local model) and `dispatch_with_source` (downloaded model) paths.
+    fn run_llm(&self, model: &str, path: &Path, llm: LlmParams) -> Result<TaskResult> {
+        let loaded = self.load_or_get(model, path)?;
         let prompt = render_prompt(&llm.messages);
         debug!(
             target: TRACE_TARGET,
             op = "dispatch",
-            kind = kind.as_str(),
+            kind = "llm",
             model,
             max_tokens = llm.max_tokens,
             temperature = llm.temperature,
@@ -326,7 +351,7 @@ impl Engine for LlamaEngine {
             warn!(
                 target: TRACE_TARGET,
                 op = "dispatch",
-                kind = kind.as_str(),
+                kind = "llm",
                 model,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 error = %e,
@@ -337,7 +362,7 @@ impl Engine for LlamaEngine {
         info!(
             target: TRACE_TARGET,
             op = "dispatch",
-            kind = kind.as_str(),
+            kind = "llm",
             model,
             elapsed_ms,
             completion_chars = content.len(),
@@ -365,6 +390,70 @@ impl Engine for LlamaEngine {
             "elapsed_ms": elapsed_ms,
         });
         Ok(TaskResult::Llm { json })
+    }
+}
+
+impl Engine for LlamaEngine {
+    fn name(&self) -> &'static str {
+        "llama"
+    }
+
+    fn capabilities(&self) -> EngineCapabilities {
+        // Advertise both any locally-present GGUF stems (pre-placed
+        // models) and the wildcard sentinel so the studio can hand this
+        // worker any llama-cpp model from its registry; the files come
+        // down on the offer's `ModelSource`.
+        let mut models: Vec<String> = self.list_models().into_iter().map(|(s, _)| s).collect();
+        models.push(LLAMA_MODEL_WILDCARD.to_string());
+        let mut map: BTreeMap<TaskKind, Vec<String>> = BTreeMap::new();
+        map.insert(TaskKind::Llm, models);
+        EngineCapabilities {
+            supported_models_per_kind: map,
+        }
+    }
+
+    fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
+        let llm = as_llm(task, model)?;
+        let path = self.resolve_path(model).ok_or_else(|| {
+            warn!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                model,
+                models_root = %self.llm_dir().display(),
+                "model not found"
+            );
+            anyhow!(
+                "model `{model}` not found in {} and the offer carried no \
+                 modelSource to download it from",
+                self.llm_dir().display()
+            )
+        })?;
+        self.run_llm(model, &path, llm)
+    }
+
+    fn dispatch_with_source(
+        &self,
+        model: &str,
+        task: Task,
+        source: &ModelSource,
+    ) -> Result<TaskResult> {
+        let llm = as_llm(task, model)?;
+        // Prefer the studio-provided files (download on demand); fall
+        // back to a locally-present GGUF when the offer lists none.
+        let path = if source.files.is_empty() {
+            self.resolve_path(model).ok_or_else(|| {
+                anyhow!(
+                    "model `{model}` not found in {} and the offer's modelSource \
+                     listed no files to download",
+                    self.llm_dir().display()
+                )
+            })?
+        } else {
+            let resolved = self.ensure_model_files(source)?;
+            pick_gguf(&resolved)
+                .ok_or_else(|| anyhow!("llama modelSource for `{model}` contained no .gguf file"))?
+        };
+        self.run_llm(model, &path, llm)
     }
 }
 
@@ -417,15 +506,20 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_lists_no_models_when_dir_missing() {
+    fn capabilities_advertise_wildcard_even_with_no_local_models() {
+        // A fresh worker has no local GGUFs but must still advertise the
+        // wildcard so the studio can hand it a llama job (files arrive on
+        // the offer's modelSource).
         let tmp = tempfile::tempdir().unwrap();
         let engine = LlamaEngine::new(tmp.path().to_path_buf()).expect("init backend");
         let caps = engine.capabilities();
-        assert!(caps.supported_models_per_kind[&TaskKind::Llm].is_empty());
+        let models = &caps.supported_models_per_kind[&TaskKind::Llm];
+        assert_eq!(models, &vec![LLAMA_MODEL_WILDCARD.to_string()]);
+        assert!(caps.supports(TaskKind::Llm, LLAMA_MODEL_WILDCARD));
     }
 
     #[test]
-    fn capabilities_picks_up_gguf_files() {
+    fn capabilities_picks_up_gguf_files_and_keeps_wildcard() {
         let tmp = tempfile::tempdir().unwrap();
         let llm_dir = tmp.path().join("llm");
         std::fs::create_dir_all(&llm_dir).unwrap();
@@ -435,7 +529,61 @@ mod tests {
         let engine = LlamaEngine::new(tmp.path().to_path_buf()).expect("init backend");
         let caps = engine.capabilities();
         let models = &caps.supported_models_per_kind[&TaskKind::Llm];
-        assert_eq!(models, &vec!["smollm-135m-q8".to_string()]);
+        assert_eq!(
+            models,
+            &vec![
+                "smollm-135m-q8".to_string(),
+                LLAMA_MODEL_WILDCARD.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn is_gguf_matches_extension_case_insensitively() {
+        assert!(is_gguf(Path::new("/m/model.gguf")));
+        assert!(is_gguf(Path::new("/m/model.GGUF")));
+        assert!(!is_gguf(Path::new("/m/model.safetensors")));
+        assert!(!is_gguf(Path::new("/m/model")));
+    }
+
+    #[test]
+    fn pick_gguf_prefers_model_role_then_first_gguf() {
+        // Model-role gguf wins even when listed after another gguf.
+        let files = vec![
+            (ModelFileRole::TextEncoder, PathBuf::from("/m/clip.gguf")),
+            (ModelFileRole::Model, PathBuf::from("/m/weights.gguf")),
+        ];
+        assert_eq!(pick_gguf(&files), Some(PathBuf::from("/m/weights.gguf")));
+        // No Model role: fall back to the first gguf.
+        let files = vec![
+            (ModelFileRole::Vae, PathBuf::from("/m/vae.safetensors")),
+            (ModelFileRole::TextEncoder, PathBuf::from("/m/first.gguf")),
+            (ModelFileRole::Lora, PathBuf::from("/m/second.gguf")),
+        ];
+        assert_eq!(pick_gguf(&files), Some(PathBuf::from("/m/first.gguf")));
+        // Nothing gguf at all.
+        let files = vec![(ModelFileRole::Vae, PathBuf::from("/m/vae.safetensors"))];
+        assert_eq!(pick_gguf(&files), None);
+    }
+
+    #[test]
+    fn as_llm_extracts_llm_params_and_rejects_other_kinds() {
+        let llm = Task::Llm(LlmParams {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            max_tokens: 8,
+            temperature: 0.1,
+            ..Default::default()
+        });
+        assert!(as_llm(llm, "m").is_ok());
+        let image = Task::Image(ImageParams {
+            prompt: "x".into(),
+            ..Default::default()
+        });
+        let err = as_llm(image, "m").unwrap_err().to_string();
+        assert!(err.contains("cannot serve image"), "got: {err}");
     }
 
     #[test]

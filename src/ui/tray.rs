@@ -1,7 +1,9 @@
-//! Tray icon state + menu factory.  The actual `tray_icon::TrayIcon`
-//! construction is wired up by `App::install_tray` so the logic that
-//! decides *what* the tray looks like (icon variant, menu labels)
-//! stays in pure data and is unit-testable.
+//! Tray icon state + menu factory (pure data).  The per-OS tray
+//! construction lives in [`super::tray_host`] (`ksni` on Linux,
+//! `tray-icon` on macOS / Windows); this module keeps the logic that
+//! decides *what* the tray looks like (icon variant, menu labels,
+//! ARGB byte order) free of any platform types so it stays
+//! unit-testable.
 
 use std::time::Duration;
 
@@ -56,6 +58,19 @@ impl TrayVariant {
             TrayVariant::Disconnected => "studio-worker — disconnected",
         }
     }
+}
+
+/// Convert an RGBA byte buffer (what [`TrayVariant::rgba_16`] produces,
+/// the format `tray-icon` wants) into the ARGB32 network-byte-order
+/// layout `ksni` expects for its `icon_pixmap`.  Each 4-byte
+/// `[R, G, B, A]` group is rotated right by one to `[A, R, G, B]`.
+/// Pure so the byte-order contract is unit-tested without a live tray.
+pub fn rgba_to_argb32(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        px.rotate_right(1);
+    }
+    out
 }
 
 /// Derive the tray variant from live state.  A heartbeat that's
@@ -183,6 +198,21 @@ mod tests {
         assert_eq!(TrayVariant::Idle.rgba_16().len(), 16 * 16 * 4);
         assert_eq!(TrayVariant::Busy.rgba_16().len(), 16 * 16 * 4);
         assert_eq!(TrayVariant::Disconnected.rgba_16().len(), 16 * 16 * 4);
+    }
+
+    #[test]
+    fn rgba_to_argb32_rotates_each_pixel_and_preserves_length() {
+        // One opaque pixel [R, G, B, A] -> [A, R, G, B].
+        let rgba = vec![0x11, 0x22, 0x33, 0xFF];
+        assert_eq!(rgba_to_argb32(&rgba), vec![0xFF, 0x11, 0x22, 0x33]);
+        // A transparent pixel keeps its zero alpha at the front.
+        let clear = vec![0x40, 0x50, 0x60, 0x00];
+        assert_eq!(rgba_to_argb32(&clear), vec![0x00, 0x40, 0x50, 0x60]);
+        // Length is preserved for the real 16x16 icon buffer.
+        assert_eq!(
+            rgba_to_argb32(&TrayVariant::Idle.rgba_16()).len(),
+            16 * 16 * 4
+        );
     }
 
     #[test]

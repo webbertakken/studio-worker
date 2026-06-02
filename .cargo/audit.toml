@@ -4,18 +4,22 @@
 # `.github/workflows/audit.yml`) fails the build on any *vulnerability*.
 # The advisories below are informational only (`unmaintained` /
 # `unsound`) and are explicitly accepted. Every one is a transitive
-# dependency of one of two off-by-default feature trees:
+# dependency that lands in `Cargo.lock` but is never compiled into any
+# artefact we ship:
 #
-#   - the `ui` feature's GTK3 desktop stack
-#     (egui / eframe / tray-icon / libappindicator / glib-macros)
+#   - the GTK3 gtk-rs stack is `tray-icon`'s **Linux** backend, which we
+#     no longer use — Linux drives the tray with `ksni` (pure Rust) and
+#     `tray-icon` is a macOS/Windows-only dependency (native APIs, not
+#     GTK).  `cargo audit` reads the lockfile (the union across every
+#     target), so these appear even though no build links them.
 #   - the `image-candle` feature's model stack
 #     (candle / gemm build macros + hf-hub's progress-bar deps)
 #
-# None build into the default headless worker, none has an upstream fix
-# available without a major rewrite, and none carries an exploitable
-# surface here, so we acknowledge rather than suppress them.
+# None has an upstream fix available without a major rewrite, and none
+# carries an exploitable surface here, so we acknowledge rather than
+# suppress them.
 #
-# Review this list whenever the `ui` or `image-candle` dependency tree
+# Review this list whenever the tray or `image-candle` dependency tree
 # is bumped: drop any entry that no longer appears in `cargo audit`
 # output so a genuinely new advisory can never hide behind a stale
 # ignore.

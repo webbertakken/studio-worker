@@ -43,3 +43,36 @@ jobs:
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
+
+  # Validate the fully-loaded release feature set (UI + in-process
+  # llama.cpp + candle image + media) compiles natively on macOS and
+  # Windows — the two platforms whose llama.cpp build can't be checked
+  # from the Linux dev box.  Linux is already covered by checks.yml's
+  # `all-backends` matrix entry, so it's omitted here to save minutes.
+  build-all-backends:
+    name: All backends (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+          - name: macOS ARM
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: all-backends
+
+      # cmake (for the llama.cpp build) is preinstalled on the GitHub
+      # Windows + macOS runners; the step is a guard against drift.
+      - name: Ensure cmake
+        run: cmake --version
+
+      - name: Build with all backends
+        run: cargo build --features all
