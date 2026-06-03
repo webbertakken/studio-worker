@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.4](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.3...studio-worker-v0.4.4) (2026-06-03)
+
+
+### Features
+
+* vulkan preflight + first-class arm/intel ([#37](https://github.com/webbertakken/studio-worker/issues/37)) ([60bc8b4](https://github.com/webbertakken/studio-worker/commit/60bc8b456834c9f70ef8fdea90b56f93f094f9db))
+
 ## [0.4.3](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.2...studio-worker-v0.4.3) (2026-06-02)
 
 
