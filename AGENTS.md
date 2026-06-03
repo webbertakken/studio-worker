@@ -82,6 +82,11 @@ CI.
   / `whisper` / `image-candle` / `video` / `tts` backends). Shared
   on-demand model provisioning lives in `src/engine/download.rs`
   (cache + Content-Length verify + path-traversal guard).
+  `src/engine/sd_provision.rs` auto-provisions the `sd-cli` binary +
+  preflights the Vulkan loader — see
+  [`@docs/engines/sdcpp.md`](docs/engines/sdcpp.md) for the platform
+  matrix, the GPU-runtime requirement, and the `sdcpp-prebuilt`
+  workflow.
 - `src/http.rs` — `ApiClient` wrapping the surviving HTTP routes
   (`register` + multipart `complete`).
 - `src/runtime.rs` — CLI helpers + auto-updater loop.  The session
@@ -164,7 +169,10 @@ weights, run with the matching feature):
 
 ## CI
 
-- `.github/workflows/checks.yml` — fmt + clippy + cargo check + tests.
+- `.github/workflows/checks.yml` — fmt + clippy + cargo check + tests
+  (frees ~25 GB of runner bloat first so the heavy candle/whisper legs
+  + cache-save don't exhaust the disk).
+- `.github/workflows/coverage.yml` — `cargo llvm-cov`, `--fail-under-lines 90`.
 - `.github/workflows/audit.yml` — `cargo audit` advisory gate on
   Cargo manifest changes + weekly cron; accepted informational
   advisories live in `.cargo/audit.toml`.
@@ -173,12 +181,28 @@ weights, run with the matching feature):
 - `.github/workflows/lint-workflows.yml` — actionlint on workflow files.
 - `.github/workflows/release-please.yml` — bump version + changelog.
 - `.github/workflows/release.yml` — cargo-dist build + publish on tag push.
+- `.github/workflows/publish-crate.yml` — publish to crates.io on tag push.
+- `.github/workflows/sdcpp-prebuilt.yml` — manual: build + host `sd-cli`
+  for platforms upstream doesn't (Linux arm64). Re-run when the pinned
+  sd.cpp ref (`DEFAULT_RELEASE_TAG`) changes.
 
 Repo secrets required:
 
 - `RELEASE_TOKEN` — a fine-grained PAT with `contents: write` + `pull_requests: write`,
   used by release-please to open its release PRs.  `GITHUB_TOKEN` alone
   cannot create PRs from a workflow.
+
+## Releasing
+
+- release-please runs with `skip-github-release: true`, so merging its
+  release PR bumps the version + changelog but does **not** tag.
+- A maintainer must then push the tag manually — that's what triggers
+  `release.yml` (cargo-dist) + `publish-crate.yml`:
+  `git tag -a studio-worker-v<X.Y.Z> -m "studio-worker <X.Y.Z>" <merge-sha> && git push origin studio-worker-v<X.Y.Z>`.
+- After tagging, relabel the merged release PR `autorelease: tagged`
+  (remove `autorelease: pending`) or the next release-please run aborts
+  with "untagged, merged release PRs outstanding".
+- Pre-1.0 a `feat` bumps the patch (`bump-patch-for-minor-pre-major`).
 
 ## Rules
 
