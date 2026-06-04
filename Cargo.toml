@@ -90,6 +90,23 @@ candle-transformers = { version = "0.10.2", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 hf-hub = { version = "0.4", optional = true }
 gif = { version = "0.13", optional = true }
+# ONNX Runtime (pykeio/ort) for the LaMa object-removal image engine.
+# `download-binaries` fetches a prebuilt ONNX Runtime for the build
+# target (covers all five cargo-dist targets: win-msvc x64, linux-gnu
+# x64 + arm64, macOS arm64 + x64) so a source build needs no system
+# onnxruntime.  `tls-rustls` keeps the build-time download OpenSSL-free
+# (the whole crate is deliberately native-tls-free for bare-box
+# `cargo install`).  CPU EP only by default — LaMa at 512×512 is ~1s on
+# CPU; GPU EPs (cuda/coreml) are opt-in later with graceful fallback.
+ort = { version = "2.0.0-rc.10", optional = true, default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "download-binaries",
+    "copy-dylibs",
+    "tls-rustls",
+    "api-24",
+] }
 # UI deps — gated behind the `ui` feature so headless installs stay
 # free of GL / winit / dbus.  Default = off (see DECISIONS.md).
 egui = { version = "0.34", optional = true, default-features = false }
@@ -144,6 +161,10 @@ image-candle = [
     "dep:tokenizers",
     "dep:hf-hub",
 ]
+# ONNX-runtime image engine.  Serves the LaMa object-removal model
+# (Carve/LaMa-ONNX) used by Find-the-Differences removals.  Single
+# self-contained binary (ort `download-binaries` links onnxruntime).
+image-onnx = ["dep:ort"]
 video = ["dep:gif"]
 tts = []
 # Desktop UI — brings in egui / eframe / tray-icon / notify-rust.
@@ -166,7 +187,7 @@ all-engines-stt = ["whisper", "image-candle", "video", "tts"]
 # binary (llama in-process + candle image + media).  whisper is excluded
 # — it static-links a second ggml that clashes with llama's.  This is the
 # feature set the cargo-dist release binaries are built with.
-all = ["ui", "llama", "image-candle", "video", "tts"]
+all = ["ui", "llama", "image-candle", "image-onnx", "video", "tts"]
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -206,7 +227,7 @@ targets = [
 # is turnkey: UI (default) + in-process llama.cpp LLM + media engines.
 # whisper is excluded — it static-links a second ggml that clashes with
 # llama's; image stays sd-cli (subprocess) to avoid the same clash.
-features = ["llama", "video", "tts"]
+features = ["llama", "video", "tts", "image-onnx"]
 # PR checks run plan-only to catch issues early
 pr-run-mode = "plan"
 

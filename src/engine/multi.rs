@@ -114,6 +114,7 @@ impl Engine for MultiEngine {
         let wanted = match source.engine {
             crate::types::ModelEngine::SdCpp => "sdcpp",
             crate::types::ModelEngine::LlamaCpp => "llama",
+            crate::types::ModelEngine::Onnx => "onnx",
             crate::types::ModelEngine::Synthetic => "synthetic",
         };
         for e in &self.engines {
