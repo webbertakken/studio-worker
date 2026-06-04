@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.5](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.4...studio-worker-v0.4.5) (2026-06-04)
+
+
+### Features
+
+* add ONNX/LaMa object-removal image engine ([#42](https://github.com/webbertakken/studio-worker/issues/42)) ([e3f1681](https://github.com/webbertakken/studio-worker/commit/e3f16812f2a782e0cf645eff2e362af61f8a6dfc))
+
 ## [0.4.4](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.3...studio-worker-v0.4.4) (2026-06-03)
 
 
