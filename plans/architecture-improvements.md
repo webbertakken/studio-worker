@@ -48,7 +48,7 @@ a product decision before implementation.
       fallback for one release.  TDD: classification tests for typed,
       legacy-string, and unrelated errors.
 
-- [ ] 5. **`run_offered_job` outcome bookkeeping is fragile.**
+- [x] 5. **`run_offered_job` outcome bookkeeping is fragile.**
       The function pre-seeds `let mut outcome = JobOutcome::Failed
       {...}` under `#[allow(unused_assignments)]` and relies on every
       match arm assigning (`src/ws/session.rs` ~line 700).  Fix:
