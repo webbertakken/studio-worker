@@ -38,32 +38,36 @@ pub struct LlamaEngine {
 // multiple `LlamaEngine` constructions in the same binary share it.
 static GLOBAL_BACKEND: std::sync::OnceLock<Arc<LlamaBackend>> = std::sync::OnceLock::new();
 
+/// Serialises first-time backend init.  `OnceLock::get_or_init` can't
+/// host the init because `LlamaBackend::init()` is fallible; without
+/// this lock two threads race `init()` and the loser observes
+/// `BackendAlreadyInitialized` before the winner has published its
+/// handle — a check-then-act gap a bounded spin-wait used to lose on
+/// loaded CI runners.
+static BACKEND_INIT_LOCK: Mutex<()> = Mutex::new(());
+
 fn global_backend() -> Result<Arc<LlamaBackend>> {
     if let Some(b) = GLOBAL_BACKEND.get() {
         return Ok(b.clone());
     }
-    match LlamaBackend::init() {
-        Ok(backend) => {
-            let arc = Arc::new(backend);
-            let _ = GLOBAL_BACKEND.set(arc.clone());
-            Ok(arc)
-        }
-        Err(llama_cpp_2::LlamaCppError::BackendAlreadyInitialized) => {
-            // Race: someone else got the global init in between.  Wait for
-            // them to publish their handle.  In practice this is
-            // extremely brief (microseconds).
-            for _ in 0..1_000 {
-                if let Some(b) = GLOBAL_BACKEND.get() {
-                    return Ok(b.clone());
-                }
-                std::thread::yield_now();
-            }
-            Err(anyhow!(
-                "llama backend already initialised but the global handle never published"
-            ))
-        }
-        Err(e) => Err(e.into()),
+    let _guard = BACKEND_INIT_LOCK.lock();
+    // Re-check under the lock: another thread may have initialised and
+    // published while we waited for it.
+    if let Some(b) = GLOBAL_BACKEND.get() {
+        return Ok(b.clone());
     }
+    let backend = LlamaBackend::init().map_err(|e| match e {
+        // With init serialised by the lock, this can only mean some
+        // other code path called `LlamaBackend::init()` directly — we
+        // have no handle to share, so surface it loudly.
+        llama_cpp_2::LlamaCppError::BackendAlreadyInitialized => anyhow!(
+            "llama backend was initialised outside global_backend(); no shared handle available"
+        ),
+        other => anyhow!(other),
+    })?;
+    let arc = Arc::new(backend);
+    let _ = GLOBAL_BACKEND.set(arc.clone());
+    Ok(arc)
 }
 
 struct CachedModel {
@@ -503,6 +507,21 @@ mod tests {
         assert!(rendered.contains("<|user|>"));
         assert!(rendered.contains("hi"));
         assert!(rendered.ends_with("<|assistant|>\n"));
+    }
+
+    /// Regression: `global_backend()` once used a bounded spin-wait for
+    /// the `BackendAlreadyInitialized` race and flaked on loaded CI
+    /// runners.  Hammer it from many threads — every call must succeed.
+    #[test]
+    fn global_backend_never_fails_under_contention() {
+        let handles: Vec<_> = (0..32)
+            .map(|_| std::thread::spawn(|| global_backend().map(|_| ())))
+            .collect();
+        for h in handles {
+            h.join()
+                .expect("thread panicked")
+                .expect("global_backend must never fail under contention");
+        }
     }
 
     #[test]
