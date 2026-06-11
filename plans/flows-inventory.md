@@ -39,6 +39,8 @@ verified against both codebases.
 - [x] 9. Write `docs/architecture/flows.md`: one section per flow with a
       concise sequence (and a plantuml diagram for the core job flow),
       cross-linked to existing docs; link it from `docs/index.md`.
-- [ ] 10. Verify: every flow section cites real files/types on both sides;
+- [x] 10. Verify: every flow section cites real files/types on both sides;
       run `cargo check` untouched-code sanity not needed, but ensure doc
       links resolve; commit.
+      Done: links verified, merged as PR #44; follow-up commit adds the
+      `onnx` engine (PR #42) to the engine-routing lists.

@@ -21,7 +21,7 @@ JSON-serialised on the WS Offer, mirrored on both sides:
 
 ```jsonc
 {
-  "engine": "sd-cpp",          // | "llama-cpp" | "synthetic"
+  "engine": "sd-cpp",          // | "llama-cpp" | "onnx" | "synthetic"
   "files": [
     {
       "role": "diffusion-model",  // | "text-encoder" | "vae" | "lora" | "model"

@@ -152,7 +152,7 @@ DO -> D1 : claimJobForWorker (CAS\nqueued -> claimed)
 DO -> W : Offer { claim incl. task + modelSource }
 W -> DO : Accept { jobId }
 W -> E : dispatch_with_source(model, task, source)\n(spawn_blocking)
-E -> E : route by source.engine\n(sd-cpp | llama-cpp | synthetic)\nNO fallback
+E -> E : route by source.engine\n(sd-cpp | llama-cpp | onnx | synthetic)\nNO fallback
 alt binary result (image / tts / video)
   W -> Q : POST /workers/:id/jobs/:jobId/complete\n(multipart, Bearer token)
   Q -> D1 : status=done + R2 upload
