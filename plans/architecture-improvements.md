@@ -15,7 +15,7 @@ a product decision before implementation.
       serialised behind a mutex with a re-check under the lock, plus a
       32-thread contention regression test.
 
-- [ ] 2. **Heartbeat capabilities go stale for a whole session.**
+- [x] 2. **Heartbeat capabilities go stale for a whole session.**
       `run_one_session` builds `WorkerCapabilities` once
       (`src/ws/session.rs` ~line 369) and the heartbeat pump only
       mutates `auto_enabled` per tick.  A Config-tab save (e.g.

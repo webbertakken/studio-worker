@@ -43,6 +43,14 @@ pub const RECENT_LOGS_CAP: usize = 1000;
 /// prompts are huge.
 pub const PROMPT_PREVIEW_CHARS: usize = 200;
 
+/// Maximum number of entries the WS ship queue (`logs:
+/// Arc<Mutex<Vec<LogEntry>>>`) may hold.  The shipper pump only drains
+/// while a session is connected, so a long approval wait or reconnect
+/// backoff would otherwise grow the queue without bound.  On overflow
+/// the oldest entries are dropped and a warn-level marker records the
+/// loss.
+pub const LOG_SHIP_QUEUE_CAP: usize = 5_000;
+
 /// Job in flight right now.  Populated by the WS session before
 /// dispatch, cleared once the job finishes (success or failure).
 #[derive(Debug, Clone)]
@@ -822,7 +830,24 @@ pub fn push_log_with_observers(
     } else {
         info!(target: "studio_worker", job_id, "[{category}] {message}");
     }
-    logs.lock().push(entry.clone());
+    {
+        let mut queue = logs.lock();
+        if queue.len() >= LOG_SHIP_QUEUE_CAP {
+            // +1 for the entry below, +1 for the drop marker.
+            let overflow = queue.len() + 2 - LOG_SHIP_QUEUE_CAP;
+            queue.drain(0..overflow);
+            queue.push(LogEntry {
+                ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                level: "warn".to_string(),
+                category: "logs".to_string(),
+                message: format!(
+                    "ship queue full ({LOG_SHIP_QUEUE_CAP} entries); dropped {overflow} oldest"
+                ),
+                job_id: None,
+            });
+        }
+        queue.push(entry.clone());
+    }
     if let Some(o) = observers {
         let mut ring = o.recent_logs.lock();
         ring.push_back(entry);
@@ -837,6 +862,35 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::engine::SyntheticEngine;
+
+    #[test]
+    fn ship_queue_is_bounded_and_records_dropped_entries() {
+        // The WS shipper only drains while a session is connected; a
+        // long approval wait / reconnect backoff must not grow the
+        // queue without bound.
+        let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        for i in 0..(LOG_SHIP_QUEUE_CAP + 100) {
+            push_log_with_observers(&logs, None, "info", "test", &format!("entry {i}"), None);
+        }
+        let queue = logs.lock();
+        assert!(
+            queue.len() <= LOG_SHIP_QUEUE_CAP,
+            "ship queue exceeded its cap: {}",
+            queue.len()
+        );
+        // The newest entry always survives.
+        assert_eq!(
+            queue.last().map(|e| e.message.as_str()),
+            Some(format!("entry {}", LOG_SHIP_QUEUE_CAP + 99).as_str())
+        );
+        // Loss is visible: a marker entry names how many were dropped.
+        assert!(
+            queue
+                .iter()
+                .any(|e| e.level == "warn" && e.message.contains("dropped")),
+            "overflow must leave a visible drop marker"
+        );
+    }
 
     #[test]
     fn capabilities_advertises_all_synthetic_kinds() {
