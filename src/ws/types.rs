@@ -19,6 +19,20 @@ pub struct HelloFrame {
     pub capabilities: WorkerCapabilities,
 }
 
+/// Structured reason class for a `Reject` frame.  The studio's
+/// `isTransientReject` branches on this instead of regex-matching the
+/// free-text `reason`, so rewording a message can't silently turn a
+/// no-attempt requeue into an attempt-burning release.  Mirrors
+/// `WorkerRejectCode` in `workerWs.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectCode {
+    /// Worker already has an in-flight job.
+    Busy,
+    /// Operator paused the worker.
+    Paused,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WorkerInbound {
@@ -37,6 +51,10 @@ pub enum WorkerInbound {
     Reject {
         job_id: String,
         reason: String,
+        /// Optional structured class (busy / paused).  Old studios
+        /// ignore it; old workers simply don't send it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<RejectCode>,
     },
     #[serde(rename_all = "camelCase")]
     CompleteJson {

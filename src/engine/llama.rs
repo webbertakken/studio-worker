@@ -321,7 +321,7 @@ impl LlamaEngine {
         let dir = self.llm_dir();
         let mut out = Vec::with_capacity(source.files.len());
         for file in &source.files {
-            let local = crate::engine::download::ensure_file(&dir, &file.filename, &file.url)?;
+            let local = crate::engine::download::ensure_file(&dir, file)?;
             out.push((file.role, local));
         }
         Ok(out)

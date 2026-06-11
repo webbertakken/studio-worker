@@ -403,6 +403,12 @@ pub struct ModelFile {
     pub filename: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approx_bytes: Option<u64>,
+    /// Hex sha256 of the file's bytes.  When present the worker
+    /// verifies the downloaded body against it before committing the
+    /// file to the cache; absent (legacy registry rows) means
+    /// Content-Length is the only integrity check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -77,7 +77,7 @@ impl OnnxImageEngine {
             .iter()
             .find(|f| f.role == ModelFileRole::Model)
             .ok_or_else(|| anyhow!("onnx modelSource has no `model` file (the .onnx weights)"))?;
-        download::ensure_file(&self.models_root, &file.filename, &file.url)
+        download::ensure_file(&self.models_root, file)
             .with_context(|| format!("downloading onnx model {}", file.url))
     }
 

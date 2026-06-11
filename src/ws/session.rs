@@ -598,6 +598,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             ctx.observers.clone(),
             job_id,
             "worker paused by operator",
+            crate::ws::types::RejectCode::Paused,
         );
         return;
     }
@@ -616,6 +617,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             ctx.observers.clone(),
             job_id,
             "worker already has an in-flight job",
+            crate::ws::types::RejectCode::Busy,
         );
         return;
     }
@@ -689,12 +691,14 @@ fn spawn_reject_offer(
     observers: WorkerObservers,
     job_id: String,
     reason: &'static str,
+    code: crate::ws::types::RejectCode,
 ) {
     tokio::spawn(async move {
         let result = sender
             .send(&WorkerInbound::Reject {
                 job_id: job_id.clone(),
                 reason: reason.to_string(),
+                code: Some(code),
             })
             .await;
         if let Some((level, message)) = offer_response_breadcrumb("reject", &job_id, &result) {

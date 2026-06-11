@@ -720,6 +720,7 @@ mod tests {
             frame_label(&WorkerInbound::Reject {
                 job_id: "j".into(),
                 reason: "r".into(),
+                code: None,
             }),
             "reject"
         );
