@@ -195,9 +195,11 @@ offer's `ModelSource` (see [model-source.md](../runtime/model-source.md)):
 1. **Model files** — `ensure_file` in
    [`src/engine/download.rs`](../../src/engine/download.rs): for
    every `ModelFile` missing from `cfg.models_root`, stream the URL
-   to `<filename>.part`, verify against `Content-Length`, rename
-   atomically.  Path-traversal guarded (`model_cache_path` rejects
-   anything but a plain file name).  Cached forever after.
+   to `<filename>.part`, verify against `Content-Length` (and the
+   registry's `sha256` when the row carries one — the body is hashed
+   while it streams), rename atomically.  Path-traversal guarded
+   (`model_cache_path` rejects anything but a plain file name).
+   Cached forever after.
 2. **The `sd-cli` binary** — [`src/engine/sd_provision.rs`](../../src/engine/sd_provision.rs):
    on the first image job, resolve `$STUDIO_WORKER_SD_CLI` →
    `<models_root>/bin/sd-cli` → `~/.local/bin` → `$PATH`, else
@@ -239,7 +241,7 @@ Worker reports, studio decides.  Studio: `repository.ts`
 |---|---|---|
 | Engine error (generic) | `Fail { retryable: true }` | `failJob`: requeue with `attempts+1`, terminal `failed` once attempts exhaust |
 | Engine `UnsupportedKind` / missing engine | `Fail { retryable: false }` | terminal `failed` immediately |
-| Offer while busy / paused | `Reject { reason }` | `isTransientReject` matches "already busy" / "paused by operator" / "in-flight job" → requeue **without** counting an attempt and **without** immediate re-offer (would spin); non-transient reject → `releaseClaim` + offer elsewhere |
+| Offer while busy / paused | `Reject { reason, code: busy\|paused }` | `isTransientReject` branches on the structured `code` (regex on the free-text reason kept as fallback for old workers) → requeue **without** counting an attempt and **without** immediate re-offer (would spin); non-transient reject → `releaseClaim` + offer elsewhere |
 | WS close mid-job | (connection drop) | `handleWebSocketClose` releases the claim (requeue or fail by attempts) |
 | Stale heartbeat (>30s) | (silence) | DO alarm closes the session, claim released on close |
 | `Accept`/`Fail`/`CompleteJson` for a jobId the DO doesn't hold | — | `protocol_violation` error frame + close 4002 |

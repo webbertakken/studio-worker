@@ -27,7 +27,8 @@ JSON-serialised on the WS Offer, mirrored on both sides:
       "role": "diffusion-model",  // | "text-encoder" | "vae" | "lora" | "model"
       "url": "https://huggingface.co/.../z_image_turbo-Q4_K.gguf",
       "filename": "z_image_turbo-Q4_K.gguf",
-      "approxBytes": 2_700_000_000  // optional; lets the UI show progress
+      "approxBytes": 2_700_000_000, // optional; lets the UI show progress
+      "sha256": "<hex digest>"      // optional; worker verifies the download
     },
     { "role": "text-encoder", "url": "...", "filename": "..." },
     { "role": "vae",          "url": "...", "filename": "..." }
