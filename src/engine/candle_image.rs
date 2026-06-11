@@ -332,9 +332,8 @@ impl Engine for CandleImageEngine {
                     model,
                     "unsupported task kind"
                 );
-                bail!(
-                    "candle-image engine cannot serve {} tasks",
-                    other.kind().as_str()
+                return Err(
+                    crate::engine::UnsupportedTask::new("candle-image", other.kind()).into(),
                 );
             }
         };

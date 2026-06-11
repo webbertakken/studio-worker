@@ -29,7 +29,7 @@ a product decision before implementation.
       `vram_threshold_gb` mid-session and asserts the next heartbeat
       frame carries the new value.
 
-- [ ] 3. **WS log ship-queue is unbounded.**
+- [x] 3. **WS log ship-queue is unbounded.**
       `push_log_with_observers` does `logs.lock().push(entry)`
       (`src/runtime.rs` ~line 825) but the shipper pump only drains
       while a session is connected.  Long approval waits / reconnect
@@ -38,7 +38,7 @@ a product decision before implementation.
       breadcrumb so loss is visible.  TDD: unit test that pushes past
       the cap and asserts size + the drop marker.
 
-- [ ] 4. **Error classification by string sniffing.**
+- [x] 4. **Error classification by string sniffing.**
       `is_unsupported_kind(e) = e.to_string().contains("cannot serve")`
       (`src/runtime.rs` ~line 704) decides `retryable` on the wire.  A
       reworded engine message silently flips terminal failures into

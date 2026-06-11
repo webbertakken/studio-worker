@@ -710,7 +710,14 @@ pub fn prompt_for(task: &Task) -> String {
 }
 
 pub fn is_unsupported_kind(e: &anyhow::Error) -> bool {
-    e.to_string().contains("cannot serve")
+    // Typed check first — survives context wrapping and rewording.
+    // The string check remains as a fallback for error paths that
+    // haven't migrated to `engine::UnsupportedTask` yet.
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::engine::UnsupportedTask>()
+            .is_some()
+    }) || e.to_string().contains("cannot serve")
 }
 
 // ---------------------------------------------------------------------------
@@ -862,6 +869,28 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::engine::SyntheticEngine;
+
+    #[test]
+    fn is_unsupported_kind_detects_typed_unsupported_task() {
+        let err: anyhow::Error =
+            crate::engine::UnsupportedTask::new("synthetic", TaskKind::Llm).into();
+        assert!(is_unsupported_kind(&err));
+        // The message keeps the legacy operator-facing shape.
+        assert!(err.to_string().contains("cannot serve llm"));
+    }
+
+    #[test]
+    fn is_unsupported_kind_survives_context_wrapping() {
+        // String sniffing broke as soon as a caller added context (the
+        // outer message no longer contains "cannot serve"); the typed
+        // downcast searches the whole chain.
+        let err = anyhow::Error::from(crate::engine::UnsupportedTask::new(
+            "sdcpp",
+            TaskKind::AudioTts,
+        ))
+        .context("dispatching job j-1");
+        assert!(is_unsupported_kind(&err));
+    }
 
     #[test]
     fn ship_queue_is_bounded_and_records_dropped_entries() {

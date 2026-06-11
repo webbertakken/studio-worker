@@ -243,10 +243,7 @@ impl Engine for WhisperEngine {
                     model,
                     "unsupported task kind"
                 );
-                bail!(
-                    "whisper engine cannot serve {} tasks",
-                    other.kind().as_str()
-                );
+                return Err(crate::engine::UnsupportedTask::new("whisper", other.kind()).into());
             }
         };
         let path = self.resolve_path(model).ok_or_else(|| {

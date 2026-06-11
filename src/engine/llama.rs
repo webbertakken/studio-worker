@@ -306,7 +306,7 @@ fn as_llm(task: Task, model: &str) -> Result<LlmParams> {
                 model,
                 "unsupported task kind"
             );
-            bail!("llama engine cannot serve {} tasks", other.kind().as_str())
+            Err(crate::engine::UnsupportedTask::new("llama", other.kind()).into())
         }
     }
 }
