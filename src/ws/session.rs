@@ -27,7 +27,7 @@ use crate::runtime::{
     is_unsupported_kind, prompt_for, push_log_with_observers, record_recent_job, truncate_prompt,
     wait_with_stop, CurrentJob, JobOutcome, RecentJob, WorkerObservers,
 };
-use crate::types::{LogEntry, TaskResult, WorkerCapabilities};
+use crate::types::{LogEntry, TaskResult};
 use crate::ws::client::{connect, WsClientError, WsResult, WsSender};
 use crate::ws::types::{HelloFrame, JobOfferClaim, WorkerInbound, WorkerOutbound};
 
@@ -424,13 +424,16 @@ async fn run_one_session(
         }
     }
 
-    // Heartbeat task.  Reuse the engine we already built for the
-    // Hello frame instead of rebuilding it on every heartbeat —
-    // rebuilding fires every engine's registration log every 5s and
-    // floods the logs.
-    let capabilities_for_heartbeat = capabilities.clone();
+    // Heartbeat task.  Reuses the engine handle built for the Hello
+    // frame (rebuilding fires every engine's registration log every
+    // 5s and floods the logs) but rebuilds the capability snapshot
+    // from the live config each tick, so operator edits (e.g. a new
+    // VRAM threshold saved from the UI's Config tab) reach the studio
+    // without waiting for a reconnect.
+    let engine_arc: Arc<dyn Engine> = engine.into();
     let heartbeat = spawn_heartbeat_pump(
-        capabilities_for_heartbeat,
+        cfg.clone(),
+        engine_arc.clone(),
         sender.clone(),
         stop.clone(),
         paused.clone(),
@@ -445,7 +448,6 @@ async fn run_one_session(
     let shutdown_observer = spawn_shutdown_observer(stop.clone(), event_tx.clone(), schedule);
     drop(event_tx);
 
-    let engine_arc: Arc<dyn Engine> = engine.into();
     let ctx = SessionContext {
         sender: sender.clone(),
         engine: engine_arc,
@@ -971,8 +973,12 @@ fn spawn_reader(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
+// Seven collaborators (config + engine + sender + shared flags + observers + schedule);
+// grouping them adds indirection without improving readability.
+#[allow(clippy::too_many_arguments)]
 fn spawn_heartbeat_pump(
-    capabilities: WorkerCapabilities,
+    cfg: SharedConfig,
+    engine: Arc<dyn Engine>,
     sender: WsSender,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -987,11 +993,14 @@ fn spawn_heartbeat_pump(
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            // The capability snapshot is captured once at session
-            // start.  Only `auto_enabled` (the pause flag) and the
-            // current job id can change between heartbeats.
-            let mut caps = capabilities.clone();
-            caps.auto_enabled = !paused.load(Ordering::SeqCst);
+            // Rebuild the snapshot from the live config so operator
+            // edits (VRAM threshold, auto-start) propagate on the
+            // next tick instead of on the next reconnect.
+            let caps = crate::runtime::build_capabilities_with(
+                &cfg.lock(),
+                &*engine,
+                !paused.load(Ordering::SeqCst),
+            );
             let current_job_id = heartbeat_current_job_id(&observers);
             if let Err(e) = sender
                 .send(&WorkerInbound::Heartbeat {

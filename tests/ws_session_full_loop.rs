@@ -206,6 +206,68 @@ async fn spawn_silent_after_welcome_ws() -> (SocketAddr, tokio::task::JoinHandle
     (addr, handle)
 }
 
+/// Minimal studio that acks every heartbeat and forwards each
+/// heartbeat's advertised `vramThresholdGb` to the test through an
+/// unbounded channel, so a test can observe what the worker is
+/// advertising tick by tick.
+async fn spawn_heartbeat_collecting_ws() -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<f64>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut ws = tokio_tungstenite::accept_hdr_async(stream, echo_subprotocol).await?;
+
+        let hello = ws
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("hello missing"))??
+            .into_text()
+            .map_err(|_| anyhow::anyhow!("hello not text"))?;
+        let hello_json: serde_json::Value = serde_json::from_str(&hello)?;
+        assert_eq!(hello_json["type"], "hello");
+        ws.send(Message::Text(
+            serde_json::to_string(
+                &json!({"type":"welcome","workerId":"w-test","serverTime":"now"}),
+            )?
+            .into(),
+        ))
+        .await?;
+
+        while let Some(item) = ws.next().await {
+            let msg = match item {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            match msg {
+                Message::Text(t) => {
+                    let frame: serde_json::Value = serde_json::from_str(&t)?;
+                    if frame["type"] == "heartbeat" {
+                        let threshold = frame["capabilities"]["vramThresholdGb"]
+                            .as_f64()
+                            .unwrap_or(-1.0);
+                        if tx.send(threshold).is_err() {
+                            break;
+                        }
+                        ws.send(Message::Text(
+                            serde_json::to_string(&json!({"type":"heartbeatAck"}))?.into(),
+                        ))
+                        .await?;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        Ok(())
+    });
+    (addr, rx, handle)
+}
+
 async fn collect_frames(
     ws: &mut WebSocketStream<TcpStream>,
     expected: &[&str],
@@ -380,6 +442,82 @@ async fn ws_session_logs_a_breadcrumb_when_json_result_is_sent() {
             .any(|(_, job_id)| job_id.as_deref() == Some("job-stt")),
         "missing breadcrumb for the STT job: {json_completion:?}"
     );
+}
+
+#[tokio::test]
+async fn ws_session_heartbeats_pick_up_live_config_changes() {
+    // Regression: the capability snapshot used to be built once per
+    // session, so an operator saving a new VRAM threshold from the UI
+    // Config tab (or `set-threshold` on a shared config) was never
+    // advertised to the studio until the next reconnect — and the
+    // studio's pickWorkerForJob kept filtering on the stale budget.
+    let (ws_addr, mut thresholds, _server) = spawn_heartbeat_collecting_ws().await;
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        vram_threshold_gb: 12.0,
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let shared = config::shared(cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
+    let busy = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+
+    let session_handle = tokio::spawn({
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let logs = logs.clone();
+        let busy = busy.clone();
+        let paused = paused.clone();
+        async move {
+            spawn_ws_session(
+                shared,
+                stop,
+                logs,
+                busy,
+                paused,
+                WorkerObservers::default(),
+                SessionSchedule::fast_for_tests(),
+            )
+            .await
+        }
+    });
+
+    // The first heartbeat advertises the boot-time threshold.
+    let first = tokio::time::timeout(TIMEOUT, thresholds.recv())
+        .await
+        .expect("timed out waiting for the first heartbeat")
+        .expect("server channel closed before the first heartbeat");
+    assert_eq!(first, 12.0);
+
+    // Operator saves a new threshold mid-session.
+    shared.lock().vram_threshold_gb = 20.0;
+
+    // A subsequent heartbeat must advertise the new value without a
+    // reconnect.
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let v = thresholds
+                .recv()
+                .await
+                .expect("server channel closed before the updated heartbeat");
+            if v == 20.0 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("no heartbeat carried the updated vram threshold within the timeout");
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(5), session_handle)
+        .await
+        .expect("session loop timed out");
 }
 
 #[tokio::test]
