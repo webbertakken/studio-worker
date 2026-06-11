@@ -43,6 +43,30 @@ fn log_engine_roster(engines: &[Box<dyn Engine>]) {
     );
 }
 
+/// Typed "this engine cannot serve this task kind" error.
+///
+/// Engines return this (instead of an ad-hoc string) when a task of a
+/// kind they don't implement reaches their dispatch, so the session
+/// classifies the failure as non-retryable via a downcast
+/// (`runtime::is_unsupported_kind`) instead of sniffing message text.
+/// The rendered message keeps the legacy `<engine> engine cannot
+/// serve <kind> tasks` shape operators already grep for.
+#[derive(Debug, thiserror::Error)]
+#[error("{engine} engine cannot serve {kind} tasks")]
+pub struct UnsupportedTask {
+    pub engine: &'static str,
+    pub kind: &'static str,
+}
+
+impl UnsupportedTask {
+    pub fn new(engine: &'static str, kind: TaskKind) -> Self {
+        Self {
+            engine,
+            kind: kind.as_str(),
+        }
+    }
+}
+
 /// What a single engine is able to do.
 #[derive(Debug, Clone, Default)]
 pub struct EngineCapabilities {

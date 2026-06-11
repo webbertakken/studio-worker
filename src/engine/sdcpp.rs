@@ -347,7 +347,7 @@ impl Engine for SdCppEngine {
         let kind = task.kind();
         match task {
             Task::Image(p) => self.dispatch_image(model, p, source),
-            _ => bail!("sdcpp engine cannot serve {} tasks", kind.as_str()),
+            _ => Err(crate::engine::UnsupportedTask::new("sdcpp", kind).into()),
         }
     }
 }

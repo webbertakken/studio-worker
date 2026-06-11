@@ -27,7 +27,7 @@ use crate::runtime::{
     is_unsupported_kind, prompt_for, push_log_with_observers, record_recent_job, truncate_prompt,
     wait_with_stop, CurrentJob, JobOutcome, RecentJob, WorkerObservers,
 };
-use crate::types::{LogEntry, TaskResult, WorkerCapabilities};
+use crate::types::{LogEntry, TaskResult};
 use crate::ws::client::{connect, WsClientError, WsResult, WsSender};
 use crate::ws::types::{HelloFrame, JobOfferClaim, WorkerInbound, WorkerOutbound};
 
@@ -40,6 +40,12 @@ const SHUTDOWN_TICK: Duration = Duration::from_millis(250);
 const BASE_BACKOFF_MS: u64 = 1_000;
 const MAX_BACKOFF_MS: u64 = 30_000;
 const DEFAULT_RECONNECT_ATTEMPTS: u32 = 5;
+/// Extra attempts for the multipart result upload when the studio
+/// returns a 5xx / transport error.  A blip is far cheaper to retry
+/// than the full GPU regeneration a reported `Fail` causes.
+const UPLOAD_RETRIES: u32 = 2;
+/// Base pause between upload retries (grows linearly per attempt).
+const UPLOAD_RETRY_PAUSE: Duration = Duration::from_secs(1);
 /// If no frame (not even a `heartbeatAck`) arrives from the studio within this window, treat the
 /// connection as dead and tear the session down. The studio acks every heartbeat (~5s), so a live
 /// connection always yields a frame well inside this budget; the only time it elapses is a
@@ -424,13 +430,16 @@ async fn run_one_session(
         }
     }
 
-    // Heartbeat task.  Reuse the engine we already built for the
-    // Hello frame instead of rebuilding it on every heartbeat —
-    // rebuilding fires every engine's registration log every 5s and
-    // floods the logs.
-    let capabilities_for_heartbeat = capabilities.clone();
+    // Heartbeat task.  Reuses the engine handle built for the Hello
+    // frame (rebuilding fires every engine's registration log every
+    // 5s and floods the logs) but rebuilds the capability snapshot
+    // from the live config each tick, so operator edits (e.g. a new
+    // VRAM threshold saved from the UI's Config tab) reach the studio
+    // without waiting for a reconnect.
+    let engine_arc: Arc<dyn Engine> = engine.into();
     let heartbeat = spawn_heartbeat_pump(
-        capabilities_for_heartbeat,
+        cfg.clone(),
+        engine_arc.clone(),
         sender.clone(),
         stop.clone(),
         paused.clone(),
@@ -445,7 +454,6 @@ async fn run_one_session(
     let shutdown_observer = spawn_shutdown_observer(stop.clone(), event_tx.clone(), schedule);
     drop(event_tx);
 
-    let engine_arc: Arc<dyn Engine> = engine.into();
     let ctx = SessionContext {
         sender: sender.clone(),
         engine: engine_arc,
@@ -489,7 +497,10 @@ enum SessionEvent {
 }
 
 /// Bundle of immutable per-session settings the dispatcher passes
-/// around — keeps clippy's `too_many_arguments` lint happy.
+/// around — keeps clippy's `too_many_arguments` lint happy.  Cloning
+/// is cheap: every field is an `Arc`, a cloneable sender, or a small
+/// `String`.
+#[derive(Clone)]
 struct SessionContext {
     sender: WsSender,
     engine: Arc<dyn Engine>,
@@ -621,16 +632,10 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     let prompt_preview = truncate_prompt(&full_prompt);
     let started_at = chrono::Utc::now();
 
-    let busy_flag = ctx.busy.clone();
-    let logs_for_task = ctx.logs.clone();
-    let observers_for_task = ctx.observers.clone();
-    let sender_for_task = ctx.sender.clone();
-    let engine_for_task = ctx.engine.clone();
-    let api_base_url = ctx.api_base_url.clone();
-    let worker_id = ctx.worker_id.clone();
-    let auth_token = ctx.auth_token.clone();
+    let ctx = ctx.clone();
     tokio::spawn(async move {
-        let accept_result = sender_for_task
+        let accept_result = ctx
+            .sender
             .send(&WorkerInbound::Accept {
                 job_id: job_id.clone(),
             })
@@ -638,8 +643,8 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         if let Some((level, message)) = offer_response_breadcrumb("accept", &job_id, &accept_result)
         {
             push_log_with_observers(
-                &logs_for_task,
-                Some(&observers_for_task),
+                &ctx.logs,
+                Some(&ctx.observers),
                 level,
                 "ws",
                 &message,
@@ -647,12 +652,12 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             );
         }
         if accept_result.is_err() {
-            busy_flag.store(false, Ordering::SeqCst);
+            ctx.busy.store(false, Ordering::SeqCst);
             return;
         }
 
         // Surface the job to the UI's Jobs tab — bounded preview only.
-        *observers_for_task.current_job.lock() = Some(CurrentJob {
+        *ctx.observers.current_job.lock() = Some(CurrentJob {
             job_id: job_id.clone(),
             kind: task_kind,
             model: job.model.clone(),
@@ -661,13 +666,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         });
 
         run_offered_job(
-            sender_for_task,
-            engine_for_task,
-            logs_for_task,
-            observers_for_task,
-            api_base_url,
-            worker_id,
-            auth_token,
+            &ctx,
             job,
             started_at,
             task_kind,
@@ -675,7 +674,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             prompt_preview,
         )
         .await;
-        busy_flag.store(false, Ordering::SeqCst);
+        ctx.busy.store(false, Ordering::SeqCst);
     });
 }
 
@@ -704,16 +703,9 @@ fn spawn_reject_offer(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_offered_job(
-    sender: WsSender,
-    engine: Arc<dyn Engine>,
-    logs: Arc<Mutex<Vec<LogEntry>>>,
-    observers: WorkerObservers,
-    api_base_url: String,
-    worker_id: String,
-    auth_token: String,
+    ctx: &SessionContext,
     job: crate::types::JobClaim,
     started_at: chrono::DateTime<chrono::Utc>,
     task_kind: crate::types::TaskKind,
@@ -729,7 +721,7 @@ async fn run_offered_job(
         let model = job.model.clone();
         let model_source = job.model_source.clone();
         let task_for_engine = job.task.clone();
-        let engine = engine.clone();
+        let engine = ctx.engine.clone();
         move || -> Result<TaskResult> {
             engine.dispatch_with_source(&model, task_for_engine, &model_source)
         }
@@ -737,187 +729,73 @@ async fn run_offered_job(
     .await;
 
     let job_id = job.job_id.clone();
-    // Tracks the outcome we record into the RecentJob ring once every
-    // dispatch arm below has either succeeded or surfaced an error.
-    // The default value here only survives if the match falls through
-    // without assigning, which is unreachable; we keep it as a
-    // belt-and-braces default so the recent-jobs ring is never left
-    // half-populated by a future code-path that forgets to assign.
-    #[allow(unused_assignments)]
-    let mut outcome = JobOutcome::Failed {
-        reason: "dispatch did not run to completion".to_string(),
-    };
-    match dispatch {
+    // Every arm produces the outcome as a value, so the compiler
+    // proves the RecentJob ring always records a real outcome — no
+    // mutable default that survives a forgotten assignment.
+    let outcome = match dispatch {
         Ok(Ok(result)) => {
             push_log_with_observers(
-                &logs,
-                Some(&observers),
+                &ctx.logs,
+                Some(&ctx.observers),
                 "info",
                 "ws",
                 &format!("{} dispatched in {:?}", task_kind.as_str(), start.elapsed()),
                 Some(job_id.clone()),
             );
-            match result {
-                TaskResult::Image { bytes, ext }
-                | TaskResult::AudioTts { bytes, ext }
-                | TaskResult::Video { bytes, ext } => {
-                    // Binary outputs go via HTTP multipart \u2014 the only
-                    // worker-side HTTP route that survives the migration.
-                    let upload_result = tokio::task::spawn_blocking({
-                        let api_base_url = api_base_url.clone();
-                        let job_id = job_id.clone();
-                        let auth_token = auth_token.clone();
-                        let worker_id = worker_id.clone();
-                        let prompt = full_prompt.clone();
-                        move || -> Result<()> {
-                            let api = ApiClient::new(api_base_url)?;
-                            api.complete(&worker_id, &auth_token, &job_id, &ext, &prompt, bytes)
-                        }
-                    })
-                    .await;
-                    let msg = match upload_result {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e.to_string()),
-                        Err(e) => Some(format!("upload task panic: {e}")),
-                    };
-                    if let Some(msg) = msg {
-                        push_log_with_observers(
-                            &logs,
-                            Some(&observers),
-                            "error",
-                            "ws",
-                            &msg,
-                            Some(job_id.clone()),
-                        );
-                        outcome = JobOutcome::Failed {
-                            reason: msg.clone(),
-                        };
-                        let fail_result = sender
-                            .send(&WorkerInbound::Fail {
-                                job_id: job_id.clone(),
-                                error: msg,
-                                retryable: true,
-                            })
-                            .await;
-                        record_fail_send(&fail_result, &job_id, &logs, &observers);
-                    } else {
-                        push_log_with_observers(
-                            &logs,
-                            Some(&observers),
-                            "info",
-                            "ws",
-                            "binary upload ok",
-                            Some(job_id.clone()),
-                        );
-                        outcome = JobOutcome::Completed;
-                        // The studio's HTTP `/complete` handler defers a
-                        // `notifyJobCompleted` RPC to the
-                        // WorkerConnections DO; that's the canonical
-                        // "offer next job" nudge.  Sending an extra
-                        // `ReadyForMore` here races that flow: both can
-                        // call `offerNextFor` concurrently, double-
-                        // reserve the session's `currentJob` slot, and
-                        // ship two `Offer` frames — the second `Accept`
-                        // then trips the studio's `session not
-                        // authenticated`-shaped `accept for unknown
-                        // jobId` invariant and the DO kills the
-                        // session.  See:
-                        //   apps/studio/src/worker/modules/graphics/
-                        //     WorkerConnections/orchestrator.ts (commitOffer)
-                    }
-                }
-                TaskResult::Llm { json } | TaskResult::AudioStt { json } => {
-                    // Mirror the binary path: branch on the send result
-                    // so a dropped `completeJson` frame is recorded as a
-                    // failure (never a false-positive `Completed`) and a
-                    // successful send leaves an explicit completion
-                    // breadcrumb in the logs + shipped studio logs,
-                    // symmetric with the binary path's "binary upload ok".
-                    match sender
-                        .send(&WorkerInbound::CompleteJson {
-                            job_id: job_id.clone(),
-                            result: json,
-                            prompt: Some(full_prompt.clone()),
-                        })
-                        .await
-                    {
-                        Ok(()) => {
-                            push_log_with_observers(
-                                &logs,
-                                Some(&observers),
-                                "info",
-                                "ws",
-                                "json result sent",
-                                Some(job_id.clone()),
-                            );
-                            outcome = JobOutcome::Completed;
-                        }
-                        Err(e) => {
-                            let msg = format!("failed to send result: {e}");
-                            push_log_with_observers(
-                                &logs,
-                                Some(&observers),
-                                "error",
-                                "ws",
-                                &msg,
-                                Some(job_id.clone()),
-                            );
-                            outcome = JobOutcome::Failed { reason: msg };
-                        }
-                    }
-                }
-            }
+            deliver_result(ctx, &job_id, result, &full_prompt).await
         }
         Ok(Err(e)) => {
             warn!(target: TRACE_TARGET, error = %e, "engine dispatch failed");
             push_log_with_observers(
-                &logs,
-                Some(&observers),
+                &ctx.logs,
+                Some(&ctx.observers),
                 "error",
                 "ws",
                 &format!("dispatch failed: {e}"),
                 Some(job_id.clone()),
             );
-            outcome = JobOutcome::Failed {
-                reason: e.to_string(),
-            };
-            let fail_result = sender
+            let fail_result = ctx
+                .sender
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
                     error: e.to_string(),
                     retryable: !is_unsupported_kind(&e),
                 })
                 .await;
-            record_fail_send(&fail_result, &job_id, &logs, &observers);
+            record_fail_send(&fail_result, &job_id, &ctx.logs, &ctx.observers);
+            JobOutcome::Failed {
+                reason: e.to_string(),
+            }
         }
         Err(e) => {
             push_log_with_observers(
-                &logs,
-                Some(&observers),
+                &ctx.logs,
+                Some(&ctx.observers),
                 "error",
                 "ws",
                 &format!("dispatch task panic: {e}"),
                 Some(job_id.clone()),
             );
-            outcome = JobOutcome::Failed {
-                reason: e.to_string(),
-            };
-            let fail_result = sender
+            let fail_result = ctx
+                .sender
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
                     error: e.to_string(),
                     retryable: true,
                 })
                 .await;
-            record_fail_send(&fail_result, &job_id, &logs, &observers);
+            record_fail_send(&fail_result, &job_id, &ctx.logs, &ctx.observers);
+            JobOutcome::Failed {
+                reason: e.to_string(),
+            }
         }
-    }
+    };
 
     // Surface the finished job to the UI: clear the current-job slot
     // and push a RecentJob entry into the ring.
-    *observers.current_job.lock() = None;
+    *ctx.observers.current_job.lock() = None;
     record_recent_job(
-        &observers,
+        &ctx.observers,
         RecentJob {
             job_id: job_id.clone(),
             kind: task_kind,
@@ -928,6 +806,138 @@ async fn run_offered_job(
             finished_at: chrono::Utc::now(),
         },
     );
+}
+
+/// Deliver a successful engine result to the studio and return the
+/// outcome to record.  Binary outputs travel the multipart HTTP
+/// `/complete` route (R2 doesn't fit in WS frames); JSON outputs
+/// travel the WS `completeJson` frame.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn deliver_result(
+    ctx: &SessionContext,
+    job_id: &str,
+    result: TaskResult,
+    full_prompt: &str,
+) -> JobOutcome {
+    match result {
+        TaskResult::Image { bytes, ext }
+        | TaskResult::AudioTts { bytes, ext }
+        | TaskResult::Video { bytes, ext } => {
+            let upload_result = tokio::task::spawn_blocking({
+                let api_base_url = ctx.api_base_url.clone();
+                let job_id = job_id.to_string();
+                let auth_token = ctx.auth_token.clone();
+                let worker_id = ctx.worker_id.clone();
+                let prompt = full_prompt.to_string();
+                move || -> Result<()> {
+                    let api = ApiClient::new(api_base_url)?;
+                    api.complete_with_retry(
+                        &worker_id,
+                        &auth_token,
+                        &job_id,
+                        &ext,
+                        &prompt,
+                        bytes,
+                        UPLOAD_RETRIES,
+                        UPLOAD_RETRY_PAUSE,
+                    )
+                }
+            })
+            .await;
+            let msg = match upload_result {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(e) => Some(format!("upload task panic: {e}")),
+            };
+            match msg {
+                Some(msg) => {
+                    push_log_with_observers(
+                        &ctx.logs,
+                        Some(&ctx.observers),
+                        "error",
+                        "ws",
+                        &msg,
+                        Some(job_id.to_string()),
+                    );
+                    let fail_result = ctx
+                        .sender
+                        .send(&WorkerInbound::Fail {
+                            job_id: job_id.to_string(),
+                            error: msg.clone(),
+                            retryable: true,
+                        })
+                        .await;
+                    record_fail_send(&fail_result, job_id, &ctx.logs, &ctx.observers);
+                    JobOutcome::Failed { reason: msg }
+                }
+                None => {
+                    push_log_with_observers(
+                        &ctx.logs,
+                        Some(&ctx.observers),
+                        "info",
+                        "ws",
+                        "binary upload ok",
+                        Some(job_id.to_string()),
+                    );
+                    // The studio's HTTP `/complete` handler defers a
+                    // `notifyJobCompleted` RPC to the
+                    // WorkerConnections DO; that's the canonical
+                    // "offer next job" nudge.  Sending an extra
+                    // `ReadyForMore` here races that flow: both can
+                    // call `offerNextFor` concurrently, double-
+                    // reserve the session's `currentJob` slot, and
+                    // ship two `Offer` frames — the second `Accept`
+                    // then trips the studio's `session not
+                    // authenticated`-shaped `accept for unknown
+                    // jobId` invariant and the DO kills the
+                    // session.  See:
+                    //   apps/studio/src/worker/modules/graphics/
+                    //     WorkerConnections/orchestrator.ts (commitOffer)
+                    JobOutcome::Completed
+                }
+            }
+        }
+        TaskResult::Llm { json } | TaskResult::AudioStt { json } => {
+            // Mirror the binary path: branch on the send result so a
+            // dropped `completeJson` frame is recorded as a failure
+            // (never a false-positive `Completed`) and a successful
+            // send leaves an explicit completion breadcrumb, symmetric
+            // with the binary path's "binary upload ok".
+            match ctx
+                .sender
+                .send(&WorkerInbound::CompleteJson {
+                    job_id: job_id.to_string(),
+                    result: json,
+                    prompt: Some(full_prompt.to_string()),
+                })
+                .await
+            {
+                Ok(()) => {
+                    push_log_with_observers(
+                        &ctx.logs,
+                        Some(&ctx.observers),
+                        "info",
+                        "ws",
+                        "json result sent",
+                        Some(job_id.to_string()),
+                    );
+                    JobOutcome::Completed
+                }
+                Err(e) => {
+                    let msg = format!("failed to send result: {e}");
+                    push_log_with_observers(
+                        &ctx.logs,
+                        Some(&ctx.observers),
+                        "error",
+                        "ws",
+                        &msg,
+                        Some(job_id.to_string()),
+                    );
+                    JobOutcome::Failed { reason: msg }
+                }
+            }
+        }
+    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -971,8 +981,12 @@ fn spawn_reader(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
+// Seven collaborators (config + engine + sender + shared flags + observers + schedule);
+// grouping them adds indirection without improving readability.
+#[allow(clippy::too_many_arguments)]
 fn spawn_heartbeat_pump(
-    capabilities: WorkerCapabilities,
+    cfg: SharedConfig,
+    engine: Arc<dyn Engine>,
     sender: WsSender,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -987,11 +1001,14 @@ fn spawn_heartbeat_pump(
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            // The capability snapshot is captured once at session
-            // start.  Only `auto_enabled` (the pause flag) and the
-            // current job id can change between heartbeats.
-            let mut caps = capabilities.clone();
-            caps.auto_enabled = !paused.load(Ordering::SeqCst);
+            // Rebuild the snapshot from the live config so operator
+            // edits (VRAM threshold, auto-start) propagate on the
+            // next tick instead of on the next reconnect.
+            let caps = crate::runtime::build_capabilities_with(
+                &cfg.lock(),
+                &*engine,
+                !paused.load(Ordering::SeqCst),
+            );
             let current_job_id = heartbeat_current_job_id(&observers);
             if let Err(e) = sender
                 .send(&WorkerInbound::Heartbeat {
@@ -1037,11 +1054,14 @@ fn spawn_log_shipper_pump(
                 }
                 std::mem::take(&mut *guard)
             };
-            if let Err(e) = sender
-                .send(&WorkerInbound::LogBatch { entries: batch })
-                .await
-            {
-                warn!(target: TRACE_TARGET, error = %e, "log batch send failed");
+            let frame = WorkerInbound::LogBatch { entries: batch };
+            if let Err(e) = sender.send(&frame).await {
+                warn!(target: TRACE_TARGET, error = %e, "log batch send failed; requeueing batch");
+                // Put the batch back so it ships on the next session
+                // instead of vanishing with this one.
+                if let WorkerInbound::LogBatch { entries } = frame {
+                    crate::runtime::restore_unshipped(&logs, entries);
+                }
                 break;
             }
         }

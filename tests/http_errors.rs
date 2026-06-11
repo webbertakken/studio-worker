@@ -50,6 +50,99 @@ async fn complete_surfaces_4xx() {
 }
 
 #[tokio::test]
+async fn complete_with_retry_survives_transient_5xx() {
+    // Two 5xx blips then success: the upload must complete instead of
+    // failing the job back to the studio (which costs a full GPU
+    // regeneration).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/w/jobs/j/complete"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("blip"))
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/w/jobs/j/complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    detached(move || {
+        let api = ApiClient::new(uri).unwrap();
+        api.complete_with_retry(
+            "w",
+            "t",
+            "j",
+            "webp",
+            "p",
+            vec![1, 2, 3],
+            2,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap()
+    });
+}
+
+#[tokio::test]
+async fn complete_with_retry_gives_up_after_the_retry_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/w/jobs/j/complete"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("down"))
+        .expect(3) // 1 initial + 2 retries
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let err = detached(move || {
+        let api = ApiClient::new(uri).unwrap();
+        api.complete_with_retry(
+            "w",
+            "t",
+            "j",
+            "webp",
+            "p",
+            vec![1, 2, 3],
+            2,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap_err()
+    });
+    assert!(err.to_string().contains("complete failed"), "got: {err}");
+}
+
+#[tokio::test]
+async fn complete_with_retry_does_not_retry_4xx() {
+    // A 4xx is a contract error (e.g. job no longer claimed by this
+    // worker) — retrying would just hammer the studio with a request
+    // it has already refused.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/w/jobs/j/complete"))
+        .respond_with(ResponseTemplate::new(409).set_body_string("conflict"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let err = detached(move || {
+        let api = ApiClient::new(uri).unwrap();
+        api.complete_with_retry(
+            "w",
+            "t",
+            "j",
+            "webp",
+            "p",
+            vec![1, 2, 3],
+            2,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap_err()
+    });
+    assert!(err.to_string().contains("complete failed"), "got: {err}");
+}
+
+#[tokio::test]
 async fn complete_for_mp3_uses_audio_mime() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

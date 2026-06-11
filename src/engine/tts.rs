@@ -13,7 +13,7 @@
 //! The trait + capability surface is ready for them.
 use crate::engine::{Engine, EngineCapabilities};
 use crate::types::*;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -163,7 +163,7 @@ impl Engine for TtsEngine {
                     model,
                     "unsupported task kind"
                 );
-                bail!("tts engine cannot serve {} tasks", other.kind().as_str());
+                return Err(crate::engine::UnsupportedTask::new("tts", other.kind()).into());
             }
         };
         let text_len = params.text.chars().count();

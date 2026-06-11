@@ -16,7 +16,7 @@
 use crate::engine::render_procedural;
 use crate::engine::{Engine, EngineCapabilities};
 use crate::types::*;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use gif::{Encoder, Frame, Repeat};
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -70,7 +70,7 @@ impl Engine for VideoEngine {
                     model,
                     "unsupported task kind"
                 );
-                bail!("video engine cannot serve {} tasks", other.kind().as_str());
+                return Err(crate::engine::UnsupportedTask::new("video", other.kind()).into());
             }
         };
         let result = render_gif(&params);

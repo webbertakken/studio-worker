@@ -43,6 +43,14 @@ pub const RECENT_LOGS_CAP: usize = 1000;
 /// prompts are huge.
 pub const PROMPT_PREVIEW_CHARS: usize = 200;
 
+/// Maximum number of entries the WS ship queue (`logs:
+/// Arc<Mutex<Vec<LogEntry>>>`) may hold.  The shipper pump only drains
+/// while a session is connected, so a long approval wait or reconnect
+/// backoff would otherwise grow the queue without bound.  On overflow
+/// the oldest entries are dropped and a warn-level marker records the
+/// loss.
+pub const LOG_SHIP_QUEUE_CAP: usize = 5_000;
+
 /// Job in flight right now.  Populated by the WS session before
 /// dispatch, cleared once the job finishes (success or failure).
 #[derive(Debug, Clone)]
@@ -702,7 +710,14 @@ pub fn prompt_for(task: &Task) -> String {
 }
 
 pub fn is_unsupported_kind(e: &anyhow::Error) -> bool {
-    e.to_string().contains("cannot serve")
+    // Typed check first — survives context wrapping and rewording.
+    // The string check remains as a fallback for error paths that
+    // haven't migrated to `engine::UnsupportedTask` yet.
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::engine::UnsupportedTask>()
+            .is_some()
+    }) || e.to_string().contains("cannot serve")
 }
 
 // ---------------------------------------------------------------------------
@@ -822,7 +837,24 @@ pub fn push_log_with_observers(
     } else {
         info!(target: "studio_worker", job_id, "[{category}] {message}");
     }
-    logs.lock().push(entry.clone());
+    {
+        let mut queue = logs.lock();
+        if queue.len() >= LOG_SHIP_QUEUE_CAP {
+            // +1 for the entry below, +1 for the drop marker.
+            let overflow = queue.len() + 2 - LOG_SHIP_QUEUE_CAP;
+            queue.drain(0..overflow);
+            queue.push(LogEntry {
+                ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                level: "warn".to_string(),
+                category: "logs".to_string(),
+                message: format!(
+                    "ship queue full ({LOG_SHIP_QUEUE_CAP} entries); dropped {overflow} oldest"
+                ),
+                job_id: None,
+            });
+        }
+        queue.push(entry.clone());
+    }
     if let Some(o) = observers {
         let mut ring = o.recent_logs.lock();
         ring.push_back(entry);
@@ -832,11 +864,115 @@ pub fn push_log_with_observers(
     }
 }
 
+/// Put a drained-but-unsent batch back at the front of the ship queue
+/// so it survives for the next session attempt.  Entries that arrived
+/// while the batch was in flight stay behind it (newest last).  The
+/// combined queue is clipped to [`LOG_SHIP_QUEUE_CAP`], dropping the
+/// oldest entries first.
+pub fn restore_unshipped(logs: &Arc<Mutex<Vec<LogEntry>>>, mut batch: Vec<LogEntry>) {
+    let mut queue = logs.lock();
+    batch.append(&mut queue);
+    *queue = batch;
+    if queue.len() > LOG_SHIP_QUEUE_CAP {
+        let overflow = queue.len() - LOG_SHIP_QUEUE_CAP;
+        queue.drain(0..overflow);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
     use crate::engine::SyntheticEngine;
+
+    #[test]
+    fn is_unsupported_kind_detects_typed_unsupported_task() {
+        let err: anyhow::Error =
+            crate::engine::UnsupportedTask::new("synthetic", TaskKind::Llm).into();
+        assert!(is_unsupported_kind(&err));
+        // The message keeps the legacy operator-facing shape.
+        assert!(err.to_string().contains("cannot serve llm"));
+    }
+
+    #[test]
+    fn is_unsupported_kind_survives_context_wrapping() {
+        // String sniffing broke as soon as a caller added context (the
+        // outer message no longer contains "cannot serve"); the typed
+        // downcast searches the whole chain.
+        let err = anyhow::Error::from(crate::engine::UnsupportedTask::new(
+            "sdcpp",
+            TaskKind::AudioTts,
+        ))
+        .context("dispatching job j-1");
+        assert!(is_unsupported_kind(&err));
+    }
+
+    fn entry(message: &str) -> LogEntry {
+        LogEntry {
+            ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            level: "info".into(),
+            category: "test".into(),
+            message: message.into(),
+            job_id: None,
+        }
+    }
+
+    #[test]
+    fn restore_unshipped_requeues_batch_ahead_of_newer_entries() {
+        // A batch the shipper drained but failed to send must survive
+        // for the next session, ordered before entries that arrived
+        // while it was in flight.
+        let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(vec![entry("newer")]));
+        restore_unshipped(&logs, vec![entry("batch-1"), entry("batch-2")]);
+        let queue = logs.lock();
+        let order: Vec<&str> = queue.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(order, vec!["batch-1", "batch-2", "newer"]);
+    }
+
+    #[test]
+    fn restore_unshipped_respects_the_queue_cap() {
+        // Requeueing must never grow the queue past the ship cap; the
+        // oldest (front) entries give way so the newest survive.
+        let logs: Arc<Mutex<Vec<LogEntry>>> =
+            Arc::new(Mutex::new(vec![entry("newest"); LOG_SHIP_QUEUE_CAP]));
+        restore_unshipped(&logs, vec![entry("old-batch"); 100]);
+        let queue = logs.lock();
+        assert_eq!(queue.len(), LOG_SHIP_QUEUE_CAP);
+        assert_eq!(
+            queue.last().map(|e| e.message.as_str()),
+            Some("newest"),
+            "newest entries must survive the cap"
+        );
+    }
+
+    #[test]
+    fn ship_queue_is_bounded_and_records_dropped_entries() {
+        // The WS shipper only drains while a session is connected; a
+        // long approval wait / reconnect backoff must not grow the
+        // queue without bound.
+        let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        for i in 0..(LOG_SHIP_QUEUE_CAP + 100) {
+            push_log_with_observers(&logs, None, "info", "test", &format!("entry {i}"), None);
+        }
+        let queue = logs.lock();
+        assert!(
+            queue.len() <= LOG_SHIP_QUEUE_CAP,
+            "ship queue exceeded its cap: {}",
+            queue.len()
+        );
+        // The newest entry always survives.
+        assert_eq!(
+            queue.last().map(|e| e.message.as_str()),
+            Some(format!("entry {}", LOG_SHIP_QUEUE_CAP + 99).as_str())
+        );
+        // Loss is visible: a marker entry names how many were dropped.
+        assert!(
+            queue
+                .iter()
+                .any(|e| e.level == "warn" && e.message.contains("dropped")),
+            "overflow must leave a visible drop marker"
+        );
+    }
 
     #[test]
     fn capabilities_advertises_all_synthetic_kinds() {
