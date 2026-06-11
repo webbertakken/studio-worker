@@ -57,14 +57,14 @@ a product decision before implementation.
       lint allow disappears.  Pure refactor — behaviour pinned by
       existing tests.
 
-- [ ] 6. **Failed log batches are dropped.**
+- [x] 6. **Failed log batches are dropped.**
       The shipper `std::mem::take`s the buffer and, when the send
       fails, the batch is gone (warn only).  Fix: on send failure,
       push the batch back to the front of the queue (the cap from
       task 3 bounds the requeue).  TDD: pump test with a failing
       sender asserting entries survive for the next session.
 
-- [ ] 7. **Transient upload failure costs a full regeneration.**
+- [x] 7. **Transient upload failure costs a full regeneration.**
       A single multipart `/complete` 5xx → `Fail { retryable: true }`
       → studio requeues → the GPU re-renders (~10s) for what was a
       2s upload blip.  Fix: bounded retry (2 attempts, 1s/2s backoff,
