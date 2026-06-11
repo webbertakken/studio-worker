@@ -864,6 +864,21 @@ pub fn push_log_with_observers(
     }
 }
 
+/// Put a drained-but-unsent batch back at the front of the ship queue
+/// so it survives for the next session attempt.  Entries that arrived
+/// while the batch was in flight stay behind it (newest last).  The
+/// combined queue is clipped to [`LOG_SHIP_QUEUE_CAP`], dropping the
+/// oldest entries first.
+pub fn restore_unshipped(logs: &Arc<Mutex<Vec<LogEntry>>>, mut batch: Vec<LogEntry>) {
+    let mut queue = logs.lock();
+    batch.append(&mut queue);
+    *queue = batch;
+    if queue.len() > LOG_SHIP_QUEUE_CAP {
+        let overflow = queue.len() - LOG_SHIP_QUEUE_CAP;
+        queue.drain(0..overflow);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +905,44 @@ mod tests {
         ))
         .context("dispatching job j-1");
         assert!(is_unsupported_kind(&err));
+    }
+
+    fn entry(message: &str) -> LogEntry {
+        LogEntry {
+            ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            level: "info".into(),
+            category: "test".into(),
+            message: message.into(),
+            job_id: None,
+        }
+    }
+
+    #[test]
+    fn restore_unshipped_requeues_batch_ahead_of_newer_entries() {
+        // A batch the shipper drained but failed to send must survive
+        // for the next session, ordered before entries that arrived
+        // while it was in flight.
+        let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(vec![entry("newer")]));
+        restore_unshipped(&logs, vec![entry("batch-1"), entry("batch-2")]);
+        let queue = logs.lock();
+        let order: Vec<&str> = queue.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(order, vec!["batch-1", "batch-2", "newer"]);
+    }
+
+    #[test]
+    fn restore_unshipped_respects_the_queue_cap() {
+        // Requeueing must never grow the queue past the ship cap; the
+        // oldest (front) entries give way so the newest survive.
+        let logs: Arc<Mutex<Vec<LogEntry>>> =
+            Arc::new(Mutex::new(vec![entry("newest"); LOG_SHIP_QUEUE_CAP]));
+        restore_unshipped(&logs, vec![entry("old-batch"); 100]);
+        let queue = logs.lock();
+        assert_eq!(queue.len(), LOG_SHIP_QUEUE_CAP);
+        assert_eq!(
+            queue.last().map(|e| e.message.as_str()),
+            Some("newest"),
+            "newest entries must survive the cap"
+        );
     }
 
     #[test]

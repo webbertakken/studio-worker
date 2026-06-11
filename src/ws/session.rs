@@ -1039,11 +1039,14 @@ fn spawn_log_shipper_pump(
                 }
                 std::mem::take(&mut *guard)
             };
-            if let Err(e) = sender
-                .send(&WorkerInbound::LogBatch { entries: batch })
-                .await
-            {
-                warn!(target: TRACE_TARGET, error = %e, "log batch send failed");
+            let frame = WorkerInbound::LogBatch { entries: batch };
+            if let Err(e) = sender.send(&frame).await {
+                warn!(target: TRACE_TARGET, error = %e, "log batch send failed; requeueing batch");
+                // Put the batch back so it ships on the next session
+                // instead of vanishing with this one.
+                if let WorkerInbound::LogBatch { entries } = frame {
+                    crate::runtime::restore_unshipped(&logs, entries);
+                }
                 break;
             }
         }
