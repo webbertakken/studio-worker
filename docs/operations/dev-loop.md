@@ -78,7 +78,7 @@ This is what you want when:
 
 - **One worker per `worker_id`**.  Don't run both flavours
   simultaneously \u2014 the studio's DO closes the older session with
-  `4002 duplicate_worker` and both workers thrash trying to
+  `4003 duplicate_worker` and both workers thrash trying to
   reconnect.  `pm2 stop` one before starting the other.
 - **Orphan child after cargo-watch restart**.  Killing the
   watcher's `cargo run` doesn't always reap the

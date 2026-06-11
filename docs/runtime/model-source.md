@@ -3,7 +3,8 @@
 The studio is the single source of truth for which files a worker
 needs to download to serve a given model.  When a job is queued (or
 promoted, or retried), the studio resolves the job's model name
-against its in-tree registry (`apps/studio/src/worker/modules/graphics/modelRegistry.ts`)
+against its D1-backed registry (the `studioModels` table, via
+`apps/studio/src/worker/modules/graphics/resolveModelSource.ts`)
 and persists the resolved `ModelSource` JSON onto the row's
 `modelSource` column.  Every Offer frame the studio sends over WS
 includes that JSON.  The worker is dumb: it downloads what it's
@@ -58,13 +59,15 @@ JSON-serialised on the WS Offer, mirrored on both sides:
 
 ## Studio side
 
-`modelRegistry.ts` is a hand-maintained `Record<string, ModelSource>`
-keyed by the `model` field the studio writes onto a `graphicsJobs`
-row.  Adding a new model means adding an entry.  No D1 migration;
-the registry is in-tree because it's tiny and changes only when we
-add new model variants.
+The registry lives in the `studioModels` D1 table (originally a
+hand-maintained in-tree `modelRegistry.ts`; migrated to D1 with
+migration `0017_seed_registry.sql` + an admin CRUD surface in
+`routes/models.ts`).  Rows are keyed by the `model` field the studio
+writes onto a `graphicsJobs` row; a missing or disabled row is a 400
+at queue time.
 
-The studio calls `resolveModelSource(model)` at three write sites:
+The studio calls `resolveModelSourceFromDatabase(database, model)` at
+three write sites:
 
 | Site | Where |
 |---|---|
@@ -118,18 +121,13 @@ richer.
 
 ## Adding a new model
 
-1. Edit `apps/studio/src/worker/modules/graphics/modelRegistry.ts`.
-   Add an entry keyed by the model name the operator will type into
-   the studio UI / promote with.
+1. Add a `studioModels` row via the studio's Models admin page (or a
+   seed migration), keyed by the model name the operator will type
+   into the studio UI / promote with.
 2. Verify each `url` resolves to a public HF / GitHub asset
    (`curl -I` should return `200` or `302` without auth).
-3. `cargo test`-equivalent on the studio: `yarn vitest run
-   src/worker/modules/graphics/modelRegistry.test.ts` \u2014 the
-   "every file has an https URL + a filename" contract test catches
-   typos.
-4. Open a PR; production deploy ships the new registry entry.  No
-   worker rebuild needed \u2014 the worker reads the entry off every
-   offer.
+3. No worker rebuild and no deploy needed \u2014 the worker reads the
+   entry off every offer.
 
 If a brand-new **engine** is needed (e.g. a Whisper-based STT
 backend), add the `WorkerModelEngine` enum value on both sides AND a
