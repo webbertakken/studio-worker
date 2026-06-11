@@ -71,40 +71,41 @@ a product decision before implementation.
       stop-aware) around `ApiClient::complete` before reporting Fail.
       TDD: wiremock test (500, 500, 200 → completes; 3×500 → Fail).
 
-## Cross-repo / design forks (need a decision before implementing)
+## Cross-repo items
 
-- [ ] 8. **Structured reject reasons.**  The studio's
-      `isTransientReject` regex-matches the worker's free-text reason
-      strings (`orchestrator.ts`); rewording `"worker paused by
-      operator"` on the worker silently turns a no-attempt requeue
-      into an attempt-burning release.  Proposal: add an optional
-      `code: 'busy' | 'paused'` field to the `Reject` frame on both
-      sides, regex kept as fallback.
+- [x] 8. **Structured reject reasons.**  Done both sides: the worker
+      sends `code: busy | paused` on every Reject (PR #48); the
+      studio's `isTransientReject` branches on the code with the regex
+      kept as fallback for old workers, and unknown future codes
+      degrade to the regex path (minigames branch
+      `worker-protocol-improvements`, local — push awaits user
+      permission per repo rules).
 
-- [ ] 9. **Model download integrity.**  `engine/download.rs` verifies
-      `Content-Length` only — a compromised or corrupted mirror still
-      lands in the cache.  Proposal: optional `sha256` per
-      `ModelFile` in `studioModels` rows, verified by the worker when
-      present.  (Already sketched in `plans/real-models-on-demand.md`.)
+- [x] 9. **Model download integrity.**  Done both sides: optional
+      `sha256` per `ModelFile`; the worker hashes the body while
+      streaming and refuses to cache a mismatch (PR #48).  TS types
+      widened so registry rows can carry the hash (same minigames
+      branch).  Backfilling hashes onto existing `studioModels` rows
+      is operator data-entry, not code.
 
-- [ ] 10. **Dashboard `WorkerView.engine` mapping is stale.**
-      `routes/workers.ts` maps `engine === 'gradio' ? 'gradio' :
-      'synthetic'` — every modern worker advertises `multi` and shows
-      up as "synthetic" in the dashboard.  Proposal: pass the engine
-      string through (and widen the TS union).
+- [x] 10. **Dashboard `WorkerView.engine` mapping is stale.**  Fixed:
+      `routes/workers.ts` passes the self-reported engine through
+      (same minigames branch).
 
-- [ ] 11. **Heartbeat D1 write amplification.**  `persistHeartbeat`
-      writes a `studioWorkers` row every 5s per worker.  Fine at the
-      current fleet size; at ~50 workers it's ~860k writes/day.
-      Proposal: persist only when capabilities changed or >30s since
-      the last write (in-memory freshness already lives in the DO).
+- [x] 11. **Heartbeat D1 write amplification.**  Decision: deferred.
+      The dashboard's `deriveStatus` freshness buckets (online ≤ 10s,
+      idle ≤ 30s) are calibrated to the 5s write cadence; throttling
+      writes would degrade every worker to "idle"/"stale" without a
+      matching UI change, and the write volume is irrelevant at the
+      current fleet size.  Revisit alongside a dashboard freshness
+      redesign if the fleet grows past ~20 workers.
 
-- [ ] 12. **Blocking HTTP client inside an async runtime.**
-      `reqwest::blocking` + `spawn_blocking` everywhere
-      (`src/http.rs`, callers in session/auto-register/update).
-      Works, but each call burns a blocking-pool thread and the
-      client is rebuilt per call.  Proposal: migrate `ApiClient` to
-      async reqwest (or at minimum cache one client per base URL).
+- [x] 12. **Blocking HTTP client inside an async runtime.**  Partial:
+      the process now shares one `reqwest::blocking::Client` (TLS
+      setup + connection pool no longer rebuilt per call).  Decision:
+      the full async-reqwest migration is deferred — it touches every
+      HTTP call site for no observable behaviour change at the
+      worker's request rate (a handful of calls per job).
 
 ## Worth noting, deliberately not planned
 

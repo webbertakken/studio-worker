@@ -60,15 +60,29 @@ pub struct ApiClient {
     pub client: Client,
 }
 
+/// Process-wide blocking client, shared by every `ApiClient`.
+/// `reqwest::blocking::Client` is an `Arc` around a connection pool;
+/// rebuilding it per call (the old behaviour) re-did TLS setup and
+/// threw the pool away between requests.
+fn shared_client() -> Result<Client> {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let built = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("building reqwest client")?;
+    // A concurrent first call may have won the publish; either client
+    // is fine — take whichever landed.
+    Ok(CLIENT.get_or_init(|| built).clone())
+}
+
 impl ApiClient {
     pub fn new(base_url: String) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .context("building reqwest client")?;
         Ok(Self {
             base_url: normalize_base_url(&base_url)?,
-            client,
+            client: shared_client()?,
         })
     }
 
