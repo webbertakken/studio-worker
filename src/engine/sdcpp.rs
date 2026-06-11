@@ -130,7 +130,7 @@ impl SdCppEngine {
     fn ensure_files(&self, source: &ModelSource) -> Result<Vec<(ModelFileRole, PathBuf)>> {
         let mut out = Vec::with_capacity(source.files.len());
         for file in &source.files {
-            let local = download::ensure_file(&self.models_root, &file.filename, &file.url)?;
+            let local = download::ensure_file(&self.models_root, file)?;
             out.push((file.role, local));
         }
         Ok(out)
@@ -817,6 +817,7 @@ mod tests {
             url: "https://example.invalid/cached.gguf".into(),
             filename: "cached.gguf".into(),
             approx_bytes: None,
+            sha256: None,
         }]);
         let resolved = engine.ensure_files(&source).expect("cached file used");
         assert_eq!(resolved.len(), 1);

@@ -151,20 +151,57 @@ fn inbound_accept_round_trips() {
 
 #[test]
 fn inbound_reject_round_trips() {
+    // Legacy shape without a code must keep round-tripping unchanged.
     let json = json!({ "type": "reject", "jobId": "job-1", "reason": "model unloaded" });
     let parsed: WorkerInbound = serde_json::from_value(json.clone()).unwrap();
     match parsed {
         WorkerInbound::Reject {
             ref job_id,
             ref reason,
+            code,
         } => {
             assert_eq!(job_id, "job-1");
             assert_eq!(reason, "model unloaded");
+            assert_eq!(code, None);
         }
         ref other => panic!("expected Reject, got {other:?}"),
     }
     let back = serde_json::to_value(&parsed).unwrap();
     assert_eq!(back, json);
+}
+
+#[test]
+fn inbound_reject_carries_a_structured_code() {
+    // The structured `code` lets the studio classify transient rejects
+    // (busy / paused) without regex-matching the free-text reason —
+    // mirrored in `parseInbound.ts` + `isTransientReject`.
+    let json = json!({
+        "type": "reject",
+        "jobId": "job-1",
+        "reason": "worker paused by operator",
+        "code": "paused",
+    });
+    let parsed: WorkerInbound = serde_json::from_value(json.clone()).unwrap();
+    match parsed {
+        WorkerInbound::Reject { code, .. } => {
+            assert_eq!(code, Some(studio_worker::ws::types::RejectCode::Paused));
+        }
+        ref other => panic!("expected Reject, got {other:?}"),
+    }
+    let back = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(back, json);
+    assert_eq!(back["code"], "paused");
+
+    let busy: WorkerInbound = serde_json::from_value(json!({
+        "type": "reject", "jobId": "j", "reason": "r", "code": "busy",
+    }))
+    .unwrap();
+    match busy {
+        WorkerInbound::Reject { code, .. } => {
+            assert_eq!(code, Some(studio_worker::ws::types::RejectCode::Busy));
+        }
+        ref other => panic!("expected Reject, got {other:?}"),
+    }
 }
 
 #[test]

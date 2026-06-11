@@ -12,9 +12,13 @@
 //! load.
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 use tracing::{info, warn};
+
+use crate::types::ModelFile;
 
 /// Tracing target for model downloads.  Stable so operators can filter
 /// with `RUST_LOG=studio_worker::engine::download=debug`.
@@ -56,6 +60,41 @@ pub fn verify_download_len(copied: u64, expected: Option<u64>) -> Result<()> {
     }
 }
 
+/// Verify a downloaded body's sha256 against the registry's expected
+/// hex digest (case-insensitive).  `None` means the registry row
+/// predates integrity hashes — nothing to check.  A mismatch means a
+/// corrupted or tampered body that must never be committed to the
+/// cache.
+pub fn verify_sha256(actual_hex: &str, expected: Option<&str>) -> Result<()> {
+    match expected {
+        Some(expected) if !actual_hex.eq_ignore_ascii_case(expected.trim()) => bail!(
+            "sha256 mismatch: downloaded body hashes to {actual_hex} but the registry \
+             expects {expected} (corrupted or tampered download)"
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Writer adapter that feeds every chunk through a [`Sha256`] hasher
+/// on its way to the underlying file, so verification needs no second
+/// read pass over a multi-GiB model.
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Best-effort removal of a partial `.part` download.  A `NotFound` is
 /// the desired end state (something already cleaned it up); any other
 /// failure is surfaced so a stuck temp file can't silently fill the
@@ -74,10 +113,13 @@ pub fn remove_partial(path: &Path) {
     }
 }
 
-/// Ensure `filename` is present under `dir`, downloading it from `url`
-/// when missing.  Returns the resolved local path.
+/// Ensure `file.filename` is present under `dir`, downloading it from
+/// `file.url` when missing (verified against `file.sha256` when the
+/// registry provides one).  Returns the resolved local path.
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub fn ensure_file(dir: &Path, filename: &str, url: &str) -> Result<PathBuf> {
+pub fn ensure_file(dir: &Path, file: &ModelFile) -> Result<PathBuf> {
+    let filename = file.filename.as_str();
+    let url = file.url.as_str();
     let local = model_cache_path(dir, filename)?;
     if local.is_file() {
         tracing::debug!(
@@ -89,7 +131,7 @@ pub fn ensure_file(dir: &Path, filename: &str, url: &str) -> Result<PathBuf> {
         );
         return Ok(local);
     }
-    download_file(url, &local)
+    download_file_verified(url, &local, file.sha256.as_deref())
         .with_context(|| format!("downloading {filename} ({url}) -> {}", local.display()))?;
     Ok(local)
 }
@@ -103,6 +145,14 @@ pub fn ensure_file(dir: &Path, filename: &str, url: &str) -> Result<PathBuf> {
 /// ([`verify_download_len`], [`model_cache_path`]) are unit-tested.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub fn download_file(url: &str, dest: &Path) -> Result<()> {
+    download_file_verified(url, dest, None)
+}
+
+/// [`download_file`] with an optional expected sha256 — the body is
+/// hashed while it streams and a mismatch is rejected before the
+/// rename, so a bad body never lands in the cache.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -125,12 +175,17 @@ pub fn download_file(url: &str, dest: &Path) -> Result<()> {
         bail!("GET {url} -> {}", response.status());
     }
     let expected_len = response.content_length();
-    let mut file =
+    let file =
         std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-    let copied = std::io::copy(&mut response, &mut file);
+    let mut writer = HashingWriter {
+        inner: file,
+        hasher: Sha256::new(),
+    };
+    let copied = std::io::copy(&mut response, &mut writer);
+    let digest = writer.hasher.finalize();
     // Close the handle before any remove / rename so cleanup works on
     // Windows, where an open file can't be unlinked.
-    drop(file);
+    drop(writer.inner);
     let bytes = match copied {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -139,6 +194,11 @@ pub fn download_file(url: &str, dest: &Path) -> Result<()> {
         }
     };
     if let Err(e) = verify_download_len(bytes, expected_len) {
+        remove_partial(&part);
+        return Err(e).with_context(|| format!("downloading {url}"));
+    }
+    let actual_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    if let Err(e) = verify_sha256(&actual_hex, expected_sha256) {
         remove_partial(&part);
         return Err(e).with_context(|| format!("downloading {url}"));
     }
@@ -199,13 +259,27 @@ mod tests {
         assert!(verify_download_len(120, Some(100)).is_err());
     }
 
+    fn test_file(filename: &str, url: &str) -> ModelFile {
+        ModelFile {
+            role: crate::types::ModelFileRole::Model,
+            url: url.to_string(),
+            filename: filename.to_string(),
+            approx_bytes: None,
+            sha256: None,
+        }
+    }
+
     #[test]
     fn ensure_file_returns_cached_path_without_network() {
         // A file already present must be returned as-is — `ensure_file`
         // never touches the network, so an unreachable URL is fine.
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("cached.gguf"), b"already here").unwrap();
-        let path = ensure_file(dir.path(), "cached.gguf", "https://example.invalid/x").unwrap();
+        let path = ensure_file(
+            dir.path(),
+            &test_file("cached.gguf", "https://example.invalid/x"),
+        )
+        .unwrap();
         assert_eq!(path, dir.path().join("cached.gguf"));
         assert_eq!(std::fs::read(&path).unwrap(), b"already here");
     }
@@ -213,10 +287,46 @@ mod tests {
     #[test]
     fn ensure_file_rejects_path_traversal_before_any_network() {
         let dir = tempdir().unwrap();
-        let err = ensure_file(dir.path(), "../escape.gguf", "https://example.invalid/x")
+        let err = ensure_file(
+            dir.path(),
+            &test_file("../escape.gguf", "https://example.invalid/x"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("plain file name"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // verify_sha256 — the integrity gate for registry-pinned hashes.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn verify_sha256_accepts_match_and_absence() {
+        assert!(verify_sha256("abc123", Some("abc123")).is_ok());
+        assert!(
+            verify_sha256("abc123", Some("ABC123")).is_ok(),
+            "case-insensitive"
+        );
+        assert!(
+            verify_sha256("abc123", Some(" abc123 ")).is_ok(),
+            "whitespace-tolerant"
+        );
+        assert!(
+            verify_sha256("abc123", None).is_ok(),
+            "legacy rows have no hash"
+        );
+    }
+
+    #[test]
+    fn verify_sha256_rejects_mismatch() {
+        let err = verify_sha256("abc123", Some("def456"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("plain file name"), "got: {err}");
+        assert!(err.contains("sha256 mismatch"), "got: {err}");
+        assert!(
+            err.contains("abc123") && err.contains("def456"),
+            "must name both digests: {err}"
+        );
     }
 
     #[test]
