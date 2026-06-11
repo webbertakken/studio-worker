@@ -40,6 +40,12 @@ const SHUTDOWN_TICK: Duration = Duration::from_millis(250);
 const BASE_BACKOFF_MS: u64 = 1_000;
 const MAX_BACKOFF_MS: u64 = 30_000;
 const DEFAULT_RECONNECT_ATTEMPTS: u32 = 5;
+/// Extra attempts for the multipart result upload when the studio
+/// returns a 5xx / transport error.  A blip is far cheaper to retry
+/// than the full GPU regeneration a reported `Fail` causes.
+const UPLOAD_RETRIES: u32 = 2;
+/// Base pause between upload retries (grows linearly per attempt).
+const UPLOAD_RETRY_PAUSE: Duration = Duration::from_secs(1);
 /// If no frame (not even a `heartbeatAck`) arrives from the studio within this window, treat the
 /// connection as dead and tear the session down. The studio acks every heartbeat (~5s), so a live
 /// connection always yields a frame well inside this budget; the only time it elapses is a
@@ -825,7 +831,16 @@ async fn deliver_result(
                 let prompt = full_prompt.to_string();
                 move || -> Result<()> {
                     let api = ApiClient::new(api_base_url)?;
-                    api.complete(&worker_id, &auth_token, &job_id, &ext, &prompt, bytes)
+                    api.complete_with_retry(
+                        &worker_id,
+                        &auth_token,
+                        &job_id,
+                        &ext,
+                        &prompt,
+                        bytes,
+                        UPLOAD_RETRIES,
+                        UPLOAD_RETRY_PAUSE,
+                    )
                 }
             })
             .await;

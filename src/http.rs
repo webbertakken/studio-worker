@@ -25,6 +25,36 @@ const API_PREFIX: &str = "/graphics/api";
 /// the agent's logs.
 const TRACE_TARGET: &str = "studio_worker::http";
 
+/// Typed non-2xx response error so callers can branch on the status
+/// class (e.g. retry 5xx, never retry 4xx) without sniffing message
+/// strings.  The rendered message keeps the legacy `<op> failed:
+/// <status> — <body>` shape existing tests and log consumers expect.
+#[derive(Debug, thiserror::Error)]
+#[error("{op} failed: {status} — {body}")]
+pub struct HttpStatusError {
+    pub op: String,
+    pub status: u16,
+    pub body: String,
+}
+
+impl HttpStatusError {
+    /// Server-side failures are worth retrying; 4xx contract errors
+    /// are not.
+    pub fn is_transient(&self) -> bool {
+        self.status >= 500
+    }
+}
+
+/// True when the upload failed for a reason a short retry can fix: a
+/// 5xx from the studio or a transport-level error (connect refused,
+/// timeout, broken pipe).  4xx contract errors return false.
+pub fn is_transient_upload_error(e: &anyhow::Error) -> bool {
+    if let Some(status) = e.downcast_ref::<HttpStatusError>() {
+        return status.is_transient();
+    }
+    e.downcast_ref::<reqwest::Error>().is_some()
+}
+
 pub struct ApiClient {
     pub base_url: String,
     pub client: Client,
@@ -76,7 +106,12 @@ impl ApiClient {
             body = %body,
             "{op} failed"
         );
-        Err(anyhow!("{op} failed: {status} — {body}"))
+        Err(HttpStatusError {
+            op: op.to_string(),
+            status: status.as_u16(),
+            body,
+        }
+        .into())
     }
 
     // -----------------------------------------------------------------------
@@ -177,6 +212,46 @@ impl ApiClient {
             .send()?;
         self.check("complete", &url, started, response)?;
         Ok(())
+    }
+
+    /// Like [`Self::complete`] but retries transient failures (5xx +
+    /// transport errors) up to `retries` additional attempts, pausing
+    /// `pause * attempt` between them.  4xx contract errors surface
+    /// immediately.  Keeps a brief upload blip from costing a full GPU
+    /// regeneration — a reported `Fail` makes the studio requeue and
+    /// re-render the whole job.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_with_retry(
+        &self,
+        worker_id: &str,
+        token: &str,
+        job_id: &str,
+        ext: &str,
+        prompt: &str,
+        image: Vec<u8>,
+        retries: u32,
+        pause: Duration,
+    ) -> Result<()> {
+        let mut attempt: u32 = 0;
+        loop {
+            match self.complete(worker_id, token, job_id, ext, prompt, image.clone()) {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < retries && is_transient_upload_error(&e) => {
+                    attempt += 1;
+                    warn!(
+                        target: TRACE_TARGET,
+                        op = "complete",
+                        job_id,
+                        attempt,
+                        max_attempts = retries + 1,
+                        error = %e,
+                        "transient upload failure; retrying"
+                    );
+                    std::thread::sleep(pause * attempt);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
