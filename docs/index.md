@@ -12,6 +12,10 @@ top-level [`README.md`](../README.md).  For active plans, see
 - [Overview](architecture/overview.md) — what the worker is, how it
   boots, the lifecycle of one job, every Rust module's role, the
   HTTP + WebSocket surfaces it speaks to the studio.
+- [Flows](architecture/flows.md) — every flow end-to-end
+  (registration, WS session, offer/dispatch, model provisioning,
+  result delivery, failure/retry, pause, logs, update, UI), each
+  cross-referenced to the studio-side implementation.
 
 ## Runtime
 

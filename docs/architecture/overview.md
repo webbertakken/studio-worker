@@ -703,8 +703,8 @@ contributors.
 | `register-requests/:id` 401 | poll response | Same as 404; the worker's secret doesn't match the row \u2014 only happens if config was tampered |
 | WS connect refused / TLS error | `WsClientError::Transport` | Back off + reconnect, up to `ws_reconnect_attempts` |
 | WS close code `4001 AuthFailed` | session loop | Stop reconnecting; user must `register --reset` |
-| WS close code `4002 DuplicateWorker` | session loop | Stop reconnecting (another instance is connected with the same id) |
-| WS close code `4003 WorkerDeleted` | session loop | Stop; the studio operator deleted us |
+| WS close code `4003 DuplicateWorker` | session loop | Stop reconnecting (another instance is connected with the same id) |
+| WS close code `4004 WorkerDeleted` | session loop | Stop; the studio operator deleted us |
 | WS protocol violation | session loop | Server sends `Error { code: ProtocolViolation }` then closes |
 | Engine `dispatch` returns `UnsupportedKind` | runtime job-runner | `Fail { retryable: false }` \u2014 server moves the job to terminal failed |
 | Engine `dispatch` returns generic `Err` | runtime job-runner | `Fail { retryable: true }` \u2014 server requeues |
