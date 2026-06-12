@@ -107,6 +107,26 @@ a product decision before implementation.
       HTTP call site for no observable behaviour change at the
       worker's request rate (a handful of calls per job).
 
+## Follow-up requirements (2026-06-12)
+
+- [x] 13. **Auto-update must work on all platforms.**  Audit result:
+      release assets cover every target (installer.sh + installer.ps1 +
+      5 archives); unix replace + execvp is sound.  **Windows is
+      broken by design**: `installer.ps1` does `Copy-Item -ErrorAction
+      Stop` over the running exe, which Windows locks — the installer
+      fails every time the worker is running (always).  Fix: park the
+      running exe (`rename` is allowed for running binaries on NTFS)
+      before the installer runs, confirm the new binary landed at the
+      original path, roll back on any failure, and clean up the parked
+      `.old` file on next startup.  Pure-fs guard logic unit-tested on
+      every platform; only the activation is Windows-gated.
+
+- [x] 14. **Start minimised by default.**  New `start_minimised` config
+      field (default `true`), honoured by `ui::run`'s viewport
+      (`with_minimized`), exposed as a toggle in the Config tab's
+      Background mode group.  Minimised-to-taskbar (not hidden) so the
+      window stays reachable even when no tray host is available.
+
 ## Worth noting, deliberately not planned
 
 - `sd-cli` per-job process spawn (model reload each job) — known,

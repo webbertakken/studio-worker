@@ -83,6 +83,11 @@ pub struct App {
     tray_variant: TrayVariant,
     quit_requested: Arc<std::sync::atomic::AtomicBool>,
     tray: Option<super::tray_host::TrayHandle>,
+    /// One-shot request to minimise the window on the first frame
+    /// (config `start_minimised`, default true).  Minimised to the
+    /// taskbar — not hidden — so the window stays reachable even when
+    /// no tray host is available.
+    start_minimised_pending: bool,
 }
 
 impl App {
@@ -102,9 +107,9 @@ impl App {
         notifier: Box<dyn Notifier + Send + Sync>,
         registration: crate::auto_register::SharedRegistration,
     ) -> Self {
-        let config_draft = {
+        let (config_draft, start_minimised_pending) = {
             let cfg = deps.cfg.lock();
-            ConfigDraft::from(&cfg)
+            (ConfigDraft::from(&cfg), cfg.start_minimised)
         };
         let vram_total_gb = sys::detect_vram_gb().unwrap_or(0.0);
         Self {
@@ -121,7 +126,14 @@ impl App {
             tray_variant: TrayVariant::Disconnected,
             quit_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray: None,
+            start_minimised_pending,
         }
+    }
+
+    /// Whether the first frame will request a minimised window.
+    /// Public for the start-minimised regression tests.
+    pub fn start_minimised_pending(&self) -> bool {
+        self.start_minimised_pending
     }
 
     pub fn registration_handle(&self) -> crate::auto_register::SharedRegistration {
@@ -247,6 +259,17 @@ impl App {
     /// Shared housekeeping invoked before every frame's render — keeps
     /// the `ui()` entry point thin.
     fn pre_render(&mut self, ctx: &egui::Context) {
+        // Honour `start_minimised` on the first frame.
+        if self.start_minimised_pending {
+            self.start_minimised_pending = false;
+            tracing::info!(
+                target: TRACE_TARGET,
+                op = "start_minimised",
+                "minimising window on startup (config start_minimised)"
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
         self.drain_notifications();
         self.refresh_tray_variant();
 
@@ -401,6 +424,22 @@ mod tests {
             config_path: PathBuf::from("/tmp/studio-worker-test.toml"),
             tokio: handle,
         }
+    }
+
+    #[test]
+    fn start_minimised_pending_follows_the_config() {
+        // Default config: minimised on the first frame.
+        let app = App::new(mock_deps());
+        assert!(
+            app.start_minimised_pending(),
+            "default config must request a minimised start"
+        );
+
+        // Operator opted out: no minimise request.
+        let deps = mock_deps();
+        deps.cfg.lock().start_minimised = false;
+        let app = App::new(deps);
+        assert!(!app.start_minimised_pending());
     }
 
     #[test]

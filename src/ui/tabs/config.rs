@@ -73,6 +73,7 @@ fn configs_equal(a: &Config, b: &Config) -> bool {
     a.api_base_url == b.api_base_url
         && (a.vram_threshold_gb - b.vram_threshold_gb).abs() < f32::EPSILON
         && a.auto_start == b.auto_start
+        && a.start_minimised == b.start_minimised
         && a.auto_update_enabled == b.auto_update_enabled
         && a.auto_update_interval_secs == b.auto_update_interval_secs
         && a.auto_update_feed == b.auto_update_feed
@@ -157,6 +158,9 @@ pub fn render(
     section(ui, "Background mode", |ui| {
         ui.label("Run in tray on login");
         ui.checkbox(&mut autostart_enabled, "");
+        ui.end_row();
+        ui.label("Start minimised");
+        ui.checkbox(&mut draft.current.start_minimised, "");
         ui.end_row();
     });
     if autostart_enabled != prev_autostart {

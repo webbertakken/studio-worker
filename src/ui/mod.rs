@@ -115,6 +115,9 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         tokio: handle.clone(),
     };
 
+    // Start-minimised is requested by the App on its first frame via
+    // `ViewportCommand::Minimized` — egui 0.34's ViewportBuilder has
+    // no `with_minimized`.
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([960.0, 720.0])
         .with_min_inner_size([640.0, 480.0])
