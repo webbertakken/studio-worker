@@ -311,8 +311,12 @@ exhausts its reconnect budget.
 when enabled and not mid-job: poll the GitHub Releases feed →
 compare semver vs `AGENT_VERSION` → on newer, download the
 cargo-dist installer, run it, `execvp` into the new binary (unix) or
-spawn-successor + exit (Windows).  Any failure leaves the old
-version running and retries next interval.  Manual check via
+spawn-successor + exit (Windows).  Windows-specific: the running exe
+is **parked** (renamed to `<exe>.old`) before the installer runs —
+NTFS locks a running binary against overwrite but allows the rename
+— with rollback on failure and cleanup of the parked file on the
+next start.  Any failure leaves the old version running and retries
+next interval.  Manual check via
 `check-update` CLI or the UI About tab.  No studio involvement —
 the feed is GitHub.
 

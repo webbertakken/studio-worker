@@ -50,6 +50,12 @@ pub struct Config {
     pub vram_threshold_gb: f32,
     /// Whether to auto-launch the run loop at boot via the OS service.
     pub auto_start: bool,
+    /// Start the desktop UI minimised (taskbar only — not hidden, so
+    /// the window stays reachable even when no tray host exists).
+    /// Default `true`: a worker auto-started at login must not pop a
+    /// window over the operator's session.
+    #[serde(default = "default_start_minimised")]
+    pub start_minimised: bool,
     /// Periodically check the release feed and auto-install newer
     /// versions when no job is running.
     #[serde(default = "default_auto_update_enabled")]
@@ -89,6 +95,9 @@ pub struct Config {
 }
 
 fn default_auto_update_enabled() -> bool {
+    true
+}
+fn default_start_minimised() -> bool {
     true
 }
 fn default_auto_update_interval() -> u64 {
@@ -139,6 +148,7 @@ impl Default for Config {
             auth_token: None,
             vram_threshold_gb: 12.0,
             auto_start: true,
+            start_minimised: default_start_minimised(),
             auto_update_enabled: default_auto_update_enabled(),
             auto_update_interval_secs: default_auto_update_interval(),
             auto_update_feed: default_auto_update_feed(),
@@ -330,10 +340,29 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn start_minimised_defaults_true_for_configs_predating_the_field() {
+        // Operators upgrading from a config.toml written before the
+        // field existed must get the minimised-by-default behaviour.
+        let cfg: Config = toml::from_str(
+            r#"
+            api_base_url = "https://studio.minis.gg/"
+            vram_threshold_gb = 12.0
+            auto_start = true
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.start_minimised);
+    }
+
+    #[test]
     fn default_values_are_sensible() {
         let cfg = Config::default();
         assert_eq!(cfg.api_base_url, "https://studio.minis.gg/");
         assert!(cfg.auto_start);
+        assert!(
+            cfg.start_minimised,
+            "the UI must start minimised by default"
+        );
         assert!(cfg.auto_update_enabled);
         assert_eq!(cfg.auto_update_interval_secs, 1800);
         assert!(!cfg.auto_update_prerelease);

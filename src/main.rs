@@ -37,6 +37,11 @@ fn main() -> Result<()> {
     // `Drop` flushes pending events on shutdown.
     let _sentry_guard = telemetry::init();
 
+    // A Windows auto-update parks the previous binary as
+    // `<exe>.old` (a running exe can be renamed but not overwritten);
+    // remove the leftover now that we're the fresh binary.
+    studio_worker::update::cleanup_parked_artifact_for_current_exe();
+
     let cli_args = cli::Cli::parse();
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(run_cli(cli_args));

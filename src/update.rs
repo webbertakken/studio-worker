@@ -248,6 +248,113 @@ fn validate_installer_download_url(raw: &str) -> Result<()> {
     bail!("installer URL must use https (loopback http is allowed for tests): {raw}");
 }
 
+/// Where a parked (renamed-aside) running executable lives: the full
+/// original file name with `.old` appended.  `with_extension` would
+/// turn `studio-worker.exe` into `studio-worker.old` and risk
+/// clobbering an unrelated sibling.
+pub fn parked_artifact_path(exe: &Path) -> PathBuf {
+    let name = exe
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "studio-worker".to_string());
+    exe.with_file_name(format!("{name}.old"))
+}
+
+/// Remove a leftover parked binary from a previous update.  Called on
+/// startup; best-effort — a locked or missing file is fine.
+pub fn cleanup_parked_artifact(exe: &Path) {
+    let parked = parked_artifact_path(exe);
+    match std::fs::remove_file(&parked) {
+        Ok(()) => info!(
+            target: TRACE_TARGET,
+            parked = %parked.display(),
+            "removed parked binary from a previous update"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            target: TRACE_TARGET,
+            parked = %parked.display(),
+            error = %e,
+            "could not remove parked binary; will retry next start"
+        ),
+    }
+}
+
+/// Best-effort startup cleanup for the running process's own parked
+/// artifact.  Excluded from coverage: depends on `current_exe`.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn cleanup_parked_artifact_for_current_exe() {
+    if let Ok(exe) = std::env::current_exe() {
+        cleanup_parked_artifact(&exe);
+    }
+}
+
+/// Windows can't overwrite a running executable (the file is locked),
+/// but it CAN rename it.  Parking the running exe under a `.old` name
+/// frees the original path so the cargo-dist installer's `Copy-Item`
+/// succeeds; the parked file is removed on the next start.
+///
+/// The guard is plain filesystem logic so it is unit-tested on every
+/// platform; `apply_with` only activates it on Windows.
+pub struct ExeReplaceGuard {
+    original: PathBuf,
+    parked: PathBuf,
+}
+
+impl ExeReplaceGuard {
+    /// Rename `exe` aside.  Replaces any stale artifact from a
+    /// previous update first.
+    pub fn park(exe: &Path) -> Result<Self> {
+        let parked = parked_artifact_path(exe);
+        if parked.exists() {
+            std::fs::remove_file(&parked)
+                .with_context(|| format!("removing stale parked binary {}", parked.display()))?;
+        }
+        std::fs::rename(exe, &parked).with_context(|| {
+            format!(
+                "parking running binary {} -> {}",
+                exe.display(),
+                parked.display()
+            )
+        })?;
+        info!(
+            target: TRACE_TARGET,
+            exe = %exe.display(),
+            parked = %parked.display(),
+            "parked running binary so the installer can replace it"
+        );
+        Ok(Self {
+            original: exe.to_path_buf(),
+            parked,
+        })
+    }
+
+    /// After the installer ran: did a new binary land at the original
+    /// path?  If not, the installer wrote somewhere else and a restart
+    /// would find nothing to exec — the caller must roll back.
+    pub fn confirm_replaced(&self) -> Result<()> {
+        if self.original.is_file() {
+            return Ok(());
+        }
+        bail!(
+            "installer did not write a new binary at {} (custom install dir?)",
+            self.original.display()
+        )
+    }
+
+    /// Undo the park — the update failed and the worker keeps running
+    /// the old version.
+    pub fn rollback(self) -> Result<()> {
+        std::fs::rename(&self.parked, &self.original).with_context(|| {
+            format!(
+                "restoring parked binary {} -> {}",
+                self.parked.display(),
+                self.original.display()
+            )
+        })
+    }
+}
+
 pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R) -> Result<()> {
     info!(
         target: TRACE_TARGET,
@@ -285,7 +392,43 @@ pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R)
         latest = %latest,
         "running installer"
     );
-    runner.run_installer(&installer_path)?;
+    // Windows locks the running executable: the installer's Copy-Item
+    // fails with "file in use" unless we park (rename) ourselves out
+    // of the way first.  Renames of running binaries are allowed on
+    // NTFS.  Unix installers replace via unlink + write, no parking
+    // needed.
+    let guard = if cfg!(target_os = "windows") {
+        let exe = std::env::current_exe().context("resolving current exe for update")?;
+        Some(ExeReplaceGuard::park(&exe)?)
+    } else {
+        None
+    };
+    match runner.run_installer(&installer_path) {
+        Ok(()) => {
+            if let Some(guard) = guard {
+                if let Err(e) = guard.confirm_replaced() {
+                    // Roll back so the (still-running) old version can
+                    // be restarted by path; surface why the update
+                    // didn't take.
+                    if let Err(rb) = guard.rollback() {
+                        warn!(target: TRACE_TARGET, error = %rb, "rollback after failed replace also failed");
+                    }
+                    return Err(e);
+                }
+                // Parked file stays until the next start (this process
+                // is still executing it); cleanup_parked_artifact
+                // removes it then.
+            }
+        }
+        Err(e) => {
+            if let Some(guard) = guard {
+                if let Err(rb) = guard.rollback() {
+                    warn!(target: TRACE_TARGET, error = %rb, "rollback after installer failure also failed");
+                }
+            }
+            return Err(e);
+        }
+    }
     info!(
         target: TRACE_TARGET,
         latest = %latest,
@@ -373,6 +516,93 @@ mod tests {
             draft,
             assets,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // ExeReplaceGuard — the Windows locked-exe dance.  Pure fs logic,
+    // unit-tested on every platform; only the activation in apply_with
+    // is Windows-gated.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn park_moves_the_exe_aside_and_confirm_fails_until_replaced() {
+        let dir = tempdir().unwrap();
+        let exe = dir.path().join("studio-worker.exe");
+        std::fs::write(&exe, b"old binary").unwrap();
+
+        let guard = ExeReplaceGuard::park(&exe).unwrap();
+        assert!(
+            !exe.exists(),
+            "original path must be free for the installer"
+        );
+        assert_eq!(
+            std::fs::read(parked_artifact_path(&exe)).unwrap(),
+            b"old binary"
+        );
+        // Installer hasn't written the new binary yet.
+        assert!(guard.confirm_replaced().is_err());
+
+        // Installer writes the new binary at the original path.
+        std::fs::write(&exe, b"new binary").unwrap();
+        guard.confirm_replaced().unwrap();
+    }
+
+    #[test]
+    fn rollback_restores_the_original_exe() {
+        let dir = tempdir().unwrap();
+        let exe = dir.path().join("studio-worker.exe");
+        std::fs::write(&exe, b"old binary").unwrap();
+
+        let guard = ExeReplaceGuard::park(&exe).unwrap();
+        guard.rollback().unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old binary");
+        assert!(!parked_artifact_path(&exe).exists());
+    }
+
+    #[test]
+    fn park_replaces_a_stale_artifact_from_a_previous_update() {
+        let dir = tempdir().unwrap();
+        let exe = dir.path().join("studio-worker.exe");
+        std::fs::write(&exe, b"current").unwrap();
+        std::fs::write(parked_artifact_path(&exe), b"ancient leftover").unwrap();
+
+        let _guard = ExeReplaceGuard::park(&exe).unwrap();
+        assert_eq!(
+            std::fs::read(parked_artifact_path(&exe)).unwrap(),
+            b"current"
+        );
+    }
+
+    #[test]
+    fn parked_artifact_path_appends_old_to_the_full_file_name() {
+        // `.with_extension` would turn studio-worker.exe into
+        // studio-worker.old and clobber a sibling file — the artifact
+        // must keep the full original name.
+        assert_eq!(
+            parked_artifact_path(Path::new("/x/studio-worker.exe")),
+            PathBuf::from("/x/studio-worker.exe.old")
+        );
+        assert_eq!(
+            parked_artifact_path(Path::new("/x/studio-worker")),
+            PathBuf::from("/x/studio-worker.old")
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_only_the_parked_artifact() {
+        let dir = tempdir().unwrap();
+        let exe = dir.path().join("studio-worker.exe");
+        std::fs::write(&exe, b"current").unwrap();
+        std::fs::write(parked_artifact_path(&exe), b"leftover").unwrap();
+        let bystander = dir.path().join("other.txt");
+        std::fs::write(&bystander, b"keep me").unwrap();
+
+        cleanup_parked_artifact(&exe);
+        assert!(!parked_artifact_path(&exe).exists());
+        assert!(exe.exists());
+        assert!(bystander.exists());
+        // Idempotent when nothing is parked.
+        cleanup_parked_artifact(&exe);
     }
 
     #[test]

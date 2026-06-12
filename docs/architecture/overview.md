@@ -610,7 +610,14 @@ Every `auto_update_interval_secs` (default 30 min):
 3. Compare highest published semver to `AGENT_VERSION`.
 4. If newer:
    - Download the per-platform cargo-dist installer script.
-   - Run it (overwrites the binary in place).
+   - On Windows only: **park** the running exe first (rename to
+     `<exe>.old` — NTFS allows renaming a running binary but not
+     overwriting it, so without this the installer's `Copy-Item`
+     fails with "file in use" every time).  After the installer
+     runs, confirm a new binary landed at the original path; roll
+     the rename back otherwise.  The parked file is removed on the
+     next start (`update::cleanup_parked_artifact`).
+   - Run the installer (overwrites the binary in place).
    - On unix: `execvp` the new binary, replacing this process.
    - On Windows: spawn the successor + exit, since `execvp` isn't
      a clean fit.
