@@ -250,3 +250,76 @@ fn candle_image_engine_dispatch_unsupported_kind_emits_warn() {
     );
     assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
 }
+
+// ---------------------------------------------------------------------------
+// OnnxImageEngine (LaMa object-removal).  Source-driven, so we drive it
+// through `dispatch_with_source`.  Both paths short-circuit before any
+// network / onnxruntime native call, so they're CI-safe.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "image-onnx")]
+fn onnx_source(files: Vec<ModelFile>) -> ModelSource {
+    ModelSource {
+        engine: ModelEngine::Onnx,
+        files,
+        cli_defaults: ModelCliDefaults::default(),
+    }
+}
+
+#[cfg(feature = "image-onnx")]
+#[test]
+fn onnx_engine_dispatch_unsupported_kind_emits_warn() {
+    use studio_worker::engine::onnx::OnnxImageEngine;
+    let tmp = tempfile::tempdir().unwrap();
+    let logs = captured_logs_for(move || {
+        let engine = OnnxImageEngine::new(tmp.path().to_path_buf());
+        let _ = engine.dispatch_with_source(
+            "lama",
+            Task::AudioTts(AudioTtsParams {
+                text: "x".into(),
+                voice: "v".into(),
+                ext: "wav".into(),
+                ..Default::default()
+            }),
+            &onnx_source(vec![]),
+        );
+    });
+    assert!(
+        logs.contains("studio_worker::engine::onnx"),
+        "expected onnx target, got: {logs}"
+    );
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+}
+
+#[cfg(feature = "image-onnx")]
+#[test]
+fn onnx_engine_removal_failure_emits_warn() {
+    use studio_worker::engine::onnx::OnnxImageEngine;
+    // A removal job with no `initImageUrl` fails before any download or
+    // onnxruntime call, so this exercises the failure-logging path on a
+    // GPU-less CI runner.  The engine must surface *why* the removal
+    // failed under its own target, not stay silent and leave the only
+    // breadcrumb to the WS session.
+    let tmp = tempfile::tempdir().unwrap();
+    let logs = captured_logs_for(move || {
+        let engine = OnnxImageEngine::new(tmp.path().to_path_buf());
+        let err = engine.dispatch_with_source("lama", image_task("x"), &onnx_source(vec![]));
+        assert!(
+            err.is_err(),
+            "expected removal to fail without an initImageUrl"
+        );
+    });
+    assert!(
+        logs.contains("studio_worker::engine::onnx"),
+        "expected onnx target, got: {logs}"
+    );
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"dispatch\""),
+        "expected op=dispatch field: {logs}"
+    );
+    assert!(
+        logs.contains("elapsed_ms"),
+        "expected elapsed_ms field: {logs}"
+    );
+}
