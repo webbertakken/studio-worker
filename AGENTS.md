@@ -126,6 +126,9 @@ Auto-register + register CLI:
   `config::save` failures inside the poll loop.
 - `tests/register_reset.rs` — `register` CLI contracts (`--reset`
   clears local registration state, etc.).
+- `tests/registration_gate.rs` — `runtime::ensure_registered`, the
+  startup gate: already-registered short-circuit, Ctrl-C abort,
+  operator-rejection (with reset guidance), and approval pass-through.
 
 Runtime helpers + loops:
 
