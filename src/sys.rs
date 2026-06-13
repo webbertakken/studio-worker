@@ -76,6 +76,13 @@ fn probe_vram_gb() -> f32 {
 /// Probe VRAM via `nvidia-smi --query-gpu=memory.total`.  Returns `None`
 /// when the binary is absent (no driver / non-NVIDIA host) or exits
 /// non-zero, in which cases the caller defaults to 0 GB.
+///
+/// Coverage-off: spawning a real `nvidia-smi` is host-dependent (CI has
+/// none), so its success / non-zero-exit arms can't be exercised
+/// deterministically.  The parse + GB conversion + logging it delegates
+/// to ([`vram_gb_from_smi_stdout`], [`parse_nvidia_smi_mib`]) are
+/// unit-tested directly.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn detect_vram_gb_via_nvidia_smi() -> Option<f32> {
     let output = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
