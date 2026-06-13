@@ -344,10 +344,24 @@ impl Engine for SdCppEngine {
         task: Task,
         source: &ModelSource,
     ) -> Result<TaskResult> {
-        let kind = task.kind();
         match task {
             Task::Image(p) => self.dispatch_image(model, p, source),
-            _ => Err(crate::engine::UnsupportedTask::new("sdcpp", kind).into()),
+            other => {
+                // Surface the rejection at this engine's own target,
+                // matching the onnx/llama/whisper/candle engines.
+                // Without it an operator filtering
+                // `RUST_LOG=studio_worker::engine::sdcpp=debug` sees
+                // nothing when sdcpp refuses a non-image task.
+                let kind = other.kind();
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    model,
+                    kind = kind.as_str(),
+                    "sdcpp engine only serves image jobs"
+                );
+                Err(crate::engine::UnsupportedTask::new("sdcpp", kind).into())
+            }
         }
     }
 }

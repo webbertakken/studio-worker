@@ -104,6 +104,49 @@ fn multi_engine_logs_no_engine_for_unknown_model() {
 }
 
 // ---------------------------------------------------------------------------
+// SdCppEngine — the always-on default image engine (no feature flag).
+// Source-driven, so the rejection path runs through
+// `dispatch_with_source`.  It short-circuits before resolving sd-cli or
+// touching any file, so it's CI-safe.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sdcpp_engine_dispatch_unsupported_kind_emits_warn() {
+    use studio_worker::engine::sdcpp::SdCppEngine;
+    let tmp = tempfile::tempdir().unwrap();
+    let logs = captured_logs_for(move || {
+        let engine = SdCppEngine::new(tmp.path());
+        let _ = engine.dispatch_with_source(
+            "sd-cpp:any",
+            Task::AudioTts(AudioTtsParams {
+                text: "x".into(),
+                voice: "v".into(),
+                ext: "wav".into(),
+                ..Default::default()
+            }),
+            &ModelSource {
+                engine: ModelEngine::SdCpp,
+                files: vec![],
+                cli_defaults: ModelCliDefaults::default(),
+            },
+        );
+    });
+    assert!(
+        logs.contains("studio_worker::engine::sdcpp"),
+        "expected sdcpp target, got: {logs}"
+    );
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"dispatch\""),
+        "expected op=dispatch field: {logs}"
+    );
+    assert!(
+        logs.contains("kind=\"audio_tts\""),
+        "expected kind field: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Feature-gated engines — cheap dispatch-rejection paths only.  The
 // heavy "loading model" tracing is exercised by `tests/real_*.rs`,
 // which run only when `RUN_REAL_ENGINE_TESTS=1`.
