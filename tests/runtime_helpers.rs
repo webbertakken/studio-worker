@@ -160,10 +160,14 @@ async fn run_cli_dispatches_install_and_uninstall_into_temp_xdg() {
     // tempdir that we clean up.  This still exercises real fs writes
     // (good!) but doesn't pollute the user's actual home.
     let xdg = tempfile::tempdir().unwrap();
-    // SAFETY: tests run single-threaded per crate by default but we
-    // restore the env var to be safe.
+    // SAFETY: the Rust test harness runs tests concurrently, so mutating
+    // the process-global XDG_CONFIG_HOME could race a parallel test that
+    // resolves the default config path. This is the only test in this
+    // binary that does (every other passes an explicit `config: Some`),
+    // so nothing reads the var concurrently; we still snapshot + restore
+    // it. If you add another default-path test here, serialise them
+    // through a shared lock (see tests/sd_provision.rs's URL_ENV_LOCK).
     let previous = std::env::var("XDG_CONFIG_HOME").ok();
-    // SAFETY: the env mutation is fine in single-threaded test contexts.
     unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg.path()) };
 
     let result_install = run_cli(cli::Cli {
