@@ -264,7 +264,25 @@ impl Engine for OnnxImageEngine {
         source: &ModelSource,
     ) -> Result<TaskResult> {
         match task {
-            Task::Image(p) => self.dispatch_removal(&p, source),
+            Task::Image(p) => {
+                // Surface *why* a removal failed under this engine's own
+                // target (missing init/mask URL, model download, onnx
+                // run), matching the sdcpp/llama/whisper engines.
+                // Without this the only breadcrumb is the WS session's
+                // generic "engine dispatch failed", which never names the
+                // engine, model, or elapsed time.
+                let started = Instant::now();
+                self.dispatch_removal(&p, source).inspect_err(|e| {
+                    warn!(
+                        target: TRACE_TARGET,
+                        op = "dispatch",
+                        model,
+                        error = %e,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "lama removal failed"
+                    );
+                })
+            }
             other => {
                 warn!(
                     target: TRACE_TARGET,
