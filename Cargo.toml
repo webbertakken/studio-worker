@@ -189,6 +189,13 @@ all-engines-stt = ["whisper", "image-candle", "video", "tts"]
 # feature set the cargo-dist release binaries are built with.
 all = ["ui", "llama", "image-candle", "image-onnx", "video", "tts"]
 
+# Build-only: compile the glibc 2.38 `__isoc23_*` shims (build.rs) so the
+# prebuilt ONNX Runtime static lib links on the older-glibc release runner.
+# `cc` is already in the tree transitively (llama-cpp-2), so this adds nothing
+# to the default build.
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 wiremock = "0.6"
 # Build fake sd-cli release zips in the provisioning integration test.
