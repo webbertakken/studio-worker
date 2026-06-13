@@ -187,7 +187,7 @@ pub async fn spawn_ws_session(
                 );
                 return Err(anyhow!("ws fatal: {reason}"));
             }
-            Ok(SessionOutcome::Disconnected) | Err(_) => {
+            outcome @ (Ok(SessionOutcome::Disconnected) | Err(_)) => {
                 // A session that successfully connected shouldn't count its later drop toward the
                 // connect-failure cap — only consecutive failures to connect should accumulate, so
                 // a long-lived worker isn't killed by transient mid-session disconnects.
@@ -212,10 +212,7 @@ pub async fn spawn_ws_session(
                     Some(&observers),
                     "warn",
                     "ws",
-                    &format!(
-                        "disconnected; reconnect attempt {attempt} in {}ms",
-                        backoff.as_millis()
-                    ),
+                    &reconnect_breadcrumb(outcome.as_ref().err(), attempt, backoff),
                     None,
                 );
                 wait_with_stop(backoff, &stop, schedule.shutdown_tick).await;
@@ -1098,6 +1095,28 @@ fn backoff_for(attempt: u32, schedule: SessionSchedule) -> Duration {
     Duration::from_millis(raw_ms.min(schedule.max_backoff_ms))
 }
 
+/// Build the operator breadcrumb for a session that dropped or never
+/// established, surfacing the underlying error so a reconnect loop is
+/// never opaque about *why* it's retrying.
+///
+/// A plain mid-session disconnect (`Ok(SessionOutcome::Disconnected)`)
+/// carries no error and keeps the legacy "disconnected; reconnect
+/// attempt …" wording that the studio-shipped log view and the
+/// `ws_session_full_loop` contract test key on.  An `Err` outcome — an
+/// engine that failed to build, or a `hello` frame that never made it
+/// onto the wire — previously vanished into that same wording with no
+/// cause, leaving an operator staring at an endless reconnect loop with
+/// nothing to diagnose.  The full anyhow chain (`{:#}`) rides along so a
+/// wrapped root cause isn't truncated to its outer context.  Pure so
+/// the wording is unit-tested without a live WS round-trip.
+fn reconnect_breadcrumb(error: Option<&anyhow::Error>, attempt: u32, backoff: Duration) -> String {
+    let in_ms = backoff.as_millis();
+    match error {
+        Some(e) => format!("session error: {e:#}; reconnect attempt {attempt} in {in_ms}ms"),
+        None => format!("disconnected; reconnect attempt {attempt} in {in_ms}ms"),
+    }
+}
+
 /// Decide whether a just-attempted offer-response send (accept /
 /// reject) warrants a session-level breadcrumb.
 ///
@@ -1287,6 +1306,46 @@ mod tests {
         // Capped.
         assert_eq!(backoff_for(5, schedule), Duration::from_millis(1_000));
         assert_eq!(backoff_for(10, schedule), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn reconnect_breadcrumb_keeps_legacy_wording_for_a_plain_disconnect() {
+        // A mid-session drop carries no error; the exact wording the
+        // studio-shipped log view and the `ws_session_full_loop`
+        // contract test key on must be preserved.
+        let msg = reconnect_breadcrumb(None, 3, Duration::from_millis(800));
+        assert_eq!(msg, "disconnected; reconnect attempt 3 in 800ms");
+    }
+
+    #[test]
+    fn reconnect_breadcrumb_surfaces_the_underlying_error() {
+        // An `Err` outcome (engine build failure, `hello` send failure)
+        // used to vanish into the plain "disconnected" line, leaving an
+        // operator with an opaque endless reconnect loop. The cause must
+        // now ride along while still naming the attempt + backoff.
+        let err = anyhow!("hello send failed: connection closed");
+        let msg = reconnect_breadcrumb(Some(&err), 2, Duration::from_millis(400));
+        assert!(
+            msg.contains("reconnect attempt 2 in 400ms"),
+            "must still name attempt + backoff: {msg}"
+        );
+        assert!(
+            msg.contains("hello send failed: connection closed"),
+            "must carry the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn reconnect_breadcrumb_includes_the_full_error_chain() {
+        // anyhow context chains must reach the operator so a wrapped
+        // root cause isn't truncated to just the outer context.
+        let err = anyhow!("driver missing").context("engine build failed");
+        let msg = reconnect_breadcrumb(Some(&err), 1, Duration::from_millis(100));
+        assert!(msg.contains("engine build failed"), "got: {msg}");
+        assert!(
+            msg.contains("driver missing"),
+            "must include the root cause: {msg}"
+        );
     }
 
     #[test]
