@@ -606,6 +606,80 @@ mod tests {
     }
 
     #[test]
+    fn park_surfaces_a_rename_failure_with_actionable_context() {
+        // The exe path doesn't exist, so the rename that parks it
+        // fails.  park must surface a clear error (not panic / not a
+        // bare OS code) so a failed update is diagnosable — this is
+        // the entry point of the Windows replace dance, and if it
+        // fails silently the caller would proceed to run an installer
+        // against an unparked, still-locked binary.
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("studio-worker.exe");
+        // `.err()` drops the Ok guard without needing it to be Debug.
+        let err = ExeReplaceGuard::park(&missing)
+            .err()
+            .expect("park must fail when the exe is missing")
+            .to_string();
+        assert!(
+            err.contains("parking running binary"),
+            "park error must name the operation: {err}"
+        );
+        assert!(
+            err.contains("studio-worker.exe"),
+            "park error must name the offending path: {err}"
+        );
+    }
+
+    #[test]
+    fn rollback_surfaces_a_restore_failure_with_actionable_context() {
+        // Park succeeds, then the parked binary vanishes (disk full,
+        // operator meddling, a racing cleanup) before rollback runs.
+        // rollback is the safety net that restores the running version
+        // when an update fails; if its own restore fails it must
+        // report why rather than leave the worker with no binary and
+        // no explanation.
+        let dir = tempdir().unwrap();
+        let exe = dir.path().join("studio-worker.exe");
+        std::fs::write(&exe, b"old binary").unwrap();
+        let guard = ExeReplaceGuard::park(&exe).unwrap();
+        // Remove the parked file out from under the guard.
+        std::fs::remove_file(parked_artifact_path(&exe)).unwrap();
+        let err = guard.rollback().unwrap_err().to_string();
+        assert!(
+            err.contains("restoring parked binary"),
+            "rollback error must name the operation: {err}"
+        );
+        assert!(
+            err.contains("studio-worker.exe"),
+            "rollback error must name the target path: {err}"
+        );
+    }
+
+    #[test]
+    fn cleanup_warns_when_the_parked_artifact_cannot_be_removed() {
+        // A parked path that is a non-empty directory (not a file)
+        // makes `remove_file` fail with a non-NotFound error.  Cleanup
+        // runs on every startup and must surface such a stuck artifact
+        // (so a wedged update leftover is visible and retried) instead
+        // of swallowing the failure.
+        let dir = tempdir().unwrap();
+        let exe = dir.path().join("studio-worker.exe");
+        std::fs::write(&exe, b"current").unwrap();
+        let parked = parked_artifact_path(&exe);
+        std::fs::create_dir(&parked).unwrap();
+        std::fs::write(parked.join("blocker"), b"x").unwrap();
+        let out = crate::test_support::capture(move || cleanup_parked_artifact(&exe));
+        assert!(
+            out.contains("could not remove parked binary"),
+            "a failed cleanup must warn: {out:?}"
+        );
+        assert!(
+            out.contains("studio-worker.exe.old"),
+            "the warning must name the stuck artifact: {out:?}"
+        );
+    }
+
+    #[test]
     fn parse_tag_accepts_v_prefix_and_bare() {
         assert_eq!(parse_tag("v1.2.3"), Some(Version::new(1, 2, 3)));
         assert_eq!(parse_tag("1.2.3"), Some(Version::new(1, 2, 3)));
