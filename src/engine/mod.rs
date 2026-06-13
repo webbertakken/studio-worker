@@ -467,6 +467,36 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_image_round_trips_as_png() {
+        // A job can request `ext: "png"`; the synthetic engine routes
+        // every non-webp ext through `render_procedural`'s PNG arm and
+        // returns the requested ext unchanged.  Without this the only
+        // image coverage is the webp happy path, so a regression in the
+        // PNG encode branch would silently ship undecodable bytes for
+        // every PNG-requested job.
+        let engine = SyntheticEngine::new();
+        let task = Task::Image(ImageParams {
+            prompt: "hello world".into(),
+            width: 512,
+            height: 512,
+            steps: 20,
+            ext: "png".into(),
+            ..Default::default()
+        });
+        let result = engine.dispatch("synthetic", task).unwrap();
+        let (bytes, ext) = match result {
+            TaskResult::Image { bytes, ext } => (bytes, ext),
+            other => panic!("expected image, got {:?}", other.kind()),
+        };
+        assert_eq!(ext, "png", "the requested ext must be preserved");
+        assert!(bytes.len() > 100);
+        let reader = image::ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .unwrap();
+        assert_eq!(reader.format().unwrap(), image::ImageFormat::Png);
+    }
+
+    #[test]
     fn synthetic_llm_returns_chat_completion_shape() {
         let engine = SyntheticEngine::new();
         let task = Task::Llm(LlmParams {
