@@ -151,6 +151,9 @@ Engines + multi-modal:
   and on its key failure paths.
 - `tests/engine_download.rs` — the shared model downloader against a
   wiremock server (happy path, non-2xx, cache reuse).
+- `tests/sd_provision.rs` — the `sd-cli` auto-provisioner against a
+  wiremock release zip (download + extract, cache reuse, missing-binary
+  error).
 
 Telemetry + host-probe tracing:
 
