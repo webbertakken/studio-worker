@@ -28,7 +28,7 @@
 //! at all so it skips registration and the multi engine falls through
 //! to synthetic for any kind it doesn't have a real backend for.
 
-use crate::engine::download;
+use crate::engine::download::{self, TempFileGuard};
 use crate::engine::sd_provision;
 use crate::engine::{Engine, EngineCapabilities};
 use crate::types::{ImageParams, ModelFileRole, ModelSource, Task, TaskKind, TaskResult};
@@ -370,57 +370,9 @@ impl Engine for SdCppEngine {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Best-effort removal of a temporary file (a per-job `sd-cli` output,
-/// an init image, or a half-written `.part` download).  Removal is
-/// non-fatal — the artefact has already been read or the job already
-/// failed — but a remove that keeps failing silently leaks temp files
-/// and can quietly fill the worker's disk over a long-running session,
-/// so we surface the failure instead of swallowing it.  A `NotFound`
-/// is the desired end state (something already cleaned it up), so it's
-/// not logged.
-fn remove_temp_file(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!(
-                target: TRACE_TARGET,
-                op = "cleanup",
-                path = %path.display(),
-                error = %e,
-                "failed to remove temp file"
-            );
-        }
-    }
-}
-
-/// RAII owner of a job's scratch files (the `sd-cli` output image and a
-/// downloaded init image).  Registering them up front means every exit
-/// path - the success return, an `sd-cli` non-zero exit, an unreadable
-/// output file, even a panic - removes them on drop instead of leaking
-/// them into the temp dir and slowly filling the worker's disk over a
-/// long-running session.  Removal is best-effort via [`remove_temp_file`],
-/// so a path that never materialised (job failed before `sd-cli` wrote
-/// anything) is silently tolerated.
-struct TempFileGuard {
-    paths: Vec<PathBuf>,
-}
-
-impl TempFileGuard {
-    fn new() -> Self {
-        Self { paths: Vec::new() }
-    }
-
-    fn push(&mut self, path: PathBuf) {
-        self.paths.push(path);
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        for path in &self.paths {
-            remove_temp_file(path);
-        }
-    }
-}
+// The per-job scratch cleanup primitives (`remove_temp_file` +
+// `TempFileGuard`) live in `engine::download` so this engine and the
+// onnx engine share one tested implementation.
 
 fn file_for_role(files: &[(ModelFileRole, PathBuf)], role: ModelFileRole) -> Option<&Path> {
     files
@@ -715,92 +667,6 @@ mod tests {
                 ..Default::default()
             },
         }
-    }
-
-    #[test]
-    fn temp_file_guard_removes_every_registered_file_on_drop() {
-        let dir = tempdir().unwrap();
-        let out = dir.path().join("out.webp");
-        let init = dir.path().join("out-init.png");
-        std::fs::write(&out, b"image").unwrap();
-        std::fs::write(&init, b"init").unwrap();
-        {
-            let mut guard = TempFileGuard::new();
-            guard.push(out.clone());
-            guard.push(init.clone());
-            assert!(out.exists() && init.exists(), "files present before drop");
-        }
-        assert!(!out.exists(), "sd-cli output temp must be removed on drop");
-        assert!(!init.exists(), "init-image temp must be removed on drop");
-    }
-
-    #[test]
-    fn temp_file_guard_tolerates_a_file_that_never_materialised() {
-        // The output path is registered before sd-cli runs, so a job
-        // that fails before writing anything drops a guard pointing at
-        // a path that never existed.  That is the desired end state,
-        // not a cleanup warning.
-        let dir = tempdir().unwrap();
-        let missing = dir.path().join("never-written.webp");
-        let out = crate::test_support::capture(move || {
-            let mut guard = TempFileGuard::new();
-            guard.push(missing);
-            drop(guard);
-        });
-        assert!(
-            !out.contains("failed to remove temp file"),
-            "a never-created temp file must not warn on cleanup: {out:?}"
-        );
-    }
-
-    #[test]
-    fn remove_temp_file_deletes_an_existing_file_quietly() {
-        let dir = tempdir().unwrap();
-        let f = dir.path().join("artefact.webp");
-        std::fs::write(&f, b"bytes").unwrap();
-        let out = crate::test_support::capture({
-            let f = f.clone();
-            move || remove_temp_file(&f)
-        });
-        assert!(!f.exists(), "file should be gone after cleanup");
-        assert!(
-            !out.contains("failed to remove temp file"),
-            "the success path must not warn: {out:?}"
-        );
-    }
-
-    #[test]
-    fn remove_temp_file_ignores_an_already_missing_file() {
-        let dir = tempdir().unwrap();
-        let missing = dir.path().join("never-existed.webp");
-        let out = crate::test_support::capture(move || remove_temp_file(&missing));
-        assert!(
-            !out.contains("failed to remove temp file"),
-            "a not-found file is the desired end state, not a warning: {out:?}"
-        );
-    }
-
-    #[test]
-    fn remove_temp_file_surfaces_a_failed_removal() {
-        // Pointing the helper at a directory makes `remove_file` fail
-        // on every platform (it refuses to unlink a dir): the closest
-        // portable stand-in for a locked / permission-denied temp file.
-        let dir = tempdir().unwrap();
-        let stubborn = dir.path().join("subdir");
-        std::fs::create_dir(&stubborn).unwrap();
-        let out = crate::test_support::capture(move || remove_temp_file(&stubborn));
-        assert!(
-            out.contains("failed to remove temp file"),
-            "a failed removal must surface in the logs: {out:?}"
-        );
-        assert!(
-            out.contains("subdir"),
-            "the warning must name the offending path: {out:?}"
-        );
-        assert!(
-            out.contains("cleanup"),
-            "the warning should tag the cleanup op: {out:?}"
-        );
     }
 
     #[test]

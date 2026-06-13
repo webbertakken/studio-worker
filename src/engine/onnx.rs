@@ -150,17 +150,22 @@ impl OnnxImageEngine {
         );
         let init_path = work_dir.join(format!("{stem}-init"));
         let mask_path = work_dir.join(format!("{stem}-mask"));
+        // Own the scratch downloads from the moment their paths exist so
+        // every exit path — a failed mask download, a decode/onnx error,
+        // even a panic mid-removal — removes them (warning on a stuck
+        // file) instead of leaking them into the temp dir over a long
+        // session.  The old `let _ = remove_file(…)` ran only on the
+        // success/`Err` fall-through and swallowed every failure.
+        let mut scratch = download::TempFileGuard::new();
+        scratch.push(init_path.clone());
+        scratch.push(mask_path.clone());
         download::download_file(init_url, &init_path)
             .with_context(|| format!("downloading init image {init_url}"))?;
         download::download_file(mask_url, &mask_path)
             .with_context(|| format!("downloading mask {mask_url}"))?;
 
         let started = Instant::now();
-        let result = self.remove(&model_path, &init_path, &mask_path, params);
-        // Always clean up the scratch downloads.
-        let _ = std::fs::remove_file(&init_path);
-        let _ = std::fs::remove_file(&mask_path);
-        let bytes = result?;
+        let bytes = self.remove(&model_path, &init_path, &mask_path, params)?;
 
         debug!(
             target: TRACE_TARGET,

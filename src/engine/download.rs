@@ -95,11 +95,12 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
-/// Best-effort removal of a partial `.part` download.  A `NotFound` is
-/// the desired end state (something already cleaned it up); any other
-/// failure is surfaced so a stuck temp file can't silently fill the
-/// worker's disk over a long session.
-pub fn remove_partial(path: &Path) {
+/// Best-effort removal of a temporary file — a partial `.part`
+/// download, an engine's per-job scratch image, or a downloaded init /
+/// mask.  A `NotFound` is the desired end state (something already
+/// cleaned it up); any other failure is surfaced so a stuck temp file
+/// can't silently fill the worker's disk over a long session.
+pub fn remove_temp_file(path: &Path) {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             warn!(
@@ -107,8 +108,39 @@ pub fn remove_partial(path: &Path) {
                 op = "cleanup",
                 path = %path.display(),
                 error = %e,
-                "failed to remove partial download"
+                "failed to remove temp file"
             );
+        }
+    }
+}
+
+/// RAII owner of a job's scratch files.  Registering a job's temp
+/// paths up front means every exit path — the success return, an
+/// engine error, even a panic mid-dispatch — removes them on drop
+/// instead of leaking them into the temp dir and slowly filling the
+/// worker's disk over a long-running session.  Removal is best-effort
+/// via [`remove_temp_file`], so a path that never materialised (the
+/// job failed before the file was written) is silently tolerated.
+#[derive(Default)]
+pub struct TempFileGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl TempFileGuard {
+    pub fn new() -> Self {
+        Self { paths: Vec::new() }
+    }
+
+    /// Register a path to be removed when the guard drops.
+    pub fn push(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            remove_temp_file(path);
         }
     }
 }
@@ -189,17 +221,17 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
     let bytes = match copied {
         Ok(bytes) => bytes,
         Err(e) => {
-            remove_partial(&part);
+            remove_temp_file(&part);
             return Err(e).context("streaming body");
         }
     };
     if let Err(e) = verify_download_len(bytes, expected_len) {
-        remove_partial(&part);
+        remove_temp_file(&part);
         return Err(e).with_context(|| format!("downloading {url}"));
     }
     let actual_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     if let Err(e) = verify_sha256(&actual_hex, expected_sha256) {
-        remove_partial(&part);
+        remove_temp_file(&part);
         return Err(e).with_context(|| format!("downloading {url}"));
     }
     std::fs::rename(&part, dest)
@@ -329,30 +361,98 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // remove_temp_file + TempFileGuard — the shared best-effort cleanup
+    // primitives every engine routes its per-job scratch files through.
+    // Owned here (the shared engine-provisioning module) so the sdcpp
+    // output guard and the onnx init/mask cleanup share one tested
+    // implementation instead of each rolling its own silent removal.
+    // -----------------------------------------------------------------
+
     #[test]
-    fn remove_partial_ignores_a_missing_file() {
+    fn remove_temp_file_deletes_an_existing_file_quietly() {
         let dir = tempdir().unwrap();
+        let f = dir.path().join("artefact.webp");
+        std::fs::write(&f, b"bytes").unwrap();
         let out = crate::test_support::capture({
-            let missing = dir.path().join("never.part");
-            move || remove_partial(&missing)
+            let f = f.clone();
+            move || remove_temp_file(&f)
         });
+        assert!(!f.exists(), "file should be gone after cleanup");
         assert!(
-            !out.contains("failed to remove partial download"),
-            "a not-found partial is the desired end state: {out:?}"
+            !out.contains("failed to remove temp file"),
+            "the success path must not warn: {out:?}"
         );
     }
 
     #[test]
-    fn remove_partial_surfaces_a_failed_removal() {
+    fn remove_temp_file_ignores_a_missing_file() {
+        let dir = tempdir().unwrap();
+        let out = crate::test_support::capture({
+            let missing = dir.path().join("never.part");
+            move || remove_temp_file(&missing)
+        });
+        assert!(
+            !out.contains("failed to remove temp file"),
+            "a not-found temp file is the desired end state: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_temp_file_surfaces_a_failed_removal() {
         // Pointing the helper at a directory makes `remove_file` fail on
-        // every platform (it refuses to unlink a dir).
+        // every platform (it refuses to unlink a dir): the closest
+        // portable stand-in for a locked / permission-denied temp file.
         let dir = tempdir().unwrap();
         let stubborn = dir.path().join("subdir");
         std::fs::create_dir(&stubborn).unwrap();
-        let out = crate::test_support::capture(move || remove_partial(&stubborn));
+        let out = crate::test_support::capture(move || remove_temp_file(&stubborn));
         assert!(
-            out.contains("failed to remove partial download"),
+            out.contains("failed to remove temp file"),
             "a failed removal must surface in the logs: {out:?}"
+        );
+        assert!(
+            out.contains("subdir"),
+            "the warning must name the offending path: {out:?}"
+        );
+        assert!(
+            out.contains("cleanup"),
+            "the warning should tag the cleanup op: {out:?}"
+        );
+    }
+
+    #[test]
+    fn temp_file_guard_removes_every_registered_file_on_drop() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.webp");
+        let init = dir.path().join("out-init.png");
+        std::fs::write(&out, b"image").unwrap();
+        std::fs::write(&init, b"init").unwrap();
+        {
+            let mut guard = TempFileGuard::new();
+            guard.push(out.clone());
+            guard.push(init.clone());
+            assert!(out.exists() && init.exists(), "files present before drop");
+        }
+        assert!(!out.exists(), "output temp must be removed on drop");
+        assert!(!init.exists(), "init-image temp must be removed on drop");
+    }
+
+    #[test]
+    fn temp_file_guard_tolerates_a_file_that_never_materialised() {
+        // A path registered before its download runs (so an early
+        // failure drops a guard pointing at a file that never existed)
+        // is the desired end state, not a cleanup warning.
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("never-written.webp");
+        let out = crate::test_support::capture(move || {
+            let mut guard = TempFileGuard::new();
+            guard.push(missing);
+            drop(guard);
+        });
+        assert!(
+            !out.contains("failed to remove temp file"),
+            "a never-created temp file must not warn on cleanup: {out:?}"
         );
     }
 }
