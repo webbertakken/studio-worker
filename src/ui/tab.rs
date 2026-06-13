@@ -78,8 +78,11 @@ mod tests {
 
     #[test]
     fn initial_falls_back_to_default_when_env_unset() {
-        // SAFETY: tests run single-threaded for env mutation isolation.
-        // Snapshot + restore even if the test panics.
+        // SAFETY: the Rust test harness runs tests concurrently, so this
+        // mutates the process-global STUDIO_WORKER_UI_TAB. Safe because
+        // this is the only test that touches that var; we snapshot it and
+        // restore it afterwards. (A panic here would skip the restore, but
+        // it also fails the run and no other test reads the var.)
         let prev = std::env::var("STUDIO_WORKER_UI_TAB").ok();
         std::env::remove_var("STUDIO_WORKER_UI_TAB");
         assert_eq!(Tab::initial(), Tab::default());
