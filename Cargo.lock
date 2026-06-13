@@ -5740,6 +5740,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "cc",
  "chrono",
  "clap",
  "directories",
