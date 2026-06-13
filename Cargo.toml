@@ -88,7 +88,14 @@ candle-core = { version = "0.10.2", optional = true }
 candle-nn = { version = "0.10.2", optional = true }
 candle-transformers = { version = "0.10.2", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
-hf-hub = { version = "0.4", optional = true }
+# Blocking (ureq) HF download API — candle_image uses `api::sync`.
+# `default-features = false` drops hf-hub's `default-tls` (= native-tls
+# -> openssl-sys) and its async `tokio`/reqwest stack; the `ureq`
+# feature keeps the sync client, and ureq defaults to rustls, so the
+# `image-candle` / `all` build stays OpenSSL-free like the rest.
+hf-hub = { version = "0.4", optional = true, default-features = false, features = [
+    "ureq",
+] }
 gif = { version = "0.13", optional = true }
 # ONNX Runtime (pykeio/ort) for the LaMa object-removal image engine.
 # `download-binaries` fetches a prebuilt ONNX Runtime for the build
@@ -202,7 +209,12 @@ wiremock = "0.6"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 dirs = "6.0.0"
-sentry = { version = "0.48", features = ["test"] }
+# Mirror the main dep's `default-features = false`: sentry's default
+# `transport` feature drags in reqwest+native-tls (-> openssl-sys),
+# which would otherwise leak OpenSSL back into the test build + the
+# lockfile.  The `test` capture helpers need no transport; the rustls
+# transport is supplied by the normal dep via feature unification.
+sentry = { version = "0.48", default-features = false, features = ["test"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
 
 [lints.rust]
