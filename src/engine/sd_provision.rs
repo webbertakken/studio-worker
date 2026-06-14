@@ -739,6 +739,38 @@ mod tests {
     }
 
     #[test]
+    fn install_dir_skips_subdirectories_and_counts_only_files() {
+        // `install_dir` publishes a *flat* set of files; a directory in
+        // staging (a malformed build archive, or a future extract that
+        // stops flattening) must be skipped, not recursed into or
+        // copied as-is, and must not inflate the moved-file count the
+        // provisioner relies on.
+        let staging = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        std::fs::write(staging.path().join("sd-cli"), b"binary").unwrap();
+        std::fs::write(staging.path().join("libstable-diffusion.so"), b"lib").unwrap();
+        let nested = staging.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("buried"), b"should-not-publish").unwrap();
+
+        let moved = install_dir(staging.path(), target.path()).unwrap();
+
+        // Only the two top-level files count; the directory is skipped.
+        assert_eq!(moved, 2);
+        assert!(target.path().join("sd-cli").is_file());
+        assert!(target.path().join("libstable-diffusion.so").is_file());
+        // The directory (and its contents) must never reach the target.
+        assert!(
+            !target.path().join("nested").exists(),
+            "a staging subdirectory must not be published"
+        );
+        assert!(
+            !target.path().join("buried").exists(),
+            "a staging subdirectory's contents must not be flattened into the target"
+        );
+    }
+
+    #[test]
     fn clean_scratch_removes_zip_and_staging_quietly() {
         let dir = tempdir().unwrap();
         let zip = dir.path().join("scratch.zip");
