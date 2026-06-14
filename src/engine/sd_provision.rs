@@ -23,7 +23,7 @@
 use crate::engine::download;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Tracing target for provisioning.  Stable so operators can filter
 /// with `RUST_LOG=studio_worker::engine::sd_provision=info`.
@@ -127,9 +127,43 @@ pub fn vulkan_runtime_status() -> Result<()> {
     vulkan_runtime_status_with(vulkan_loader_loads())
 }
 
+/// Choose the release tag from an optional override, logging which
+/// source won so an operator can confirm their
+/// `STUDIO_WORKER_SDCPP_RELEASE` took effect (rather than being
+/// silently ignored, e.g. a typo'd var name).  Pure — the override is
+/// injected — so the decision + breadcrumb are unit-testable without
+/// touching the process-global environment.
+fn select_release_tag(override_tag: Option<String>) -> String {
+    match override_tag {
+        Some(tag) => {
+            info!(
+                target: TRACE_TARGET,
+                op = "resolve-url",
+                tag = %tag,
+                source = RELEASE_ENV,
+                "using sd-cli release-tag override"
+            );
+            tag
+        }
+        None => {
+            debug!(
+                target: TRACE_TARGET,
+                op = "resolve-url",
+                tag = DEFAULT_RELEASE_TAG,
+                "using pinned sd-cli release tag"
+            );
+            DEFAULT_RELEASE_TAG.to_string()
+        }
+    }
+}
+
 /// The release tag to provision — env override or the pinned default.
+/// Thin env-reading wrapper over [`select_release_tag`]; excluded from
+/// coverage because it reads the process environment (the decision +
+/// logging are covered via [`select_release_tag`]).
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn release_tag() -> String {
-    std::env::var(RELEASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASE_TAG.to_string())
+    select_release_tag(std::env::var(RELEASE_ENV).ok())
 }
 
 /// The short commit sha embedded in asset filenames is the trailing
@@ -201,16 +235,39 @@ fn download_url(tag: &str, os: &str, arch: &str) -> Result<String> {
     })
 }
 
-/// Resolve the zip URL to fetch: the `STUDIO_WORKER_SDCPP_URL`
-/// override if set, otherwise the pinned/overridden release for this
-/// host's platform.
-fn resolve_url() -> Result<String> {
-    if let Ok(url) = std::env::var(URL_ENV) {
+/// Choose the zip URL: a non-empty `STUDIO_WORKER_SDCPP_URL` override
+/// wins (and is logged so the operator can confirm it took effect),
+/// otherwise fall back to `default_url`.  Pure — both inputs are
+/// injected — so the precedence + breadcrumb are unit-testable without
+/// touching the environment or the network.
+fn select_url(
+    override_url: Option<String>,
+    default_url: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    if let Some(url) = override_url {
         if !url.is_empty() {
+            info!(
+                target: TRACE_TARGET,
+                op = "resolve-url",
+                url = %url,
+                source = URL_ENV,
+                "using sd-cli zip-URL override"
+            );
             return Ok(url);
         }
     }
-    download_url(&release_tag(), std::env::consts::OS, std::env::consts::ARCH)
+    default_url()
+}
+
+/// Resolve the zip URL to fetch: the `STUDIO_WORKER_SDCPP_URL`
+/// override if set, otherwise the pinned/overridden release for this
+/// host's platform.  Thin env-reading wrapper over [`select_url`];
+/// excluded from coverage because it reads the process environment.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn resolve_url() -> Result<String> {
+    select_url(std::env::var(URL_ENV).ok(), || {
+        download_url(&release_tag(), std::env::consts::OS, std::env::consts::ARCH)
+    })
 }
 
 /// If a stable-diffusion shared library sits next to `sd_cli`, return
@@ -515,6 +572,78 @@ mod tests {
         let intel = download_url("master-669-2d40a8b", "macos", "x86_64").unwrap();
         assert_eq!(arm, intel, "Intel Macs use the same universal2 asset");
         assert!(intel.contains("Darwin-macOS-15.7.7-arm64"), "got: {intel}");
+    }
+
+    #[test]
+    fn select_release_tag_prefers_the_override() {
+        assert_eq!(
+            select_release_tag(Some("master-700-deadbee".into())),
+            "master-700-deadbee"
+        );
+    }
+
+    #[test]
+    fn select_release_tag_falls_back_to_the_pinned_default() {
+        assert_eq!(select_release_tag(None), DEFAULT_RELEASE_TAG);
+    }
+
+    #[test]
+    fn select_release_tag_logs_the_override_source() {
+        let logs = crate::test_support::capture(|| {
+            let _ = select_release_tag(Some("master-700-deadbee".into()));
+        });
+        assert!(
+            logs.contains("STUDIO_WORKER_SDCPP_RELEASE"),
+            "override log must name the env var: {logs}"
+        );
+        assert!(logs.contains("master-700-deadbee"), "got: {logs}");
+        assert!(logs.contains("override"), "got: {logs}");
+    }
+
+    #[test]
+    fn select_url_prefers_a_non_empty_override() {
+        let url = select_url(Some("https://mirror.example/sd.zip".into()), || {
+            panic!("default must not be consulted when an override is present")
+        })
+        .unwrap();
+        assert_eq!(url, "https://mirror.example/sd.zip");
+    }
+
+    #[test]
+    fn select_url_ignores_an_empty_override_and_falls_back() {
+        let url = select_url(Some(String::new()), || Ok("fallback".into())).unwrap();
+        assert_eq!(url, "fallback");
+    }
+
+    #[test]
+    fn select_url_falls_back_when_no_override_is_set() {
+        let url = select_url(None, || Ok("fallback".into())).unwrap();
+        assert_eq!(url, "fallback");
+    }
+
+    #[test]
+    fn select_url_propagates_a_default_resolution_error() {
+        let err = select_url(None, || bail!("no prebuilt for this platform"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no prebuilt"), "got: {err}");
+    }
+
+    #[test]
+    fn select_url_logs_the_override_source() {
+        let logs = crate::test_support::capture(|| {
+            let _ = select_url(Some("https://mirror.example/sd.zip".into()), || {
+                Ok("unused".into())
+            });
+        });
+        assert!(
+            logs.contains("STUDIO_WORKER_SDCPP_URL"),
+            "override log must name the env var: {logs}"
+        );
+        assert!(
+            logs.contains("https://mirror.example/sd.zip"),
+            "got: {logs}"
+        );
     }
 
     #[test]
