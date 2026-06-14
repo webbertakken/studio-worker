@@ -47,6 +47,24 @@ impl ConfigDraft {
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
         match config::save(&self.current, path) {
             Ok(()) => {
+                // An operator deliberately applying settings through the
+                // window is a discrete, rare action that warrants an
+                // info-level breadcrumb — unlike `config::save`, which
+                // the auto-register poll loop calls every tick and so
+                // logs the routine persist at debug.  Emitting here (not
+                // in `config::save`) keeps that hot path quiet while
+                // surfacing operator-driven changes in default logs.
+                // Only non-secret, user-editable fields are named.
+                let changed = changed_fields(&self.original, &self.current).join(",");
+                tracing::info!(
+                    target: "studio_worker::ui::config",
+                    changed = ?changed,
+                    vram_threshold_gb = self.current.vram_threshold_gb,
+                    auto_start = self.current.auto_start,
+                    auto_update_enabled = self.current.auto_update_enabled,
+                    models_root = %self.current.models_root.display(),
+                    "operator applied config changes via UI"
+                );
                 self.original = self.current.clone();
                 self.last_save_error = None;
                 Ok(())
@@ -69,16 +87,48 @@ impl ConfigDraft {
 /// Equality over the persisted, user-editable fields.  Internal state
 /// (registration ids, auth token, worker id, install id) is excluded
 /// because the UI never mutates it; the auto-register flow owns it.
+///
+/// Delegates to [`changed_fields`] so the dirty-check and the save
+/// breadcrumb can never drift: any field that dirties the form is, by
+/// construction, also named when the operator applies it.
 fn configs_equal(a: &Config, b: &Config) -> bool {
-    a.api_base_url == b.api_base_url
-        && (a.vram_threshold_gb - b.vram_threshold_gb).abs() < f32::EPSILON
-        && a.auto_start == b.auto_start
-        && a.start_minimised == b.start_minimised
-        && a.auto_update_enabled == b.auto_update_enabled
-        && a.auto_update_interval_secs == b.auto_update_interval_secs
-        && a.auto_update_feed == b.auto_update_feed
-        && a.auto_update_prerelease == b.auto_update_prerelease
-        && a.models_root == b.models_root
+    changed_fields(a, b).is_empty()
+}
+
+/// Names of the user-editable fields that differ between `a` and `b`,
+/// in declaration order.  Backs both the dirty-check ([`configs_equal`])
+/// and the operator-apply breadcrumb in [`ConfigDraft::save`], so the
+/// two share a single source of truth for "what the UI can change".
+fn changed_fields(a: &Config, b: &Config) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if a.api_base_url != b.api_base_url {
+        fields.push("api_base_url");
+    }
+    if (a.vram_threshold_gb - b.vram_threshold_gb).abs() >= f32::EPSILON {
+        fields.push("vram_threshold_gb");
+    }
+    if a.auto_start != b.auto_start {
+        fields.push("auto_start");
+    }
+    if a.start_minimised != b.start_minimised {
+        fields.push("start_minimised");
+    }
+    if a.auto_update_enabled != b.auto_update_enabled {
+        fields.push("auto_update_enabled");
+    }
+    if a.auto_update_interval_secs != b.auto_update_interval_secs {
+        fields.push("auto_update_interval_secs");
+    }
+    if a.auto_update_feed != b.auto_update_feed {
+        fields.push("auto_update_feed");
+    }
+    if a.auto_update_prerelease != b.auto_update_prerelease {
+        fields.push("auto_update_prerelease");
+    }
+    if a.models_root != b.models_root {
+        fields.push("models_root");
+    }
+    fields
 }
 
 pub fn render(
@@ -342,6 +392,48 @@ mod tests {
         draft.autostart_error = Some("boom".into());
         draft.reset();
         assert!(draft.autostart_error.is_none());
+    }
+
+    #[test]
+    fn changed_fields_names_only_differing_user_editable_fields() {
+        let base = Config::default();
+        let mut edited = base.clone();
+        edited.vram_threshold_gb = base.vram_threshold_gb + 8.0;
+        edited.models_root = PathBuf::from("/tmp/other-models");
+        let changed = changed_fields(&base, &edited);
+        assert_eq!(changed, vec!["vram_threshold_gb", "models_root"]);
+    }
+
+    #[test]
+    fn changed_fields_is_empty_for_identical_configs() {
+        let cfg = Config::default();
+        assert!(changed_fields(&cfg, &cfg).is_empty());
+    }
+
+    #[test]
+    fn save_emits_operator_apply_breadcrumb() {
+        use crate::test_support::capture;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let logs = capture(move || {
+            let cfg = Config::default();
+            let mut draft = ConfigDraft::from(&cfg);
+            draft.current.vram_threshold_gb = 24.0;
+            draft.save(&path).expect("save must succeed");
+        });
+        assert!(logs.contains("INFO"), "expected INFO level, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::ui::config"),
+            "expected ui::config target, got: {logs}"
+        );
+        assert!(
+            logs.contains("changed=\"vram_threshold_gb\""),
+            "expected the changed field list, got: {logs}"
+        );
+        assert!(
+            logs.contains("operator applied config changes via UI"),
+            "expected the apply message, got: {logs}"
+        );
     }
 
     #[test]
