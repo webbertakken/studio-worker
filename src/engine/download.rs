@@ -10,6 +10,13 @@
 //! so a truncated download is rejected and cleaned up instead of being
 //! renamed into place as a corrupt model that every later job fails to
 //! load.
+//!
+//! Every download emits a structured `tracing` breadcrumb at the
+//! `studio_worker::engine::download` target: `info` on `starting` and
+//! `done`, and a symmetric `warn` on each failure (non-success status,
+//! a streaming error, or a length / sha256 mismatch) so an operator
+//! never sees a dangling `starting` with no terminal event explaining
+//! what went wrong — mirroring the `ApiClient` HTTP surface.
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -203,8 +210,18 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
     );
     let started = Instant::now();
     let mut response = client.get(url).send().context("GET")?;
-    if !response.status().is_success() {
-        bail!("GET {url} -> {}", response.status());
+    let status = response.status();
+    if !status.is_success() {
+        warn!(
+            target: TRACE_TARGET,
+            op = "download",
+            url,
+            dest = %dest.display(),
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "download failed: non-success status"
+        );
+        bail!("GET {url} -> {status}");
     }
     let expected_len = response.content_length();
     let file =
@@ -222,16 +239,45 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
         Ok(bytes) => bytes,
         Err(e) => {
             remove_temp_file(&part);
+            warn!(
+                target: TRACE_TARGET,
+                op = "download",
+                url,
+                dest = %dest.display(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "download failed: streaming body"
+            );
             return Err(e).context("streaming body");
         }
     };
     if let Err(e) = verify_download_len(bytes, expected_len) {
         remove_temp_file(&part);
+        warn!(
+            target: TRACE_TARGET,
+            op = "download",
+            url,
+            dest = %dest.display(),
+            bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %e,
+            "download failed: size mismatch"
+        );
         return Err(e).with_context(|| format!("downloading {url}"));
     }
     let actual_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     if let Err(e) = verify_sha256(&actual_hex, expected_sha256) {
         remove_temp_file(&part);
+        warn!(
+            target: TRACE_TARGET,
+            op = "download",
+            url,
+            dest = %dest.display(),
+            bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %e,
+            "download failed: sha256 mismatch"
+        );
         return Err(e).with_context(|| format!("downloading {url}"));
     }
     std::fs::rename(&part, dest)

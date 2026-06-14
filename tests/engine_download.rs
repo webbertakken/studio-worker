@@ -16,6 +16,7 @@
 //! a declared `Content-Length` — hyper enforces the two match.)
 
 use studio_worker::engine::download;
+use studio_worker::test_support::capture as captured_logs_for;
 use studio_worker::types::{ModelFile, ModelFileRole};
 use wiremock::matchers::{method, path as match_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -140,6 +141,81 @@ async fn download_file_surfaces_a_non_success_status() {
     });
     assert!(err.contains("404"), "got: {err}");
     assert!(!dest.exists());
+}
+
+// ---------------------------------------------------------------------------
+// Tracing emission — a failed model download must leave an
+// operator-visible `warn` breadcrumb at the download target, mirroring
+// the `ApiClient` HTTP surface.  Without it, an operator filtering
+// `studio_worker::engine::download` sees the `info` "starting" line
+// then silence, with no terminal event explaining what went wrong.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn download_failure_emits_a_warn_breadcrumb_with_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path("/gone.gguf"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let url = format!("{}/gone.gguf", server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("gone.gguf");
+    let dest_for_thread = dest.clone();
+    // `capture` spawns its own non-tokio thread, so `reqwest::blocking`
+    // inside the closure works without a separate `detached(...)` wrap.
+    let logs = captured_logs_for(move || {
+        let _ = download::download_file(&url, &dest_for_thread);
+    });
+
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"download\""),
+        "expected op field, got: {logs}"
+    );
+    assert!(
+        logs.contains("status=404"),
+        "expected status field, got: {logs}"
+    );
+    assert!(
+        logs.contains("elapsed_ms"),
+        "expected elapsed_ms field, got: {logs}"
+    );
+    assert!(
+        logs.contains("gone.gguf"),
+        "expected the dest/url in the breadcrumb, got: {logs}"
+    );
+    assert!(!dest.exists(), "no file committed on a failed download");
+}
+
+#[tokio::test]
+async fn sha256_mismatch_emits_a_warn_breadcrumb() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path("/tampered.gguf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"evil bytes".to_vec()))
+        .mount(&server)
+        .await;
+    let url = format!("{}/tampered.gguf", server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    let file = model_file("tampered.gguf", &url, Some(BODY_SHA256));
+    let logs = captured_logs_for(move || {
+        let _ = download::ensure_file(&dir_path, &file);
+    });
+
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"download\""),
+        "expected op field, got: {logs}"
+    );
+    assert!(
+        logs.contains("sha256"),
+        "expected the sha256 reason in the breadcrumb, got: {logs}"
+    );
 }
 
 #[tokio::test]
