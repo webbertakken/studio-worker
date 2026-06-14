@@ -866,6 +866,48 @@ mod tests {
         assert!(!dir.path().join("escape.txt").exists());
     }
 
+    #[test]
+    fn extract_zip_skips_directory_entries() {
+        // Real stable-diffusion.cpp prebuilt zips carry explicit
+        // directory entries (a top-level `build/` marker, a `bin/`
+        // dir, etc.).  Those must be skipped, not turned into spurious
+        // empty files in the flat output dir: a directory entry's name
+        // ends in `/`, so without the `is_dir` guard `file_name()`
+        // would strip the slash and write an empty `build` file
+        // alongside the real binary, and inflate the written-file count
+        // the provisioner reports.
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("with-dirs.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.add_directory("build/", opts).unwrap();
+            zw.start_file("sd-cli", opts).unwrap();
+            zw.write_all(b"binary").unwrap();
+            zw.add_directory("nested/empty/", opts).unwrap();
+            zw.finish().unwrap();
+        }
+        let dest = dir.path().join("out");
+        let count = extract_zip(&zip_path, &dest).unwrap();
+        // Only the single real file counts; both directory entries are skipped.
+        assert_eq!(
+            count, 1,
+            "directory entries must not count as written files"
+        );
+        assert_eq!(std::fs::read(dest.join("sd-cli")).unwrap(), b"binary");
+        // No spurious file is created from a directory entry's slash-stripped name.
+        assert!(
+            !dest.join("build").exists(),
+            "a directory entry must not become a file in the flat output"
+        );
+        assert!(
+            !dest.join("empty").exists(),
+            "a nested directory entry must not become a file either"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn extract_zip_preserves_exec_bit() {
