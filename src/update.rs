@@ -900,6 +900,40 @@ mod tests {
         assert!(err.contains("https"), "got: {err}");
     }
 
+    // -----------------------------------------------------------------
+    // RealRunner::run_installer — the production path that hands the
+    // downloaded installer to `sh` (unix) / PowerShell (Windows).  The
+    // unix branch is exercised here against trivial scripts so the
+    // safety property is locked in: a non-zero installer exit MUST
+    // bail, never report success.  Tests elsewhere drive `apply_with`
+    // through a fake runner, so without this the real subprocess
+    // dispatch shipped untested.
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_run_installer_succeeds_on_zero_exit() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("installer.sh");
+        // `sh <path>` reads the file directly, so no shebang or +x bit
+        // is needed.
+        std::fs::write(&script, "exit 0\n").unwrap();
+        RealRunner.run_installer(&script).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_run_installer_bails_on_nonzero_exit() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("installer.sh");
+        std::fs::write(&script, "exit 3\n").unwrap();
+        let err = RealRunner.run_installer(&script).unwrap_err().to_string();
+        assert!(
+            err.contains("installer exited"),
+            "a failed installer must surface a clear error, got: {err}"
+        );
+    }
+
     #[test]
     fn restart_argv_uses_current_exe_and_args() {
         let (bin, _args) = restart_argv();
