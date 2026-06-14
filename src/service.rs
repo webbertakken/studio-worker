@@ -52,6 +52,12 @@ fn run_step(op: &'static str, step: &'static str, mut cmd: Command) -> StepOutco
     let started = std::time::Instant::now();
     let status = cmd.status();
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    // Capture the spawn error's text before `classify_status` consumes the
+    // result and drops it; a SpawnFailed otherwise loses its root cause.
+    let spawn_error = match &status {
+        Err(e) => Some(e.to_string()),
+        Ok(_) => None,
+    };
     let outcome = classify_status(status);
     match outcome {
         StepOutcome::Succeeded => {
@@ -79,6 +85,7 @@ fn run_step(op: &'static str, step: &'static str, mut cmd: Command) -> StepOutco
                 op,
                 step,
                 elapsed_ms,
+                error = spawn_error.as_deref().unwrap_or("unknown"),
                 "service step could not be spawned (tool missing on PATH?)"
             );
         }
@@ -651,6 +658,31 @@ mod tests {
         let status =
             std::process::Command::new("definitely-not-on-path-zzzqxq-studio-worker").status();
         assert_eq!(classify_status(status), StepOutcome::SpawnFailed);
+    }
+
+    #[test]
+    fn run_step_spawn_failure_logs_underlying_io_error() {
+        // A spawn failure can be ENOENT (tool missing) *or* a permission
+        // error, a broken interpreter, etc.  The warn must carry the real
+        // OS error so an operator isn't misled by the generic "missing on
+        // PATH?" hint when the true cause is something else.
+        let cmd = std::process::Command::new("definitely-not-on-path-zzzqxq-studio-worker");
+        let logs = capture(move || {
+            assert_eq!(run_step("activate", "smoke", cmd), StepOutcome::SpawnFailed);
+        });
+        assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+        assert!(
+            logs.contains("could not be spawned"),
+            "expected spawn-failure message, got: {logs}"
+        );
+        assert!(
+            logs.contains("error="),
+            "expected structured error field, got: {logs}"
+        );
+        assert!(
+            logs.contains("os error"),
+            "expected the underlying io::Error text, got: {logs}"
+        );
     }
 
     #[test]
