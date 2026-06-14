@@ -28,6 +28,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::Response;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
 use tokio_tungstenite::tungstenite::{Error as TError, Message};
@@ -87,9 +88,60 @@ impl From<TError> for WsClientError {
                     reason: "401 on websocket upgrade".to_string(),
                 }
             }
+            // Any other upgrade status (500/502/503/429 …) is a
+            // transient server-side fault the reconnect loop retries.
+            // Carry the status + body so the studio's error
+            // `reference` id reaches the operator's log.
+            TError::Http(response) => {
+                WsClientError::Transport(http_upgrade_error_message(&response))
+            }
             TError::ConnectionClosed | TError::AlreadyClosed => WsClientError::ConnectionClosed,
             other => WsClientError::Transport(other.to_string()),
         }
+    }
+}
+
+/// Upper bound on the number of characters of a non-401 HTTP upgrade
+/// body we fold into the transport-error breadcrumb.  Enough to carry
+/// the studio's JSON error `reference` id without letting a stray HTML
+/// error page flood the log line.
+const HTTP_ERROR_BODY_MAX_CHARS: usize = 300;
+
+/// Render a non-401 HTTP upgrade failure into a transport-error string
+/// that surfaces both the status and (when present) the response body.
+/// tungstenite's own `Error::Http` Display keeps only the status, but
+/// the studio answers a failed `/connect` upgrade with a JSON body
+/// carrying an error `reference` id — the same value Sentry shows for
+/// the matching studio-side event.  Folding it into the breadcrumb
+/// lets an operator correlate the worker's reconnect-loop warning with
+/// the studio's logged failure.  The body is decoded lossily, trimmed,
+/// and clipped to [`HTTP_ERROR_BODY_MAX_CHARS`].
+fn http_upgrade_error_message(response: &Response<Option<Vec<u8>>>) -> String {
+    let status = response.status();
+    let body = response.body().as_deref().and_then(|bytes| {
+        let decoded = String::from_utf8_lossy(bytes);
+        let trimmed = decoded.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(clip_error_body(trimmed))
+    });
+    match body {
+        Some(b) => format!("HTTP {status} on websocket upgrade: {b}"),
+        None => format!("HTTP {status} on websocket upgrade"),
+    }
+}
+
+/// Clip a decoded error body to [`HTTP_ERROR_BODY_MAX_CHARS`],
+/// appending an ellipsis when truncated.  Char-based so a multibyte
+/// body can't be split mid-codepoint.
+fn clip_error_body(body: &str) -> String {
+    if body.chars().count() > HTTP_ERROR_BODY_MAX_CHARS {
+        let mut clipped: String = body.chars().take(HTTP_ERROR_BODY_MAX_CHARS).collect();
+        clipped.push('\u{2026}');
+        clipped
+    } else {
+        body.to_string()
     }
 }
 
@@ -810,6 +862,93 @@ mod tests {
         assert!(
             logs.contains("worker_id=\"w-err\""),
             "expected worker_id field: {logs}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // From<TError> — HTTP upgrade-error mapping.  A 401 stays a typed
+    // AuthFailed so the runtime surfaces a friendly token hint; every
+    // other status is a transient server-side fault the reconnect loop
+    // retries.  For the latter we fold the studio's response body —
+    // which carries the JSON error `reference` id Sentry also shows —
+    // into the breadcrumb so the worker's reconnect warning can be
+    // correlated with the studio-side failure.  tungstenite's own
+    // `Error::Http` Display keeps only the status and drops the body.
+    // -----------------------------------------------------------------
+
+    fn http_error(status: u16, body: Option<&[u8]>) -> TError {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(status)
+            .body(body.map(<[u8]>::to_vec))
+            .expect("a valid response");
+        TError::Http(response)
+    }
+
+    #[test]
+    fn http_401_upgrade_maps_to_auth_failed_ignoring_body() {
+        let err = WsClientError::from(http_error(401, Some(b"any body")));
+        assert!(
+            matches!(err, WsClientError::AuthFailed { .. }),
+            "401 must stay AuthFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn http_500_upgrade_surfaces_status_and_reference_body() {
+        let err = WsClientError::from(http_error(
+            500,
+            Some(b"internal error; reference = q1mtuhheh7en3lfqoofvgfgd"),
+        ));
+        let WsClientError::Transport(msg) = err else {
+            panic!("a non-401 HTTP error must map to Transport, got {err:?}");
+        };
+        assert!(msg.contains("500"), "status must be present: {msg}");
+        assert!(
+            msg.contains("q1mtuhheh7en3lfqoofvgfgd"),
+            "the studio's error reference id must survive into the breadcrumb: {msg}"
+        );
+    }
+
+    #[test]
+    fn http_503_upgrade_without_body_keeps_just_the_status() {
+        let err = WsClientError::from(http_error(503, None));
+        let WsClientError::Transport(msg) = err else {
+            panic!("expected Transport, got {err:?}");
+        };
+        assert!(msg.contains("503"), "status must be present: {msg}");
+        assert!(
+            !msg.trim_end().ends_with(':'),
+            "a bodyless error must not leave a dangling colon: {msg}"
+        );
+    }
+
+    #[test]
+    fn http_upgrade_blank_body_is_treated_as_no_body() {
+        let err = WsClientError::from(http_error(500, Some(b"   \n\t ")));
+        let WsClientError::Transport(msg) = err else {
+            panic!("expected Transport, got {err:?}");
+        };
+        assert!(
+            !msg.trim_end().ends_with(':'),
+            "a whitespace-only body must not leave a dangling colon: {msg}"
+        );
+    }
+
+    #[test]
+    fn http_upgrade_error_body_is_clipped() {
+        let big = "x".repeat(5_000);
+        let err = WsClientError::from(http_error(502, Some(big.as_bytes())));
+        let WsClientError::Transport(msg) = err else {
+            panic!("expected Transport, got {err:?}");
+        };
+        assert!(
+            msg.chars().count() < big.len(),
+            "a huge error page must be clipped, got {} chars",
+            msg.chars().count()
+        );
+        assert!(
+            msg.contains('\u{2026}'),
+            "a clipped body must carry an ellipsis: {msg}"
         );
     }
 }
