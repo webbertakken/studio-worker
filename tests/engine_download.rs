@@ -78,6 +78,21 @@ fn serve_truncated_response() -> String {
     format!("http://{addr}")
 }
 
+/// Grab a loopback port, then drop the listener so nothing is bound to
+/// it.  A subsequent connect to that address is refused at the TCP
+/// level (`ECONNREFUSED`), which is how the most common real-world
+/// download failures surface: a flaky network, a closed firewall port,
+/// a DNS hiccup, or a TLS handshake error all bubble up as a
+/// connection-level `reqwest::send()` error *before* any HTTP status is
+/// seen.  Returns a URL on that now-closed port.
+fn refused_loopback_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    // Free the port so the connect that follows is refused, not served.
+    drop(listener);
+    format!("http://{addr}/model.gguf")
+}
+
 #[tokio::test]
 async fn download_file_writes_the_served_bytes() {
     let server = MockServer::start().await;
@@ -177,6 +192,38 @@ async fn download_file_surfaces_a_non_success_status() {
     });
     assert!(err.contains("404"), "got: {err}");
     assert!(!dest.exists());
+}
+
+#[test]
+fn download_surfaces_a_connection_level_failure_and_caches_nothing() {
+    // A connection that never reaches an HTTP response (refused,
+    // DNS/TLS error, dropped before the status line) must surface as an
+    // error and commit nothing — the symmetric sibling of the 404 and
+    // truncation guards.  Without this the most common production
+    // failure (a network blip) was the only download error path with no
+    // regression cover.
+    let url = refused_loopback_url();
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("refused.gguf");
+    let dest_for_thread = dest.clone();
+    let err = detached(move || {
+        download::download_file(&url, &dest_for_thread)
+            .expect_err("a refused connection must error")
+            .to_string()
+    });
+    // The download path attaches a `GET` context to a connection-level
+    // send() failure, distinguishing it from a non-success status
+    // (which bails with `GET <url> -> <status>`).
+    assert_eq!(
+        err, "GET",
+        "expected the connection-level GET context, got: {err}"
+    );
+    assert!(!dest.exists(), "no file committed on a refused connection");
+    assert!(
+        !dest.with_extension("part").exists(),
+        ".part scratch litter left behind"
+    );
 }
 
 #[test]
@@ -287,6 +334,39 @@ async fn download_failure_emits_a_warn_breadcrumb_with_status() {
         "expected the dest/url in the breadcrumb, got: {logs}"
     );
     assert!(!dest.exists(), "no file committed on a failed download");
+}
+
+#[test]
+fn connection_level_failure_emits_a_warn_breadcrumb() {
+    // The connection-level failure path must be observable too: an
+    // operator filtering `studio_worker::engine::download` needs a
+    // terminal `warn` after the `info` "starting" line, not silence.
+    // This breadcrumb names "request error" specifically, which is
+    // unique to the `send()` Err arm — proving the connection guard
+    // fired rather than a status or streaming failure.
+    let url = refused_loopback_url();
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("refused.gguf");
+    let dest_for_thread = dest.clone();
+    let logs = captured_logs_for(move || {
+        let _ = download::download_file(&url, &dest_for_thread);
+    });
+
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"download\""),
+        "expected op field, got: {logs}"
+    );
+    assert!(
+        logs.contains("download failed: request error"),
+        "expected the connection-level failure breadcrumb, got: {logs}"
+    );
+    assert!(
+        logs.contains("elapsed_ms"),
+        "expected elapsed_ms field, got: {logs}"
+    );
+    assert!(!dest.exists(), "no file committed on a refused connection");
 }
 
 #[tokio::test]
