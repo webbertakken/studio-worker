@@ -111,10 +111,24 @@ fn default_auto_update_feed() -> String {
 /// `$TMPDIR/studio-worker-models` on the (extremely unusual) machines
 /// where `directories` can't find a home directory.
 pub fn default_models_root() -> PathBuf {
-    if let Some(user) = UserDirs::new() {
-        return user.home_dir().join("models");
+    models_root_from(home_dir())
+}
+
+/// The running user's home directory, if `directories` can resolve it.
+/// Returns `None` on the home-less boxes the fallbacks below guard
+/// against (containers, `DynamicUser=` systemd units, minimal images).
+fn home_dir() -> Option<PathBuf> {
+    UserDirs::new().map(|d| d.home_dir().to_path_buf())
+}
+
+/// Resolve the default models root given the running user's home dir.
+/// Pure (the home dir is injected) so both the normal path and the
+/// home-less fallback are unit-testable without touching the host.
+fn models_root_from(home: Option<PathBuf>) -> PathBuf {
+    match home {
+        Some(home) => home.join("models"),
+        None => std::env::temp_dir().join("studio-worker-models"),
     }
-    std::env::temp_dir().join("studio-worker-models")
 }
 
 fn default_models_root_persisted() -> PathBuf {
@@ -126,15 +140,20 @@ fn default_models_root_persisted() -> PathBuf {
 /// config carries an unexpanded path (most commonly: a hand-edited
 /// `models_root = "~/models"`).
 fn expand_home(path: PathBuf) -> PathBuf {
+    expand_home_with(path, home_dir())
+}
+
+/// Pure core of [`expand_home`]: the home dir is injected so the
+/// home-less branches (where the path stays unexpanded) are testable
+/// without depending on the host having a real home directory.
+fn expand_home_with(path: PathBuf, home: Option<PathBuf>) -> PathBuf {
     let s = path.to_string_lossy();
     if s == "~" {
-        return UserDirs::new()
-            .map(|d| d.home_dir().to_path_buf())
-            .unwrap_or(path);
+        return home.unwrap_or(path);
     }
     if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(d) = UserDirs::new() {
-            return d.home_dir().join(rest);
+        if let Some(home) = home {
+            return home.join(rest);
         }
     }
     path
@@ -508,6 +527,66 @@ mod tests {
             expanded.is_absolute() || expanded == Path::new("~"),
             "bare ~ expands to home (or stays put on weird boxes), got {}",
             expanded.display()
+        );
+    }
+
+    // The injected-home seams below pin the home-less fallback paths
+    // (containers, `DynamicUser=` systemd units, minimal images where
+    // `UserDirs::new()` returns `None`) without depending on the host's
+    // real home directory.
+
+    #[test]
+    fn models_root_from_uses_home_when_available() {
+        let home = PathBuf::from("/home/someuser");
+        assert_eq!(models_root_from(Some(home.clone())), home.join("models"));
+    }
+
+    #[test]
+    fn models_root_from_falls_back_to_tmp_without_home() {
+        assert_eq!(
+            models_root_from(None),
+            std::env::temp_dir().join("studio-worker-models")
+        );
+    }
+
+    #[test]
+    fn expand_home_with_bare_tilde_uses_injected_home() {
+        let home = PathBuf::from("/home/x");
+        assert_eq!(
+            expand_home_with(PathBuf::from("~"), Some(home.clone())),
+            home
+        );
+    }
+
+    #[test]
+    fn expand_home_with_bare_tilde_without_home_stays_put() {
+        assert_eq!(
+            expand_home_with(PathBuf::from("~"), None),
+            PathBuf::from("~")
+        );
+    }
+
+    #[test]
+    fn expand_home_with_prefix_joins_injected_home() {
+        let home = PathBuf::from("/home/x");
+        assert_eq!(
+            expand_home_with(PathBuf::from("~/models"), Some(home.clone())),
+            home.join("models")
+        );
+    }
+
+    #[test]
+    fn expand_home_with_prefix_without_home_stays_unexpanded() {
+        let p = PathBuf::from("~/models");
+        assert_eq!(expand_home_with(p.clone(), None), p);
+    }
+
+    #[test]
+    fn expand_home_with_leaves_absolute_paths_alone() {
+        let p = PathBuf::from("/tmp/anywhere");
+        assert_eq!(
+            expand_home_with(p.clone(), Some(PathBuf::from("/home/x"))),
+            p
         );
     }
 
