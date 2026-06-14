@@ -209,7 +209,26 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
         "starting"
     );
     let started = Instant::now();
-    let mut response = client.get(url).send().context("GET")?;
+    let mut response = match client.get(url).send() {
+        Ok(response) => response,
+        Err(e) => {
+            // A connection-level failure (DNS, TLS, timeout, or a
+            // connection closed before the declared body completed)
+            // must leave the same terminal breadcrumb as the other
+            // failure modes below — otherwise an operator filtering
+            // this target sees the "starting" line then silence.
+            warn!(
+                target: TRACE_TARGET,
+                op = "download",
+                url,
+                dest = %dest.display(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "download failed: request error"
+            );
+            return Err(e).context("GET");
+        }
+    };
     let status = response.status();
     if !status.is_success() {
         warn!(

@@ -10,10 +10,10 @@
 //!   `ensure_file` returns that path;
 //! - a non-2xx response is surfaced as an error (no file committed);
 //! - an already-cached file is returned without touching the network.
-//!
-//! (Truncated-body rejection is covered by the `verify_download_len`
-//! unit tests in the module; an HTTP server can't be made to under-send
-//! a declared `Content-Length` — hyper enforces the two match.)
+//! - a body shorter than its declared `Content-Length` is rejected and
+//!   leaves nothing cached (the integrity guard that stops a truncated
+//!   model file from ever being loaded), driven end-to-end by setting
+//!   the `Content-Length` header manually so the server under-sends.
 
 use studio_worker::engine::download;
 use studio_worker::test_support::capture as captured_logs_for;
@@ -141,6 +141,83 @@ async fn download_file_surfaces_a_non_success_status() {
     });
     assert!(err.contains("404"), "got: {err}");
     assert!(!dest.exists());
+}
+
+#[tokio::test]
+async fn download_rejects_a_truncated_body_and_caches_nothing() {
+    // A body shorter than its declared Content-Length must never be
+    // renamed into the cache — a half-written GGUF would crash every
+    // later job that loads it (or worse, be run).  An HTTP server *can*
+    // under-send a declared length: wiremock lets us set the header
+    // manually, the same trick `tests/auto_update.rs` uses for the
+    // installer download.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path("/truncated.gguf"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "9999")
+                .set_body_bytes(b"only a few bytes".to_vec()),
+        )
+        .mount(&server)
+        .await;
+    let url = format!("{}/truncated.gguf", server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("truncated.gguf");
+    let dest_for_thread = dest.clone();
+    let err = detached(move || {
+        download::download_file(&url, &dest_for_thread)
+            .expect_err("a truncated download must be rejected")
+            .to_string()
+    });
+    assert!(!err.is_empty(), "the rejection must carry an error: {err}");
+    // Whatever the precise failure (short read or post-copy length
+    // check), no file and no `.part` litter may survive.
+    assert!(!dest.exists(), "no truncated file may be committed");
+    assert!(
+        !dest.with_extension("part").exists(),
+        ".part scratch litter left behind"
+    );
+}
+
+#[tokio::test]
+async fn truncated_download_emits_a_warn_breadcrumb() {
+    // The integrity guard must also be observable: an operator filtering
+    // `studio_worker::engine::download` needs a terminal `warn` after the
+    // `info` "starting" line, not silence.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path("/short.gguf"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "9999")
+                .set_body_bytes(b"only a few bytes".to_vec()),
+        )
+        .mount(&server)
+        .await;
+    let url = format!("{}/short.gguf", server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("short.gguf");
+    let dest_for_thread = dest.clone();
+    let logs = captured_logs_for(move || {
+        let _ = download::download_file(&url, &dest_for_thread);
+    });
+
+    assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+    assert!(
+        logs.contains("op=\"download\""),
+        "expected op field, got: {logs}"
+    );
+    assert!(
+        logs.contains("short.gguf"),
+        "expected the dest/url in the breadcrumb, got: {logs}"
+    );
+    assert!(
+        logs.contains("elapsed_ms"),
+        "expected elapsed_ms field, got: {logs}"
+    );
 }
 
 // ---------------------------------------------------------------------------
