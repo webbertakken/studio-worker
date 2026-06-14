@@ -347,6 +347,64 @@ mod tests {
     }
 
     #[test]
+    fn is_transient_classifies_5xx_as_retryable_and_4xx_as_terminal() {
+        // The retry gate: server-side failures are worth a short retry,
+        // client-side contract errors are not.  This pins the boundary
+        // the upload-retry loop branches on.
+        let err = |status| HttpStatusError {
+            op: "complete".into(),
+            status,
+            body: "x".into(),
+        };
+        assert!(err(500).is_transient());
+        assert!(err(503).is_transient());
+        assert!(!err(499).is_transient());
+        assert!(!err(409).is_transient());
+        assert!(!err(400).is_transient());
+    }
+
+    #[test]
+    fn is_transient_upload_error_branches_on_error_kind() {
+        // 5xx HTTP status → retry; 4xx → terminal.
+        let server_err: anyhow::Error = HttpStatusError {
+            op: "complete".into(),
+            status: 502,
+            body: "bad gateway".into(),
+        }
+        .into();
+        assert!(is_transient_upload_error(&server_err));
+        let client_err: anyhow::Error = HttpStatusError {
+            op: "complete".into(),
+            status: 409,
+            body: "conflict".into(),
+        }
+        .into();
+        assert!(!is_transient_upload_error(&client_err));
+
+        // A transport-level reqwest error (connection refused) is the
+        // branch the wiremock tests can't reach — no HTTP response ever
+        // comes back — yet it's exactly the upload blip a retry fixes.
+        let transport: anyhow::Error = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap()
+            .post("http://127.0.0.1:1/unreachable")
+            .body(Vec::<u8>::new())
+            .send()
+            .expect_err("connect to a dead port must fail")
+            .into();
+        assert!(
+            is_transient_upload_error(&transport),
+            "a transport-level failure must be retryable"
+        );
+
+        // An unrelated error (neither HTTP status nor transport) is not
+        // an upload blip, so it must not trigger a retry.
+        let unrelated = anyhow!("local disk full while staging the upload");
+        assert!(!is_transient_upload_error(&unrelated));
+    }
+
+    #[test]
     fn mime_for_ext_covers_every_extension_engines_emit() {
         // Lock the contract: each binary extension an engine actually
         // emits must resolve to a real MIME type, never the
