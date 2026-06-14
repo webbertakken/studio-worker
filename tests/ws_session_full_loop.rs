@@ -268,6 +268,20 @@ async fn spawn_heartbeat_collecting_ws() -> (
     (addr, rx, handle)
 }
 
+/// Poll `pred` every 5ms until it returns true or `timeout` elapses.
+/// Used to wait on an operator log line landing in `recent_logs`
+/// without racing the heartbeat pump's tick cadence.
+async fn wait_until<F: Fn() -> bool>(timeout: Duration, pred: F) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if pred() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    pred()
+}
+
 async fn collect_frames(
     ws: &mut WebSocketStream<TcpStream>,
     expected: &[&str],
@@ -650,4 +664,95 @@ async fn ws_session_logs_advertised_capabilities_on_handshake() {
         summary.contains("auto_enabled=true"),
         "unpaused worker must advertise auto_enabled=true: {summary}"
     );
+}
+
+#[tokio::test]
+async fn ws_session_ships_pause_and_resume_transitions_to_operator_logs() {
+    // A Pause / Resume from the Status tab or tray menu only emits a
+    // local `tracing` breadcrumb (stdout / Sentry); it never enters the
+    // worker's shipped log stream.  So the studio's shipped-log view and
+    // the UI's Logs tab used to show `auto_enabled=false` heartbeats
+    // with no record of *why* the worker stopped claiming.  The
+    // heartbeat pump must observe the runtime pause flag and ship the
+    // transition, so a toggle from any source is visible to operators.
+    let (ws_addr, mut thresholds, _server) = spawn_heartbeat_collecting_ws().await;
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let shared = config::shared(cfg);
+    let stop = Arc::new(AtomicBool::new(false));
+    let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
+    let busy = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    // `recent_logs` is *not* drained by the log shipper, so the
+    // transition breadcrumbs stay inspectable after they ship.
+    let observers = WorkerObservers::default();
+
+    let session_handle = tokio::spawn({
+        let shared = shared.clone();
+        let stop = stop.clone();
+        let logs = logs.clone();
+        let busy = busy.clone();
+        let paused = paused.clone();
+        let observers = observers.clone();
+        async move {
+            spawn_ws_session(
+                shared,
+                stop,
+                logs,
+                busy,
+                paused,
+                observers,
+                SessionSchedule::fast_for_tests(),
+            )
+            .await
+        }
+    });
+
+    // The session is welcomed + heartbeating once the first heartbeat
+    // lands, so a pause flipped after this is guaranteed to be observed
+    // by a running pump.
+    tokio::time::timeout(TIMEOUT, thresholds.recv())
+        .await
+        .expect("timed out waiting for the first heartbeat")
+        .expect("server channel closed before the first heartbeat");
+
+    // Operator pauses: the pump must ship the transition.
+    paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    let paused_logged = wait_until(TIMEOUT, || {
+        observers
+            .recent_logs
+            .lock()
+            .iter()
+            .any(|e| e.level == "info" && e.message.contains("claiming paused by operator"))
+    })
+    .await;
+    assert!(
+        paused_logged,
+        "a pause must reach the operator-facing log stream"
+    );
+
+    // Operator resumes: the next transition must ship too.
+    paused.store(false, std::sync::atomic::Ordering::SeqCst);
+    let resumed_logged = wait_until(TIMEOUT, || {
+        observers
+            .recent_logs
+            .lock()
+            .iter()
+            .any(|e| e.level == "info" && e.message.contains("claiming resumed by operator"))
+    })
+    .await;
+    assert!(
+        resumed_logged,
+        "a resume must reach the operator-facing log stream"
+    );
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(5), session_handle).await;
 }
