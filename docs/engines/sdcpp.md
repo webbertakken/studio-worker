@@ -111,7 +111,11 @@ Overrides:
 When `STUDIO_WORKER_SDCPP_RELEASE` / `STUDIO_WORKER_SDCPP_URL` are in
 effect the worker logs an `info` breadcrumb at
 `studio_worker::engine::sd_provision` naming the env var that won, so a
-typo'd override that's silently ignored is easy to spot in the logs.
+typo'd override that's silently ignored is easy to spot in the logs.  A
+`STUDIO_WORKER_SDCPP_URL` that's set but **empty** (e.g. a blank
+`Environment="STUDIO_WORKER_SDCPP_URL="` unit-file line) is dropped in
+favour of the default release URL and logged as a `warn` on the same
+target, so a blank override can't quietly fall back without a trace.
 
 Targets with no prebuilt at all (e.g. Windows arm64) error with a
 pointer to the manual [install playbook](../operations/sd-cli-install.md).
