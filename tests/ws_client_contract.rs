@@ -536,3 +536,37 @@ async fn split_sender_close_is_observed_by_the_server() {
     assert_eq!(code, 1000);
     let _ = server.await;
 }
+
+/// A `WsSender::send` that fails surfaces a typed error rather than
+/// vanishing.  The session pushes accepts / fails / completeJson /
+/// heartbeats through the shared sender with `let _ = sender.send(...)`,
+/// discarding the result — so this mapped error (and the warn
+/// breadcrumb it drives via `log_send_error`) is the only signal an
+/// operator gets that a frame never made it onto the wire.  Closing the
+/// sender first puts the sink into its closing handshake, so the next
+/// send deterministically errors without racing the socket teardown.
+#[tokio::test]
+async fn split_sender_send_after_close_surfaces_a_typed_error() {
+    let (addr, server) = spawn_server(echo_subprotocol, |mut ws| async move {
+        // Hold the connection open and drain until the client goes away.
+        while ws.next().await.is_some() {}
+    })
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let client = connect(&base, "w-split", "t").await.unwrap();
+    let (sender, _receiver) = client.split();
+    sender.close(1000, "bye").await.unwrap();
+    let err = sender
+        .send(&WorkerInbound::ReadyForMore)
+        .await
+        .expect_err("send after close must fail");
+    assert!(
+        matches!(
+            err,
+            WsClientError::Transport(_) | WsClientError::ConnectionClosed
+        ),
+        "a post-close send must map to a transport-class error, got {err:?}"
+    );
+    let _ = server.await;
+}
