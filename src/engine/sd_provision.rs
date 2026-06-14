@@ -255,6 +255,17 @@ fn select_url(
             );
             return Ok(url);
         }
+        // Present but empty (`STUDIO_WORKER_SDCPP_URL=`): the override is
+        // dropped and the pinned default is used.  Surface it instead of
+        // silently swallowing it, so a blank env value (a unit-file or CI
+        // misconfiguration) doesn't leave the operator wondering why their
+        // mirror override never took effect.
+        warn!(
+            target: TRACE_TARGET,
+            op = "resolve-url",
+            source = URL_ENV,
+            "ignoring empty STUDIO_WORKER_SDCPP_URL override; using the default release URL"
+        );
     }
     default_url()
 }
@@ -674,6 +685,33 @@ mod tests {
         assert!(
             logs.contains("https://mirror.example/sd.zip"),
             "got: {logs}"
+        );
+    }
+
+    #[test]
+    fn select_url_warns_when_the_override_is_present_but_empty() {
+        // An override that's present but empty (`STUDIO_WORKER_SDCPP_URL=`,
+        // e.g. an `Environment="STUDIO_WORKER_SDCPP_URL="` line in a unit file
+        // or a CI that sets the var conditionally and leaves it blank) is a
+        // misconfiguration: the override is dropped and the pinned default is
+        // used.  Without a breadcrumb the operator has no trace of why their
+        // mirror override never took effect — the symmetric silent gap to the
+        // non-empty "took effect" log above.
+        let logs = crate::test_support::capture(|| {
+            let url = select_url(Some(String::new()), || Ok("fallback".into())).unwrap();
+            assert_eq!(url, "fallback", "an empty override must still fall back");
+        });
+        assert!(
+            logs.contains("WARN"),
+            "expected a WARN breadcrumb, got: {logs}"
+        );
+        assert!(
+            logs.contains("STUDIO_WORKER_SDCPP_URL"),
+            "the warning must name the ignored env var: {logs}"
+        );
+        assert!(
+            logs.contains("op=\"resolve-url\""),
+            "expected the resolve-url op field: {logs}"
         );
     }
 
