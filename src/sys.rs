@@ -25,7 +25,27 @@ pub fn machine_name() -> String {
 }
 
 pub fn username() -> String {
-    let user = whoami::username();
+    username_from_probe(whoami::username())
+}
+
+/// Resolve the OS-user probe into a username, logging the outcome so a
+/// silent fallback can't hide a failing probe.  `whoami::username`
+/// became fallible in whoami 2.x; on the error path we emit a `warn`
+/// breadcrumb naming the underlying error and fall back to
+/// `unknown-user`, mirroring `machine_name`'s `unknown-host` default.
+fn username_from_probe<E: std::fmt::Display>(probe: std::result::Result<String, E>) -> String {
+    let user = match probe {
+        Ok(user) => user,
+        Err(e) => {
+            tracing::warn!(
+                target: "studio_worker::sys",
+                op = "username",
+                error = %e,
+                "failed to resolve OS user; falling back to unknown-user"
+            );
+            "unknown-user".to_string()
+        }
+    };
     tracing::debug!(
         target: "studio_worker::sys",
         op = "username",
@@ -262,6 +282,51 @@ mod tests {
     #[test]
     fn username_returns_non_empty() {
         assert!(!username().is_empty());
+    }
+
+    #[test]
+    fn username_from_probe_returns_the_resolved_value() {
+        let user = username_from_probe(Ok::<_, std::io::Error>("alice".to_string()));
+        assert_eq!(user, "alice");
+    }
+
+    #[test]
+    fn username_from_probe_falls_back_to_unknown_user_on_error() {
+        let user =
+            username_from_probe(Err::<String, _>(std::io::Error::other("no entropy source")));
+        assert_eq!(user, "unknown-user");
+    }
+
+    #[test]
+    fn username_from_probe_warns_with_the_error_on_failure() {
+        // whoami 2.x made the probe fallible; a failure must leave an
+        // operator-visible breadcrumb naming the error rather than a
+        // silent fallback that hides why the user came back unknown.
+        let logs = crate::test_support::capture(|| {
+            let _ =
+                username_from_probe(Err::<String, _>(std::io::Error::other("permission denied")));
+        });
+        assert!(logs.contains("WARN"), "expected WARN level, got: {logs}");
+        assert!(
+            logs.contains("op=\"username\""),
+            "expected username op, got: {logs}"
+        );
+        assert!(
+            logs.contains("permission denied"),
+            "expected underlying error, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn username_from_probe_emits_debug_value_on_success() {
+        let logs = crate::test_support::capture(|| {
+            let _ = username_from_probe(Ok::<_, std::io::Error>("bob".to_string()));
+        });
+        assert!(logs.contains("DEBUG"), "expected DEBUG event, got: {logs}");
+        assert!(
+            logs.contains("value=bob"),
+            "expected resolved value, got: {logs}"
+        );
     }
 
     #[test]
