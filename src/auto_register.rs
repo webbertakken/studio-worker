@@ -31,6 +31,12 @@ use crate::{
     AGENT_VERSION,
 };
 
+/// Tracing target for the registration state machine.  Stable so
+/// operators can filter the worker's most-asked-about flow ("why is my
+/// worker stuck unregistered?") with
+/// `RUST_LOG=studio_worker::auto_register=debug`.
+const TRACE_TARGET: &str = "studio_worker::auto_register";
+
 /// What `tick()` returns + what the UI Status tab reads.  Distinct
 /// from the persisted config fields, which carry the raw building
 /// blocks (`install_id`, `registration_request_id`, …).
@@ -132,8 +138,11 @@ fn ensure_install_state(cfg: &SharedConfig, config_path: &Path) {
         drop(snap);
         if let Err(e) = config::save(&snapshot, config_path) {
             tracing::warn!(
-                target: "studio_worker::auto_register",
-                "failed to persist install state: {e}"
+                target: TRACE_TARGET,
+                op = "ensure-install",
+                config_path = %config_path.display(),
+                error = %e,
+                "failed to persist install state"
             );
         }
     }
@@ -162,8 +171,10 @@ async fn create_request(
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(
-                target: "studio_worker::auto_register",
-                "engine build failed during register-request: {e}"
+                target: TRACE_TARGET,
+                op = "register-request",
+                error = %e,
+                "engine build failed during register-request"
             );
             return RegistrationState::Pristine;
         }
@@ -181,15 +192,19 @@ async fn create_request(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "studio_worker::auto_register",
-                "register-request HTTP failed; will retry next tick: {e}"
+                target: TRACE_TARGET,
+                op = "register-request",
+                error = %e,
+                "register-request HTTP failed; will retry next tick"
             );
             return RegistrationState::Pristine;
         }
         Err(e) => {
             tracing::warn!(
-                target: "studio_worker::auto_register",
-                "register-request task panic; will retry next tick: {e}"
+                target: TRACE_TARGET,
+                op = "register-request",
+                error = %e,
+                "register-request task panic; will retry next tick"
             );
             return RegistrationState::Pristine;
         }
@@ -204,8 +219,11 @@ async fn create_request(
         drop(snap);
         if let Err(e) = config::save(&snapshot, config_path) {
             tracing::warn!(
-                target: "studio_worker::auto_register",
-                "failed to persist request_id: {e}"
+                target: TRACE_TARGET,
+                op = "register-request",
+                config_path = %config_path.display(),
+                error = %e,
+                "failed to persist request_id"
             );
         }
     }
@@ -238,8 +256,10 @@ async fn poll_existing(
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "studio_worker::auto_register",
-                "poll failed; will retry next tick: {e}"
+                target: TRACE_TARGET,
+                op = "poll",
+                error = %e,
+                "poll failed; will retry next tick"
             );
             let state = RegistrationState::Pending {
                 request_id,
@@ -250,8 +270,10 @@ async fn poll_existing(
         }
         Err(e) => {
             tracing::warn!(
-                target: "studio_worker::auto_register",
-                "poll task panic; will retry next tick: {e}"
+                target: TRACE_TARGET,
+                op = "poll",
+                error = %e,
+                "poll task panic; will retry next tick"
             );
             let state = RegistrationState::Pending {
                 request_id,
@@ -274,9 +296,11 @@ async fn poll_existing(
                 drop(snap);
                 if let Err(e) = config::save(&snapshot, config_path) {
                     tracing::warn!(
-                        target: "studio_worker::auto_register",
+                        target: TRACE_TARGET,
+                        op = "poll",
                         config_path = %config_path.display(),
-                        "failed to persist cleared request state after stale 404; the stale request id stays on disk until the next successful save: {e}"
+                        error = %e,
+                        "failed to persist cleared request state after stale 404; the stale request id stays on disk until the next successful save"
                     );
                 }
             }
@@ -305,9 +329,11 @@ async fn poll_existing(
                 drop(snap);
                 if let Err(e) = config::save(&snapshot, config_path) {
                     tracing::error!(
-                        target: "studio_worker::auto_register",
+                        target: TRACE_TARGET,
+                        op = "poll",
                         config_path = %config_path.display(),
-                        "failed to persist approved credentials; this session is registered in memory but the worker will re-register from scratch on the next restart: {e}"
+                        error = %e,
+                        "failed to persist approved credentials; this session is registered in memory but the worker will re-register from scratch on the next restart"
                     );
                 }
             }
@@ -323,9 +349,11 @@ async fn poll_existing(
                 drop(snap);
                 if let Err(e) = config::save(&snapshot, config_path) {
                     tracing::warn!(
-                        target: "studio_worker::auto_register",
+                        target: TRACE_TARGET,
+                        op = "poll",
                         config_path = %config_path.display(),
-                        "failed to persist cleared request state after rejection; the stale request id stays on disk until the next successful save: {e}"
+                        error = %e,
+                        "failed to persist cleared request state after rejection; the stale request id stays on disk until the next successful save"
                     );
                 }
             }
