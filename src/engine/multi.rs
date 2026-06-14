@@ -301,9 +301,12 @@ mod tests {
         assert_eq!(multi.name(), "multi");
     }
 
-    fn sd_cpp_source() -> crate::types::ModelSource {
+    /// Build a `ModelSource` for `engine` with throwaway CLI defaults.
+    /// `dispatch_with_source` routes purely on `engine`, so the file
+    /// roster + params are irrelevant to the routing tests.
+    fn source_for(engine: crate::types::ModelEngine) -> crate::types::ModelSource {
         crate::types::ModelSource {
-            engine: crate::types::ModelEngine::SdCpp,
+            engine,
             files: vec![],
             cli_defaults: crate::types::ModelCliDefaults {
                 cfg_scale: 1.0,
@@ -314,6 +317,10 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn sd_cpp_source() -> crate::types::ModelSource {
+        source_for(crate::types::ModelEngine::SdCpp)
     }
 
     /// The no-fallback policy: when the studio asks for an `sd-cpp`
@@ -373,21 +380,54 @@ mod tests {
     fn dispatch_with_source_routes_synthetic_engine_for_synthetic_models() {
         let synth: Box<dyn Engine> = Box::new(SyntheticEngine::new());
         let multi = MultiEngine::new(vec![synth]);
-        let source = crate::types::ModelSource {
-            engine: crate::types::ModelEngine::Synthetic,
-            files: vec![],
-            cli_defaults: crate::types::ModelCliDefaults {
-                cfg_scale: 1.0,
-                steps: 8,
-                width: 1024,
-                height: 1024,
-                sampling_method: None,
-                ..Default::default()
-            },
-        };
+        let source = source_for(crate::types::ModelEngine::Synthetic);
         let result = multi
             .dispatch_with_source("synthetic", image_task(), &source)
             .unwrap();
         assert!(matches!(result, TaskResult::Image { .. }));
+    }
+
+    /// `ModelSource.engine == Onnx` must route strictly to the engine
+    /// named `onnx` (the LaMa object-removal backend that serves
+    /// Find-the-Differences removals).  This arm had no test, so a
+    /// typo'd engine string or a dropped/reordered match arm would have
+    /// shipped silently and mis-routed every removal job.
+    #[test]
+    fn dispatch_with_source_routes_onnx_to_the_onnx_backend() {
+        let onnx: Box<dyn Engine> = Box::new(StubEngine {
+            name: "onnx",
+            kinds: vec![TaskKind::Image],
+            models: vec![],
+        });
+        let multi = MultiEngine::new(vec![onnx]);
+        let source = source_for(crate::types::ModelEngine::Onnx);
+        let result = multi
+            .dispatch_with_source("lama", image_task(), &source)
+            .unwrap();
+        match result {
+            TaskResult::Image { bytes, .. } => assert_eq!(bytes, b"onnx"),
+            _ => panic!("expected the image to route to the onnx stub"),
+        }
+    }
+
+    /// `ModelSource.engine == LlamaCpp` must route strictly to the
+    /// engine named `llama`.  Symmetric cover for the second
+    /// previously-untested routing arm.
+    #[test]
+    fn dispatch_with_source_routes_llamacpp_to_the_llama_backend() {
+        let llama: Box<dyn Engine> = Box::new(StubEngine {
+            name: "llama",
+            kinds: vec![TaskKind::Llm],
+            models: vec![],
+        });
+        let multi = MultiEngine::new(vec![llama]);
+        let source = source_for(crate::types::ModelEngine::LlamaCpp);
+        let result = multi
+            .dispatch_with_source("some-gguf", llm_task(), &source)
+            .unwrap();
+        match result {
+            TaskResult::Llm { json } => assert_eq!(json["from"], "llama"),
+            _ => panic!("expected the llm to route to the llama stub"),
+        }
     }
 }

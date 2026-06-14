@@ -79,7 +79,8 @@ CI.
   `ui::run` reconciles it with `auto_start` on launch.
 - `src/engine/` — pluggable inference engines (`SyntheticEngine` +
   `MultiEngine` dispatcher, `SdCppEngine`, plus feature-gated `llama`
-  / `whisper` / `image-candle` / `video` / `tts` backends). Shared
+  / `whisper` / `image-candle` / `image-onnx` (LaMa removal) / `video`
+  / `tts` backends). Shared
   on-demand model provisioning lives in `src/engine/download.rs`
   (cache + Content-Length verify + path-traversal guard).
   `src/engine/sd_provision.rs` auto-provisions the `sd-cli` binary +
