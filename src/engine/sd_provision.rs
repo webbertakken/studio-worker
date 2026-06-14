@@ -31,7 +31,11 @@ const TRACE_TARGET: &str = "studio_worker::engine::sd_provision";
 
 /// Pinned, known-good upstream release.  Bump deliberately after
 /// verifying a newer build still serves our model set.  Overridable
-/// per box via `STUDIO_WORKER_SDCPP_RELEASE`.
+/// per box via `STUDIO_WORKER_SDCPP_RELEASE`.  When bumping, also update
+/// the pinned URL in `docs/operations/sd-cli-install.md` and the
+/// `sdcpp-prebuilt.yml` workflow default so the manual playbook, the
+/// self-hosted arm64 build, and the auto-provisioner all share one
+/// known-good sd.cpp commit.
 const DEFAULT_RELEASE_TAG: &str = "master-669-2d40a8b";
 
 /// Env override for the release tag.
