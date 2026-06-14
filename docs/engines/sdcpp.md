@@ -108,6 +108,11 @@ Overrides:
 | `STUDIO_WORKER_SDCPP_RELEASE` | A `master-<n>-<sha>` tag to fetch instead of the pinned default |
 | `STUDIO_WORKER_SDCPP_URL` | A full zip URL (air-gapped mirror / tests); skips tag + asset resolution |
 
+When `STUDIO_WORKER_SDCPP_RELEASE` / `STUDIO_WORKER_SDCPP_URL` are in
+effect the worker logs an `info` breadcrumb at
+`studio_worker::engine::sd_provision` naming the env var that won, so a
+typo'd override that's silently ignored is easy to spot in the logs.
+
 Targets with no prebuilt at all (e.g. Windows arm64) error with a
 pointer to the manual [install playbook](../operations/sd-cli-install.md).
 

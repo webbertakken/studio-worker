@@ -23,7 +23,7 @@
 use crate::engine::download;
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Tracing target for provisioning.  Stable so operators can filter
 /// with `RUST_LOG=studio_worker::engine::sd_provision=info`.
@@ -127,9 +127,43 @@ pub fn vulkan_runtime_status() -> Result<()> {
     vulkan_runtime_status_with(vulkan_loader_loads())
 }
 
+/// Choose the release tag from an optional override, logging which
+/// source won so an operator can confirm their
+/// `STUDIO_WORKER_SDCPP_RELEASE` took effect (rather than being
+/// silently ignored, e.g. a typo'd var name).  Pure — the override is
+/// injected — so the decision + breadcrumb are unit-testable without
+/// touching the process-global environment.
+fn select_release_tag(override_tag: Option<String>) -> String {
+    match override_tag {
+        Some(tag) => {
+            info!(
+                target: TRACE_TARGET,
+                op = "resolve-url",
+                tag = %tag,
+                source = RELEASE_ENV,
+                "using sd-cli release-tag override"
+            );
+            tag
+        }
+        None => {
+            debug!(
+                target: TRACE_TARGET,
+                op = "resolve-url",
+                tag = DEFAULT_RELEASE_TAG,
+                "using pinned sd-cli release tag"
+            );
+            DEFAULT_RELEASE_TAG.to_string()
+        }
+    }
+}
+
 /// The release tag to provision — env override or the pinned default.
+/// Thin env-reading wrapper over [`select_release_tag`]; excluded from
+/// coverage because it reads the process environment (the decision +
+/// logging are covered via [`select_release_tag`]).
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn release_tag() -> String {
-    std::env::var(RELEASE_ENV).unwrap_or_else(|_| DEFAULT_RELEASE_TAG.to_string())
+    select_release_tag(std::env::var(RELEASE_ENV).ok())
 }
 
 /// The short commit sha embedded in asset filenames is the trailing
@@ -201,16 +235,39 @@ fn download_url(tag: &str, os: &str, arch: &str) -> Result<String> {
     })
 }
 
-/// Resolve the zip URL to fetch: the `STUDIO_WORKER_SDCPP_URL`
-/// override if set, otherwise the pinned/overridden release for this
-/// host's platform.
-fn resolve_url() -> Result<String> {
-    if let Ok(url) = std::env::var(URL_ENV) {
+/// Choose the zip URL: a non-empty `STUDIO_WORKER_SDCPP_URL` override
+/// wins (and is logged so the operator can confirm it took effect),
+/// otherwise fall back to `default_url`.  Pure — both inputs are
+/// injected — so the precedence + breadcrumb are unit-testable without
+/// touching the environment or the network.
+fn select_url(
+    override_url: Option<String>,
+    default_url: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    if let Some(url) = override_url {
         if !url.is_empty() {
+            info!(
+                target: TRACE_TARGET,
+                op = "resolve-url",
+                url = %url,
+                source = URL_ENV,
+                "using sd-cli zip-URL override"
+            );
             return Ok(url);
         }
     }
-    download_url(&release_tag(), std::env::consts::OS, std::env::consts::ARCH)
+    default_url()
+}
+
+/// Resolve the zip URL to fetch: the `STUDIO_WORKER_SDCPP_URL`
+/// override if set, otherwise the pinned/overridden release for this
+/// host's platform.  Thin env-reading wrapper over [`select_url`];
+/// excluded from coverage because it reads the process environment.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn resolve_url() -> Result<String> {
+    select_url(std::env::var(URL_ENV).ok(), || {
+        download_url(&release_tag(), std::env::consts::OS, std::env::consts::ARCH)
+    })
 }
 
 /// If a stable-diffusion shared library sits next to `sd_cli`, return
@@ -336,6 +393,37 @@ fn install_dir(staging: &Path, target: &Path) -> Result<usize> {
     Ok(moved)
 }
 
+/// Best-effort removal of the provisioning scratch zip + staging dir.
+/// Unlike a bare `let _ = remove(..)`, a failed removal is logged: a
+/// leftover multi-hundred-MB scratch file silently filling the disk is
+/// the exact failure this cleanup guards against, so operators must see
+/// it.  A NotFound (the path was already gone) is the normal case and
+/// stays quiet.
+fn clean_scratch(zip_path: &Path, staging: &Path) {
+    if let Err(e) = std::fs::remove_file(zip_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                target: TRACE_TARGET,
+                op = "cleanup",
+                path = %zip_path.display(),
+                error = %e,
+                "could not remove sd-cli scratch zip; it may fill the disk"
+            );
+        }
+    }
+    if let Err(e) = std::fs::remove_dir_all(staging) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                target: TRACE_TARGET,
+                op = "cleanup",
+                path = %staging.display(),
+                error = %e,
+                "could not remove sd-cli staging dir; it may fill the disk"
+            );
+        }
+    }
+}
+
 /// Ensure `sd-cli` is installed under `<models_root>/bin/`, downloading
 /// and extracting the platform's stable-diffusion.cpp build when it's
 /// missing.  Returns the resolved binary path.  Idempotent: a binary
@@ -389,9 +477,9 @@ pub fn provision(models_root: &Path) -> Result<PathBuf> {
 
     // Best-effort cleanup of the scratch zip + staging dir on every
     // exit path so a failed provision can't leave half-extracted
-    // multi-hundred-MB files filling the disk.
-    let _ = std::fs::remove_file(&zip_path);
-    let _ = std::fs::remove_dir_all(&staging);
+    // multi-hundred-MB files filling the disk.  Removal failures are
+    // logged, not swallowed.
+    clean_scratch(&zip_path, &staging);
 
     match &result {
         Ok(path) => info!(
@@ -518,6 +606,78 @@ mod tests {
     }
 
     #[test]
+    fn select_release_tag_prefers_the_override() {
+        assert_eq!(
+            select_release_tag(Some("master-700-deadbee".into())),
+            "master-700-deadbee"
+        );
+    }
+
+    #[test]
+    fn select_release_tag_falls_back_to_the_pinned_default() {
+        assert_eq!(select_release_tag(None), DEFAULT_RELEASE_TAG);
+    }
+
+    #[test]
+    fn select_release_tag_logs_the_override_source() {
+        let logs = crate::test_support::capture(|| {
+            let _ = select_release_tag(Some("master-700-deadbee".into()));
+        });
+        assert!(
+            logs.contains("STUDIO_WORKER_SDCPP_RELEASE"),
+            "override log must name the env var: {logs}"
+        );
+        assert!(logs.contains("master-700-deadbee"), "got: {logs}");
+        assert!(logs.contains("override"), "got: {logs}");
+    }
+
+    #[test]
+    fn select_url_prefers_a_non_empty_override() {
+        let url = select_url(Some("https://mirror.example/sd.zip".into()), || {
+            panic!("default must not be consulted when an override is present")
+        })
+        .unwrap();
+        assert_eq!(url, "https://mirror.example/sd.zip");
+    }
+
+    #[test]
+    fn select_url_ignores_an_empty_override_and_falls_back() {
+        let url = select_url(Some(String::new()), || Ok("fallback".into())).unwrap();
+        assert_eq!(url, "fallback");
+    }
+
+    #[test]
+    fn select_url_falls_back_when_no_override_is_set() {
+        let url = select_url(None, || Ok("fallback".into())).unwrap();
+        assert_eq!(url, "fallback");
+    }
+
+    #[test]
+    fn select_url_propagates_a_default_resolution_error() {
+        let err = select_url(None, || bail!("no prebuilt for this platform"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no prebuilt"), "got: {err}");
+    }
+
+    #[test]
+    fn select_url_logs_the_override_source() {
+        let logs = crate::test_support::capture(|| {
+            let _ = select_url(Some("https://mirror.example/sd.zip".into()), || {
+                Ok("unused".into())
+            });
+        });
+        assert!(
+            logs.contains("STUDIO_WORKER_SDCPP_URL"),
+            "override log must name the env var: {logs}"
+        );
+        assert!(
+            logs.contains("https://mirror.example/sd.zip"),
+            "got: {logs}"
+        );
+    }
+
+    #[test]
     fn install_dir_moves_files_and_overwrites() {
         let staging = tempdir().unwrap();
         let target = tempdir().unwrap();
@@ -538,6 +698,68 @@ mod tests {
         );
         // Files were moved, so staging is now empty of them.
         assert!(!staging.path().join("sd-cli").exists());
+    }
+
+    #[test]
+    fn clean_scratch_removes_zip_and_staging_quietly() {
+        let dir = tempdir().unwrap();
+        let zip = dir.path().join("scratch.zip");
+        let staging = dir.path().join("staging");
+        std::fs::write(&zip, b"zip").unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("sd-cli"), b"bin").unwrap();
+
+        let (zip_c, staging_c) = (zip.clone(), staging.clone());
+        let logs = crate::test_support::capture(move || clean_scratch(&zip_c, &staging_c));
+
+        assert!(!zip.exists(), "scratch zip must be removed");
+        assert!(!staging.exists(), "staging dir must be removed");
+        assert!(
+            !logs.contains("could not remove"),
+            "a clean removal must not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn clean_scratch_is_silent_when_paths_are_already_gone() {
+        let dir = tempdir().unwrap();
+        let zip = dir.path().join("missing.zip");
+        let staging = dir.path().join("missing-staging");
+
+        let (zip_c, staging_c) = (zip.clone(), staging.clone());
+        let logs = crate::test_support::capture(move || clean_scratch(&zip_c, &staging_c));
+
+        // A NotFound (already gone) is the normal case and must stay quiet.
+        assert!(
+            !logs.contains("could not remove"),
+            "an already-clean slot must not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn clean_scratch_warns_when_removal_fails() {
+        let dir = tempdir().unwrap();
+        // A directory where the zip is expected makes `remove_file` fail
+        // with a non-NotFound error; a file where the staging dir is
+        // expected makes `remove_dir_all` fail likewise.  A leftover
+        // multi-hundred-MB scratch file silently filling the disk is
+        // exactly what this guards against, so both must surface.
+        let zip = dir.path().join("zip-slot");
+        std::fs::create_dir_all(&zip).unwrap();
+        let staging = dir.path().join("staging-slot");
+        std::fs::write(&staging, b"not a dir").unwrap();
+
+        let (zip_c, staging_c) = (zip.clone(), staging.clone());
+        let logs = crate::test_support::capture(move || clean_scratch(&zip_c, &staging_c));
+
+        assert!(
+            logs.matches("could not remove").count() >= 2,
+            "both failed removals must warn: {logs}"
+        );
+        assert!(
+            logs.contains("fill the disk"),
+            "the warning must flag the disk-fill risk: {logs}"
+        );
     }
 
     #[test]

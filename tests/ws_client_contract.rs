@@ -339,3 +339,234 @@ async fn surfaces_unknown_close_as_connection_closed() {
     assert!(got_eof);
     let _ = server.await;
 }
+
+// ---------------------------------------------------------------------------
+// Split-half contract tests.
+//
+// Production (`ws::session`) never drives the combined `WsClient`: it calls
+// `client.split()` once and then pushes every worker frame through the
+// cheap-to-clone `WsSender` (shared by the heartbeat / log-shipper /
+// engine-dispatch tasks) while a dedicated reader task drains the
+// single-owner `WsReceiver`.  Those split halves are a separate code path
+// from the `WsClient::{send,recv,close}` convenience methods the rest of
+// this file exercises, so the protocol contract is pinned on them directly
+// here — otherwise the methods that actually ship frames in production have
+// no live-socket coverage at all.
+// ---------------------------------------------------------------------------
+
+/// hello (via `WsSender`) → welcome (via `WsReceiver`) over a live socket —
+/// the handshake every session performs after `split()`.
+#[tokio::test]
+async fn split_round_trips_a_hello_then_a_welcome() {
+    let (addr, server) = spawn_server(echo_subprotocol, |mut ws| async move {
+        let frame = ws
+            .next()
+            .await
+            .expect("frame")
+            .expect("ok")
+            .into_text()
+            .unwrap();
+        assert!(frame.contains("\"hello\""));
+        let welcome = serde_json::to_string(
+            &json!({"type":"welcome","workerId":"w-split","serverTime":"now"}),
+        )
+        .unwrap();
+        ws.send(Message::Text(welcome.into())).await.unwrap();
+        let _ = ws.close(None).await;
+    })
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let client = connect(&base, "w-split", "t").await.unwrap();
+    let (sender, mut receiver) = client.split();
+    sender
+        .send(&WorkerInbound::Hello(HelloFrame {
+            auth_token: "t".into(),
+            capabilities: capabilities(),
+        }))
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(TIMEOUT, receiver.recv())
+        .await
+        .expect("recv timed out")
+        .expect("recv ok")
+        .expect("got a frame");
+    match received {
+        WorkerOutbound::Welcome { worker_id, .. } => assert_eq!(worker_id, "w-split"),
+        other => panic!("expected welcome, got {other:?}"),
+    }
+    server.await.unwrap();
+}
+
+/// A 4001 server close surfaces through `WsReceiver::recv` as the typed
+/// `AuthFailed` — the session keys its "auth rejected, stop reconnecting"
+/// branch on exactly this.
+#[tokio::test]
+async fn split_receiver_surfaces_4001_as_auth_failed() {
+    let (addr, server) = spawn_server(echo_subprotocol, |mut ws| async move {
+        let _ = ws
+            .close(Some(CloseFrame {
+                code: CloseCode::Library(4001),
+                reason: "invalid auth token".into(),
+            }))
+            .await;
+    })
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let client = connect(&base, "w-split", "t").await.unwrap();
+    let (_sender, mut receiver) = client.split();
+    let mut error = None;
+    for _ in 0..5 {
+        match tokio::time::timeout(TIMEOUT, receiver.recv()).await {
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(_))) => continue,
+            Ok(Err(e)) => {
+                error = Some(e);
+                break;
+            }
+            Err(_) => panic!("recv timed out"),
+        }
+    }
+    let err = error.expect("expected a typed close-driven error");
+    assert!(
+        matches!(err, WsClientError::AuthFailed { .. }),
+        "got {err:?}"
+    );
+    server.await.unwrap();
+}
+
+/// A normal server close drives `WsReceiver::recv` to a generic
+/// `ConnectionClosed`, after which the receiver is latched: every
+/// subsequent `recv()` returns `Ok(None)` without touching the socket.
+#[tokio::test]
+async fn split_receiver_latches_closed_after_a_normal_close() {
+    let (addr, server) = spawn_server(echo_subprotocol, |mut ws| async move {
+        let _ = ws
+            .close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "bye".into(),
+            }))
+            .await;
+    })
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let client = connect(&base, "w-split", "t").await.unwrap();
+    let (_sender, mut receiver) = client.split();
+    let mut observed_close = false;
+    for _ in 0..5 {
+        match tokio::time::timeout(TIMEOUT, receiver.recv()).await {
+            Ok(Ok(None)) => {
+                observed_close = true;
+                break;
+            }
+            Ok(Ok(Some(_))) => continue,
+            Ok(Err(WsClientError::ConnectionClosed)) => {
+                observed_close = true;
+                break;
+            }
+            Ok(Err(other)) => panic!("unexpected error: {other:?}"),
+            Err(_) => panic!("recv timed out"),
+        }
+    }
+    assert!(observed_close, "expected the receiver to observe the close");
+    // A latched receiver returns Ok(None) forever without re-reading.
+    assert!(receiver.recv().await.unwrap().is_none());
+    let _ = server.await;
+}
+
+/// The server drops the socket without a close frame (a yanked cable /
+/// crashed DO): `WsReceiver::recv` surfaces it as end-of-stream
+/// (`Ok(None)`) or a transport error, then latches to `Ok(None)`.  This
+/// is the disconnect the session's reader task turns into a reconnect.
+#[tokio::test]
+async fn split_receiver_returns_none_on_a_silent_eof() {
+    let (addr, server) = spawn_server(echo_subprotocol, |ws| async move {
+        drop(ws); // Drop with no Close frame.
+    })
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let client = connect(&base, "w-split", "t").await.unwrap();
+    let (_sender, mut receiver) = client.split();
+    let got_end = match tokio::time::timeout(TIMEOUT, receiver.recv()).await {
+        Ok(Ok(None)) => true,
+        Ok(Ok(Some(_))) => panic!("unexpected frame"),
+        Ok(Err(WsClientError::ConnectionClosed | WsClientError::Transport(_))) => true,
+        Ok(Err(other)) => panic!("unexpected error: {other:?}"),
+        Err(_) => panic!("recv timed out"),
+    };
+    assert!(got_end);
+    // A second recv() after the stream ended must return Ok(None) cleanly.
+    assert!(receiver.recv().await.unwrap().is_none());
+    let _ = server.await;
+}
+
+/// `WsSender::close` emits a close frame the peer observes — the graceful
+/// drain path the session runs on shutdown.
+#[tokio::test]
+async fn split_sender_close_is_observed_by_the_server() {
+    let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
+    let (addr, server) = spawn_server(echo_subprotocol, move |mut ws| {
+        let tx = close_tx.clone();
+        async move {
+            while let Some(item) = ws.next().await {
+                match item {
+                    Ok(Message::Close(Some(frame))) => {
+                        let _ = tx.send(frame.code.into());
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    })
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let client = connect(&base, "w-split", "t").await.unwrap();
+    let (sender, _receiver) = client.split();
+    sender.close(1000, "bye").await.unwrap();
+    let code = tokio::time::timeout(Duration::from_secs(1), close_rx.recv())
+        .await
+        .expect("close frame")
+        .expect("channel ok");
+    assert_eq!(code, 1000);
+    let _ = server.await;
+}
+
+/// A `WsSender::send` that fails surfaces a typed error rather than
+/// vanishing.  The session pushes accepts / fails / completeJson /
+/// heartbeats through the shared sender with `let _ = sender.send(...)`,
+/// discarding the result — so this mapped error (and the warn
+/// breadcrumb it drives via `log_send_error`) is the only signal an
+/// operator gets that a frame never made it onto the wire.  Closing the
+/// sender first puts the sink into its closing handshake, so the next
+/// send deterministically errors without racing the socket teardown.
+#[tokio::test]
+async fn split_sender_send_after_close_surfaces_a_typed_error() {
+    let (addr, server) = spawn_server(echo_subprotocol, |mut ws| async move {
+        // Hold the connection open and drain until the client goes away.
+        while ws.next().await.is_some() {}
+    })
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let client = connect(&base, "w-split", "t").await.unwrap();
+    let (sender, _receiver) = client.split();
+    sender.close(1000, "bye").await.unwrap();
+    let err = sender
+        .send(&WorkerInbound::ReadyForMore)
+        .await
+        .expect_err("send after close must fail");
+    assert!(
+        matches!(
+            err,
+            WsClientError::Transport(_) | WsClientError::ConnectionClosed
+        ),
+        "a post-close send must map to a transport-class error, got {err:?}"
+    );
+    let _ = server.await;
+}
