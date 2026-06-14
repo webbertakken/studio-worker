@@ -1,11 +1,14 @@
 //! Regression coverage for silent `config::save` failures inside the
 //! auto-register poll loop.
 //!
-//! `poll_existing` persists state on three studio responses: 404
-//! (stale id dropped), Approved (`worker_id` + `auth_token` written),
-//! and Rejected (request state cleared).  All three used to swallow a
-//! failed `config::save` with `let _ = ...`, so a read-only or full
-//! disk produced *zero* operator-visible breadcrumb.
+//! The create side (`ensure_install_state` + `create_request`) persists
+//! twice on a first-ever tick — the freshly-seeded install_id + secret,
+//! then the request_id the studio hands back — and `poll_existing`
+//! persists on three studio responses: 404 (stale id dropped), Approved
+//! (`worker_id` + `auth_token` written), and Rejected (request state
+//! cleared).  Every one of these used to swallow a failed
+//! `config::save` with `let _ = ...`, so a read-only or full disk
+//! produced *zero* operator-visible breadcrumb.
 //!
 //! The Approved case is the worst: the in-memory snapshot flips to
 //! `Approved` and the current session runs fine, but the credentials
@@ -45,6 +48,53 @@ fn unwritable_config_path(dir: &tempfile::TempDir) -> PathBuf {
     let blocker = dir.path().join("blocker");
     std::fs::write(&blocker, b"not a directory").unwrap();
     blocker.join("config.toml")
+}
+
+#[tokio::test]
+async fn create_request_save_failures_are_logged_as_warn() {
+    // A first-ever tick (Pristine: no install_id, no request_id)
+    // persists twice: the freshly-seeded install_id + secret
+    // (ensure_install_state) and the request_id the studio returns
+    // (create_request).  Both used to swallow a failed config::save, so
+    // an operator on a read-only / full disk saw nothing — yet the bug
+    // is corrosive: the worker re-seeds a new secret every tick and
+    // never converges to a stable registration request.  Both saves
+    // must leave a WARN breadcrumb naming what couldn't be persisted.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/register-request"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "rr-seed",
+            "status": "pending",
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let bad_path = unwritable_config_path(&dir);
+    let cfg = pristine_cfg(&server.uri());
+
+    let (logs, state) = capture_tick(cfg, bad_path);
+
+    // The POST still succeeds, so the in-memory state advances to
+    // Pending; the failure is silent disk loss, not a crash.
+    assert!(
+        matches!(state, RegistrationState::Pending { ref request_id, .. } if request_id == "rr-seed"),
+        "expected Pending with rr-seed, got {state:?}"
+    );
+    assert!(logs.contains("WARN"), "expected WARN events, got: {logs}");
+    assert!(
+        logs.contains("studio_worker::auto_register"),
+        "expected the auto_register target, got: {logs}"
+    );
+    assert!(
+        logs.contains("failed to persist install state"),
+        "expected the install-state save-failure warn, got: {logs}"
+    );
+    assert!(
+        logs.contains("failed to persist request_id"),
+        "expected the request_id save-failure warn, got: {logs}"
+    );
 }
 
 fn cfg_with_pending_request(api: &str, request_id: &str) -> Config {
