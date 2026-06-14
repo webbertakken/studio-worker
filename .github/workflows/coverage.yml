@@ -16,7 +16,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Nightly is the canonical accurate-coverage toolchain: the crate's
+      # 26 `#[cfg_attr(coverage_nightly, coverage(off))]` annotations
+      # (host-, network-, env-, and platform-dependent code) only take
+      # effect under the `coverage_nightly` cfg cargo-llvm-cov sets on
+      # nightly. On stable those exclusions compile to nothing, so the
+      # gate would measure untestable code and drift with the host GPU.
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
 
@@ -31,7 +37,7 @@ jobs:
       # meaningful (the UI still gets clippy + tests in checks.yml).
       - name: Run coverage
         run: |
-          cargo llvm-cov --workspace --no-default-features \
+          cargo +nightly llvm-cov --workspace --no-default-features \
             --ignore-filename-regex 'src/main\.rs$|src/engine/sdcpp\.rs$|src/ws/session\.rs$' \
             --fail-under-lines 90 \
             --summary-only
@@ -39,7 +45,7 @@ jobs:
       - name: Upload lcov to Codecov
         if: success()
         run: |
-          cargo llvm-cov --workspace --no-default-features \
+          cargo +nightly llvm-cov --workspace --no-default-features \
             --ignore-filename-regex 'src/main\.rs$|src/engine/sdcpp\.rs$|src/ws/session\.rs$' \
             --lcov --output-path lcov.info
         continue-on-error: true

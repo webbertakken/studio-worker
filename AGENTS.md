@@ -179,7 +179,8 @@ weights, run with the matching feature):
 - `.github/workflows/checks.yml` — fmt + clippy + cargo check + tests
   (frees ~25 GB of runner bloat first so the heavy candle/whisper legs
   + cache-save don't exhaust the disk).
-- `.github/workflows/coverage.yml` — `cargo llvm-cov`, `--fail-under-lines 90`.
+- `.github/workflows/coverage.yml` — nightly `cargo llvm-cov`,
+  `--fail-under-lines 90` (nightly so the `coverage(off)` exclusions apply).
 - `.github/workflows/audit.yml` — `cargo audit` advisory gate on
   Cargo manifest changes + weekly cron; accepted informational
   advisories live in `.cargo/audit.toml`.
