@@ -3,6 +3,15 @@
 //! Exposes the worker's modules so integration tests (and downstream
 //! tooling) can drive the contract without going through the CLI.
 
+// Enable the unstable `#[coverage(off)]` attribute used across the
+// crate (behind `#[cfg_attr(coverage_nightly, ...)]`) to exclude
+// host-, network-, and platform-dependent code from `cargo llvm-cov`.
+// `coverage_nightly` is set only by cargo-llvm-cov on a nightly
+// toolchain; on stable it's unset, so this gate (and every
+// `coverage(off)` annotation) compiles to nothing. Without it,
+// `cargo +nightly llvm-cov` fails to compile the crate (E0658).
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 pub mod auto_register;
 pub mod autostart;
 pub mod cli;
