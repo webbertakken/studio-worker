@@ -735,6 +735,59 @@ mod tests {
     }
 
     #[test]
+    fn classify_debug_logs_when_the_transport_read_closes_cleanly() {
+        // A clean close can surface as a stream `Err`
+        // (ConnectionClosed / AlreadyClosed) instead of a Close frame
+        // on some transports.  Both must fail the recv but stay at
+        // DEBUG so the logs aren't spammed on every expected reconnect.
+        for already_closed in [false, true] {
+            let logs = capture(move || {
+                let inner = if already_closed {
+                    TError::AlreadyClosed
+                } else {
+                    TError::ConnectionClosed
+                };
+                let step = classify_incoming(Err(inner));
+                assert!(matches!(
+                    step,
+                    RecvStep::Fail(WsClientError::ConnectionClosed)
+                ));
+            });
+            assert!(
+                logs.contains("DEBUG"),
+                "already_closed={already_closed}: expected DEBUG, got: {logs}"
+            );
+            assert!(
+                !logs.contains("WARN"),
+                "already_closed={already_closed}: a clean close must not warn: {logs}"
+            );
+            assert!(
+                logs.contains("connection closed by peer"),
+                "already_closed={already_closed}: expected message: {logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_warns_on_a_transport_read_error() {
+        // A genuine transport fault (not a clean close) must surface
+        // the recv failure at WARN: the session discards recv errors in
+        // its generic `Disconnected(_)` arm, so this breadcrumb is the
+        // only place an operator sees why the session dropped.
+        let logs = capture(|| {
+            let inner = TError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "peer reset the connection",
+            ));
+            let step = classify_incoming(Err(inner));
+            assert!(matches!(step, RecvStep::Fail(WsClientError::Transport(_))));
+        });
+        assert!(logs.contains("WARN"), "expected WARN, got: {logs}");
+        assert!(logs.contains("op=\"recv\""), "expected op field: {logs}");
+        assert!(logs.contains("transport error"), "expected message: {logs}");
+    }
+
+    #[test]
     fn frame_label_names_every_inbound_variant() {
         use crate::types::WorkerCapabilities;
         let caps = WorkerCapabilities {
