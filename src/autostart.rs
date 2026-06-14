@@ -322,6 +322,36 @@ mod backend {
         }
 
         #[test]
+        fn remove_entry_failure_surfaces_error_and_emits_warn() {
+            // `remove_file` cannot delete a directory, so pointing the
+            // entry path at one drives the failure branch
+            // deterministically on every OS: `path.exists()` is true
+            // (so the idempotent early-return is skipped) but the
+            // removal itself errors.
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("entry-as-dir.desktop");
+            std::fs::create_dir(&path).unwrap();
+            let path_for_closure = path.clone();
+            let logs = capture(move || {
+                let err = remove_entry(&path_for_closure)
+                    .expect_err("removing a directory as a file should fail");
+                assert!(
+                    err.to_string().contains("removing"),
+                    "unexpected error: {err}"
+                );
+            });
+            assert!(logs.contains("WARN"), "expected WARN event, got: {logs}");
+            assert!(logs.contains("op=\"disable\""), "expected op field: {logs}");
+            assert!(
+                logs.contains("failed to disable autostart-on-login"),
+                "expected failure message: {logs}"
+            );
+            // A failed disable must not silently report success: the
+            // stale entry has to survive so a retry can act on it.
+            assert!(path.exists(), "the entry must survive a failed removal");
+        }
+
+        #[test]
         fn enable_at_persists_rendered_artefact_and_disable_at_removes_it() {
             let dir = tempdir().unwrap();
             let path = dir
