@@ -1098,6 +1098,60 @@ mod tests {
     }
 
     #[test]
+    fn truncate_prompt_passes_short_through_and_clips_long_prompts() {
+        // Under the cap → returned verbatim, no ellipsis.
+        let short = "a stone golem";
+        assert_eq!(truncate_prompt(short), short);
+
+        // Exactly at the cap is the boundary: still untouched.
+        let exactly = "x".repeat(PROMPT_PREVIEW_CHARS);
+        assert_eq!(
+            truncate_prompt(&exactly),
+            exactly,
+            "a prompt exactly at the cap must not be clipped"
+        );
+
+        // One past the cap → clipped to PROMPT_PREVIEW_CHARS chars plus
+        // the single ellipsis terminator.
+        let over = "y".repeat(PROMPT_PREVIEW_CHARS + 1);
+        let clipped = truncate_prompt(&over);
+        assert_eq!(
+            clipped.chars().count(),
+            PROMPT_PREVIEW_CHARS + 1,
+            "clipped preview is the cap plus one ellipsis char"
+        );
+        assert!(
+            clipped.ends_with('\u{2026}'),
+            "a clipped preview ends with an ellipsis"
+        );
+        assert_eq!(
+            clipped
+                .chars()
+                .take(PROMPT_PREVIEW_CHARS)
+                .collect::<String>(),
+            "y".repeat(PROMPT_PREVIEW_CHARS),
+            "the kept prefix is the first PROMPT_PREVIEW_CHARS chars"
+        );
+    }
+
+    #[test]
+    fn truncate_prompt_clips_on_char_boundaries_for_multibyte_text() {
+        // Each char here is 3 bytes, so the cap-th *byte* lands
+        // mid-codepoint: a naive `&s[..PROMPT_PREVIEW_CHARS]` byte slice
+        // would panic.  `truncate_prompt` counts chars, so a one-over
+        // multibyte prompt clips cleanly to the cap plus the ellipsis.
+        let multibyte = "\u{3042}".repeat(PROMPT_PREVIEW_CHARS + 1);
+        let clipped = truncate_prompt(&multibyte);
+        assert_eq!(clipped.chars().count(), PROMPT_PREVIEW_CHARS + 1);
+        assert!(clipped.ends_with('\u{2026}'));
+        assert_eq!(
+            clipped.chars().filter(|c| *c == '\u{3042}').count(),
+            PROMPT_PREVIEW_CHARS,
+            "exactly PROMPT_PREVIEW_CHARS multibyte chars survive the clip"
+        );
+    }
+
+    #[test]
     fn is_unsupported_kind_matches_engine_message() {
         let err = anyhow!("multi engine cannot serve llm tasks");
         assert!(is_unsupported_kind(&err));
