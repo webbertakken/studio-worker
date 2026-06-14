@@ -393,6 +393,37 @@ fn install_dir(staging: &Path, target: &Path) -> Result<usize> {
     Ok(moved)
 }
 
+/// Best-effort removal of the provisioning scratch zip + staging dir.
+/// Unlike a bare `let _ = remove(..)`, a failed removal is logged: a
+/// leftover multi-hundred-MB scratch file silently filling the disk is
+/// the exact failure this cleanup guards against, so operators must see
+/// it.  A NotFound (the path was already gone) is the normal case and
+/// stays quiet.
+fn clean_scratch(zip_path: &Path, staging: &Path) {
+    if let Err(e) = std::fs::remove_file(zip_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                target: TRACE_TARGET,
+                op = "cleanup",
+                path = %zip_path.display(),
+                error = %e,
+                "could not remove sd-cli scratch zip; it may fill the disk"
+            );
+        }
+    }
+    if let Err(e) = std::fs::remove_dir_all(staging) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                target: TRACE_TARGET,
+                op = "cleanup",
+                path = %staging.display(),
+                error = %e,
+                "could not remove sd-cli staging dir; it may fill the disk"
+            );
+        }
+    }
+}
+
 /// Ensure `sd-cli` is installed under `<models_root>/bin/`, downloading
 /// and extracting the platform's stable-diffusion.cpp build when it's
 /// missing.  Returns the resolved binary path.  Idempotent: a binary
@@ -446,9 +477,9 @@ pub fn provision(models_root: &Path) -> Result<PathBuf> {
 
     // Best-effort cleanup of the scratch zip + staging dir on every
     // exit path so a failed provision can't leave half-extracted
-    // multi-hundred-MB files filling the disk.
-    let _ = std::fs::remove_file(&zip_path);
-    let _ = std::fs::remove_dir_all(&staging);
+    // multi-hundred-MB files filling the disk.  Removal failures are
+    // logged, not swallowed.
+    clean_scratch(&zip_path, &staging);
 
     match &result {
         Ok(path) => info!(
@@ -667,6 +698,68 @@ mod tests {
         );
         // Files were moved, so staging is now empty of them.
         assert!(!staging.path().join("sd-cli").exists());
+    }
+
+    #[test]
+    fn clean_scratch_removes_zip_and_staging_quietly() {
+        let dir = tempdir().unwrap();
+        let zip = dir.path().join("scratch.zip");
+        let staging = dir.path().join("staging");
+        std::fs::write(&zip, b"zip").unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("sd-cli"), b"bin").unwrap();
+
+        let (zip_c, staging_c) = (zip.clone(), staging.clone());
+        let logs = crate::test_support::capture(move || clean_scratch(&zip_c, &staging_c));
+
+        assert!(!zip.exists(), "scratch zip must be removed");
+        assert!(!staging.exists(), "staging dir must be removed");
+        assert!(
+            !logs.contains("could not remove"),
+            "a clean removal must not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn clean_scratch_is_silent_when_paths_are_already_gone() {
+        let dir = tempdir().unwrap();
+        let zip = dir.path().join("missing.zip");
+        let staging = dir.path().join("missing-staging");
+
+        let (zip_c, staging_c) = (zip.clone(), staging.clone());
+        let logs = crate::test_support::capture(move || clean_scratch(&zip_c, &staging_c));
+
+        // A NotFound (already gone) is the normal case and must stay quiet.
+        assert!(
+            !logs.contains("could not remove"),
+            "an already-clean slot must not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn clean_scratch_warns_when_removal_fails() {
+        let dir = tempdir().unwrap();
+        // A directory where the zip is expected makes `remove_file` fail
+        // with a non-NotFound error; a file where the staging dir is
+        // expected makes `remove_dir_all` fail likewise.  A leftover
+        // multi-hundred-MB scratch file silently filling the disk is
+        // exactly what this guards against, so both must surface.
+        let zip = dir.path().join("zip-slot");
+        std::fs::create_dir_all(&zip).unwrap();
+        let staging = dir.path().join("staging-slot");
+        std::fs::write(&staging, b"not a dir").unwrap();
+
+        let (zip_c, staging_c) = (zip.clone(), staging.clone());
+        let logs = crate::test_support::capture(move || clean_scratch(&zip_c, &staging_c));
+
+        assert!(
+            logs.matches("could not remove").count() >= 2,
+            "both failed removals must warn: {logs}"
+        );
+        assert!(
+            logs.contains("fill the disk"),
+            "the warning must flag the disk-fill risk: {logs}"
+        );
     }
 
     #[test]
