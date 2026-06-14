@@ -380,13 +380,17 @@ cargo test --no-default-features        # headless core
 cargo test --features all               # + llama.cpp + candle (needs cmake)
 cargo clippy --tests -- -D warnings
 cargo fmt --check
-# Coverage gates the headless core (UI rendering isn't unit-testable):
-cargo llvm-cov --workspace --no-default-features \
+# Coverage gates the headless core (UI rendering isn't unit-testable).
+# Use nightly: the crate's `#[coverage(off)]` exclusions only take
+# effect under the `coverage_nightly` cfg cargo-llvm-cov sets there.
+cargo +nightly llvm-cov --workspace --no-default-features \
   --ignore-filename-regex 'src/main\.rs$|src/engine/sdcpp\.rs$|src/ws/session\.rs$' \
   --summary-only
 ```
 
-Coverage CI enforces **≥ 90% line coverage** on the headless core.
+Coverage CI enforces **≥ 90% line coverage** on the headless core, on
+the **nightly** toolchain so the `#[cfg_attr(coverage_nightly,
+coverage(off))]` exclusions below actually drop out of the measurement.
 Truly-untestable bits excluded from the gate:
 
 - `src/main.rs` — the CLI bootstrap (all logic lives in `lib.rs`).
