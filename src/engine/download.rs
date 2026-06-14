@@ -427,6 +427,113 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // HashingWriter — streams the body into the cache file while
+    // computing the sha256 that `verify_sha256` later checks.  The
+    // integrity guarantee hinges on hashing *exactly* the bytes the
+    // inner writer accepted: `write` slices `&buf[..written]`, so a
+    // short write (inner takes only a prefix) must hash only that
+    // prefix — the unwritten tail is re-offered by `io::copy` on the
+    // next call.  Hashing the whole `buf` on a short write would
+    // silently corrupt every digest and turn the integrity gate into a
+    // false-reject.  The download integration test wraps a real `File`,
+    // which never short-writes, so this prefix branch is only reachable
+    // here.
+    // -----------------------------------------------------------------
+
+    /// A writer that accepts at most `max_per_write` bytes per call (to
+    /// model a short write) and counts `flush` calls.
+    struct ProbeWriter {
+        sink: Vec<u8>,
+        max_per_write: usize,
+        flushes: usize,
+    }
+
+    impl Write for ProbeWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let take = buf.len().min(self.max_per_write);
+            self.sink.extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn hashing_writer_hashes_only_the_bytes_the_inner_accepted() {
+        // The inner writer takes only 3 of the 8 offered bytes, so the
+        // hasher must absorb just "abc" — proving the `&buf[..written]`
+        // slice.  If `write` hashed the whole `buf`, the digest would be
+        // sha256("abcdefgh") and this assertion would fail.
+        let mut writer = HashingWriter {
+            inner: ProbeWriter {
+                sink: Vec::new(),
+                max_per_write: 3,
+                flushes: 0,
+            },
+            hasher: Sha256::new(),
+        };
+        let written = writer.write(b"abcdefgh").unwrap();
+        assert_eq!(written, 3, "inner accepts at most 3 bytes per write");
+        assert_eq!(writer.inner.sink, b"abc", "only the prefix reaches inner");
+        assert_eq!(
+            hex(&writer.hasher.finalize()),
+            hex(&Sha256::digest(b"abc")),
+            "hash covers only the accepted prefix"
+        );
+    }
+
+    #[test]
+    fn hashing_writer_digest_matches_a_short_writing_stream_end_to_end() {
+        // Drive the writer the way `download_file_verified` does — via
+        // `io::copy`, which re-offers the unwritten tail — through an
+        // inner that only takes 4 bytes at a time.  The streamed bytes
+        // and the final digest must both equal the full source, with no
+        // double-hashing across the re-offered chunks.
+        let source = b"the quick brown model weights".to_vec();
+        let mut reader = source.as_slice();
+        let mut writer = HashingWriter {
+            inner: ProbeWriter {
+                sink: Vec::new(),
+                max_per_write: 4,
+                flushes: 0,
+            },
+            hasher: Sha256::new(),
+        };
+        let copied = std::io::copy(&mut reader, &mut writer).unwrap();
+        assert_eq!(copied as usize, source.len());
+        assert_eq!(
+            writer.inner.sink, source,
+            "every byte reaches the cache file"
+        );
+        assert_eq!(
+            hex(&writer.hasher.finalize()),
+            hex(&Sha256::digest(&source)),
+            "digest matches the full body"
+        );
+    }
+
+    #[test]
+    fn hashing_writer_flush_delegates_to_the_inner_writer() {
+        let mut writer = HashingWriter {
+            inner: ProbeWriter {
+                sink: Vec::new(),
+                max_per_write: usize::MAX,
+                flushes: 0,
+            },
+            hasher: Sha256::new(),
+        };
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        assert_eq!(writer.inner.flushes, 2, "flush is forwarded to inner");
+    }
+
+    // -----------------------------------------------------------------
     // remove_temp_file + TempFileGuard — the shared best-effort cleanup
     // primitives every engine routes its per-job scratch files through.
     // Owned here (the shared engine-provisioning module) so the sdcpp
