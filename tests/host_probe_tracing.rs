@@ -116,6 +116,64 @@ fn vram_probe_emits_warn_when_sysfs_present_but_unparseable() {
 }
 
 // ---------------------------------------------------------------------------
+// detect_vram_gb_from_sysfs — multi-GPU box where one card parses and a
+// second is present but unparseable (older driver / a card that lost its
+// `Video Memory` line).  The survivor must still total, but the dropped
+// card must leave a per-GPU WARN naming it and bump the summary's
+// `dropped` count — otherwise the box silently under-reports its VRAM
+// and refuses jobs it could actually run, with no log evidence.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vram_probe_warns_and_counts_a_partially_dropped_gpu() {
+    let dir = tempdir().unwrap();
+    let good = dir.path().join("0000:01:00.0");
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::write(
+        good.join("information"),
+        "Model: NVIDIA Fake GPU\nVideo Memory:    24576 MiB\n",
+    )
+    .unwrap();
+    let bad = dir.path().join("0000:02:00.0");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("information"), "Model: NVIDIA Fake GPU\n").unwrap();
+    let root = dir.path().to_path_buf();
+
+    let logs = capture(move || {
+        let gb = sys::detect_vram_gb_from_sysfs(&root);
+        // Only the healthy 24 GiB card counts; the other is dropped.
+        assert!((gb - 24.0).abs() < 1e-3, "expected ~24 GB, got {gb}");
+    });
+    // The success breadcrumb still fires (one GPU parsed) and now reports
+    // the drop so a partial total can't pass for a complete one.
+    assert!(
+        logs.contains("source=\"nvidia_sysfs\""),
+        "expected source=nvidia_sysfs, got: {logs}"
+    );
+    assert!(
+        logs.contains("gpu_count=1"),
+        "one GPU contributed, got: {logs}"
+    );
+    assert!(
+        logs.contains("dropped=1"),
+        "the breadcrumb must report the drop, got: {logs}"
+    );
+    // The dropped GPU is named in its own WARN with the reason.
+    assert!(
+        logs.contains("WARN"),
+        "expected a per-GPU WARN, got: {logs}"
+    );
+    assert!(
+        logs.contains("reason=\"no_video_memory_line\""),
+        "expected the drop reason, got: {logs}"
+    );
+    assert!(
+        logs.contains("0000:02:00.0"),
+        "the warn must name the dropped GPU, got: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // machine_name / username — debug breadcrumb so a job that misbehaves
 // can be correlated back to the host it ran on without tailing the
 // process arguments.

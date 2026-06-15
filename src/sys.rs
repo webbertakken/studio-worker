@@ -213,16 +213,22 @@ fn parse_nvidia_smi_mib(stdout: &str) -> Option<SmiMemTotal> {
 /// the integration tests can exercise both the "missing root" and
 /// "populated root" branches without a real `/proc/driver/nvidia` tree.
 ///
-/// Emits exactly one tracing event per call describing the outcome:
+/// Emits a summary tracing event per call, plus a `WARN` for every GPU
+/// dropped from the total so a multi-GPU box never under-reports its
+/// VRAM silently:
 ///
 /// - `INFO source="no_nvidia_sysfs"` — `root` is not a directory.  This
 ///   is the normal case on CI runners / non-GPU hosts.
 /// - `INFO source="nvidia_sysfs"` — at least one GPU's `information`
-///   file was parseable.  `gpu_count` reflects how many contributed.
+///   file was parseable.  `gpu_count` is how many contributed; `dropped`
+///   is how many were present but unreadable / had no parseable `Video
+///   Memory` line (each of those also gets its own `WARN` naming it).
 /// - `WARN source="sysfs_unparseable"` — directories were present but
-///   no `Video Memory` line was readable (current 5xx drivers dropped
-///   it).  The caller then falls back to `nvidia-smi`; the warn is the
+///   none parseable (current 5xx drivers dropped the `Video Memory`
+///   line).  The caller then falls back to `nvidia-smi`; the warn is the
 ///   breadcrumb that the cheap sysfs path no longer works on this host.
+/// - `WARN source="nvidia_sysfs" reason="no_video_memory_line"|"info_unreadable"`
+///   — a specific GPU was dropped from the total while others survived.
 pub fn detect_vram_gb_from_sysfs(root: &Path) -> f32 {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -244,24 +250,48 @@ pub fn detect_vram_gb_from_sysfs(root: &Path) -> f32 {
     let mut parseable: u32 = 0;
     for entry in entries.flatten() {
         gpu_count += 1;
-        let info_path = entry.path().join("information");
-        if let Ok(content) = std::fs::read_to_string(&info_path) {
-            let mut found = false;
-            for line in content.lines() {
-                if let Some(rest) = line.trim().strip_prefix("Video Memory:") {
-                    if let Some(mib) = parse_mib(rest) {
-                        total_mib += mib;
-                        found = true;
+        let gpu_path = entry.path();
+        let info_path = gpu_path.join("information");
+        match std::fs::read_to_string(&info_path) {
+            Ok(content) => {
+                let mut found = false;
+                for line in content.lines() {
+                    if let Some(rest) = line.trim().strip_prefix("Video Memory:") {
+                        if let Some(mib) = parse_mib(rest) {
+                            total_mib += mib;
+                            found = true;
+                        }
                     }
                 }
+                if found {
+                    parseable += 1;
+                } else {
+                    tracing::warn!(
+                        target: "studio_worker::sys",
+                        op = "probe_vram",
+                        source = "nvidia_sysfs",
+                        reason = "no_video_memory_line",
+                        gpu = %gpu_path.display(),
+                        "sysfs GPU has no parseable Video Memory line — dropping it from the total"
+                    );
+                }
             }
-            if found {
-                parseable += 1;
+            Err(e) => {
+                tracing::warn!(
+                    target: "studio_worker::sys",
+                    op = "probe_vram",
+                    source = "nvidia_sysfs",
+                    reason = "info_unreadable",
+                    gpu = %gpu_path.display(),
+                    error = %e,
+                    "could not read a sysfs GPU information file — dropping it from the total"
+                );
             }
         }
     }
 
     let vram_gb = (total_mib / 1024.0) as f32;
+    let dropped = gpu_count.saturating_sub(parseable);
     if parseable > 0 {
         tracing::info!(
             target: "studio_worker::sys",
@@ -269,6 +299,7 @@ pub fn detect_vram_gb_from_sysfs(root: &Path) -> f32 {
             source = "nvidia_sysfs",
             vram_gb = vram_gb,
             gpu_count = parseable,
+            dropped = dropped,
             "detected NVIDIA VRAM via sysfs"
         );
     } else {
@@ -416,6 +447,23 @@ mod tests {
         // (12288 + 24576) / 1024 = 36 GiB
         let gb = detect_vram_gb_from_sysfs(dir.path());
         assert!((gb - 36.0).abs() < 1e-3, "got {gb}");
+    }
+
+    #[test]
+    fn detect_vram_gb_from_sysfs_sums_only_survivors_when_one_gpu_is_unreadable() {
+        // A healthy card next to one whose `information` can't be read
+        // (here a *directory* named `information`, so `read_to_string`
+        // fails on every platform): the survivor still totals, the bad
+        // card is dropped from the sum rather than zeroing the host out.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("0000:01:00.0");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join("information"), "Video Memory: 12288 MiB\n").unwrap();
+        let bad = dir.path().join("0000:02:00.0");
+        std::fs::create_dir_all(bad.join("information")).unwrap();
+        // Only the healthy card's 12288 MiB / 1024 = 12 GiB counts.
+        let gb = detect_vram_gb_from_sysfs(dir.path());
+        assert!((gb - 12.0).abs() < 1e-3, "got {gb}");
     }
 
     // -----------------------------------------------------------------
