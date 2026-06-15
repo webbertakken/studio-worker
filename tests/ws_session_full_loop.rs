@@ -10,7 +10,7 @@
 //! 2. wait for `hello`, reply with `welcome`
 //! 3. send an LLM `offer`, expect `accept` + `completeJson`
 //! 4. send an STT `offer`, expect `accept` + `completeJson`
-//! 5. close cleanly with 1000 \u2192 the worker session loop sees
+//! 5. close cleanly with 1000 → the worker session loop sees
 //!    `Disconnected`, hits its 1-attempt reconnect cap, and exits.
 //!
 //! The multipart `complete` HTTP path is covered separately by

@@ -2,7 +2,7 @@
 
 How to run the worker locally for the kind of iterate-watch-restart
 loop you want during real development.  Production workers run the
-release binary under systemd / launchd, not this dev loop \u2014 see
+release binary under systemd / launchd, not this dev loop — see
 [`docs/architecture/overview.md`](../architecture/overview.md#service--autostart).
 
 ## Why PM2
@@ -77,7 +77,7 @@ This is what you want when:
 ## Gotchas
 
 - **One worker per `worker_id`**.  Don't run both flavours
-  simultaneously \u2014 the studio's DO closes the older session with
+  simultaneously — the studio's DO closes the older session with
   `4003 duplicate_worker` and both workers thrash trying to
   reconnect.  `pm2 stop` one before starting the other.
 - **Orphan child after cargo-watch restart**.  Killing the
@@ -115,7 +115,7 @@ pm2 stop studio-worker-ui-stable
 pm2 delete studio-worker-ui-stable    # if you want it gone from `pm2 list`
 ```
 
-The worker handles SIGTERM gracefully \u2014 finishes the current job
+The worker handles SIGTERM gracefully — finishes the current job
 (up to ~5 s), then exits.
 
 ## Where this came from

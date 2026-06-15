@@ -21,7 +21,7 @@ A subprocess gets us:
 
 - Zero build-system pain on the Rust side; `cargo build --features
   ui` doesn't need CUDA.
-- The upstream pre-built binaries we use \u2014 the Vulkan Linux build
+- The upstream pre-built binaries we use — the Vulkan Linux build
   works on NVIDIA, AMD, Intel.
 - Process isolation: a buggy sd-cli OOM kills the subprocess, not
   the worker.
@@ -30,7 +30,7 @@ The trade-off is per-job startup overhead.  In practice on a 4090
 running the Vulkan build, model load is ~1s and amortises across
 the steady-state job stream (`sd-cli` loads weights once then
 generates back-to-back in the same process when called repeatedly
-\u2014 actually no, each call spawns fresh, so each job pays the load
+— actually no, each call spawns fresh, so each job pays the load
 cost; see [Performance](#performance) below).
 
 ## Engine registration
@@ -128,7 +128,7 @@ The legacy `with_builtin(models_root)` returned a hardcoded
 
 `dispatch_with_source(model, task, Some(&source))`:
 
-1. **`ensure_files(&source)`** \u2014 for every `ModelFile` in
+1. **`ensure_files(&source)`** — for every `ModelFile` in
    `source.files`, check `cfg.models_root / file.filename`.  If
    missing, stream-download from `file.url` (atomic via `.part` +
    rename).  Cached after first download.
@@ -158,20 +158,20 @@ The legacy `with_builtin(models_root)` returned a hardcoded
    is the studio's default; we override to the model's 8-step
    schedule).  When the task explicitly overrides we honour it.
 
-4. **`Command::output()`** \u2014 blocking wait.  On non-zero exit,
+4. **`Command::output()`** — blocking wait.  On non-zero exit,
    warn-log the stderr's last line + bail with a `Fail { retryable:
    true }`-shaped anyhow error.  Operators see the OOM / driver
    message immediately in the worker logs.
 
-5. **Read `out_path`** \u2014 the WEBP bytes from `sd-cli`.  Delete the
+5. **Read `out_path`** — the WEBP bytes from `sd-cli`.  Delete the
    file (best-effort; ignored on failure).
-6. **Return `TaskResult::Image { bytes, ext: "webp" }`** \u2014 the WS
+6. **Return `TaskResult::Image { bytes, ext: "webp" }`** — the WS
    session uploads it via the multipart `/complete` route.
 
 ## Models root
 
 `cfg.models_root` defaults to `~/models`.  Every file from every
-`ModelSource.files` lands directly in that directory \u2014 there's no
+`ModelSource.files` lands directly in that directory — there's no
 per-model subdirectory.  Two models that name the same `filename`
 will collide; in practice the registry uses distinguishing filenames
 (e.g. `z_image_turbo-Q4_K.gguf` vs `Qwen3-4B-Instruct-2507-Q4_K_M.gguf`).
@@ -185,13 +185,13 @@ For Z-Image-Turbo Q4_K (4GB diffusion) + Qwen3-4B Q4_K_M (2.5GB) +
 Flux VAE (335MB) on an RTX 4090 via the Vulkan build:
 
 - Model load (cold): ~1s
-- 8-step generation at 1024\u00d71024: ~5-9s
-- 8-step generation at 768\u00d7768: ~5s
+- 8-step generation at 1024×1024: ~5-9s
+- 8-step generation at 768×768: ~5s
 - Multipart upload to R2: 2-3s
 - **End-to-end per job: ~10-15s steady-state**
 
 Each `sd-cli` invocation pays the model-load cost.  That's the
-biggest single optimisation we haven't done \u2014 keeping an
+biggest single optimisation we haven't done — keeping an
 `sd-server` subprocess alive and routing every job through HTTP
 would amortise load to once per worker boot.  Not done yet because
 the current rate is already inside the operator's tolerance window.
@@ -202,7 +202,7 @@ the current rate is already inside the operator's tolerance window.
 |---|---|---|
 | `requires a ModelSource on the offer` | Legacy queued row without `modelSource` (pre-migration-0015) | Re-promote via the studio; the registry attaches the source |
 | Download `GET <url> -> 404` | Bad URL in the registry, or HF moved the file | Operator fixes the registry entry |
-| Download `GET <url> -> 401` | HF gated repo without auth | Operator finds a public mirror (see Z-Image-Turbo's VAE \u2014 BFL's repo is gated, Comfy-Org's mirror isn't) |
+| Download `GET <url> -> 401` | HF gated repo without auth | Operator finds a public mirror (see Z-Image-Turbo's VAE — BFL's repo is gated, Comfy-Org's mirror isn't) |
 | `sd-cli exited with Some(...): error: invalid parameter for argument` | sd-cli flag drift between releases | Pin the sd-cli version in the install playbook |
 | `sd-cli exited` with no stderr line | OOM or driver crash | Lower `cli_defaults.width`/`height`; check `nvidia-smi` |
 

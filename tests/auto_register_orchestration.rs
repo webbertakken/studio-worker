@@ -1,6 +1,6 @@
-//! Phase 2 of plans/auto-register-with-approval.md \u2014 the
-//! orchestration tick that drives the worker through Pristine \u2192
-//! Pending \u2192 Approved (writing `worker_id` + `auth_token` to
+//! Phase 2 of plans/auto-register-with-approval.md — the
+//! orchestration tick that drives the worker through Pristine →
+//! Pending → Approved (writing `worker_id` + `auth_token` to
 //! `config.toml`) or Rejected.
 //!
 //! The tick is pure-ish: it takes a config snapshot + observers,

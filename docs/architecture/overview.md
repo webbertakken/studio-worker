@@ -75,10 +75,10 @@ The worker speaks **three** different surfaces to the studio:
 |---|---|---|
 | `POST /workers/register-request` + `GET /workers/register-requests/:id` | One-shot at install + 30s polling until approved | Operator-gated registration; mints `worker_id` + `auth_token` |
 | WebSocket at `GET /workers/:id/connect` | Long-lived, reconnect on disconnect | Heartbeats, claim offers (carrying the [`ModelSource`](../runtime/model-source.md) the worker needs to download + run the model), accept/reject, complete-json, fail, log batches |
-| `POST /workers/:id/jobs/:jobId/complete` (multipart) | Per finished job with binary output | Image / audio / video bytes \u2192 R2 |
+| `POST /workers/:id/jobs/:jobId/complete` (multipart) | Per finished job with binary output | Image / audio / video bytes → R2 |
 
 Everything else (heartbeat ack, accept, fail, log shipping, etc.) is
-WebSocket frames \u2014 the legacy `/heartbeat`, `/claim`,
+WebSocket frames — the legacy `/heartbeat`, `/claim`,
 `/complete-json`, `/fail`, `/logs` HTTP routes are gone.
 
 ---
@@ -111,7 +111,7 @@ The CLI surface from [`src/cli.rs`](../../src/cli.rs):
 |---|---|
 | `run` | Start the runtime: ensure registered, then the WS session + auto-updater |
 | `ui` (feature `ui`) | Same as `run` but with the egui window + tray + notifications |
-| `register` | Persist api-base-url / clear state (`--reset`).  **No HTTP** \u2014 the next `run`/`ui` actually auto-registers |
+| `register` | Persist api-base-url / clear state (`--reset`).  **No HTTP** — the next `run`/`ui` actually auto-registers |
 | `status` | Print config path, registration state, threshold, auto-update toggle |
 | `set-threshold <gb>` | Update `vram_threshold_gb` |
 | `install-service` / `uninstall-service` | Per-OS service file (systemd / launchd / scheduled task) |
@@ -300,7 +300,7 @@ Defined in [`src/ws/types.rs`](../../src/ws/types.rs) as two enums:
 | server → | `Error` | `code` + `message` (auth, protocol, duplicate, deleted) |
 
 The `complete` route for image / audio / video bytes is a separate
-HTTP multipart upload \u2014 R2 doesn't fit cleanly into WS frames.
+HTTP multipart upload — R2 doesn't fit cleanly into WS frames.
 Everything else stays on the session.
 
 ### Session loop
@@ -377,14 +377,14 @@ lifecycle](#job-lifecycle-one-claim-end-to-end)).
 
 Built-in:
 
-- **`synthetic`** \u2014 deterministic real bytes for every kind,
+- **`synthetic`** — deterministic real bytes for every kind,
   keyed by SHA-256 of the prompt.  Real WEBP, real WAV, real animated
   WEBP, real OpenAI-shaped JSON.  No GPU, no model downloads, ~0ms
   per task.  Powers CI + smoke-tests.  Advertises only `synthetic*`
   model names so it never claims a real-model job (it would happily
   upload placeholder bytes for a real manifest, which is destructive
   on a live queue).
-- **`sdcpp`** \u2014 real image inference via `stable-diffusion.cpp` as a
+- **`sdcpp`** — real image inference via `stable-diffusion.cpp` as a
   subprocess.  Reads the `ModelSource` off every offer, downloads
   any missing files into `cfg.models_root`, invokes `sd-cli` with
   the right `--diffusion-model` / `--llm` / `--vae` flags + CLI
@@ -394,7 +394,7 @@ Built-in:
 The legacy `gradio` engine is gone (operators run a Gradio app via
 an external service if they need it).  Feature-gated heavyweights
 (`llama`, `whisper`, `image-candle`, `video`, `tts`) still drop in
-via the same trait when their cargo features are enabled \u2014 see
+via the same trait when their cargo features are enabled — see
 [`plans/real-engines.md`](../../plans/real-engines.md).
 
 ---
@@ -475,9 +475,9 @@ Rules worth pinning explicitly:
 The runtime tracks all three observable slots in
 [`runtime::WorkerObservers`](../../src/runtime.rs):
 
-- `current_job: Option<CurrentJob>` \u2014 set during dispatch
+- `current_job: Option<CurrentJob>` — set during dispatch
 - `recent_jobs: VecDeque<RecentJob>` (cap 50, newest-first)
-- `last_heartbeat: Option<HeartbeatStatus>` \u2014 written after every
+- `last_heartbeat: Option<HeartbeatStatus>` — written after every
   WS heartbeat ack / failure
 
 These are `Arc<Mutex<…>>` and read directly by the UI for live state.
@@ -532,7 +532,7 @@ the runtime pause flag replaces `auto_enabled`, and the studio's
 Pending Workers panel no longer surfaces a label.
 
 Every load + save emits a structured `tracing` event on the
-`studio_worker::config` target with the resolved path \u2014 makes
+`studio_worker::config` target with the resolved path — makes
 "why is the worker reading the wrong config" trivially debuggable from
 `journalctl`.  `auth_token` and `registration_secret` are
 **deliberately omitted** from these events so logs ship off-box
@@ -555,7 +555,7 @@ headless server install stays lean.
 |---|---|
 | **Status** | Worker id, API URL, VRAM total / threshold, IDLE / BUSY / PAUSED badge, last heartbeat freshness, **Pause / Resume button** (flips the runtime `paused` flag).  When unregistered: Initialising / Pending (with request id + copy button) / Rejected (with reason + `--reset` hint) state. |
 | **Jobs** | Current job card (kind, model, prompt preview, elapsed) + last 50 finished jobs with outcome / duration. |
-| **Config** | The operator-facing subset of `Config` as widgets, grouped into Connection (API base URL) / Worker (VRAM threshold + Auto-start) / Auto-update / Models (folder picker for `models_root`) / Notifications / Background mode.  Save writes through; Reset reverts.  Internal state (`worker_id`, `auth_token`, `install_id`, registration ids) is deliberately not shown \u2014 the auto-register flow owns it. |
+| **Config** | The operator-facing subset of `Config` as widgets, grouped into Connection (API base URL) / Worker (VRAM threshold + Auto-start) / Auto-update / Models (folder picker for `models_root`) / Notifications / Background mode.  Save writes through; Reset reverts.  Internal state (`worker_id`, `auth_token`, `install_id`, registration ids) is deliberately not shown — the auto-register flow owns it. |
 | **Logs** | Level filter (all/info/warn/error), free-text search across category/message/job id, auto-scroll toggle.  Reads from `WorkerObservers.recent_logs` (bounded 1000-entry ring) so it doesn't blank out when the WS log-shipper drains every second. |
 | **About** | Version, Sentry release name, config path, manual "Check for updates" button. |
 
@@ -565,9 +565,9 @@ Screenshots in [`docs/screenshots/`](../screenshots/).
 
 Three coloured variants derived from `(busy, last_heartbeat)`:
 
-- **Idle** \u2014 green; not busy + heartbeat fresh + ok
-- **Busy** \u2014 amber; busy flag set
-- **Disconnected** \u2014 red; heartbeat stale (> 3 \u00d7 interval), missing,
+- **Idle** — green; not busy + heartbeat fresh + ok
+- **Busy** — amber; busy flag set
+- **Disconnected** — red; heartbeat stale (> 3 × interval), missing,
   or returned an error
 
 Menu: **Open Window** / **Pause / Resume** / **Quit**.  The label
@@ -630,7 +630,7 @@ idle window stops the worker promptly instead of blocking
 `run_loops`' join for a whole `auto_update_tick`.  The
 `RealRunner::{download, run_installer}`
 + `restart_self` paths are tested through a fake `UpdateRunner`
-trait \u2014 they're excluded from the 90% coverage gate
+trait — they're excluded from the 90% coverage gate
 (`.cargo-llvm-cov.toml`).
 
 ---
@@ -674,7 +674,7 @@ file:
 - macOS: LaunchAgent plist at
   `~/Library/LaunchAgents/gg.minis.studio-worker.plist`
 - Windows: `schtasks /Create` XML template (`%APPDATA%\\minis-studio-worker\\minis-studio-worker.task.xml`)
-  \u2014 written but **not registered**, since CreateTrigger needs
+  — written but **not registered**, since CreateTrigger needs
   the operator to confirm.
 
 `uninstall-service` removes them.  Tested in
@@ -707,14 +707,14 @@ contributors.
 | `register-request` HTTP 5xx | `auto_register::tick` | Stay Pristine, log warn, retry on next tick |
 | `register-request` rate-limited (429) | studio binding | Same as 5xx; the 30s poll cadence already respects backoff implicitly |
 | `register-requests/:id` 404 | poll response | Drop stale `request_id` + secret from config, recreate on next tick |
-| `register-requests/:id` 401 | poll response | Same as 404; the worker's secret doesn't match the row \u2014 only happens if config was tampered |
+| `register-requests/:id` 401 | poll response | Same as 404; the worker's secret doesn't match the row — only happens if config was tampered |
 | WS connect refused / TLS error | `WsClientError::Transport` | Back off + reconnect, up to `ws_reconnect_attempts` |
 | WS close code `4001 AuthFailed` | session loop | Stop reconnecting; user must `register --reset` |
 | WS close code `4003 DuplicateWorker` | session loop | Stop reconnecting (another instance is connected with the same id) |
 | WS close code `4004 WorkerDeleted` | session loop | Stop; the studio operator deleted us |
 | WS protocol violation | session loop | Server sends `Error { code: ProtocolViolation }` then closes |
-| Engine `dispatch` returns `UnsupportedKind` | runtime job-runner | `Fail { retryable: false }` \u2014 server moves the job to terminal failed |
-| Engine `dispatch` returns generic `Err` | runtime job-runner | `Fail { retryable: true }` \u2014 server requeues |
+| Engine `dispatch` returns `UnsupportedKind` | runtime job-runner | `Fail { retryable: false }` — server moves the job to terminal failed |
+| Engine `dispatch` returns generic `Err` | runtime job-runner | `Fail { retryable: true }` — server requeues |
 | `complete` multipart 5xx | runtime job-runner | `Fail` so the server can retry |
 | Auto-update download / install failure | `update::apply` | Log + leave worker running on the old version; try again next interval |
 | Auto-update `execvp` failure (unix) | `update::restart_self` | Should never happen; if it does, exit 0 and let systemd restart |
@@ -752,9 +752,9 @@ captures them.
 - **Approve / reject is admin-only**: studio's Firebase auth +
   allowlist guards the dashboard.
 - **Worker side reads `/dev/urandom` directly** on unix for the
-  install_id + secret \u2014 no `rand` dep, smaller surface area.
+  install_id + secret — no `rand` dep, smaller surface area.
 - **Auto-update binary swap** runs the cargo-dist installer the same
-  way the user did on first install \u2014 same HTTPS + checksum
+  way the user did on first install — same HTTPS + checksum
   verification (cargo-dist's own).
 
 ---
