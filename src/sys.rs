@@ -272,6 +272,36 @@ mod tests {
         assert_eq!(parse_mib(" 24576 MiB"), Some(24576.0));
         assert_eq!(parse_mib("12288 MB"), Some(12288.0));
         assert_eq!(parse_mib("24 GiB"), Some(24576.0));
+        assert_eq!(parse_mib("8 GB"), Some(8192.0));
+    }
+
+    #[test]
+    fn parse_mib_defaults_to_mib_when_the_unit_is_omitted() {
+        // A bare value (no unit token) is assumed to already be in MiB,
+        // matching nvidia-smi's `--units` output where the suffix is
+        // sometimes stripped.
+        assert_eq!(parse_mib("4096"), Some(4096.0));
+    }
+
+    #[test]
+    fn parse_mib_treats_an_unknown_unit_as_raw_mib() {
+        // An unrecognised suffix must not silently zero the GPU out of
+        // the VRAM total: the worker claims jobs by VRAM, so dropping a
+        // card to 0 would make it refuse work it can actually run. We
+        // keep the numeric value as-is (best-effort MiB) rather than
+        // returning `None`.
+        assert_eq!(parse_mib("2048 KiB"), Some(2048.0));
+        assert_eq!(parse_mib("4 TB"), Some(4.0));
+    }
+
+    #[test]
+    fn parse_mib_rejects_unparseable_or_empty_values() {
+        // A non-numeric leading token (e.g. an `[N/A]` placeholder) or
+        // an empty / whitespace-only line yields `None` so the caller
+        // skips it instead of polluting the total with a bogus number.
+        assert_eq!(parse_mib("N/A MiB"), None);
+        assert_eq!(parse_mib(""), None);
+        assert_eq!(parse_mib("   "), None);
     }
 
     #[test]

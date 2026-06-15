@@ -440,6 +440,7 @@ async fn run_one_session(
         sender.clone(),
         stop.clone(),
         paused.clone(),
+        logs.clone(),
         observers.clone(),
         schedule,
     );
@@ -982,7 +983,7 @@ fn spawn_reader(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-// Seven collaborators (config + engine + sender + shared flags + observers + schedule);
+// Eight collaborators (config + engine + sender + shared flags + logs + observers + schedule);
 // grouping them adds indirection without improving readability.
 #[allow(clippy::too_many_arguments)]
 fn spawn_heartbeat_pump(
@@ -991,25 +992,35 @@ fn spawn_heartbeat_pump(
     sender: WsSender,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    logs: Arc<Mutex<Vec<LogEntry>>>,
     observers: WorkerObservers,
     schedule: SessionSchedule,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(schedule.heartbeat);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Seed with the pause flag's value at session start so the first
+        // tick never logs a spurious transition; only genuine operator
+        // toggles during the session ship a breadcrumb.
+        let mut last_paused = paused.load(Ordering::SeqCst);
         loop {
             interval.tick().await;
             if stop.load(Ordering::SeqCst) {
                 break;
             }
+            // A Pause / Resume from any source (Status tab, tray menu)
+            // only emits a local `tracing` breadcrumb; ship the actual
+            // transition so the studio's shipped-log view and the UI's
+            // Logs tab record why the worker started / stopped claiming.
+            let now_paused = paused.load(Ordering::SeqCst);
+            if let Some(message) = pause_transition_breadcrumb(last_paused, now_paused) {
+                push_log_with_observers(&logs, Some(&observers), "info", "ws", message, None);
+            }
+            last_paused = now_paused;
             // Rebuild the snapshot from the live config so operator
             // edits (VRAM threshold, auto-start) propagate on the
             // next tick instead of on the next reconnect.
-            let caps = crate::runtime::build_capabilities_with(
-                &cfg.lock(),
-                &*engine,
-                !paused.load(Ordering::SeqCst),
-            );
+            let caps = crate::runtime::build_capabilities_with(&cfg.lock(), &*engine, !now_paused);
             let current_job_id = heartbeat_current_job_id(&observers);
             if let Err(e) = sender
                 .send(&WorkerInbound::Heartbeat {
@@ -1191,6 +1202,27 @@ fn record_fail_send(
             &message,
             Some(job_id.to_string()),
         );
+    }
+}
+
+/// Operator-facing breadcrumb for a change in the runtime pause flag,
+/// or `None` when the flag is unchanged since the previous heartbeat
+/// tick.
+///
+/// A Pause / Resume from the Status tab or tray menu only emits a local
+/// `tracing` breadcrumb (stdout / Sentry) naming the source; it never
+/// enters the worker's shipped log stream.  So the studio's shipped-log
+/// view and the UI's Logs tab used to show `auto_enabled=false`
+/// heartbeats with no record of *why* the worker stopped claiming.  The
+/// heartbeat pump calls this each tick and ships the transition through
+/// `push_log_with_observers`, so a toggle from *any* source reaches the
+/// operator-facing surfaces.  Pure so the wording is unit-tested without
+/// driving the pump.
+fn pause_transition_breadcrumb(prev: bool, now: bool) -> Option<&'static str> {
+    match (prev, now) {
+        (false, true) => Some("claiming paused by operator; new offers are rejected until resumed"),
+        (true, false) => Some("claiming resumed by operator; accepting new offers again"),
+        _ => None,
     }
 }
 
@@ -1382,5 +1414,30 @@ mod tests {
         };
         let shared = crate::config::shared(cfg);
         assert!(!has_credentials(&shared));
+    }
+
+    #[test]
+    fn pause_transition_breadcrumb_is_silent_when_unchanged() {
+        // No flag change since the previous tick — the pump must not add
+        // a per-tick log line on every 5s heartbeat.
+        assert!(pause_transition_breadcrumb(false, false).is_none());
+        assert!(pause_transition_breadcrumb(true, true).is_none());
+    }
+
+    #[test]
+    fn pause_transition_breadcrumb_reports_pause_and_resume() {
+        // A genuine operator toggle must ship an info-level breadcrumb
+        // naming the new claiming state so the studio's shipped-log view
+        // and the UI's Logs tab record why the worker stopped / resumed.
+        let paused = pause_transition_breadcrumb(false, true).expect("a pause must be reported");
+        assert!(
+            paused.contains("paused by operator"),
+            "expected a pause message, got: {paused}"
+        );
+        let resumed = pause_transition_breadcrumb(true, false).expect("a resume must be reported");
+        assert!(
+            resumed.contains("resumed by operator"),
+            "expected a resume message, got: {resumed}"
+        );
     }
 }

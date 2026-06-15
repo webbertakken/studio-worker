@@ -129,21 +129,31 @@ pub fn init() -> Option<sentry::ClientInitGuard> {
     Some(guard)
 }
 
-/// Build the `sentry-tracing` layer with our chosen severity mapping.
+/// Map a tracing severity level to the Sentry ingest action.
 ///
 /// * `ERROR` -> Sentry event (operator-visible alert)
 /// * `WARN`  -> breadcrumb attached to the next event
 /// * `INFO`/`DEBUG`/`TRACE` -> ignored (too noisy for breadcrumbs;
 ///   already surfaced via the structured log shipper)
+///
+/// Split out of [`tracing_layer`] so the severity-mapping policy is a
+/// pure function unit tests can pin without constructing a subscriber
+/// or mutating global Sentry state.
+pub fn event_filter_for_level(level: tracing::Level) -> EventFilter {
+    match level {
+        tracing::Level::ERROR => EventFilter::Event,
+        tracing::Level::WARN => EventFilter::Breadcrumb,
+        _ => EventFilter::Ignore,
+    }
+}
+
+/// Build the `sentry-tracing` layer with our chosen severity mapping
+/// (see [`event_filter_for_level`]).
 pub fn tracing_layer<S>() -> sentry_tracing::SentryLayer<S>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
-    sentry_tracing::layer().event_filter(|md| match *md.level() {
-        tracing::Level::ERROR => EventFilter::Event,
-        tracing::Level::WARN => EventFilter::Breadcrumb,
-        _ => EventFilter::Ignore,
-    })
+    sentry_tracing::layer().event_filter(|md| event_filter_for_level(*md.level()))
 }
 
 #[cfg(test)]
@@ -206,6 +216,42 @@ mod tests {
         let resolved =
             SentryConfig::from_env_inner(Some("\t \n".into()), None, "0.0.0".into(), "h".into());
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn event_filter_maps_each_severity_to_its_sentry_action() {
+        // The operator-facing telemetry contract: ERROR is the only
+        // level that becomes a Sentry *event* (the alert an operator
+        // gets paged on), WARN attaches a breadcrumb to the next event
+        // (context, not noise), and INFO/DEBUG/TRACE are ignored (they
+        // already ship via the structured log shipper).  This mapping
+        // had no test, so a regression flipping WARN -> Event would
+        // flood Sentry with warning spam, and ERROR -> Breadcrumb would
+        // silently drop every alert — both invisible until production.
+        // EventFilter is a bitflags struct without PartialEq, so we
+        // compare the raw bits.
+        use sentry_tracing::EventFilter;
+        assert_eq!(
+            event_filter_for_level(tracing::Level::ERROR).bits(),
+            EventFilter::Event.bits(),
+            "ERROR must surface as a Sentry event"
+        );
+        assert_eq!(
+            event_filter_for_level(tracing::Level::WARN).bits(),
+            EventFilter::Breadcrumb.bits(),
+            "WARN must attach a breadcrumb, not raise an event"
+        );
+        for quiet in [
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
+        ] {
+            assert_eq!(
+                event_filter_for_level(quiet).bits(),
+                EventFilter::Ignore.bits(),
+                "{quiet} must be ignored by Sentry (it ships via the log shipper)"
+            );
+        }
     }
 
     #[test]

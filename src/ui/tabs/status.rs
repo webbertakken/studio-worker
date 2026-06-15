@@ -333,14 +333,18 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
         });
 }
 
-/// Flip the operator pause flag and emit a structured breadcrumb, so a
-/// pause/resume from the Status tab's button is as visible in the logs
-/// (and the studio's shipped-log view) as the identical toggle from the
-/// tray menu (`ui::mod`).  Without it, pausing from the window left no
-/// trace while pausing from the tray did.  `fetch_xor` returns the
-/// previous value, so the new paused state is its negation.  Extracted
-/// from the button handler so the logging is unit-testable without an
-/// egui context.  Returns the new paused state.
+/// Flip the operator pause flag and emit a local `tracing` breadcrumb
+/// (stdout / Sentry) naming the Status tab as the source, matching the
+/// identical toggle from the tray menu (`ui::tray_host`).  The
+/// operator-facing record of the resulting claiming-state change — in
+/// the studio's shipped-log view and the UI's Logs tab — is shipped by
+/// the heartbeat pump, which observes this flag each tick (see
+/// `ws::session::pause_transition_breadcrumb`), so a toggle from any
+/// source is surfaced uniformly without plumbing the log channel into
+/// every UI control.  `fetch_xor` returns the previous value, so the
+/// new paused state is its negation.  Extracted from the button handler
+/// so the logging is unit-testable without an egui context.  Returns
+/// the new paused state.
 fn toggle_pause(paused_flag: &Arc<AtomicBool>) -> bool {
     let now_paused = !paused_flag.fetch_xor(true, Ordering::SeqCst);
     tracing::info!(

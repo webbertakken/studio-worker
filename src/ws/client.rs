@@ -1004,4 +1004,72 @@ mod tests {
             "a clipped body must carry an ellipsis: {msg}"
         );
     }
+
+    #[test]
+    fn http_upgrade_error_body_clips_on_char_boundary_not_mid_codepoint() {
+        // The studio's failed-`/connect` upgrade body (the one carrying
+        // the Sentry `reference` id — see STUDIO-WORKER-1) can contain
+        // multibyte characters: a Cloudflare HTML error page, a
+        // non-ASCII operator hostname echoed back, an em-dash, etc.
+        // `clip_error_body` documents that it clips on *character*
+        // boundaries so such a body is never split mid-codepoint.  Pad
+        // with ASCII up to one char short of the limit, then place a
+        // 3-byte char straddling the byte that a naive `&body[..N]`
+        // byte-slice would cut on — char-based clipping keeps it whole,
+        // a byte-slice regression would panic before producing any
+        // message at all.
+        let body = format!(
+            "{}{}",
+            "a".repeat(HTTP_ERROR_BODY_MAX_CHARS - 1),
+            "\u{4e16}".repeat(101)
+        );
+        let err = WsClientError::from(http_error(502, Some(body.as_bytes())));
+        let WsClientError::Transport(msg) = err else {
+            panic!("expected Transport, got {err:?}");
+        };
+        assert!(msg.contains("502"), "status must survive: {msg}");
+        assert!(
+            msg.contains('\u{2026}'),
+            "an over-limit body must be clipped: {msg}"
+        );
+        assert!(
+            msg.contains('\u{4e16}'),
+            "the char straddling the clip point must survive whole: {msg}"
+        );
+        assert!(
+            !msg.contains('\u{fffd}'),
+            "no codepoint may be split (no replacement char): {msg}"
+        );
+    }
+
+    #[test]
+    fn clip_error_body_keeps_an_exactly_at_limit_body_verbatim() {
+        // The clip is gated on `chars().count() > MAX`, so a body of
+        // exactly `MAX` chars must pass through untouched (no ellipsis),
+        // and one char over must clip.  Pins the off-by-one boundary so
+        // a `>=`-vs-`>` regression can't silently start truncating a
+        // body that fit.
+        let at_limit = "x".repeat(HTTP_ERROR_BODY_MAX_CHARS);
+        let clipped = clip_error_body(&at_limit);
+        assert_eq!(
+            clipped, at_limit,
+            "a body exactly at the limit must be returned verbatim"
+        );
+        assert!(
+            !clipped.contains('\u{2026}'),
+            "an at-limit body must not gain an ellipsis: {clipped}"
+        );
+
+        let over_limit = "x".repeat(HTTP_ERROR_BODY_MAX_CHARS + 1);
+        let clipped = clip_error_body(&over_limit);
+        assert_eq!(
+            clipped.chars().count(),
+            HTTP_ERROR_BODY_MAX_CHARS + 1,
+            "an over-limit body keeps MAX chars plus the ellipsis"
+        );
+        assert!(
+            clipped.ends_with('\u{2026}'),
+            "an over-limit body must end with an ellipsis: {clipped}"
+        );
+    }
 }
