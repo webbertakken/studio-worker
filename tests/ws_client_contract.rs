@@ -398,6 +398,58 @@ async fn split_round_trips_a_hello_then_a_welcome() {
     server.await.unwrap();
 }
 
+/// A server keepalive ping is swallowed by `WsReceiver::recv` (the half
+/// the session actually reads): the receiver keeps polling past the
+/// control frame and still delivers the next real frame.  The studio's
+/// `WorkerConnections` DO pings idle sockets, so a receiver that bailed
+/// on a ping would tear the session down on every keepalive.
+#[tokio::test]
+async fn split_receiver_swallows_a_ping_then_yields_the_next_frame() {
+    let (addr, server) = spawn_server(echo_subprotocol, |mut ws| async move {
+        let frame = ws
+            .next()
+            .await
+            .expect("frame")
+            .expect("ok")
+            .into_text()
+            .unwrap();
+        assert!(frame.contains("\"hello\""));
+        // A keepalive ping *before* the real frame must not surface to
+        // the caller — it has to be silently consumed.
+        ws.send(Message::Ping(Vec::new().into())).await.unwrap();
+        let welcome = serde_json::to_string(
+            &json!({"type":"welcome","workerId":"w-ping","serverTime":"now"}),
+        )
+        .unwrap();
+        ws.send(Message::Text(welcome.into())).await.unwrap();
+        let _ = ws.close(None).await;
+    })
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let client = connect(&base, "w-ping", "t").await.unwrap();
+    let (sender, mut receiver) = client.split();
+    sender
+        .send(&WorkerInbound::Hello(HelloFrame {
+            auth_token: "t".into(),
+            capabilities: capabilities(),
+        }))
+        .await
+        .unwrap();
+    // The very first frame the caller observes is the welcome; the ping
+    // was consumed by the `Skip` arm without yielding.
+    let received = tokio::time::timeout(TIMEOUT, receiver.recv())
+        .await
+        .expect("recv timed out")
+        .expect("recv ok")
+        .expect("got a frame");
+    match received {
+        WorkerOutbound::Welcome { worker_id, .. } => assert_eq!(worker_id, "w-ping"),
+        other => panic!("expected welcome after the swallowed ping, got {other:?}"),
+    }
+    server.await.unwrap();
+}
+
 /// A 4001 server close surfaces through `WsReceiver::recv` as the typed
 /// `AuthFailed` — the session keys its "auth rejected, stop reconnecting"
 /// branch on exactly this.
