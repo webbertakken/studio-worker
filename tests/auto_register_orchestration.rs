@@ -328,3 +328,65 @@ async fn install_id_is_stable_across_ticks() {
     let second = shared.lock().install_id.clone();
     assert_eq!(first, second, "install_id must persist across ticks");
 }
+
+#[tokio::test]
+async fn orphaned_request_id_without_secret_regenerates_and_resubmits() {
+    // Recovery path: config still carries a `registration_request_id`
+    // from a previous run but its `registration_secret` is gone — e.g. a
+    // partially-edited or truncated `config.toml`.  `ensure_install_state`
+    // deliberately won't re-seed a secret while a request id is present,
+    // so the tick can't poll the orphaned request (it lacks the secret to
+    // authenticate the poll).  `create_request` must regenerate the
+    // secret, POST a fresh register-request, and converge on a new
+    // Pending row instead of wedging forever on an un-pollable id.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/register-request"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "rr-recovered",
+            "status": "pending",
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let mut cfg = pristine_cfg(&server.uri());
+    cfg.install_id = Some("install-abc".into());
+    cfg.registration_request_id = Some("rr-orphan".into());
+    cfg.registration_secret = None; // lost the secret post-crash / edit
+    let path = write_cfg(&dir, &cfg);
+    let shared = Arc::new(Mutex::new(cfg));
+    let observers = Arc::new(Mutex::new(RegistrationState::Pristine));
+
+    let state = auto_register::tick(&shared, &path, &observers).await;
+
+    // Routed through create_request (POST), not poll_existing (GET): we
+    // land on the brand-new request id, not the orphaned one.
+    assert!(
+        matches!(state, RegistrationState::Pending { ref request_id, .. } if request_id == "rr-recovered"),
+        "expected Pending with rr-recovered, got {state:?}"
+    );
+
+    let on_disk = config::load(Some(path.to_str().unwrap())).unwrap().0;
+    assert_eq!(
+        on_disk.registration_request_id.as_deref(),
+        Some("rr-recovered"),
+        "fresh request id must replace the orphaned one"
+    );
+    let regenerated = on_disk
+        .registration_secret
+        .expect("a fresh secret must be regenerated and persisted");
+    assert!(
+        !regenerated.is_empty(),
+        "regenerated secret must be non-empty"
+    );
+    // The in-memory snapshot the runtime loops read carries the same
+    // regenerated secret that reached disk.
+    assert_eq!(
+        shared.lock().registration_secret.as_deref(),
+        Some(regenerated.as_str()),
+        "on-disk and in-memory secret must match"
+    );
+    // install_id is untouched by the recovery.
+    assert_eq!(shared.lock().install_id.as_deref(), Some("install-abc"));
+}

@@ -155,7 +155,12 @@ async fn create_request(
     api_base_url: String,
     install_id: String,
 ) -> RegistrationState {
-    let secret = match cfg.lock().registration_secret.clone() {
+    // Bind the cloned value in its own statement so the `cfg.lock()`
+    // guard releases at the `;`.  Holding it across the `match` would
+    // deadlock the non-reentrant mutex the moment the `None` arm below
+    // re-locks to store a freshly generated secret.
+    let existing_secret = cfg.lock().registration_secret.clone();
+    let secret = match existing_secret {
         Some(s) => s,
         None => {
             // Should never happen post-ensure_install_state, but be safe.
