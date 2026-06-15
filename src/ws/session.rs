@@ -245,13 +245,16 @@ async fn wait_for_welcome(
 ) -> WelcomeOutcome {
     while let Some(event) = event_rx.recv().await {
         match event {
-            SessionEvent::Frame(WorkerOutbound::Welcome { worker_id: wid, .. }) => {
+            SessionEvent::Frame(WorkerOutbound::Welcome {
+                worker_id: wid,
+                server_time,
+            }) => {
                 push_log_with_observers(
                     logs,
                     Some(observers),
                     "info",
                     "ws",
-                    &format!("server welcomed {wid}"),
+                    &welcome_breadcrumb(&wid, &server_time),
                     None,
                 );
                 return WelcomeOutcome::Welcomed;
@@ -524,13 +527,16 @@ async fn run_dispatch_loop(
             SessionEvent::Disconnected(_) => return SessionOutcome::Disconnected,
             SessionEvent::Stopped => return SessionOutcome::Stopped,
             SessionEvent::Frame(frame) => match frame {
-                WorkerOutbound::Welcome { worker_id: wid, .. } => {
+                WorkerOutbound::Welcome {
+                    worker_id: wid,
+                    server_time,
+                } => {
                     push_log_with_observers(
                         &ctx.logs,
                         Some(&ctx.observers),
                         "info",
                         "ws",
-                        &format!("server welcomed {wid}"),
+                        &welcome_breadcrumb(&wid, &server_time),
                         None,
                     );
                 }
@@ -1131,6 +1137,21 @@ fn reconnect_breadcrumb(error: Option<&anyhow::Error>, attempt: u32, backoff: Du
     }
 }
 
+/// Operator-facing breadcrumb for the studio's `Welcome` frame.
+///
+/// The studio stamps `server_time` (its clock at the moment it
+/// authenticated this worker) onto every `Welcome`, but it used to be
+/// deserialised and dropped — the line named only the worker id. With
+/// it surfaced, an operator can spot clock skew between the worker host
+/// and the studio straight from the UI's Logs tab and the
+/// studio-shipped log view: skew distorts heartbeat-timeout reasoning,
+/// auth-token expiry windows, and log-timestamp correlation across the
+/// two sides. Pure so the wording is unit-tested without a live
+/// welcome.
+fn welcome_breadcrumb(worker_id: &str, server_time: &str) -> String {
+    format!("server welcomed {worker_id} server_time={server_time}")
+}
+
 /// Operator-facing breadcrumb summarising an incoming job offer.
 ///
 /// The studio populates `game_id` + `asset_name` on every offer, but
@@ -1463,6 +1484,25 @@ mod tests {
         assert!(
             resumed.contains("resumed by operator"),
             "expected a resume message, got: {resumed}"
+        );
+    }
+
+    #[test]
+    fn welcome_breadcrumb_surfaces_server_time() {
+        // The studio stamps `server_time` (its clock at the moment it
+        // authenticated this worker) onto every `Welcome`; it used to be
+        // deserialised and dropped, so an operator couldn't spot clock
+        // skew between the worker host and the studio. The breadcrumb
+        // must keep the legacy "server welcomed <id>" wording and add the
+        // server time alongside it.
+        let line = welcome_breadcrumb("worker-7", "2026-06-15T21:00:00Z");
+        assert!(
+            line.contains("server welcomed worker-7"),
+            "expected the legacy wording + worker id, got: {line}"
+        );
+        assert!(
+            line.contains("server_time=2026-06-15T21:00:00Z"),
+            "expected the server time, got: {line}"
         );
     }
 
