@@ -162,7 +162,7 @@ src/
 │
 └── ui/               (feature `ui`) Native egui desktop window.
     ├── mod.rs        ui::run: load config, spawn auto-register + run_loops on tokio,
-    │                 hand main thread to eframe.  Tray install (Linux GTK thread).
+    │                 hand main thread to eframe.  Tray install (Linux ksni on tokio).
     ├── app.rs        eframe App impl: tab dispatch, shared state, hide-to-tray, quit.
     ├── tab.rs        Tab enum + STUDIO_WORKER_UI_TAB env override for screenshots.
     ├── tabs/
@@ -546,8 +546,10 @@ Coverage regression contract in
 ## Optional desktop UI
 
 Built behind the `ui` cargo feature; brings in `egui` + `eframe` +
-`tray-icon` + `notify-rust` + GTK on Linux.  Off by default so the
-headless server install stays lean.
+`notify-rust`, plus the platform tray backend: `tray-icon` on
+macOS / Windows, `ksni` (pure-Rust StatusNotifierItem) on Linux, so the
+build needs no GTK.  Off by default so the headless server install
+stays lean.
 
 ### Tab structure
 
@@ -691,8 +693,10 @@ Writes:
 
 - Linux: `~/.config/autostart/studio-worker-ui.desktop`
 - macOS: `~/Library/LaunchAgents/gg.minis.studio-worker-ui.plist`
-- Windows: a marker file under `%LOCALAPPDATA%` (registry-key path
-  is the proper Windows mechanism but deferred to a follow-up).
+- Windows: an `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  registry value `studio-worker-ui` = `"<exe>" ui` (via `winreg`).
+  The standard per-user autostart mechanism: no console flash, no admin
+  rights, no COM.
 
 The two mechanisms coexist; they install different artefacts.  Use
 the service for headless rigs, the autostart toggle for desktop
@@ -721,7 +725,8 @@ contributors.
 | Offer without `ModelSource` to sdcpp engine | engine `dispatch_with_source` | `Fail { retryable: false }` with "requires a ModelSource on the offer" |
 | Model file download fails | sdcpp `ensure_files` | `Fail { retryable: true }`; the next claim of the same job retries the download |
 | `sd-cli` non-zero exit | sdcpp `dispatch_image` | `Fail { retryable: true }` with the last stderr line included so operators can spot OOM / driver issues quickly |
-| `sd-cli` binary missing | `SdCppEngine::try_new` | Engine doesn't register itself; the worker still boots with synthetic as the only available image engine and the studio sees a worker that advertises `image` kind only |
+| `sd-cli` binary missing | sdcpp `ensure_sd_cli` (first image job) | The engine always registers and advertises `image`; on the first image job it resolves `sd-cli` or auto-provisions the prebuilt into `cfg.models_root/bin`.  If no prebuilt exists for the target or the download fails, the job `Fail`s with the install remedy |
+| Vulkan loader (`libvulkan.so.1` / `vulkan-1.dll`) missing | sdcpp dispatch preflight | `Fail { retryable: true }` with the exact remedy (install `libvulkan1` + a GPU driver) instead of a cryptic `sd-cli` crash.  macOS uses Metal, so no Vulkan loader is involved |
 | rustls 0.23+ CryptoProvider missing | first WSS handshake | Process panics on `crypto/mod.rs:249`.  Fix is `rustls::crypto::ring::default_provider().install_default()` once at startup; see [`src/main.rs`](../../src/main.rs) |
 | `worker_id` / `auth_token` missing at WS connect | `has_credentials` check | Session loop waits (polling cfg every 1s) instead of fatal-bailing.  Lets the UI's parallel auto-register + WS flow work. |
 | Hello-without-Welcome race | `wait_for_welcome` gate | Block heartbeat + log-shipper spawn until the studio's Welcome reply arrives, so `tokio::interval()`'s t=0 first tick doesn't ship a heartbeat into an unauthenticated session |
