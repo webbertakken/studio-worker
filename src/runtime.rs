@@ -975,6 +975,48 @@ mod tests {
     }
 
     #[test]
+    fn recent_logs_ring_is_bounded_at_recent_logs_cap() {
+        // The observer ring backing the UI Logs tab is never drained
+        // (unlike the ship queue, which the WS shipper empties every
+        // second), so this cap is its only bound.  A regression that
+        // dropped the eviction loop would leak memory for the lifetime
+        // of a long-running worker; one that flipped `pop_front` for
+        // `pop_back` would silently retain the *oldest* entries and show
+        // a stale Logs tab.  Mirrors `recent_jobs_ring_caps_at_*`.
+        let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        let observers = WorkerObservers::default();
+        let overflow = 25;
+        for i in 0..(RECENT_LOGS_CAP + overflow) {
+            push_log_with_observers(
+                &logs,
+                Some(&observers),
+                "info",
+                "test",
+                &format!("entry {i}"),
+                None,
+            );
+        }
+        let ring = observers.recent_logs.lock();
+        assert_eq!(
+            ring.len(),
+            RECENT_LOGS_CAP,
+            "the recent-logs ring must cap at RECENT_LOGS_CAP"
+        );
+        // Newest entries go to the back; the oldest `overflow` entries
+        // must have been evicted from the front.
+        assert_eq!(
+            ring.back().map(|e| e.message.as_str()),
+            Some(format!("entry {}", RECENT_LOGS_CAP + overflow - 1).as_str()),
+            "the newest entry must survive at the back of the ring"
+        );
+        assert_eq!(
+            ring.front().map(|e| e.message.as_str()),
+            Some(format!("entry {overflow}").as_str()),
+            "the oldest surviving entry must be entry #overflow (older evicted)"
+        );
+    }
+
+    #[test]
     fn capabilities_advertises_all_synthetic_kinds() {
         let cfg = Config::default();
         let engine = SyntheticEngine::new();
