@@ -89,7 +89,8 @@ disconnected = red) and exposes:
 Closing the window hides it to the tray; the worker keeps running.
 For an autostart-on-login workflow, tick the **Run in tray on login**
 toggle on the Config tab (writes `~/.config/autostart/studio-worker-ui.desktop`
-on Linux, a LaunchAgent plist on macOS, a marker file on Windows).
+on Linux, a LaunchAgent plist on macOS, an `HKCU\…\Run` registry
+value on Windows).
 
 ### Build-time deps
 
