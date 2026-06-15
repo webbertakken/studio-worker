@@ -900,6 +900,47 @@ mod tests {
         assert!(err.contains("https"), "got: {err}");
     }
 
+    #[test]
+    fn validate_installer_download_url_rejects_non_http_schemes() {
+        // The gate must reject anything that isn't https (or loopback
+        // http) *before* the auto-updater downloads and executes the
+        // asset.  These schemes take a different path through the guard
+        // than `http://example.com` — they skip the `http` block
+        // entirely and fall straight to the bail — so they need their
+        // own cover.  `file://` is the dangerous one: a compromised
+        // release feed handing back `file:///etc/cron.d/evil.sh` would,
+        // without this guard, point the installer runner at an arbitrary
+        // local script.  `ftp://` is unencrypted (tamperable in
+        // transit) and `javascript:` carries no host at all.
+        for raw in [
+            "file:///etc/cron.d/evil.sh",
+            "ftp://example.com/i.sh",
+            "javascript:alert(1)",
+        ] {
+            let err = validate_installer_download_url(raw)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("https"),
+                "{raw} must be rejected with the https guidance, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_installer_download_url_rejects_a_malformed_url() {
+        // A feed entry that doesn't parse as a URL at all must error at
+        // the parse step (carrying the `invalid installer URL` context)
+        // rather than slipping through to a download attempt.
+        let err = validate_installer_download_url("not a url")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid installer URL"),
+            "a malformed URL must surface the parse context, got: {err}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // RealRunner::run_installer — the production path that hands the
     // downloaded installer to `sh` (unix) / PowerShell (Windows).  The
