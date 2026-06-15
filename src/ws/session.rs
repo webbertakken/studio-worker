@@ -389,6 +389,13 @@ async fn run_one_session(
         &crate::runtime::summarize_capabilities(&capabilities),
         None,
     );
+    // A threshold above the card's detected VRAM makes the studio offer
+    // jobs this GPU can't fit — they OOM on load.  Flag the
+    // misconfiguration on the handshake so the OOM has an operator-facing
+    // cause instead of surfacing only as a failed job.
+    if let Some(warning) = crate::runtime::vram_threshold_warning(&capabilities) {
+        push_log_with_observers(logs, Some(observers), "warn", "ws", &warning, None);
+    }
     sender
         .send(&WorkerInbound::Hello(HelloFrame {
             auth_token: auth_token.clone(),
