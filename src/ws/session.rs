@@ -559,10 +559,31 @@ async fn run_dispatch_loop(
                         _ => SessionOutcome::Fatal(message),
                     };
                 }
-                WorkerOutbound::HeartbeatAck
-                | WorkerOutbound::CompleteAck { .. }
-                | WorkerOutbound::FailAck { .. } => {
-                    // Acks are best-effort; ignore.
+                WorkerOutbound::CompleteAck { job_id } => {
+                    push_log_with_observers(
+                        &ctx.logs,
+                        Some(&ctx.observers),
+                        "info",
+                        "ws",
+                        &result_ack_breadcrumb("completion", &job_id),
+                        Some(job_id),
+                    );
+                }
+                WorkerOutbound::FailAck { job_id } => {
+                    push_log_with_observers(
+                        &ctx.logs,
+                        Some(&ctx.observers),
+                        "info",
+                        "ws",
+                        &result_ack_breadcrumb("failure", &job_id),
+                        Some(job_id),
+                    );
+                }
+                WorkerOutbound::HeartbeatAck => {
+                    // Heartbeat acks fire every ~5s; logging each would
+                    // flood the operator log with no diagnostic value
+                    // (a genuinely missed ack already surfaces via the
+                    // read-idle timeout + reconnect breadcrumb).
                 }
             },
         }
@@ -1174,6 +1195,26 @@ fn offer_received_breadcrumb(
     )
 }
 
+/// Operator-facing breadcrumb for the studio's `CompleteAck` /
+/// `FailAck` frames.
+///
+/// The studio sends one of these the moment it has persisted a job's
+/// result (the binary landed in R2, or the `completeJson` / `Fail`
+/// frame updated the row). Both used to be silently dropped on the
+/// "acks are best-effort; ignore" arm, so the worker's own
+/// "binary upload ok" / completeJson breadcrumb was the last word on a
+/// job: an operator triaging a job that ran twice (worker reported
+/// done, studio never persisted, the job timed out + requeued) had no
+/// signal telling them whether the studio ever acknowledged the
+/// result. Surfacing the ack closes the job lifecycle in the UI's Logs
+/// tab and the studio-shipped log view. `HeartbeatAck` stays unlogged:
+/// it fires every ~5s and a genuinely missed ack already surfaces via
+/// the read-idle timeout + reconnect breadcrumb. Pure so the wording is
+/// unit-tested without a live ack.
+fn result_ack_breadcrumb(outcome: &str, job_id: &str) -> String {
+    format!("studio confirmed {outcome} of job {job_id}")
+}
+
 /// Decide whether a just-attempted offer-response send (accept /
 /// reject) warrants a session-level breadcrumb.
 ///
@@ -1537,5 +1578,26 @@ mod tests {
             "expected the model, got: {line}"
         );
         assert!(line.contains("vram=12.5"), "expected the vram, got: {line}");
+    }
+
+    #[test]
+    fn result_ack_breadcrumb_names_the_outcome_and_job() {
+        // The studio sends `CompleteAck` / `FailAck` the moment it has
+        // persisted a job's result; both used to be silently dropped on
+        // the "acks are best-effort; ignore" arm, so the worker's own
+        // "binary upload ok" / completeJson line was the last word on a
+        // job. An operator triaging a job that ran twice (worker
+        // reported done, studio never persisted, job requeued) had no
+        // signal telling them whether the studio acknowledged the
+        // result. The breadcrumb must name both the outcome and the
+        // offending job id.
+        assert_eq!(
+            result_ack_breadcrumb("completion", "j-1"),
+            "studio confirmed completion of job j-1"
+        );
+        assert_eq!(
+            result_ack_breadcrumb("failure", "j-2"),
+            "studio confirmed failure of job j-2"
+        );
     }
 }
