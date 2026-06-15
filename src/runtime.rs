@@ -367,8 +367,18 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     });
 
     // Block on auto-register until the operator approves (or rejects).
-    // Polls every 30s; aborts on Ctrl-C.
-    ensure_registered(&cfg, &path, &registration, &stop).await?;
+    // Polls every 30s; aborts on Ctrl-C.  A stop signal that arrives
+    // before approval is a clean shutdown (the pre-approval wait is the
+    // normal state of a fresh worker), so exit Ok rather than letting
+    // `run_cli` log it at error and exit non-zero.
+    if ensure_registered(&cfg, &path, &registration, &stop).await? == RegistrationGate::Stopped {
+        info!(
+            target: TRACE_TARGET,
+            op = "shutdown",
+            "stopped before registration completed; exiting cleanly"
+        );
+        return Ok(());
+    }
 
     run_loops(
         cfg,
@@ -443,28 +453,53 @@ async fn wait_for_shutdown_signal() -> &'static str {
     }
 }
 
+/// Outcome of the startup registration gate ([`ensure_registered`]).
+///
+/// A clean stop signal (Ctrl-C / SIGTERM) that arrives **before** the
+/// studio approves the worker is a routine shutdown, not a failure:
+/// the pre-approval wait is the normal state of a freshly-installed
+/// worker sitting in the studio's approval queue.  Surfacing it as a
+/// distinct [`Stopped`](RegistrationGate::Stopped) outcome lets `run`
+/// exit 0 — so `systemctl stop` doesn't mark the unit failed — and
+/// skip the top-level `tracing::error!` that would otherwise ship a
+/// spurious Sentry event on every clean stop of an unapproved worker.
+/// An operator *rejection*, by contrast, stays a hard `Err`: it's a
+/// terminal state the operator must act on (`register --reset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationGate {
+    /// The worker is registered (already, or just approved); proceed
+    /// to open the WS session.
+    Ready,
+    /// A stop signal arrived before approval; shut down cleanly.
+    Stopped,
+}
+
 /// Loop auto_register::tick on a 30s cadence until `worker_id` +
-/// `auth_token` are populated (Approved) or the operator rejects.
+/// `auth_token` are populated (Approved → [`RegistrationGate::Ready`]),
+/// a stop signal arrives (→ [`RegistrationGate::Stopped`]), or the
+/// operator rejects the worker (→ `Err` with recovery guidance).
 pub async fn ensure_registered(
     cfg: &SharedConfig,
     path: &std::path::Path,
     registration: &crate::auto_register::SharedRegistration,
     stop: &Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<RegistrationGate> {
     use std::time::Duration;
     loop {
         if stop.load(Ordering::SeqCst) {
-            return Err(anyhow!("shutdown before registration completed"));
+            return Ok(RegistrationGate::Stopped);
         }
         {
             let snap = cfg.lock();
             if snap.worker_id.is_some() && snap.auth_token.is_some() {
-                return Ok(());
+                return Ok(RegistrationGate::Ready);
             }
         }
         let state = crate::auto_register::tick(cfg, path, registration).await;
         match state {
-            crate::auto_register::RegistrationState::Approved => return Ok(()),
+            crate::auto_register::RegistrationState::Approved => {
+                return Ok(RegistrationGate::Ready)
+            }
             crate::auto_register::RegistrationState::Rejected { reason } => {
                 return Err(anyhow!(
                     "registration rejected by the studio operator: {reason}.  \
@@ -477,7 +512,7 @@ pub async fn ensure_registered(
         // Sleep with a fast-cancel on stop.
         for _ in 0..30 {
             if stop.load(Ordering::SeqCst) {
-                return Err(anyhow!("shutdown during registration wait"));
+                return Ok(RegistrationGate::Stopped);
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
