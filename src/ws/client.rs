@@ -297,17 +297,12 @@ pub struct WsSender {
 
 impl WsSender {
     pub async fn send(&self, frame: &WorkerInbound) -> WsResult<()> {
-        let text = serde_json::to_string(frame).map_err(|e| {
-            let err = WsClientError::Protocol(e.to_string());
-            log_send_error(frame, &err);
-            err
-        })?;
+        let text = serialize_frame(frame)?;
         let mut guard = self.sink.lock().await;
-        guard.send(Message::Text(text.into())).await.map_err(|e| {
-            let err = WsClientError::from(e);
-            log_send_error(frame, &err);
-            err
-        })
+        guard
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|e| map_send_failure(frame, e))
     }
 
     pub async fn close(&self, code: u16, reason: &str) -> WsResult<()> {
@@ -342,23 +337,7 @@ impl WsReceiver {
     /// `WsClient::recv` — silent close → `Ok(None)`, close frame with
     /// 4001 → `AuthFailed`, other closes → `ConnectionClosed`.
     pub async fn recv(&mut self) -> WsResult<Option<WorkerOutbound>> {
-        if self.closed {
-            return Ok(None);
-        }
-        while let Some(item) = self.source.next().await {
-            match classify_incoming(item) {
-                RecvStep::Yield(frame) => return Ok(Some(frame)),
-                RecvStep::Skip => continue,
-                RecvStep::Fail(e) => return Err(e),
-                RecvStep::Closed(e) => {
-                    self.closed = true;
-                    return Err(e);
-                }
-            }
-        }
-        self.closed = true;
-        debug!(target: TRACE_TARGET, op = "recv", "stream ended (no close frame)");
-        Ok(None)
+        recv_next(&mut self.source, &mut self.closed).await
     }
 }
 
@@ -373,19 +352,11 @@ impl std::fmt::Debug for WsClient {
 impl WsClient {
     /// Send a typed inbound frame as a JSON text frame.
     pub async fn send(&mut self, frame: &WorkerInbound) -> WsResult<()> {
-        let text = serde_json::to_string(frame).map_err(|e| {
-            let err = WsClientError::Protocol(e.to_string());
-            log_send_error(frame, &err);
-            err
-        })?;
+        let text = serialize_frame(frame)?;
         self.sink
             .send(Message::Text(text.into()))
             .await
-            .map_err(|e| {
-                let err = WsClientError::from(e);
-                log_send_error(frame, &err);
-                err
-            })
+            .map_err(|e| map_send_failure(frame, e))
     }
 
     /// Receive the next typed outbound frame.  Returns `Ok(None)` on
@@ -393,23 +364,7 @@ impl WsClient {
     /// failures, or `Ok(Some(frame))` for normal traffic.  Pings and
     /// other control frames are swallowed silently.
     pub async fn recv(&mut self) -> WsResult<Option<WorkerOutbound>> {
-        if self.closed {
-            return Ok(None);
-        }
-        while let Some(item) = self.source.next().await {
-            match classify_incoming(item) {
-                RecvStep::Yield(frame) => return Ok(Some(frame)),
-                RecvStep::Skip => continue,
-                RecvStep::Fail(e) => return Err(e),
-                RecvStep::Closed(e) => {
-                    self.closed = true;
-                    return Err(e);
-                }
-            }
-        }
-        self.closed = true;
-        debug!(target: TRACE_TARGET, op = "recv", "stream ended (no close frame)");
-        Ok(None)
+        recv_next(&mut self.source, &mut self.closed).await
     }
 
     /// Best-effort graceful close.  Idempotent.
@@ -466,9 +421,58 @@ fn log_send_error(frame: &WorkerInbound, err: &WsClientError) {
     );
 }
 
+/// Serialise an inbound frame to its JSON wire form, mapping (and
+/// logging) a serialisation failure to a `Protocol` error.  Shared by
+/// `WsSender::send` and `WsClient::send` so the split and monolithic
+/// send paths can't drift in how they encode a frame or report a
+/// failure.
+fn serialize_frame(frame: &WorkerInbound) -> WsResult<String> {
+    serde_json::to_string(frame).map_err(|e| {
+        let err = WsClientError::Protocol(e.to_string());
+        log_send_error(frame, &err);
+        err
+    })
+}
+
+/// Map a sink-level send failure to a logged `WsClientError`.  Shared by
+/// both send paths so a dropped frame always leaves the same breadcrumb.
+fn map_send_failure(frame: &WorkerInbound, e: TError) -> WsClientError {
+    let err = WsClientError::from(e);
+    log_send_error(frame, &err);
+    err
+}
+
+/// The shared `recv` loop body for both the split `WsReceiver` and the
+/// monolithic `WsClient`.  Pulls the next application frame off
+/// `source`, routing every raw message through [`classify_incoming`] so
+/// error / close handling (and its logging) lives in exactly one place.
+/// Latches `*closed` once the stream ends or the server sends a close
+/// frame, matching `recv`'s idempotent-after-close contract.
+async fn recv_next(source: &mut WsSource, closed: &mut bool) -> WsResult<Option<WorkerOutbound>> {
+    if *closed {
+        return Ok(None);
+    }
+    while let Some(item) = source.next().await {
+        match classify_incoming(item) {
+            RecvStep::Yield(frame) => return Ok(Some(frame)),
+            RecvStep::Skip => continue,
+            RecvStep::Fail(e) => return Err(e),
+            RecvStep::Closed(e) => {
+                *closed = true;
+                return Err(e);
+            }
+        }
+    }
+    *closed = true;
+    debug!(target: TRACE_TARGET, op = "recv", "stream ended (no close frame)");
+    Ok(None)
+}
+
 /// Interpretation of a single raw WS message during `recv`.  Splitting
-/// this out keeps the two `recv` loops (split + non-split) identical
-/// and routes every error / close through one logging site.
+/// this out routes every error / close through one logging site
+/// ([`classify_incoming`]); the loop scaffolding around it is shared via
+/// [`recv_next`], so the split and monolithic receive paths are one
+/// implementation.
 enum RecvStep {
     /// Decoded application frame to hand back to the caller.
     Yield(WorkerOutbound),
@@ -868,6 +872,19 @@ mod tests {
             logs.contains("frame=\"accept\""),
             "expected frame label: {logs}"
         );
+    }
+
+    #[test]
+    fn serialize_frame_encodes_camel_case_wire_json() {
+        // Both `WsSender::send` and `WsClient::send` route through
+        // `serialize_frame`, so the on-the-wire encoding can't drift
+        // between the split and monolithic send paths. Pin the wire
+        // shape for a representative frame.
+        let json = serialize_frame(&WorkerInbound::Accept {
+            job_id: "j-9".into(),
+        })
+        .expect("a well-formed frame must serialise");
+        assert_eq!(json, r#"{"type":"accept","jobId":"j-9"}"#);
     }
 
     #[tokio::test]
