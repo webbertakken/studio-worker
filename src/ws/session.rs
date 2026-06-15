@@ -7,7 +7,7 @@
 //!
 //! Reconnect policy: on a transport error or non-auth close, back off
 //! `BASE_BACKOFF_MS * 2^attempt` and try again, up to
-//! `cfg.ws_reconnect_attempts`.  Out of retries \u2192 return `Err` and the
+//! `cfg.ws_reconnect_attempts`.  Out of retries → return `Err` and the
 //! systemd / launchd unit restarts the binary.
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -66,7 +66,7 @@ pub enum SessionOutcome {
     Fatal(String),
 }
 
-/// Tunables for the session loop \u2014 dialed down in tests.
+/// Tunables for the session loop — dialed down in tests.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionSchedule {
     pub heartbeat: Duration,

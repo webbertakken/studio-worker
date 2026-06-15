@@ -99,7 +99,7 @@ match source.engine {
 }
 ```
 
-\u2026and forwards to the matching sub-engine.  See
+…and forwards to the matching sub-engine.  See
 [`docs/engines/sdcpp.md`](../engines/sdcpp.md) for what `sd-cpp`
 actually does with the source (download, cache, invoke `sd-cli`).
 
@@ -107,7 +107,7 @@ If the offer arrives **without** a `modelSource` (legacy rows queued
 before migration `0015`, or a new engine the studio hasn't taught yet),
 sdcpp `dispatch_with_source` bails with a clear error message; the
 worker reports the fail and the job lands in terminal `failed`
-status.  This is by design \u2014 we'd rather surface "the studio's
+status.  This is by design — we'd rather surface "the studio's
 registry doesn't have this model" than silently fall back to
 synthetic and upload placeholder bytes.
 
@@ -127,7 +127,7 @@ richer.
    into the studio UI / promote with.
 2. Verify each `url` resolves to a public HF / GitHub asset
    (`curl -I` should return `200` or `302` without auth).
-3. No worker rebuild and no deploy needed \u2014 the worker reads the
+3. No worker rebuild and no deploy needed — the worker reads the
    entry off every offer.
 
 If a brand-new **engine** is needed (e.g. a Whisper-based STT

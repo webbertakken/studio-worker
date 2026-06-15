@@ -5,7 +5,7 @@
 //! need: an engine identifier (`sd-cpp`), the list of files to
 //! download (diffusion-model + text-encoder + VAE, each with a public
 //! URL + filename), and CLI defaults (cfg-scale, steps, dimensions).
-//! The worker has zero hardcoded model knowledge \u2014 it caches
+//! The worker has zero hardcoded model knowledge — it caches
 //! whatever the studio asks for under `cfg.models_root` and invokes
 //! `sd-cli` with the files arranged by role.
 //!
@@ -13,7 +13,7 @@
 //! ```text
 //! ~/models/<filename1>
 //! ~/models/<filename2>
-//! \u2026
+//! …
 //! ```
 //! Files are downloaded on first use - skipped when already present
 //! under `cfg.models_root`.  The streamed body is checked against the
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, ModelFileRole::DiffusionModel);
         assert_eq!(resolved[0].1, cached);
-        // Untouched on disk \u2014 our "download" never ran.
+        // Untouched on disk — our "download" never ran.
         assert_eq!(std::fs::read(&cached).unwrap(), b"already here");
     }
 

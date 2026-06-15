@@ -34,8 +34,8 @@ worker fetches the right one on demand anyway.
 Upstream releases live at
 <https://github.com/leejet/stable-diffusion.cpp/releases/latest>.
 There is **no Linux CUDA pre-build** (only Vulkan / ROCm / CPU /
-Windows-CUDA).  On NVIDIA the Vulkan build works perfectly \u2014 we
-verified Z-Image-Turbo at 1024\u00d71024 / 8 steps in ~5-9 s on an
+Windows-CUDA).  On NVIDIA the Vulkan build works perfectly — we
+verified Z-Image-Turbo at 1024×1024 / 8 steps in ~5-9 s on an
 RTX 4090.  If you need every last drop of perf you can compile sd.cpp
 from source against CUDA, but Vulkan is the unattended default.
 
@@ -49,10 +49,10 @@ from source against CUDA, but Vulkan is the unattended default.
 
 The zip ships three files:
 
-- `sd-cli` \u2014 the CLI we invoke per job
-- `sd-server` \u2014 long-running HTTP server (we don't use it today,
+- `sd-cli` — the CLI we invoke per job
+- `sd-server` — long-running HTTP server (we don't use it today,
   but it's a likely future optimisation)
-- `libstable-diffusion.so` \u2014 shared library both binaries dynlink
+- `libstable-diffusion.so` — shared library both binaries dynlink
 
 ## Install layout
 
@@ -64,8 +64,8 @@ We expect:
   sd-server
   libstable-diffusion.so
 ~/.local/bin/
-  sd-cli       \u2192 wrapper script that exports LD_LIBRARY_PATH
-  sd-server    \u2192 same
+  sd-cli       → wrapper script that exports LD_LIBRARY_PATH
+  sd-server    → same
 ```
 
 The wrapper script keeps the actual binaries next to their .so and
@@ -172,6 +172,6 @@ loader is missing.  `apt install vulkan-tools libvulkan1` on Ubuntu;
 
 ## See also
 
-- [`docs/engines/sdcpp.md`](../engines/sdcpp.md) \u2014 the worker engine that drives this binary
-- [`docs/runtime/model-source.md`](../runtime/model-source.md) \u2014 where the model files come from
+- [`docs/engines/sdcpp.md`](../engines/sdcpp.md) — the worker engine that drives this binary
+- [`docs/runtime/model-source.md`](../runtime/model-source.md) — where the model files come from
 - Z-Image-Turbo author's `4GB VRAM` guide: <https://github.com/leejet/stable-diffusion.cpp/wiki/How-to-Use-Z-Image-on-a-GPU-with-Only-4GB-VRAM>

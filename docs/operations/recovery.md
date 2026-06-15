@@ -1,7 +1,7 @@
 # Job-state recovery playbook
 
 How to reset stuck / mis-completed / failed jobs in the studio's
-production D1 so the worker re-processes them.  Cross-repo \u2014 the
+production D1 so the worker re-processes them.  Cross-repo — the
 SQL lives in the studio's D1, the worker just picks the resets up
 on the next Offer.
 
@@ -41,7 +41,7 @@ worker is no longer in flight.  The DO's heartbeat-sweep should
 catch these eventually but only if the WS session is still alive
 (stale-heartbeat timeout kicks the session, releases the claim).
 After a worker restart the in-memory state is rebuilt from
-hibernation attachments \u2014 a row claimed by a session that's gone
+hibernation attachments — a row claimed by a session that's gone
 stays claimed.
 
 Reset everything claimed by a specific worker that's been
@@ -89,7 +89,7 @@ yarn dlx wrangler d1 execute STUDIO_DB --env production --remote \
 ```
 
 Keep the modelSource JSON in sync with
-`apps/studio/src/worker/modules/graphics/modelRegistry.ts` \u2014 a
+`apps/studio/src/worker/modules/graphics/modelRegistry.ts` — a
 mismatch causes "downloaded a file that doesn't match what sd-cli
 expects" errors.
 
@@ -118,13 +118,13 @@ that).
 - D1 batch UPDATEs are atomic per transaction.  The wrangler
   `--file=...` mode runs the SQL as one batch.
 - Be careful with the `WHERE` clause when targeting `status='done'`
-  rows \u2014 a typo can re-queue thousands of correctly-generated
+  rows — a typo can re-queue thousands of correctly-generated
   assets.  Always count first.
 - The `notifyJobCreated` DO RPC is **not** triggered by a raw D1
-  UPDATE \u2014 the studio's WorkerConnections DO won't immediately
+  UPDATE — the studio's WorkerConnections DO won't immediately
   notice the reset rows.  But: a connected worker's next
   `notifyJobCompleted` (after finishing its current job) calls
-  `offerNextFor`, which queries D1 fresh \u2014 it'll pick up the
+  `offerNextFor`, which queries D1 fresh — it'll pick up the
   reset rows then.  In practice this means resets land within
   seconds of the next completion.
 
@@ -133,7 +133,7 @@ that).
 The WorkerConnections DO keeps an in-memory session map AND
 persists each session's attachment onto the WebSocket itself.
 After hibernation, `getStore()` rebuilds the map from
-`state.getWebSockets()`.  A D1 UPDATE doesn't touch any of this \u2014
+`state.getWebSockets()`.  A D1 UPDATE doesn't touch any of this —
 session.currentJob is in-memory only, and currentJobId on the
 studioWorkers row is updated by heartbeats.  If you reset a job
 that a session thinks it's still working on, the next
@@ -142,5 +142,5 @@ the OTHER job it's actually serving) reconciles.
 
 ## See also
 
-- [`docs/runtime/model-source.md`](../runtime/model-source.md) \u2014 the JSON shape you're writing into the modelSource column
-- [`LESSONS_LEARNED.md`](../../LESSONS_LEARNED.md) \u2014 why we're recovering from synthetic-bad runs in the first place
+- [`docs/runtime/model-source.md`](../runtime/model-source.md) — the JSON shape you're writing into the modelSource column
+- [`LESSONS_LEARNED.md`](../../LESSONS_LEARNED.md) — why we're recovering from synthetic-bad runs in the first place

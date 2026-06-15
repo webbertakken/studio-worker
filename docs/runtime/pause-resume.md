@@ -2,7 +2,7 @@
 
 Runtime-only operator toggle that tells the worker to stop accepting
 new jobs without disconnecting from the studio.  Replaces the legacy
-`auto_enabled` persisted config field \u2014 see
+`auto_enabled` persisted config field — see
 [`docs/architecture/overview.md`](../architecture/overview.md#config--persisted-state)
 for the rest of the config simplification.
 
@@ -14,7 +14,7 @@ let paused: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
 Owned by [`runtime::run`](../../src/runtime.rs) (headless) and
 [`ui::run`](../../src/ui/mod.rs) (egui), passed down into
-`run_loops` \u2192 `spawn_ws_session` \u2192 `SessionContext.paused`.  Cheap
+`run_loops` → `spawn_ws_session` → `SessionContext.paused`.  Cheap
 clone (it's an `Arc`).
 
 ## Semantics
@@ -33,14 +33,14 @@ clone (it's an `Arc`).
   flag and the next heartbeat the studio acts on), the session sends
   `Reject { jobId, reason: "worker paused by operator" }` and the
   studio requeues.
-- The current in-flight job (if any) is **not** interrupted \u2014
+- The current in-flight job (if any) is **not** interrupted —
   pausing only affects acceptance of new work.
 
 The flag is **runtime-only** by design.  No persistence to
 `config.toml`; no resurrection across restarts; a service-managed
 worker that gets restarted by systemd comes back unpaused.  The
 operator can re-pause from the UI or by `studio-worker pause`
-(future \u2014 not yet a CLI subcommand).
+(future — not yet a CLI subcommand).
 
 ## Where the flag flips
 
@@ -63,10 +63,10 @@ operator can re-pause from the UI or by `studio-worker pause`
 
 The persisted `auto_enabled` field had two problems:
 
-1. **Surface confusion** \u2014 it was both an operator-facing setting
+1. **Surface confusion** — it was both an operator-facing setting
    (in the Config tab) AND a runtime decision (read by the
    dispatcher).  Editing it required a worker restart in practice.
-2. **Restart semantics** \u2014 a service-restart should always come
+2. **Restart semantics** — a service-restart should always come
    back willing to take work.  A persisted `auto_enabled=false`
    silently kept the worker idle indefinitely.
 
