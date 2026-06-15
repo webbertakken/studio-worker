@@ -99,17 +99,28 @@ pub fn launch_sync_action(auto_start: bool, currently_enabled: bool) -> Autostar
 // Public API — dispatches to the per-OS backend.
 // ---------------------------------------------------------------------------
 
+// The three public entry points below are pure platform-dispatch shims
+// over the per-OS `backend`.  They are only ever called from the
+// `ui`-gated launch/config sync (`ui::mod`, `ui::tabs::config`), so the
+// `--no-default-features` coverage build never reaches them; the logic
+// they forward to is the unit-tested `*_at` seams plus `autostart_path`.
+// Exclude them from the coverage number rather than leave permanent
+// misses for code the measured build cannot exercise.
+
 /// Whether autostart-on-login is currently enabled.
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub fn is_enabled() -> bool {
     backend::is_enabled()
 }
 
 /// Enable autostart-on-login for `exe`.
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub fn enable(exe: &Path) -> Result<()> {
     backend::enable(exe)
 }
 
 /// Disable autostart-on-login (idempotent).
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub fn disable() -> Result<()> {
     backend::disable()
 }
@@ -129,10 +140,19 @@ mod backend {
         is_enabled_at(autostart_path().ok().as_deref())
     }
 
+    // `enable`/`disable` bind the real `autostart_path()` (which reads
+    // `$HOME`) to the unit-tested `enable_at`/`disable_at` seams.  They
+    // are only reached via the `ui`-gated public dispatch above, so the
+    // `--no-default-features` coverage build can't exercise them, and a
+    // direct test would write to the operator's real
+    // `~/.config/autostart`.  `is_enabled` stays measured: the Linux
+    // mirror test drives it read-only.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn enable(exe: &Path) -> Result<()> {
         enable_at(&autostart_path()?, exe)
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn disable() -> Result<()> {
         disable_at(&autostart_path()?)
     }
