@@ -572,9 +572,12 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         Some(&ctx.observers),
         "info",
         "ws",
-        &format!(
-            "offer received {job_id} model={} vram={}",
-            claim.model, claim.vram_gb_estimate
+        &offer_received_breadcrumb(
+            &job_id,
+            &claim.game_id,
+            &claim.asset_name,
+            &claim.model,
+            claim.vram_gb_estimate,
         ),
         Some(job_id.clone()),
     );
@@ -1128,6 +1131,28 @@ fn reconnect_breadcrumb(error: Option<&anyhow::Error>, attempt: u32, backoff: Du
     }
 }
 
+/// Operator-facing breadcrumb summarising an incoming job offer.
+///
+/// The studio populates `game_id` + `asset_name` on every offer, but
+/// they used to be deserialised and dropped — the line only named the
+/// model + vram estimate, so a worker fielding offers across many games
+/// gave no clue which game / asset each job served. Surfacing both
+/// (data already on the wire) lets operators triage "which game's jobs
+/// are failing on this box" straight from the UI's Logs tab and the
+/// studio-shipped log view. Pure so the wording is unit-tested without
+/// a live offer.
+fn offer_received_breadcrumb(
+    job_id: &str,
+    game_id: &str,
+    asset_name: &str,
+    model: &str,
+    vram_gb_estimate: f32,
+) -> String {
+    format!(
+        "offer received {job_id} game={game_id} asset={asset_name} model={model} vram={vram_gb_estimate}"
+    )
+}
+
 /// Decide whether a just-attempted offer-response send (accept /
 /// reject) warrants a session-level breadcrumb.
 ///
@@ -1439,5 +1464,38 @@ mod tests {
             resumed.contains("resumed by operator"),
             "expected a resume message, got: {resumed}"
         );
+    }
+
+    #[test]
+    fn offer_received_breadcrumb_names_game_and_asset() {
+        // The studio sends `game_id` + `asset_name` on every offer; both
+        // used to be deserialised and dropped, so an operator fielding
+        // offers across many games couldn't tell which game / asset each
+        // job served. The breadcrumb must surface both alongside the
+        // model + vram estimate it already reported.
+        let line = offer_received_breadcrumb(
+            "j-1",
+            "game-of-elements",
+            "game-of-elements/creatures/aurora-fox",
+            "sd-cpp:flux",
+            12.5,
+        );
+        assert!(
+            line.contains("offer received j-1"),
+            "expected the job id, got: {line}"
+        );
+        assert!(
+            line.contains("game=game-of-elements"),
+            "expected the game id, got: {line}"
+        );
+        assert!(
+            line.contains("asset=game-of-elements/creatures/aurora-fox"),
+            "expected the asset name, got: {line}"
+        );
+        assert!(
+            line.contains("model=sd-cpp:flux"),
+            "expected the model, got: {line}"
+        );
+        assert!(line.contains("vram=12.5"), "expected the vram, got: {line}");
     }
 }
