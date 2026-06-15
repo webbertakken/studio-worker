@@ -98,12 +98,46 @@ pub fn check(feed_url: &str, current: &Version, prerelease_ok: bool) -> Result<C
 /// Pure decision function so we can unit-test the prerelease/draft
 /// filters without going through HTTP.
 pub fn decide(releases: &[GithubRelease], current: &Version, prerelease_ok: bool) -> CheckOutcome {
+    // Count both the candidates that yielded a version and the ones that
+    // didn't.  A non-draft, non-prerelease release whose tag fails to
+    // parse is still dropped from the decision (unchanged behaviour) but
+    // warn-logged with its tag and tallied in `dropped`, so a tag-format
+    // drift that silently strands every worker on an old build leaves a
+    // breadcrumb instead of looking exactly like "already up to date".
+    // Drafts / opted-out prereleases are filtered *before* the parse step,
+    // so a garbage tag on one of those is an intentional exclusion, not a
+    // lost candidate.
+    let mut dropped: u32 = 0;
+    let mut candidates: u32 = 0;
     let latest = releases
         .iter()
         .filter(|r| !r.draft)
         .filter(|r| prerelease_ok || !r.prerelease)
-        .filter_map(|r| parse_tag(&r.tag_name))
+        .filter_map(|r| match parse_tag(&r.tag_name) {
+            Some(v) => {
+                candidates += 1;
+                Some(v)
+            }
+            None => {
+                dropped += 1;
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "decide",
+                    tag = %r.tag_name,
+                    "release tag did not parse as a version; dropping it from the update check"
+                );
+                None
+            }
+        })
         .max();
+    debug!(
+        target: TRACE_TARGET,
+        op = "decide",
+        candidates,
+        dropped,
+        latest = latest.as_ref().map(ToString::to_string),
+        "evaluated release feed for a newer version"
+    );
     match latest {
         Some(v) if v > *current => CheckOutcome::NewerAvailable {
             current: current.clone(),
@@ -821,6 +855,78 @@ mod tests {
             }
             _ => panic!("expected newer"),
         }
+    }
+
+    #[test]
+    fn decide_warns_on_each_unparseable_candidate_tag() {
+        // A non-draft, non-prerelease release whose tag can't be parsed
+        // as a version is dropped from the update check (preserving the
+        // existing behaviour) but warn-logged with the offending tag, so
+        // a tag-format drift that silently strands the worker on an old
+        // build leaves a breadcrumb instead of vanishing without a trace.
+        let logs = crate::test_support::capture(|| {
+            let releases = vec![
+                rel("totally-not-a-version", false, false, true),
+                rel("studio-worker-v0.1.0", false, false, true),
+            ];
+            let _ = decide(&releases, &Version::new(0, 0, 1), false);
+        });
+        assert!(
+            logs.contains("studio_worker::update"),
+            "expected update target, got: {logs}"
+        );
+        assert!(logs.contains("WARN"), "expected WARN level, got: {logs}");
+        assert!(
+            logs.contains("totally-not-a-version"),
+            "expected the offending tag in the warn, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn decide_breadcrumb_reports_dropped_count() {
+        // The decision breadcrumb carries the number of candidate tags
+        // dropped so a feed that under-reports its versions can't pass
+        // for a fully-evaluated one.
+        let logs = crate::test_support::capture(|| {
+            let releases = vec![
+                rel("garbage", false, false, true),
+                rel("also-bad", false, false, true),
+                rel("studio-worker-v0.2.0", false, false, true),
+            ];
+            let _ = decide(&releases, &Version::new(0, 1, 0), false);
+        });
+        assert!(
+            logs.contains("dropped=2"),
+            "expected dropped=2 in the breadcrumb, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn decide_does_not_count_filtered_out_releases_as_dropped() {
+        // Drafts and (when not opted in) prereleases are intentionally
+        // excluded before the parse step, so an unparseable tag on one of
+        // those is not a lost candidate and must not be warn-logged or
+        // counted as dropped.
+        let logs = crate::test_support::capture(|| {
+            let releases = vec![
+                rel("draft-garbage", false, true, true),
+                rel("prerelease-garbage", true, false, true),
+                rel("studio-worker-v0.2.0", false, false, true),
+            ];
+            let _ = decide(&releases, &Version::new(0, 1, 0), false);
+        });
+        assert!(
+            logs.contains("dropped=0"),
+            "filtered-out releases must not count as dropped, got: {logs}"
+        );
+        assert!(
+            !logs.contains("draft-garbage"),
+            "a filtered draft must not warn, got: {logs}"
+        );
+        assert!(
+            !logs.contains("prerelease-garbage"),
+            "a filtered prerelease must not warn, got: {logs}"
+        );
     }
 
     #[test]

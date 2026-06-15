@@ -132,18 +132,34 @@ fn detect_vram_gb_via_nvidia_smi() -> Option<f32> {
     }
 }
 
+/// Summed VRAM (MiB) from an `nvidia-smi` memory query plus the count of
+/// GPU lines that were dropped from that total.
+///
+/// `dropped` is the number of non-empty lines whose leading token wasn't
+/// a number — nvidia-smi emits `[N/A]` for `memory.total` when a card has
+/// fallen off the bus, hit an ECC fault, or sits in a MIG state with no
+/// resolvable total.  Carrying the count (rather than silently summing
+/// the survivors) means a multi-GPU box that under-reports its VRAM — and
+/// then refuses jobs it could actually run — leaves a breadcrumb instead
+/// of vanishing the card without a trace.
+struct SmiMemTotal {
+    mib: f64,
+    dropped: u32,
+}
+
 /// Convert the stdout of an `nvidia-smi` memory query to GB and emit the
 /// probe breadcrumb.  Split out from the subprocess plumbing so the
 /// parse + conversion + logging are unit-testable without a real
 /// `nvidia-smi` on the box (CI has none).
 fn vram_gb_from_smi_stdout(stdout: &str) -> Option<f32> {
-    let mib = parse_nvidia_smi_mib(stdout)?;
+    let SmiMemTotal { mib, dropped } = parse_nvidia_smi_mib(stdout)?;
     let vram_gb = (mib / 1024.0) as f32;
     tracing::info!(
         target: "studio_worker::sys",
         op = "probe_vram",
         source = "nvidia_smi",
         vram_gb = vram_gb,
+        dropped = dropped,
         "detected NVIDIA VRAM via nvidia-smi fallback"
     );
     Some(vram_gb)
@@ -153,41 +169,69 @@ fn vram_gb_from_smi_stdout(stdout: &str) -> Option<f32> {
 /// `nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits`.
 /// One line per GPU, each a bare MiB integer (e.g. `24564`).  Tolerates
 /// a trailing unit token (if `nounits` is ever dropped) and ignores
-/// blank / `[N/A]` lines.  Returns `None` when no line yielded a number.
-fn parse_nvidia_smi_mib(stdout: &str) -> Option<f64> {
+/// blank lines.  Every non-empty line that fails to parse (e.g. `[N/A]`)
+/// is warn-logged and counted in [`SmiMemTotal::dropped`] before being
+/// left out of the total.  Returns `None` when no line yielded a number.
+fn parse_nvidia_smi_mib(stdout: &str) -> Option<SmiMemTotal> {
     let mut total: f64 = 0.0;
     let mut any = false;
-    for line in stdout.lines() {
+    let mut dropped: u32 = 0;
+    for (idx, line) in stdout.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(mib) = trimmed
+        match trimmed
             .split_whitespace()
             .next()
             .and_then(|tok| tok.parse::<f64>().ok())
         {
-            total += mib;
-            any = true;
+            Some(mib) => {
+                total += mib;
+                any = true;
+            }
+            None => {
+                dropped += 1;
+                tracing::warn!(
+                    target: "studio_worker::sys",
+                    op = "probe_vram",
+                    source = "nvidia_smi",
+                    line = idx,
+                    content = trimmed,
+                    "nvidia-smi VRAM line did not parse as MiB — dropping this GPU from the total"
+                );
+            }
         }
     }
-    any.then_some(total)
+    any.then_some(SmiMemTotal {
+        mib: total,
+        dropped,
+    })
 }
 
 /// VRAM probe driven by a configurable sysfs root.  Public-in-crate so
 /// the integration tests can exercise both the "missing root" and
 /// "populated root" branches without a real `/proc/driver/nvidia` tree.
 ///
-/// Emits exactly one tracing event per call describing the outcome:
+/// Emits a summary tracing event per call, plus a `WARN` for every GPU
+/// dropped from the total so a multi-GPU box never under-reports its
+/// VRAM silently:
 ///
 /// - `INFO source="no_nvidia_sysfs"` — `root` is not a directory.  This
 ///   is the normal case on CI runners / non-GPU hosts.
 /// - `INFO source="nvidia_sysfs"` — at least one GPU's `information`
-///   file was parseable.  `gpu_count` reflects how many contributed.
+///   file was parseable.  `gpu_count` is how many contributed; `dropped`
+///   is how many were present but unreadable / had no parseable `Video
+///   Memory` line (each of those also gets its own `WARN` naming it).
 /// - `WARN source="sysfs_unparseable"` — directories were present but
-///   no `Video Memory` line was readable (current 5xx drivers dropped
-///   it).  The caller then falls back to `nvidia-smi`; the warn is the
+///   none parseable (current 5xx drivers dropped the `Video Memory`
+///   line).  The caller then falls back to `nvidia-smi`; the warn is the
 ///   breadcrumb that the cheap sysfs path no longer works on this host.
+/// - `WARN source="nvidia_sysfs" reason="no_video_memory_line"|"video_memory_unparseable"|"info_unreadable"`
+///   — a specific GPU was dropped from the total while others survived.
+///   `video_memory_unparseable` means the `Video Memory` line was
+///   present but its value didn't parse (the warn echoes the offending
+///   `content`); `no_video_memory_line` means no such line at all.
 pub fn detect_vram_gb_from_sysfs(root: &Path) -> f32 {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -209,24 +253,67 @@ pub fn detect_vram_gb_from_sysfs(root: &Path) -> f32 {
     let mut parseable: u32 = 0;
     for entry in entries.flatten() {
         gpu_count += 1;
-        let info_path = entry.path().join("information");
-        if let Ok(content) = std::fs::read_to_string(&info_path) {
-            let mut found = false;
-            for line in content.lines() {
-                if let Some(rest) = line.trim().strip_prefix("Video Memory:") {
-                    if let Some(mib) = parse_mib(rest) {
-                        total_mib += mib;
-                        found = true;
+        let gpu_path = entry.path();
+        let info_path = gpu_path.join("information");
+        match std::fs::read_to_string(&info_path) {
+            Ok(content) => {
+                let mut found = false;
+                // A `Video Memory:` line that's present but whose value
+                // can't be parsed (e.g. `N/A` on a driver that stubbed
+                // the field) must be surfaced differently from a GPU
+                // with no such line at all — otherwise the operator is
+                // told the line is missing when it's right there.  Keep
+                // the first offending value to echo in the warn.
+                let mut unparseable: Option<String> = None;
+                for line in content.lines() {
+                    if let Some(rest) = line.trim().strip_prefix("Video Memory:") {
+                        if let Some(mib) = parse_mib(rest) {
+                            total_mib += mib;
+                            found = true;
+                        } else if unparseable.is_none() {
+                            unparseable = Some(rest.trim().to_string());
+                        }
                     }
                 }
+                if found {
+                    parseable += 1;
+                } else if let Some(content) = unparseable {
+                    tracing::warn!(
+                        target: "studio_worker::sys",
+                        op = "probe_vram",
+                        source = "nvidia_sysfs",
+                        reason = "video_memory_unparseable",
+                        gpu = %gpu_path.display(),
+                        content = content.as_str(),
+                        "sysfs GPU Video Memory line did not parse as MiB — dropping it from the total"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "studio_worker::sys",
+                        op = "probe_vram",
+                        source = "nvidia_sysfs",
+                        reason = "no_video_memory_line",
+                        gpu = %gpu_path.display(),
+                        "sysfs GPU has no parseable Video Memory line — dropping it from the total"
+                    );
+                }
             }
-            if found {
-                parseable += 1;
+            Err(e) => {
+                tracing::warn!(
+                    target: "studio_worker::sys",
+                    op = "probe_vram",
+                    source = "nvidia_sysfs",
+                    reason = "info_unreadable",
+                    gpu = %gpu_path.display(),
+                    error = %e,
+                    "could not read a sysfs GPU information file — dropping it from the total"
+                );
             }
         }
     }
 
     let vram_gb = (total_mib / 1024.0) as f32;
+    let dropped = gpu_count.saturating_sub(parseable);
     if parseable > 0 {
         tracing::info!(
             target: "studio_worker::sys",
@@ -234,6 +321,7 @@ pub fn detect_vram_gb_from_sysfs(root: &Path) -> f32 {
             source = "nvidia_sysfs",
             vram_gb = vram_gb,
             gpu_count = parseable,
+            dropped = dropped,
             "detected NVIDIA VRAM via sysfs"
         );
     } else {
@@ -383,6 +471,23 @@ mod tests {
         assert!((gb - 36.0).abs() < 1e-3, "got {gb}");
     }
 
+    #[test]
+    fn detect_vram_gb_from_sysfs_sums_only_survivors_when_one_gpu_is_unreadable() {
+        // A healthy card next to one whose `information` can't be read
+        // (here a *directory* named `information`, so `read_to_string`
+        // fails on every platform): the survivor still totals, the bad
+        // card is dropped from the sum rather than zeroing the host out.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("0000:01:00.0");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join("information"), "Video Memory: 12288 MiB\n").unwrap();
+        let bad = dir.path().join("0000:02:00.0");
+        std::fs::create_dir_all(bad.join("information")).unwrap();
+        // Only the healthy card's 12288 MiB / 1024 = 12 GiB counts.
+        let gb = detect_vram_gb_from_sysfs(dir.path());
+        assert!((gb - 12.0).abs() < 1e-3, "got {gb}");
+    }
+
     // -----------------------------------------------------------------
     // nvidia-smi fallback — current NVIDIA drivers (5xx) dropped the
     // "Video Memory" line from the sysfs `information` file, so the
@@ -393,24 +498,81 @@ mod tests {
 
     #[test]
     fn parse_nvidia_smi_mib_reads_a_single_bare_value() {
-        assert_eq!(parse_nvidia_smi_mib("24564\n"), Some(24564.0));
+        let total = parse_nvidia_smi_mib("24564\n").unwrap();
+        assert_eq!(total.mib, 24564.0);
+        assert_eq!(total.dropped, 0);
     }
 
     #[test]
     fn parse_nvidia_smi_mib_sums_multiple_gpus() {
-        assert_eq!(parse_nvidia_smi_mib("24564\n24564\n"), Some(49128.0));
+        let total = parse_nvidia_smi_mib("24564\n24564\n").unwrap();
+        assert_eq!(total.mib, 49128.0);
+        assert_eq!(total.dropped, 0);
     }
 
     #[test]
     fn parse_nvidia_smi_mib_tolerates_units_and_crlf_whitespace() {
         // If `nounits` is ever dropped the value arrives as "24564 MiB".
-        assert_eq!(parse_nvidia_smi_mib("  24564 MiB \r\n"), Some(24564.0));
+        let total = parse_nvidia_smi_mib("  24564 MiB \r\n").unwrap();
+        assert_eq!(total.mib, 24564.0);
+        assert_eq!(total.dropped, 0);
     }
 
     #[test]
     fn parse_nvidia_smi_mib_returns_none_on_empty_or_na() {
-        assert_eq!(parse_nvidia_smi_mib(""), None);
-        assert_eq!(parse_nvidia_smi_mib("\n[N/A]\n"), None);
+        assert!(parse_nvidia_smi_mib("").is_none());
+        assert!(parse_nvidia_smi_mib("\n[N/A]\n").is_none());
+    }
+
+    #[test]
+    fn parse_nvidia_smi_mib_sums_survivors_and_counts_a_dropped_gpu() {
+        // A healthy 24 GiB card next to one nvidia-smi reports `[N/A]`
+        // for (fell off the bus / ECC fault): the survivor's VRAM still
+        // totals, but the dropped card is counted, not silently lost.
+        let total = parse_nvidia_smi_mib("24564\n[N/A]\n24564\n").unwrap();
+        assert_eq!(total.mib, 49128.0);
+        assert_eq!(total.dropped, 1);
+    }
+
+    #[test]
+    fn parse_nvidia_smi_mib_warns_on_each_dropped_gpu_line() {
+        // A multi-GPU box that under-reports its VRAM (and then refuses
+        // jobs it can run) must leave a per-line breadcrumb naming the
+        // offending value, not vanish the card without a trace.
+        let logs = crate::test_support::capture(|| {
+            let _ = parse_nvidia_smi_mib("24564\n[N/A]\n");
+        });
+        assert!(logs.contains("WARN"), "expected WARN level, got: {logs}");
+        assert!(
+            logs.contains("op=\"probe_vram\""),
+            "expected probe_vram op, got: {logs}"
+        );
+        assert!(
+            logs.contains("source=\"nvidia_smi\""),
+            "expected source=nvidia_smi, got: {logs}"
+        );
+        assert!(
+            logs.contains("[N/A]"),
+            "the warning must name the unparseable value, got: {logs}"
+        );
+        assert!(
+            logs.contains("dropping this GPU"),
+            "the warning must explain the drop, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn vram_gb_from_smi_stdout_reports_dropped_count_in_breadcrumb() {
+        // The success breadcrumb must surface how many GPUs were dropped
+        // so a truncated VRAM total can't pass for a complete one.
+        let logs = crate::test_support::capture(|| {
+            let gb = vram_gb_from_smi_stdout("24564\n[N/A]\n").unwrap();
+            assert!((gb - 23.99).abs() < 0.05, "survivor still totals: {gb}");
+        });
+        assert!(
+            logs.contains("dropped=1"),
+            "the breadcrumb must report the dropped count, got: {logs}"
+        );
     }
 
     #[test]
