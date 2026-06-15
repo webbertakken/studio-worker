@@ -4,17 +4,20 @@
 //! `tests/auto_register_orchestration.rs` covers a single
 //! `auto_register::tick` in isolation.  This file covers the *loop*
 //! layered on top of it: how the gate translates a tick's
-//! `RegistrationState` into a terminal `Result`, short-circuits an
-//! already-registered worker, and aborts cleanly on shutdown instead
-//! of hanging an operator who hits Ctrl-C during a long approval wait.
+//! `RegistrationState` into a terminal `RegistrationGate` /
+//! `Result`, short-circuits an already-registered worker, and shuts
+//! down *cleanly* (not as a fatal error) when an operator hits Ctrl-C
+//! during a long approval wait — the pre-approval wait is the normal
+//! state of a fresh worker, so stopping it then must not error.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use studio_worker::auto_register::RegistrationState;
 use studio_worker::config::{self, Config};
-use studio_worker::runtime;
+use studio_worker::runtime::{self, RegistrationGate};
 use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -54,15 +57,19 @@ async fn returns_ok_immediately_when_already_registered() {
     let observers = Arc::new(Mutex::new(RegistrationState::Pristine));
     let stop = Arc::new(AtomicBool::new(false));
 
-    runtime::ensure_registered(&shared, &path, &observers, &stop)
+    let gate = runtime::ensure_registered(&shared, &path, &observers, &stop)
         .await
         .expect("an already-registered worker must pass the gate");
+    assert_eq!(gate, RegistrationGate::Ready);
 }
 
 #[tokio::test]
-async fn aborts_with_an_error_when_stop_is_set_before_registration() {
+async fn returns_stopped_when_stop_is_set_before_registration() {
     // Operator hit Ctrl-C before approval ever arrived: the gate must
-    // return promptly with a shutdown error rather than loop forever.
+    // return promptly with a *clean* Stopped outcome (not a fatal
+    // error), so `run` exits 0 — `systemctl stop` mustn't see the unit
+    // fail and an unset/unapproved worker mustn't ship a Sentry event
+    // on every routine stop.
     let dir = tempdir().unwrap();
     let cfg = polling_cfg("http://127.0.0.1:1/unreachable");
     let path = write_cfg(&dir, &cfg);
@@ -70,13 +77,45 @@ async fn aborts_with_an_error_when_stop_is_set_before_registration() {
     let observers = Arc::new(Mutex::new(RegistrationState::Pristine));
     let stop = Arc::new(AtomicBool::new(true));
 
-    let err = runtime::ensure_registered(&shared, &path, &observers, &stop)
+    let gate = runtime::ensure_registered(&shared, &path, &observers, &stop)
         .await
-        .expect_err("a pre-set stop flag must abort the gate");
-    assert!(
-        err.to_string().contains("shutdown before registration"),
-        "unexpected abort error: {err}"
-    );
+        .expect("a pre-set stop flag is a clean shutdown, not an error");
+    assert_eq!(gate, RegistrationGate::Stopped);
+}
+
+#[tokio::test]
+async fn returns_stopped_when_stop_is_set_during_the_wait() {
+    // Operator hit Ctrl-C *after* the first poll returned pending but
+    // *before* approval arrived: the gate must observe the stop flag
+    // inside its poll-wait sleep and return the same clean Stopped
+    // outcome as the pre-loop check, never a fatal error.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/graphics/api/workers/register-requests/rr-gate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "pending",
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let cfg = polling_cfg(&server.uri());
+    let path = write_cfg(&dir, &cfg);
+    let shared = Arc::new(Mutex::new(cfg));
+    let observers = Arc::new(Mutex::new(RegistrationState::Pristine));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Flip the stop flag shortly after the gate enters its wait sleep.
+    let stop_flipper = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop_flipper.store(true, Ordering::SeqCst);
+    });
+
+    let gate = runtime::ensure_registered(&shared, &path, &observers, &stop)
+        .await
+        .expect("a clean stop during the wait must not be a fatal error");
+    assert_eq!(gate, RegistrationGate::Stopped);
 }
 
 #[tokio::test]
@@ -141,9 +180,10 @@ async fn passes_the_gate_when_the_studio_approves() {
     let observers = Arc::new(Mutex::new(RegistrationState::Pristine));
     let stop = Arc::new(AtomicBool::new(false));
 
-    runtime::ensure_registered(&shared, &path, &observers, &stop)
+    let gate = runtime::ensure_registered(&shared, &path, &observers, &stop)
         .await
         .expect("approval must pass the gate");
+    assert_eq!(gate, RegistrationGate::Ready);
 
     // The approval is persisted to the shared snapshot so the WS
     // session that follows sees the new credentials without a reload.
