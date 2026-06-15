@@ -304,12 +304,8 @@ impl Engine for WhisperEngine {
 
         state.full(params, &audio).context("whisper full decode")?;
         let segments = state.full_n_segments().unwrap_or(0);
-        let mut text = String::new();
-        for i in 0..segments {
-            if let Ok(s) = state.full_get_segment_text(i) {
-                text.push_str(&s);
-            }
-        }
+        let (text, decode_failures) =
+            collect_segment_text((0..segments).map(|i| state.full_get_segment_text(i)));
         let duration_seconds = audio.len() as f32 / 16_000.0;
         let decode_ms = decode_started.elapsed().as_millis() as u64;
         info!(
@@ -318,6 +314,7 @@ impl Engine for WhisperEngine {
             kind = kind.as_str(),
             model,
             segments,
+            decode_failures,
             audio_seconds = duration_seconds,
             decode_ms,
             "transcription complete"
@@ -330,6 +327,39 @@ impl Engine for WhisperEngine {
         });
         Ok(TaskResult::AudioStt { json })
     }
+}
+
+/// Concatenate decoded whisper segment texts into the transcript.
+///
+/// A segment whose text can't be decoded — whisper.cpp occasionally
+/// emits a partial multi-byte UTF-8 sequence at a segment boundary,
+/// which surfaces as a `WhisperError` from `full_get_segment_text` — is
+/// dropped from the transcript (preserving the existing behaviour) but
+/// counted and warn-logged, so a truncated transcript can never pass
+/// for a complete one and the "transcription complete" breadcrumb
+/// reports the real `decode_failures`.  Generic over the error so it's
+/// unit-testable without a live whisper `State`.
+fn collect_segment_text<E: std::fmt::Display>(
+    segments: impl IntoIterator<Item = Result<String, E>>,
+) -> (String, u32) {
+    let mut text = String::new();
+    let mut decode_failures: u32 = 0;
+    for (index, segment) in segments.into_iter().enumerate() {
+        match segment {
+            Ok(s) => text.push_str(&s),
+            Err(e) => {
+                decode_failures += 1;
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    segment = index,
+                    error = %e,
+                    "whisper segment text decode failed; dropping it from the transcript"
+                );
+            }
+        }
+    }
+    (text, decode_failures)
 }
 
 fn num_cpus_for_decode() -> usize {
@@ -390,6 +420,49 @@ mod tests {
         });
         let err = engine.dispatch("no-such", task).unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn collect_segment_text_concatenates_ok_segments() {
+        let (text, failures) = collect_segment_text(vec![
+            Ok::<_, &str>("hello ".to_string()),
+            Ok("world".to_string()),
+        ]);
+        assert_eq!(text, "hello world");
+        assert_eq!(failures, 0);
+    }
+
+    #[test]
+    fn collect_segment_text_drops_and_counts_failed_segments() {
+        // A segment whose text can't be decoded (whisper.cpp emits a
+        // partial multi-byte UTF-8 sequence at some segment boundaries)
+        // is dropped from the transcript but counted, never silently
+        // lost — so a truncated transcript can't pass for a complete one.
+        let (text, failures) = collect_segment_text(vec![
+            Ok::<_, &str>("kept ".to_string()),
+            Err("invalid utf-8"),
+            Ok("tail".to_string()),
+        ]);
+        assert_eq!(text, "kept tail");
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn collect_segment_text_warns_on_each_decode_failure() {
+        let logs = crate::test_support::capture(|| {
+            let _ = collect_segment_text(vec![Ok::<_, &str>("ok".to_string()), Err("decode boom")]);
+        });
+        assert!(
+            logs.contains("studio_worker::engine::whisper"),
+            "expected whisper target, got: {logs}"
+        );
+        assert!(logs.contains("WARN"), "expected WARN level, got: {logs}");
+        assert!(logs.contains("segment=1"), "expected segment field: {logs}");
+        assert!(logs.contains("decode boom"), "expected error field: {logs}");
+        assert!(
+            logs.contains("dropping it from the transcript"),
+            "expected drop message: {logs}"
+        );
     }
 
     #[test]
