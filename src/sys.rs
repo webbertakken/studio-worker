@@ -132,18 +132,34 @@ fn detect_vram_gb_via_nvidia_smi() -> Option<f32> {
     }
 }
 
+/// Summed VRAM (MiB) from an `nvidia-smi` memory query plus the count of
+/// GPU lines that were dropped from that total.
+///
+/// `dropped` is the number of non-empty lines whose leading token wasn't
+/// a number — nvidia-smi emits `[N/A]` for `memory.total` when a card has
+/// fallen off the bus, hit an ECC fault, or sits in a MIG state with no
+/// resolvable total.  Carrying the count (rather than silently summing
+/// the survivors) means a multi-GPU box that under-reports its VRAM — and
+/// then refuses jobs it could actually run — leaves a breadcrumb instead
+/// of vanishing the card without a trace.
+struct SmiMemTotal {
+    mib: f64,
+    dropped: u32,
+}
+
 /// Convert the stdout of an `nvidia-smi` memory query to GB and emit the
 /// probe breadcrumb.  Split out from the subprocess plumbing so the
 /// parse + conversion + logging are unit-testable without a real
 /// `nvidia-smi` on the box (CI has none).
 fn vram_gb_from_smi_stdout(stdout: &str) -> Option<f32> {
-    let mib = parse_nvidia_smi_mib(stdout)?;
+    let SmiMemTotal { mib, dropped } = parse_nvidia_smi_mib(stdout)?;
     let vram_gb = (mib / 1024.0) as f32;
     tracing::info!(
         target: "studio_worker::sys",
         op = "probe_vram",
         source = "nvidia_smi",
         vram_gb = vram_gb,
+        dropped = dropped,
         "detected NVIDIA VRAM via nvidia-smi fallback"
     );
     Some(vram_gb)
@@ -153,25 +169,44 @@ fn vram_gb_from_smi_stdout(stdout: &str) -> Option<f32> {
 /// `nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits`.
 /// One line per GPU, each a bare MiB integer (e.g. `24564`).  Tolerates
 /// a trailing unit token (if `nounits` is ever dropped) and ignores
-/// blank / `[N/A]` lines.  Returns `None` when no line yielded a number.
-fn parse_nvidia_smi_mib(stdout: &str) -> Option<f64> {
+/// blank lines.  Every non-empty line that fails to parse (e.g. `[N/A]`)
+/// is warn-logged and counted in [`SmiMemTotal::dropped`] before being
+/// left out of the total.  Returns `None` when no line yielded a number.
+fn parse_nvidia_smi_mib(stdout: &str) -> Option<SmiMemTotal> {
     let mut total: f64 = 0.0;
     let mut any = false;
-    for line in stdout.lines() {
+    let mut dropped: u32 = 0;
+    for (idx, line) in stdout.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(mib) = trimmed
+        match trimmed
             .split_whitespace()
             .next()
             .and_then(|tok| tok.parse::<f64>().ok())
         {
-            total += mib;
-            any = true;
+            Some(mib) => {
+                total += mib;
+                any = true;
+            }
+            None => {
+                dropped += 1;
+                tracing::warn!(
+                    target: "studio_worker::sys",
+                    op = "probe_vram",
+                    source = "nvidia_smi",
+                    line = idx,
+                    content = trimmed,
+                    "nvidia-smi VRAM line did not parse as MiB — dropping this GPU from the total"
+                );
+            }
         }
     }
-    any.then_some(total)
+    any.then_some(SmiMemTotal {
+        mib: total,
+        dropped,
+    })
 }
 
 /// VRAM probe driven by a configurable sysfs root.  Public-in-crate so
@@ -393,24 +428,81 @@ mod tests {
 
     #[test]
     fn parse_nvidia_smi_mib_reads_a_single_bare_value() {
-        assert_eq!(parse_nvidia_smi_mib("24564\n"), Some(24564.0));
+        let total = parse_nvidia_smi_mib("24564\n").unwrap();
+        assert_eq!(total.mib, 24564.0);
+        assert_eq!(total.dropped, 0);
     }
 
     #[test]
     fn parse_nvidia_smi_mib_sums_multiple_gpus() {
-        assert_eq!(parse_nvidia_smi_mib("24564\n24564\n"), Some(49128.0));
+        let total = parse_nvidia_smi_mib("24564\n24564\n").unwrap();
+        assert_eq!(total.mib, 49128.0);
+        assert_eq!(total.dropped, 0);
     }
 
     #[test]
     fn parse_nvidia_smi_mib_tolerates_units_and_crlf_whitespace() {
         // If `nounits` is ever dropped the value arrives as "24564 MiB".
-        assert_eq!(parse_nvidia_smi_mib("  24564 MiB \r\n"), Some(24564.0));
+        let total = parse_nvidia_smi_mib("  24564 MiB \r\n").unwrap();
+        assert_eq!(total.mib, 24564.0);
+        assert_eq!(total.dropped, 0);
     }
 
     #[test]
     fn parse_nvidia_smi_mib_returns_none_on_empty_or_na() {
-        assert_eq!(parse_nvidia_smi_mib(""), None);
-        assert_eq!(parse_nvidia_smi_mib("\n[N/A]\n"), None);
+        assert!(parse_nvidia_smi_mib("").is_none());
+        assert!(parse_nvidia_smi_mib("\n[N/A]\n").is_none());
+    }
+
+    #[test]
+    fn parse_nvidia_smi_mib_sums_survivors_and_counts_a_dropped_gpu() {
+        // A healthy 24 GiB card next to one nvidia-smi reports `[N/A]`
+        // for (fell off the bus / ECC fault): the survivor's VRAM still
+        // totals, but the dropped card is counted, not silently lost.
+        let total = parse_nvidia_smi_mib("24564\n[N/A]\n24564\n").unwrap();
+        assert_eq!(total.mib, 49128.0);
+        assert_eq!(total.dropped, 1);
+    }
+
+    #[test]
+    fn parse_nvidia_smi_mib_warns_on_each_dropped_gpu_line() {
+        // A multi-GPU box that under-reports its VRAM (and then refuses
+        // jobs it can run) must leave a per-line breadcrumb naming the
+        // offending value, not vanish the card without a trace.
+        let logs = crate::test_support::capture(|| {
+            let _ = parse_nvidia_smi_mib("24564\n[N/A]\n");
+        });
+        assert!(logs.contains("WARN"), "expected WARN level, got: {logs}");
+        assert!(
+            logs.contains("op=\"probe_vram\""),
+            "expected probe_vram op, got: {logs}"
+        );
+        assert!(
+            logs.contains("source=\"nvidia_smi\""),
+            "expected source=nvidia_smi, got: {logs}"
+        );
+        assert!(
+            logs.contains("[N/A]"),
+            "the warning must name the unparseable value, got: {logs}"
+        );
+        assert!(
+            logs.contains("dropping this GPU"),
+            "the warning must explain the drop, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn vram_gb_from_smi_stdout_reports_dropped_count_in_breadcrumb() {
+        // The success breadcrumb must surface how many GPUs were dropped
+        // so a truncated VRAM total can't pass for a complete one.
+        let logs = crate::test_support::capture(|| {
+            let gb = vram_gb_from_smi_stdout("24564\n[N/A]\n").unwrap();
+            assert!((gb - 23.99).abs() < 0.05, "survivor still totals: {gb}");
+        });
+        assert!(
+            logs.contains("dropped=1"),
+            "the breadcrumb must report the dropped count, got: {logs}"
+        );
     }
 
     #[test]
