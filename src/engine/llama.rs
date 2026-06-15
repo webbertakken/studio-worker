@@ -184,13 +184,44 @@ fn exceeds_context_window(prompt_tokens: usize, max_tokens: u32, n_ctx: u32) -> 
     prompt_tokens.saturating_add(max_tokens as usize) > n_ctx as usize
 }
 
+/// Append a sampled token's decoded text to the running completion.
+///
+/// `llama.cpp`'s `token_to_piece` occasionally fails to decode a token
+/// to UTF-8 text — a partial multi-byte sequence at a token boundary, or
+/// a byte-fallback piece the decoder rejects — which surfaces as an
+/// `Err`.  A failed piece is dropped from the completion (preserving the
+/// existing behaviour) but counted and warn-logged, so a truncated
+/// completion can never pass for a complete one and the "generation
+/// complete" breadcrumb reports the real `decode_failures`.  Generic
+/// over the error so it's unit-testable without a loaded model.
+fn append_piece<E: std::fmt::Display>(
+    out: &mut String,
+    step: usize,
+    piece: std::result::Result<String, E>,
+    decode_failures: &mut u32,
+) {
+    match piece {
+        Ok(s) => out.push_str(&s),
+        Err(e) => {
+            *decode_failures += 1;
+            warn!(
+                target: TRACE_TARGET,
+                op = "generate",
+                step,
+                error = %e,
+                "llama token piece decode failed; dropping it from the completion"
+            );
+        }
+    }
+}
+
 fn run_generation(
     model: &LlamaModel,
     backend: &LlamaBackend,
     prompt: &str,
     max_tokens: u32,
     temperature: f32,
-) -> Result<String> {
+) -> Result<(String, u32)> {
     let ctx_size = NonZeroU32::new(2048).expect("non-zero");
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(Some(ctx_size))
@@ -245,18 +276,22 @@ fn run_generation(
     });
 
     let mut out = String::new();
+    let mut decode_failures: u32 = 0;
     let mut cursor = batch.n_tokens();
     #[allow(clippy::explicit_counter_loop)]
-    for _step in 0..max_tokens {
+    for step in 0..max_tokens {
         let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(new_token);
         if model.is_eog_token(new_token) {
             break;
         }
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        if let Ok(piece) = model.token_to_piece(new_token, &mut decoder, false, None) {
-            out.push_str(&piece);
-        }
+        append_piece(
+            &mut out,
+            step as usize,
+            model.token_to_piece(new_token, &mut decoder, false, None),
+            &mut decode_failures,
+        );
         batch.clear();
         batch
             .add(new_token, cursor, &[0], true)
@@ -264,7 +299,7 @@ fn run_generation(
         cursor += 1;
         ctx.decode(&mut batch).context("decoding token")?;
     }
-    Ok(out)
+    Ok((out, decode_failures))
 }
 
 /// Sentinel the studio's claim filter recognises as "any llama-cpp
@@ -344,7 +379,7 @@ impl LlamaEngine {
             "starting generation"
         );
         let started = Instant::now();
-        let content = run_generation(
+        let (content, decode_failures) = run_generation(
             &loaded,
             &self.backend,
             &prompt,
@@ -370,6 +405,7 @@ impl LlamaEngine {
             model,
             elapsed_ms,
             completion_chars = content.len(),
+            decode_failures,
             "generation complete"
         );
 
@@ -507,6 +543,72 @@ mod tests {
         assert!(rendered.contains("<|user|>"));
         assert!(rendered.contains("hi"));
         assert!(rendered.ends_with("<|assistant|>\n"));
+    }
+
+    // -----------------------------------------------------------------
+    // append_piece — accumulates a sampled token's decoded text into the
+    // running completion.  llama.cpp's `token_to_piece` occasionally
+    // fails to decode a token to UTF-8 text; a failed piece is dropped
+    // from the completion (preserving the existing behaviour) but
+    // counted and warn-logged, so a truncated completion can never pass
+    // for a complete one and the "generation complete" breadcrumb
+    // reports the real decode_failures.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn append_piece_concatenates_ok_pieces() {
+        let mut out = String::new();
+        let mut failures = 0u32;
+        append_piece(&mut out, 0, Ok::<_, &str>("hel".to_string()), &mut failures);
+        append_piece(&mut out, 1, Ok::<_, &str>("lo".to_string()), &mut failures);
+        assert_eq!(out, "hello");
+        assert_eq!(failures, 0);
+    }
+
+    #[test]
+    fn append_piece_drops_and_counts_failed_pieces() {
+        // A token whose text can't be decoded is dropped from the
+        // completion but counted, never silently lost — so a truncated
+        // completion can't pass for a complete one.
+        let mut out = String::new();
+        let mut failures = 0u32;
+        append_piece(
+            &mut out,
+            0,
+            Ok::<_, &str>("kept".to_string()),
+            &mut failures,
+        );
+        append_piece(&mut out, 1, Err("invalid utf-8"), &mut failures);
+        append_piece(
+            &mut out,
+            2,
+            Ok::<_, &str>(" tail".to_string()),
+            &mut failures,
+        );
+        assert_eq!(out, "kept tail");
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn append_piece_warns_on_each_decode_failure() {
+        let logs = crate::test_support::capture(|| {
+            let mut out = String::new();
+            let mut failures = 0u32;
+            append_piece(&mut out, 7, Err("decode boom"), &mut failures);
+        });
+        assert!(
+            logs.contains("studio_worker::engine::llama"),
+            "expected llama target, got: {logs}"
+        );
+        assert!(logs.contains("WARN"), "expected WARN level, got: {logs}");
+        assert!(
+            logs.contains("decode boom"),
+            "expected the underlying error, got: {logs}"
+        );
+        assert!(
+            logs.contains("step=7"),
+            "expected the step index, got: {logs}"
+        );
     }
 
     /// Regression: `global_backend()` once used a bounded spin-wait for
