@@ -26,12 +26,12 @@ A subprocess gets us:
 - Process isolation: a buggy sd-cli OOM kills the subprocess, not
   the worker.
 
-The trade-off is per-job startup overhead.  In practice on a 4090
-running the Vulkan build, model load is ~1s and amortises across
-the steady-state job stream (`sd-cli` loads weights once then
-generates back-to-back in the same process when called repeatedly
-— actually no, each call spawns fresh, so each job pays the load
-cost; see [Performance](#performance) below).
+The trade-off is per-job startup overhead: each `sd-cli` invocation
+spawns fresh and reloads the weights rather than keeping them
+resident across jobs, so every job pays the model-load cost.  In
+practice on a 4090 running the Vulkan build that load is ~1s (see
+[Performance](#performance) below, which also covers the `sd-server`
+amortisation we haven't done yet).
 
 ## Engine registration
 
