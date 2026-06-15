@@ -174,6 +174,62 @@ fn vram_probe_warns_and_counts_a_partially_dropped_gpu() {
 }
 
 // ---------------------------------------------------------------------------
+// detect_vram_gb_from_sysfs — a GPU whose `Video Memory:` line IS present
+// but carries an unparseable value (e.g. `N/A` on a driver that stubbed
+// the field).  This must be distinguished from a GPU with no such line
+// at all: the per-GPU WARN names a `video_memory_unparseable` reason and
+// echoes the offending content, so an operator sees *why* the card was
+// dropped instead of a misleading "no Video Memory line" when the line
+// was right there.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vram_probe_warns_with_content_when_video_memory_line_is_unparseable() {
+    let dir = tempdir().unwrap();
+    let gpu_dir = dir.path().join("0000:03:00.0");
+    std::fs::create_dir_all(&gpu_dir).unwrap();
+    std::fs::write(
+        gpu_dir.join("information"),
+        "Model:           NVIDIA Fake GPU\nVideo Memory:    N/A\n",
+    )
+    .unwrap();
+    let root = dir.path().to_path_buf();
+
+    let logs = capture(move || {
+        let gb = sys::detect_vram_gb_from_sysfs(&root);
+        // The card contributes nothing: its only Video Memory line is
+        // unparseable, so the box reports 0 GB from sysfs and falls back
+        // to nvidia-smi.
+        assert_eq!(gb, 0.0);
+    });
+    assert!(
+        logs.contains("WARN"),
+        "expected a per-GPU WARN, got: {logs}"
+    );
+    assert!(
+        logs.contains("op=\"probe_vram\""),
+        "expected op field, got: {logs}"
+    );
+    assert!(
+        logs.contains("reason=\"video_memory_unparseable\""),
+        "a present-but-unparseable line must NOT be reported as a missing \
+         line, got: {logs}"
+    );
+    assert!(
+        !logs.contains("reason=\"no_video_memory_line\""),
+        "the missing-line reason is wrong when the line was present, got: {logs}"
+    );
+    assert!(
+        logs.contains("content=\"N/A\""),
+        "the warn must echo the offending Video Memory content, got: {logs}"
+    );
+    assert!(
+        logs.contains("0000:03:00.0"),
+        "the warn must name the dropped GPU, got: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // machine_name / username — debug breadcrumb so a job that misbehaves
 // can be correlated back to the host it ran on without tailing the
 // process arguments.

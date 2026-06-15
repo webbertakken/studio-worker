@@ -227,8 +227,11 @@ fn parse_nvidia_smi_mib(stdout: &str) -> Option<SmiMemTotal> {
 ///   none parseable (current 5xx drivers dropped the `Video Memory`
 ///   line).  The caller then falls back to `nvidia-smi`; the warn is the
 ///   breadcrumb that the cheap sysfs path no longer works on this host.
-/// - `WARN source="nvidia_sysfs" reason="no_video_memory_line"|"info_unreadable"`
+/// - `WARN source="nvidia_sysfs" reason="no_video_memory_line"|"video_memory_unparseable"|"info_unreadable"`
 ///   — a specific GPU was dropped from the total while others survived.
+///   `video_memory_unparseable` means the `Video Memory` line was
+///   present but its value didn't parse (the warn echoes the offending
+///   `content`); `no_video_memory_line` means no such line at all.
 pub fn detect_vram_gb_from_sysfs(root: &Path) -> f32 {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -255,16 +258,35 @@ pub fn detect_vram_gb_from_sysfs(root: &Path) -> f32 {
         match std::fs::read_to_string(&info_path) {
             Ok(content) => {
                 let mut found = false;
+                // A `Video Memory:` line that's present but whose value
+                // can't be parsed (e.g. `N/A` on a driver that stubbed
+                // the field) must be surfaced differently from a GPU
+                // with no such line at all — otherwise the operator is
+                // told the line is missing when it's right there.  Keep
+                // the first offending value to echo in the warn.
+                let mut unparseable: Option<String> = None;
                 for line in content.lines() {
                     if let Some(rest) = line.trim().strip_prefix("Video Memory:") {
                         if let Some(mib) = parse_mib(rest) {
                             total_mib += mib;
                             found = true;
+                        } else if unparseable.is_none() {
+                            unparseable = Some(rest.trim().to_string());
                         }
                     }
                 }
                 if found {
                     parseable += 1;
+                } else if let Some(content) = unparseable {
+                    tracing::warn!(
+                        target: "studio_worker::sys",
+                        op = "probe_vram",
+                        source = "nvidia_sysfs",
+                        reason = "video_memory_unparseable",
+                        gpu = %gpu_path.display(),
+                        content = content.as_str(),
+                        "sysfs GPU Video Memory line did not parse as MiB — dropping it from the total"
+                    );
                 } else {
                     tracing::warn!(
                         target: "studio_worker::sys",
