@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.4.6](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.5...studio-worker-v0.4.6) (2026-06-17)
+
+
+### Features
+
+* load-dynamic onnx runtime (cross-platform) ([#101](https://github.com/webbertakken/studio-worker/issues/101)) ([e4c7c74](https://github.com/webbertakken/studio-worker/commit/e4c7c7404dd8ede53096f6a2587cd4fced57571c))
+* structured reject codes + sha256 verify ([#48](https://github.com/webbertakken/studio-worker/issues/48)) ([902b278](https://github.com/webbertakken/studio-worker/commit/902b2788d0f82b12da565f423cce3c0eb9dc2111))
+
+
+### Bug Fixes
+
+* avoid deadlock regenerating register secret ([#94](https://github.com/webbertakken/studio-worker/issues/94)) ([53949a5](https://github.com/webbertakken/studio-worker/commit/53949a59ee8b42a1ed1b8aa32b6d7f3993f94d2f))
+* clean exit when stopped before approval ([#91](https://github.com/webbertakken/studio-worker/issues/91)) ([c383cf3](https://github.com/webbertakken/studio-worker/commit/c383cf38d8074c62cb2dacc9c6b6b63d5c44f27b))
+* detect VRAM via nvidia-smi when sysfs lacks it ([#55](https://github.com/webbertakken/studio-worker/issues/55)) ([4547cab](https://github.com/webbertakken/studio-worker/commit/4547cabd501d2c916a6eb99981a7b409e1bf79aa))
+* gate coverage_attribute so nightly llvm-cov builds ([#82](https://github.com/webbertakken/studio-worker/issues/82)) ([ec420e5](https://github.com/webbertakken/studio-worker/commit/ec420e573e349b46cb5f4a8bb0f75c5d8b1fba6f))
+* link onnx static lib on older glibc (__isoc23) ([#50](https://github.com/webbertakken/studio-worker/issues/50)) ([8e8957f](https://github.com/webbertakken/studio-worker/commit/8e8957f46c20302f42ee2bd818522d2e3c447409))
+* log onnx removal failures at engine target ([#57](https://github.com/webbertakken/studio-worker/issues/57)) ([94ef1e0](https://github.com/webbertakken/studio-worker/commit/94ef1e085adfa7ee4618e01ed1bd893d4902c2d0))
+* log operator config applies via UI ([#74](https://github.com/webbertakken/studio-worker/issues/74)) ([3807b20](https://github.com/webbertakken/studio-worker/commit/3807b20218a5147272aa2a1a149448088824438f))
+* log sdcpp unsupported-kind rejection ([#58](https://github.com/webbertakken/studio-worker/issues/58)) ([277fd88](https://github.com/webbertakken/studio-worker/commit/277fd88adc7a6bb4b178da06cc75084f73102dfd))
+* log spawn error on failed service step ([#69](https://github.com/webbertakken/studio-worker/issues/69)) ([5510dbd](https://github.com/webbertakken/studio-worker/commit/5510dbd52901973bfdf54d59aee54b4d6f570cef))
+* serialise llama backend init ([#46](https://github.com/webbertakken/studio-worker/issues/46)) ([1e5dd75](https://github.com/webbertakken/studio-worker/commit/1e5dd75f0688fe411f70dc055c994098f4901d3f))
+* share temp-file guard, plug onnx leak ([#59](https://github.com/webbertakken/studio-worker/issues/59)) ([8a61ae5](https://github.com/webbertakken/studio-worker/commit/8a61ae5f1bb735ef6394084a3a520c1a5b386d26))
+* ship pause/resume log; harden probe tests ([#87](https://github.com/webbertakken/studio-worker/issues/87)) ([c7319f9](https://github.com/webbertakken/studio-worker/commit/c7319f92d8e906c5b0598ac1362a71df567468b1))
+* structure auto-register log breadcrumbs ([#73](https://github.com/webbertakken/studio-worker/issues/73)) ([a5c3ab7](https://github.com/webbertakken/studio-worker/commit/a5c3ab787b2960b72f44e72d1a02864b4c1d5b23))
+* surface game + asset on offer log ([#97](https://github.com/webbertakken/studio-worker/issues/97)) ([102642c](https://github.com/webbertakken/studio-worker/commit/102642c6c51f2790a14c7b22623dead8d68e7255))
+* surface HTTP body on failed WS upgrade ([#75](https://github.com/webbertakken/studio-worker/issues/75)) ([1e1619c](https://github.com/webbertakken/studio-worker/commit/1e1619cd4cc25ea984d2e4b721599d2c4639be88))
+* surface log fields + warn on VRAM threshold ([#100](https://github.com/webbertakken/studio-worker/issues/100)) ([33996ee](https://github.com/webbertakken/studio-worker/commit/33996eee86d86e0147dabcf6815b6e07a1d76869))
+* surface session error in reconnect log ([#56](https://github.com/webbertakken/studio-worker/issues/56)) ([20f310a](https://github.com/webbertakken/studio-worker/commit/20f310a66944dd30016d13b3c31b8adca77bd215))
+* surface silent provision + WS failures ([#67](https://github.com/webbertakken/studio-worker/issues/67)) ([057a2c1](https://github.com/webbertakken/studio-worker/commit/057a2c196bbe4be3292bc641458405c21d7e22fb))
+* surface silently-dropped probe/update data ([#95](https://github.com/webbertakken/studio-worker/issues/95)) ([6f69e43](https://github.com/webbertakken/studio-worker/commit/6f69e431442248e420a1b457ecb42a93fed68f78))
+* warn on empty sd-cli URL override ([#70](https://github.com/webbertakken/studio-worker/issues/70)) ([2206ba8](https://github.com/webbertakken/studio-worker/commit/2206ba85eed7a8f7d1bc306a7d22d882e38fcafa))
+* warn on model-download failure paths ([#64](https://github.com/webbertakken/studio-worker/issues/64)) ([bf55622](https://github.com/webbertakken/studio-worker/commit/bf55622fe7f1597a8e8c146a756a331df33ba9ad))
+* Windows auto-update + start minimised ([#49](https://github.com/webbertakken/studio-worker/issues/49)) ([2f36f60](https://github.com/webbertakken/studio-worker/commit/2f36f60fcb8ee483b238fb96dcdada30623cac90))
+* worker robustness improvements ([#47](https://github.com/webbertakken/studio-worker/issues/47)) ([5ac9ff4](https://github.com/webbertakken/studio-worker/commit/5ac9ff41591264425afcdcd0d01f595f10c2e5b7))
+
 ## [0.4.5](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.4...studio-worker-v0.4.5) (2026-06-04)
 
 
