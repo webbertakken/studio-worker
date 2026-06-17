@@ -102,6 +102,88 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
+/// Sniff an image's container format from its leading magic bytes and
+/// return the file extension `sd-cli` expects for it, or `None` when
+/// the bytes match no format we hand to `sd-cli`.
+///
+/// `sd-cli`'s `media_io` loader picks its decoder purely from the file
+/// **extension**, not the content — so a JPEG saved as `foo.webp`, or a
+/// webp saved as `foo.png`, fails with `load image from '...' failed`.
+/// The studio serves asset URLs like `latest.webp` whose bytes are
+/// often actually JPEG, so the worker must name the on-disk tempfile
+/// after the real content for the decoder to pick correctly.
+pub fn sniff_image_extension(bytes: &[u8]) -> Option<&'static str> {
+    let starts = |sig: &[u8]| bytes.len() >= sig.len() && &bytes[..sig.len()] == sig;
+    if starts(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if starts(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("png")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if starts(b"GIF87a") || starts(b"GIF89a") {
+        Some("gif")
+    } else if starts(b"BM") {
+        Some("bmp")
+    } else if starts(&[0x49, 0x49, 0x2a, 0x00]) || starts(&[0x4d, 0x4d, 0x00, 0x2a]) {
+        Some("tif")
+    } else {
+        None
+    }
+}
+
+/// Make a downloaded input image (init / mask / reference) safe to hand
+/// to `sd-cli` by naming it after its **actual** content format.
+///
+/// The worker first names the tempfile from the URL's extension, but
+/// studio asset URLs lie (`latest.webp` is frequently JPEG bytes).
+/// `sd-cli` selects its image decoder from the file extension, so a
+/// mismatched name makes every img2img / edit / inpaint job fail with
+/// `load image from '...' failed`.  Here we sniff the real format from
+/// the file's magic bytes and, when it disagrees with the current
+/// extension, rename the file to a sibling with the correct one,
+/// returning the path the engine should consume.  Unknown or
+/// already-correct content passes straight through.
+///
+/// The caller owns cleanup: when the returned path differs from the
+/// input it is the same bytes under a new name, so it (not the
+/// original) must be registered with the job's [`TempFileGuard`].
+pub fn ensure_correct_image_extension(path: &Path) -> Result<PathBuf> {
+    let mut header = [0u8; 16];
+    let read = {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("opening input image {}", path.display()))?;
+        file.read(&mut header)
+            .with_context(|| format!("reading input image header {}", path.display()))?
+    };
+    let Some(actual_ext) = sniff_image_extension(&header[..read]) else {
+        return Ok(path.to_path_buf());
+    };
+    let current_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    // `jpeg` and `jpg` are the same decoder to sd-cli — don't churn the
+    // file when only the spelling differs.
+    let matches = current_ext.as_deref() == Some(actual_ext)
+        || (actual_ext == "jpg" && current_ext.as_deref() == Some("jpeg"));
+    if matches {
+        return Ok(path.to_path_buf());
+    }
+    let corrected = path.with_extension(actual_ext);
+    std::fs::rename(path, &corrected)
+        .with_context(|| format!("renaming {} -> {}", path.display(), corrected.display()))?;
+    info!(
+        target: TRACE_TARGET,
+        op = "sniff",
+        from = %path.display(),
+        to = %corrected.display(),
+        actual_ext,
+        "renamed input image to match its actual format for sd-cli"
+    );
+    Ok(corrected)
+}
+
 /// Best-effort removal of a temporary file — a partial `.part`
 /// download, an engine's per-job scratch image, or a downloaded init /
 /// mask.  A `NotFound` is the desired end state (something already
@@ -318,6 +400,100 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // -----------------------------------------------------------------
+    // sniff_image_extension / ensure_correct_image_extension — the guard
+    // that names a downloaded base after its real content so sd-cli's
+    // extension-keyed `media_io` decoder picks the right codec.  Studio
+    // asset URLs lie (`latest.webp` is often JPEG bytes); a mismatched
+    // name was failing every img2img / edit / inpaint job with
+    // `load image from '...' failed`.
+    // -----------------------------------------------------------------
+
+    /// A tiny lossy-VP8 webp (one of the formats studio bases arrive
+    /// in) used to exercise the webp signature branch.
+    const LOSSY_WEBP: &[u8] = include_bytes!("../../tests/fixtures/lossy-vp8.webp");
+
+    #[test]
+    fn sniff_image_extension_maps_each_magic_to_an_sd_cli_extension() {
+        assert_eq!(sniff_image_extension(LOSSY_WEBP), Some("webp"));
+        assert_eq!(
+            sniff_image_extension(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]),
+            Some("jpg"),
+            "JPEG (the bytes studio serves under .webp URLs)"
+        );
+        assert_eq!(
+            sniff_image_extension(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            Some("png")
+        );
+        assert_eq!(sniff_image_extension(b"GIF89a..."), Some("gif"));
+        assert_eq!(sniff_image_extension(b"BM......"), Some("bmp"));
+        assert_eq!(
+            sniff_image_extension(&[0x49, 0x49, 0x2a, 0x00]),
+            Some("tif")
+        );
+        // A RIFF container that is not WEBP (e.g. a WAV) is not an image.
+        assert_eq!(sniff_image_extension(b"RIFF\x00\x00\x00\x00WAVEfmt "), None);
+        // Unknown / too-short content yields no opinion.
+        assert_eq!(sniff_image_extension(b"\x00\x01\x02"), None);
+        assert_eq!(sniff_image_extension(b""), None);
+    }
+
+    #[test]
+    fn ensure_correct_image_extension_renames_jpeg_served_as_webp() {
+        // The exact prod failure: bytes are JPEG but the file is named
+        // `.webp` (from the lying URL).  It must be renamed to `.jpg`.
+        let dir = tempdir().unwrap();
+        let mislabelled = dir.path().join("out-init.webp");
+        std::fs::write(
+            &mislabelled,
+            [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46],
+        )
+        .unwrap();
+
+        let corrected = ensure_correct_image_extension(&mislabelled).unwrap();
+
+        assert_eq!(corrected, dir.path().join("out-init.jpg"));
+        assert!(corrected.exists(), "renamed file carries the bytes");
+        assert!(
+            !mislabelled.exists(),
+            "the misnamed file is gone after rename"
+        );
+    }
+
+    #[test]
+    fn ensure_correct_image_extension_renames_webp_served_as_png() {
+        let dir = tempdir().unwrap();
+        let mislabelled = dir.path().join("out-init.png");
+        std::fs::write(&mislabelled, LOSSY_WEBP).unwrap();
+
+        let corrected = ensure_correct_image_extension(&mislabelled).unwrap();
+
+        assert_eq!(corrected, dir.path().join("out-init.webp"));
+        assert!(corrected.exists() && !mislabelled.exists());
+    }
+
+    #[test]
+    fn ensure_correct_image_extension_leaves_correct_or_unknown_files_in_place() {
+        let dir = tempdir().unwrap();
+        // Already-correct png: returned verbatim, not renamed.
+        let png = dir.path().join("out-mask.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        assert_eq!(ensure_correct_image_extension(&png).unwrap(), png);
+        assert!(png.exists());
+
+        // `.jpeg` spelling for JPEG content is not churned to `.jpg`.
+        let jpeg = dir.path().join("out-ref.jpeg");
+        std::fs::write(&jpeg, [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]).unwrap();
+        assert_eq!(ensure_correct_image_extension(&jpeg).unwrap(), jpeg);
+        assert!(jpeg.exists() && !dir.path().join("out-ref.jpg").exists());
+
+        // Unknown content (no recognised magic) passes through untouched.
+        let unknown = dir.path().join("out-init.webp");
+        std::fs::write(&unknown, [0x00, 0x01, 0x02, 0x03]).unwrap();
+        assert_eq!(ensure_correct_image_extension(&unknown).unwrap(), unknown);
+        assert!(unknown.exists());
+    }
 
     #[test]
     fn model_cache_path_accepts_plain_filenames_only() {

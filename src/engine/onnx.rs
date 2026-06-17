@@ -402,6 +402,21 @@ fn alpha_composite(base: &RgbImage, fill: &RgbImage, alpha: &GrayImage) -> RgbIm
 mod tests {
     use super::*;
 
+    // The studio serves Find-the-Differences originals as JPEG (often
+    // under a `.webp` URL).  The LaMa-removal path decodes the init
+    // image with `image::load_from_memory`, so the build MUST carry the
+    // JPEG decoder — without it every removal failed with
+    // `decoding init image`.  This fixture-backed test locks the
+    // decoder into the feature set.
+    #[test]
+    fn build_decodes_jpeg_init_images() {
+        let jpeg = include_bytes!("../../tests/fixtures/sample.jpg");
+        let decoded = image::load_from_memory(jpeg)
+            .expect("this build must decode JPEG init images")
+            .to_rgb8();
+        assert_eq!((decoded.width(), decoded.height()), (16, 12));
+    }
+
     #[test]
     fn image_to_chw_packs_planar_normalised() {
         let mut img = RgbImage::new(LAMA_SIZE, LAMA_SIZE);
