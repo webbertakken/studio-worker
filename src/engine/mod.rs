@@ -105,6 +105,8 @@ pub mod llama;
 pub mod multi;
 #[cfg(feature = "image-onnx")]
 pub mod onnx;
+#[cfg(feature = "image-onnx")]
+pub mod onnx_provision;
 pub mod sd_provision;
 pub mod sdcpp;
 #[cfg(feature = "tts")]

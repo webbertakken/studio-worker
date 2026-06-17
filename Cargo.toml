@@ -105,15 +105,23 @@ gif = { version = "0.13", optional = true }
 # (the whole crate is deliberately native-tls-free for bare-box
 # `cargo install`).  CPU EP only by default — LaMa at 512×512 is ~1s on
 # CPU; GPU EPs (cuda/coreml) are opt-in later with graceful fallback.
+# ONNX Runtime (pykeio/ort) for the LaMa object-removal engine, in **load-dynamic** mode: the
+# crate links nothing native at build time (so the binary cross-compiles on every cargo-dist target
+# with no glibc/libstdc++/MSVC-CRT prebuilt-link issues), and the ONNX Runtime shared library is
+# downloaded per-platform at runtime by `onnx_provision` and located via `ORT_DYLIB_PATH`.
 ort = { version = "2.0.0-rc.10", optional = true, default-features = false, features = [
     "std",
     "ndarray",
     "tracing",
-    "download-binaries",
-    "copy-dylibs",
-    "tls-rustls",
+    "load-dynamic",
     "api-24",
 ] }
+# Extract the ONNX Runtime shared library from Microsoft's release archives
+# (.tgz on Linux/macOS, .zip on Windows) at runtime. Pure-Rust (miniz_oxide
+# backend) so the bare-box `cargo install` stays native-dep-free. Gated to
+# `image-onnx`; `zip` is already a top-level dep.
+flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", optional = true }
 # UI deps — gated behind the `ui` feature so headless installs stay
 # free of GL / winit / dbus.  Default = off (see DECISIONS.md).
 egui = { version = "0.34", optional = true, default-features = false }
@@ -171,7 +179,7 @@ image-candle = [
 # ONNX-runtime image engine.  Serves the LaMa object-removal model
 # (Carve/LaMa-ONNX) used by Find-the-Differences removals.  Single
 # self-contained binary (ort `download-binaries` links onnxruntime).
-image-onnx = ["dep:ort"]
+image-onnx = ["dep:ort", "dep:flate2", "dep:tar"]
 video = ["dep:gif"]
 tts = []
 # Desktop UI — brings in egui / eframe / tray-icon / notify-rust.
@@ -195,13 +203,6 @@ all-engines-stt = ["whisper", "image-candle", "video", "tts"]
 # — it static-links a second ggml that clashes with llama's.  This is the
 # feature set the cargo-dist release binaries are built with.
 all = ["ui", "llama", "image-candle", "image-onnx", "video", "tts"]
-
-# Build-only: compile the glibc 2.38 `__isoc23_*` shims (build.rs) so the
-# prebuilt ONNX Runtime static lib links on the older-glibc release runner.
-# `cc` is already in the tree transitively (llama-cpp-2), so this adds nothing
-# to the default build.
-[build-dependencies]
-cc = "1"
 
 [dev-dependencies]
 wiremock = "0.6"
