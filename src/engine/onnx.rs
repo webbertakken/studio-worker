@@ -19,8 +19,8 @@
 //! Runtime for the build target (all five cargo-dist targets), so a
 //! source build needs no system onnxruntime.  CPU execution provider
 //! only — LaMa at 512² is ~1 s on CPU.
-use crate::engine::{download, Engine, EngineCapabilities};
 use super::onnx_provision;
+use crate::engine::{download, Engine, EngineCapabilities};
 use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
 use image::{imageops::FilterType, DynamicImage, GrayImage, RgbImage};
@@ -524,7 +524,9 @@ mod tests {
             .resize_exact(1024, 768, FilterType::Triangle)
             .to_rgb8();
         let d_corner: i32 = (0..3)
-            .map(|i| (out.get_pixel(20, 20).0[i] as i32 - original.get_pixel(20, 20).0[i] as i32).abs())
+            .map(|i| {
+                (out.get_pixel(20, 20).0[i] as i32 - original.get_pixel(20, 20).0[i] as i32).abs()
+            })
             .sum();
         assert!(d_corner < 16, "outside-mask pixel drifted: {d_corner}");
     }

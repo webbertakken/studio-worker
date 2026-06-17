@@ -114,15 +114,18 @@ pub fn provision(models_root: &Path) -> Result<PathBuf> {
     };
     let _ = std::fs::remove_file(&archive);
     if !extracted? {
-        bail!("onnxruntime archive {} contained no shared library", plat.asset);
+        bail!(
+            "onnxruntime archive {} contained no shared library",
+            plat.asset
+        );
     }
     Ok(dest)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn extract_targz(archive: &Path, dest: &Path) -> Result<bool> {
-    let file = std::fs::File::open(archive)
-        .with_context(|| format!("opening {}", archive.display()))?;
+    let file =
+        std::fs::File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut tar = tar::Archive::new(gz);
     for entry in tar.entries()? {
@@ -141,8 +144,8 @@ fn extract_targz(archive: &Path, dest: &Path) -> Result<bool> {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn extract_zip(archive: &Path, dest: &Path) -> Result<bool> {
-    let file = std::fs::File::open(archive)
-        .with_context(|| format!("opening {}", archive.display()))?;
+    let file =
+        std::fs::File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
     let mut zip = zip::ZipArchive::new(file)?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
@@ -173,9 +176,15 @@ mod tests {
 
     #[test]
     fn matches_the_main_shared_library_only() {
-        assert!(is_main_lib("onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2"));
-        assert!(is_main_lib("onnxruntime-osx-arm64-1.24.2/lib/libonnxruntime.1.24.2.dylib"));
-        assert!(is_main_lib("onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll"));
+        assert!(is_main_lib(
+            "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2"
+        ));
+        assert!(is_main_lib(
+            "onnxruntime-osx-arm64-1.24.2/lib/libonnxruntime.1.24.2.dylib"
+        ));
+        assert!(is_main_lib(
+            "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll"
+        ));
         // not the providers / test libs, not headers
         assert!(!is_main_lib("lib/libonnxruntime_providers_shared.so"));
         assert!(!is_main_lib("lib/libonnxruntime_test.so"));
