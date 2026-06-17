@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.7](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.6...studio-worker-v0.4.7) (2026-06-17)
+
+
+### Bug Fixes
+
+* name sd-cli inputs by content, decode jpeg ([#103](https://github.com/webbertakken/studio-worker/issues/103)) ([1faf145](https://github.com/webbertakken/studio-worker/commit/1faf1451a952c81d094c384d0be0213d80ed24d1))
+
 ## [0.4.6](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.5...studio-worker-v0.4.6) (2026-06-17)
 
 
