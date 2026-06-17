@@ -42,7 +42,7 @@ hex = "0.4"
 # wrapper (getrandom(2) / BCryptGenRandom / getentropy), not the full
 # `rand` crate; already in the tree transitively via rustls + sentry.
 getrandom = "0.3"
-image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg"] }
 directories = "5.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

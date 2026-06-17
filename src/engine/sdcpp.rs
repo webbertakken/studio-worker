@@ -199,8 +199,10 @@ impl SdCppEngine {
         // tempfile so we can hand the path to `sd-cli --init-img`.
         // This is mandatory — the worker refuses i2i jobs whose
         // init image fails to download (no silent fallback to t2i).
-        // The local extension mirrors the URL's so sd-cli's image
-        // loader can sniff the format.
+        // The local extension first mirrors the URL's, then is corrected
+        // to the file's real content format — studio asset URLs lie
+        // (`latest.webp` is often JPEG bytes) and sd-cli picks its image
+        // decoder purely from the extension.
         let init_img_path = match params.init_image_url.as_deref() {
             Some(url) if !url.is_empty() => {
                 let ext = init_image_extension(url);
@@ -209,7 +211,11 @@ impl SdCppEngine {
                     format!("downloading init image {} -> {}", url, init_path.display())
                 })?;
                 temp_files.push(init_path.clone());
-                Some(init_path)
+                let usable = download::ensure_correct_image_extension(&init_path)?;
+                if usable != init_path {
+                    temp_files.push(usable.clone());
+                }
+                Some(usable)
             }
             _ => None,
         };
@@ -225,7 +231,11 @@ impl SdCppEngine {
                 download::download_file(url, &path)
                     .with_context(|| format!("downloading mask {} -> {}", url, path.display()))?;
                 temp_files.push(path.clone());
-                Some(path)
+                let usable = download::ensure_correct_image_extension(&path)?;
+                if usable != path {
+                    temp_files.push(usable.clone());
+                }
+                Some(usable)
             }
             _ => None,
         };
@@ -240,7 +250,11 @@ impl SdCppEngine {
                     format!("downloading reference image {} -> {}", url, path.display())
                 })?;
                 temp_files.push(path.clone());
-                Some(path)
+                let usable = download::ensure_correct_image_extension(&path)?;
+                if usable != path {
+                    temp_files.push(usable.clone());
+                }
+                Some(usable)
             }
             _ => None,
         };
