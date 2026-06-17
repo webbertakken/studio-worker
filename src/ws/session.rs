@@ -245,13 +245,16 @@ async fn wait_for_welcome(
 ) -> WelcomeOutcome {
     while let Some(event) = event_rx.recv().await {
         match event {
-            SessionEvent::Frame(WorkerOutbound::Welcome { worker_id: wid, .. }) => {
+            SessionEvent::Frame(WorkerOutbound::Welcome {
+                worker_id: wid,
+                server_time,
+            }) => {
                 push_log_with_observers(
                     logs,
                     Some(observers),
                     "info",
                     "ws",
-                    &format!("server welcomed {wid}"),
+                    &welcome_breadcrumb(&wid, &server_time),
                     None,
                 );
                 return WelcomeOutcome::Welcomed;
@@ -386,6 +389,13 @@ async fn run_one_session(
         &crate::runtime::summarize_capabilities(&capabilities),
         None,
     );
+    // A threshold above the card's detected VRAM makes the studio offer
+    // jobs this GPU can't fit — they OOM on load.  Flag the
+    // misconfiguration on the handshake so the OOM has an operator-facing
+    // cause instead of surfacing only as a failed job.
+    if let Some(warning) = crate::runtime::vram_threshold_warning(&capabilities) {
+        push_log_with_observers(logs, Some(observers), "warn", "ws", &warning, None);
+    }
     sender
         .send(&WorkerInbound::Hello(HelloFrame {
             auth_token: auth_token.clone(),
@@ -524,13 +534,16 @@ async fn run_dispatch_loop(
             SessionEvent::Disconnected(_) => return SessionOutcome::Disconnected,
             SessionEvent::Stopped => return SessionOutcome::Stopped,
             SessionEvent::Frame(frame) => match frame {
-                WorkerOutbound::Welcome { worker_id: wid, .. } => {
+                WorkerOutbound::Welcome {
+                    worker_id: wid,
+                    server_time,
+                } => {
                     push_log_with_observers(
                         &ctx.logs,
                         Some(&ctx.observers),
                         "info",
                         "ws",
-                        &format!("server welcomed {wid}"),
+                        &welcome_breadcrumb(&wid, &server_time),
                         None,
                     );
                 }
@@ -553,10 +566,31 @@ async fn run_dispatch_loop(
                         _ => SessionOutcome::Fatal(message),
                     };
                 }
-                WorkerOutbound::HeartbeatAck
-                | WorkerOutbound::CompleteAck { .. }
-                | WorkerOutbound::FailAck { .. } => {
-                    // Acks are best-effort; ignore.
+                WorkerOutbound::CompleteAck { job_id } => {
+                    push_log_with_observers(
+                        &ctx.logs,
+                        Some(&ctx.observers),
+                        "info",
+                        "ws",
+                        &result_ack_breadcrumb("completion", &job_id),
+                        Some(job_id),
+                    );
+                }
+                WorkerOutbound::FailAck { job_id } => {
+                    push_log_with_observers(
+                        &ctx.logs,
+                        Some(&ctx.observers),
+                        "info",
+                        "ws",
+                        &result_ack_breadcrumb("failure", &job_id),
+                        Some(job_id),
+                    );
+                }
+                WorkerOutbound::HeartbeatAck => {
+                    // Heartbeat acks fire every ~5s; logging each would
+                    // flood the operator log with no diagnostic value
+                    // (a genuinely missed ack already surfaces via the
+                    // read-idle timeout + reconnect breadcrumb).
                 }
             },
         }
@@ -1131,6 +1165,21 @@ fn reconnect_breadcrumb(error: Option<&anyhow::Error>, attempt: u32, backoff: Du
     }
 }
 
+/// Operator-facing breadcrumb for the studio's `Welcome` frame.
+///
+/// The studio stamps `server_time` (its clock at the moment it
+/// authenticated this worker) onto every `Welcome`, but it used to be
+/// deserialised and dropped — the line named only the worker id. With
+/// it surfaced, an operator can spot clock skew between the worker host
+/// and the studio straight from the UI's Logs tab and the
+/// studio-shipped log view: skew distorts heartbeat-timeout reasoning,
+/// auth-token expiry windows, and log-timestamp correlation across the
+/// two sides. Pure so the wording is unit-tested without a live
+/// welcome.
+fn welcome_breadcrumb(worker_id: &str, server_time: &str) -> String {
+    format!("server welcomed {worker_id} server_time={server_time}")
+}
+
 /// Operator-facing breadcrumb summarising an incoming job offer.
 ///
 /// The studio populates `game_id` + `asset_name` on every offer, but
@@ -1151,6 +1200,26 @@ fn offer_received_breadcrumb(
     format!(
         "offer received {job_id} game={game_id} asset={asset_name} model={model} vram={vram_gb_estimate}"
     )
+}
+
+/// Operator-facing breadcrumb for the studio's `CompleteAck` /
+/// `FailAck` frames.
+///
+/// The studio sends one of these the moment it has persisted a job's
+/// result (the binary landed in R2, or the `completeJson` / `Fail`
+/// frame updated the row). Both used to be silently dropped on the
+/// "acks are best-effort; ignore" arm, so the worker's own
+/// "binary upload ok" / completeJson breadcrumb was the last word on a
+/// job: an operator triaging a job that ran twice (worker reported
+/// done, studio never persisted, the job timed out + requeued) had no
+/// signal telling them whether the studio ever acknowledged the
+/// result. Surfacing the ack closes the job lifecycle in the UI's Logs
+/// tab and the studio-shipped log view. `HeartbeatAck` stays unlogged:
+/// it fires every ~5s and a genuinely missed ack already surfaces via
+/// the read-idle timeout + reconnect breadcrumb. Pure so the wording is
+/// unit-tested without a live ack.
+fn result_ack_breadcrumb(outcome: &str, job_id: &str) -> String {
+    format!("studio confirmed {outcome} of job {job_id}")
 }
 
 /// Decide whether a just-attempted offer-response send (accept /
@@ -1467,6 +1536,25 @@ mod tests {
     }
 
     #[test]
+    fn welcome_breadcrumb_surfaces_server_time() {
+        // The studio stamps `server_time` (its clock at the moment it
+        // authenticated this worker) onto every `Welcome`; it used to be
+        // deserialised and dropped, so an operator couldn't spot clock
+        // skew between the worker host and the studio. The breadcrumb
+        // must keep the legacy "server welcomed <id>" wording and add the
+        // server time alongside it.
+        let line = welcome_breadcrumb("worker-7", "2026-06-15T21:00:00Z");
+        assert!(
+            line.contains("server welcomed worker-7"),
+            "expected the legacy wording + worker id, got: {line}"
+        );
+        assert!(
+            line.contains("server_time=2026-06-15T21:00:00Z"),
+            "expected the server time, got: {line}"
+        );
+    }
+
+    #[test]
     fn offer_received_breadcrumb_names_game_and_asset() {
         // The studio sends `game_id` + `asset_name` on every offer; both
         // used to be deserialised and dropped, so an operator fielding
@@ -1497,5 +1585,26 @@ mod tests {
             "expected the model, got: {line}"
         );
         assert!(line.contains("vram=12.5"), "expected the vram, got: {line}");
+    }
+
+    #[test]
+    fn result_ack_breadcrumb_names_the_outcome_and_job() {
+        // The studio sends `CompleteAck` / `FailAck` the moment it has
+        // persisted a job's result; both used to be silently dropped on
+        // the "acks are best-effort; ignore" arm, so the worker's own
+        // "binary upload ok" / completeJson line was the last word on a
+        // job. An operator triaging a job that ran twice (worker
+        // reported done, studio never persisted, job requeued) had no
+        // signal telling them whether the studio acknowledged the
+        // result. The breadcrumb must name both the outcome and the
+        // offending job id.
+        assert_eq!(
+            result_ack_breadcrumb("completion", "j-1"),
+            "studio confirmed completion of job j-1"
+        );
+        assert_eq!(
+            result_ack_breadcrumb("failure", "j-2"),
+            "studio confirmed failure of job j-2"
+        );
     }
 }

@@ -830,6 +830,38 @@ pub fn summarize_capabilities(caps: &WorkerCapabilities) -> String {
     )
 }
 
+/// Operator-facing warning when the configured VRAM threshold exceeds
+/// the GPU VRAM the worker actually detected.
+///
+/// The studio matches jobs to a worker purely by its advertised
+/// `vram_threshold_gb`, so a threshold set above the card's real
+/// capacity — e.g. the default 12 GB on an 8 GB consumer GPU — makes the
+/// worker accept jobs its GPU can't fit: they load, exhaust VRAM, and
+/// fail with an OOM the operator then has to trace back to a config
+/// value.  Surfacing it on the handshake (one line next to the
+/// capability summary) turns a silent OOM-on-claim into an actionable
+/// "lower your threshold" breadcrumb.
+///
+/// Only fires when the VRAM probe returned a real positive total: a
+/// detected 0 GB means the probe failed (no `nvidia-smi` / sysfs tree,
+/// or a non-NVIDIA GPU we can't size), where the threshold is the only
+/// capacity signal we have and second-guessing it would be wrong.  The
+/// boundary is strict (`threshold > total`), so a threshold that exactly
+/// matches the card stays silent.  Pure so the wording + boundary are
+/// unit-tested without a live GPU.
+pub fn vram_threshold_warning(caps: &WorkerCapabilities) -> Option<String> {
+    if caps.vram_total_gb > 0.0 && caps.vram_threshold_gb > caps.vram_total_gb {
+        Some(format!(
+            "configured VRAM threshold {:.1}GB exceeds detected GPU VRAM {:.1}GB; \
+             the studio may offer jobs larger than this card can fit and they will \
+             OOM on load — lower vram_threshold_gb to at or below {:.1}GB",
+            caps.vram_threshold_gb, caps.vram_total_gb, caps.vram_total_gb
+        ))
+    } else {
+        None
+    }
+}
+
 pub fn push_log(
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     level: &str,
@@ -1116,6 +1148,57 @@ mod tests {
             summarize_capabilities(&caps).contains("auto_enabled=false"),
             "paused worker must advertise auto_enabled=false"
         );
+    }
+
+    /// Build a capability snapshot, then override the two VRAM fields so
+    /// the threshold/total relationship is deterministic regardless of
+    /// the host's real GPU (the probe is `0.0` on CI).
+    fn caps_with_vram(total_gb: f32, threshold_gb: f32) -> WorkerCapabilities {
+        let mut caps = build_capabilities_with(&Config::default(), &SyntheticEngine::new(), true);
+        caps.vram_total_gb = total_gb;
+        caps.vram_threshold_gb = threshold_gb;
+        caps
+    }
+
+    #[test]
+    fn vram_threshold_warning_flags_threshold_above_detected_vram() {
+        // The default 12 GB threshold on an 8 GB card: the studio will
+        // offer up-to-12 GB jobs this GPU can't fit, and they OOM on
+        // load.  The breadcrumb must name both numbers and the config
+        // key the operator has to lower.
+        let warning = vram_threshold_warning(&caps_with_vram(8.0, 12.0))
+            .expect("threshold above detected VRAM must warn");
+        assert!(warning.contains("12.0"), "missing threshold in: {warning}");
+        assert!(
+            warning.contains("8.0"),
+            "missing detected VRAM in: {warning}"
+        );
+        assert!(
+            warning.contains("vram_threshold_gb"),
+            "must name the config key to change: {warning}"
+        );
+    }
+
+    #[test]
+    fn vram_threshold_warning_silent_when_threshold_within_detected_vram() {
+        // A 24 GB card with a 12 GB threshold is correctly conservative.
+        assert!(vram_threshold_warning(&caps_with_vram(24.0, 12.0)).is_none());
+    }
+
+    #[test]
+    fn vram_threshold_warning_silent_when_threshold_equals_detected() {
+        // The boundary is strict: a threshold that exactly matches the
+        // card fits, so it stays silent.
+        assert!(vram_threshold_warning(&caps_with_vram(12.0, 12.0)).is_none());
+    }
+
+    #[test]
+    fn vram_threshold_warning_silent_when_vram_undetected() {
+        // A detected 0 GB means the probe failed (no nvidia-smi / sysfs)
+        // or it's a non-NVIDIA GPU we can't size; the threshold is then
+        // the only capacity signal we have, so second-guessing it with a
+        // spurious OOM warning would be wrong.
+        assert!(vram_threshold_warning(&caps_with_vram(0.0, 12.0)).is_none());
     }
 
     #[test]

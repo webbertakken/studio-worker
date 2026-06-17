@@ -125,6 +125,9 @@ Auto-register + register CLI:
   driving Pristine → Pending → Approved with config persistence.
 - `tests/auto_register_save_tracing.rs` — regression cover for silent
   `config::save` failures inside the poll loop.
+- `tests/auto_register_log_fields.rs` — every auto-register breadcrumb
+  carries structured `op` + `error` fields (register-request + poll
+  WARN, credential-save ERROR).
 - `tests/register_reset.rs` — `register` CLI contracts (`--reset`
   clears local registration state, etc.).
 - `tests/registration_gate.rs` — `runtime::ensure_registered`, the

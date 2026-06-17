@@ -26,6 +26,22 @@ use super::tray::{self, TrayVariant};
 /// operators can filter with `RUST_LOG=studio_worker::ui::tray=debug`.
 const TRACE_TARGET: &str = "studio_worker::ui::tray";
 
+/// Emit a structured breadcrumb when the native tray icon image fails to
+/// build from its RGBA buffer.  Shared by both build sites — `install`
+/// (startup) and `set_variant` (per health change) — so a failure is
+/// never swallowed and the breadcrumb is unit-testable on the Linux CI
+/// box even though the call sites are `#[cfg(not(target_os = "linux"))]`.
+/// `op` names the lifecycle phase that hit the failure.
+#[cfg(any(not(target_os = "linux"), test))]
+fn log_icon_build_failure(op: &'static str, err: &str) {
+    tracing::warn!(
+        target: TRACE_TARGET,
+        op,
+        error = %err,
+        "failed to build tray icon image"
+    );
+}
+
 /// Handle the [`App`](crate::ui::app::App) keeps for the lifetime of the
 /// window; dropping it tears the tray down.  `set_variant` pushes a new
 /// health colour + tooltip when the worker's state changes.
@@ -243,12 +259,7 @@ impl Inner {
                     );
                 }
             }
-            Err(e) => tracing::warn!(
-                target: TRACE_TARGET,
-                op = "set_variant",
-                error = %e,
-                "failed to build tray icon image"
-            ),
+            Err(e) => log_icon_build_failure("set_variant", &e.to_string()),
         }
         if let Err(e) = icon.set_tooltip(Some(variant.tooltip())) {
             tracing::warn!(
@@ -298,7 +309,13 @@ pub fn install(
     let _ = menu.append(&MenuItem::with_id(quit_id.clone(), labels.quit, true, None));
 
     let variant = TrayVariant::Disconnected;
-    let icon = Icon::from_rgba(variant.rgba_16(), 16, 16).ok();
+    let icon = match Icon::from_rgba(variant.rgba_16(), 16, 16) {
+        Ok(i) => Some(i),
+        Err(e) => {
+            log_icon_build_failure("install", &e.to_string());
+            None
+        }
+    };
     let mut builder = TrayIconBuilder::new()
         .with_tooltip(variant.tooltip())
         .with_menu(Box::new(menu));
@@ -346,4 +363,46 @@ pub fn install(
     Some(TrayHandle {
         inner: Inner { icon: tray_icon },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The mac/win tray builds an icon image from a static RGBA buffer in
+    // two places (`install` at startup, `set_variant` on every health
+    // change).  Both must surface a build failure rather than swallow it,
+    // so the breadcrumb is exercised here on the Linux CI box even though
+    // the call sites themselves are `#[cfg(not(target_os = "linux"))]`.
+    #[test]
+    fn icon_build_failure_emits_structured_warn() {
+        let logs = crate::test_support::capture(|| {
+            log_icon_build_failure("install", "bad rgba length");
+        });
+        assert!(logs.contains("WARN"), "expected WARN level, got: {logs}");
+        assert!(
+            logs.contains("studio_worker::ui::tray"),
+            "expected tray target, got: {logs}"
+        );
+        assert!(logs.contains("op=\"install\""), "expected op field: {logs}");
+        assert!(
+            logs.contains("error=bad rgba length"),
+            "expected structured error field, got: {logs}"
+        );
+        assert!(
+            logs.contains("failed to build tray icon image"),
+            "expected build-failure message: {logs}"
+        );
+    }
+
+    #[test]
+    fn icon_build_failure_op_field_tracks_the_call_site() {
+        let logs = crate::test_support::capture(|| {
+            log_icon_build_failure("set_variant", "oops");
+        });
+        assert!(
+            logs.contains("op=\"set_variant\""),
+            "expected set_variant op field: {logs}"
+        );
+    }
 }
