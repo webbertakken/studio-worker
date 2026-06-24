@@ -371,6 +371,19 @@ mod tests {
     }
 
     #[test]
+    fn post_image_honours_requested_ext() {
+        let h = Harness::start(seeded_catalog());
+        let client = reqwest::blocking::Client::new();
+        let res = client
+            .post(format!("{}/image", h.url))
+            .json(&serde_json::json!({ "prompt": "x", "ext": "png" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "image/png");
+    }
+
+    #[test]
     fn get_models_lists_catalog() {
         let h = Harness::start(seeded_catalog());
         let body = reqwest::blocking::get(format!("{}/models", h.url))

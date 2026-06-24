@@ -187,7 +187,11 @@ impl SdCppEngine {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        let out_path = out_dir.join(format!("{stem}.webp"));
+        // sd-cli picks the encoder from the output file extension, so honour the
+        // requested `ext` (png/jpg/webp); anything else falls back to webp.
+        let out_ext = normalize_output_ext(&params.ext);
+        debug!(target: TRACE_TARGET, op = "dispatch", requested_ext = %params.ext, out_ext = %out_ext, "resolved output extension");
+        let out_path = out_dir.join(format!("{stem}.{out_ext}"));
 
         // Own the scratch files from the moment their paths exist so
         // every failure path (sd-cli error, unreadable output) cleans
@@ -322,9 +326,21 @@ impl SdCppEngine {
 
         Ok(TaskResult::Image {
             bytes,
-            ext: "webp".to_string(),
+            ext: out_ext,
         })
     }
+}
+
+/// Map a requested image extension onto one `sd-cli` can encode, defaulting to
+/// `webp`. Keeps the returned `TaskResult` ext in lock-step with the bytes.
+fn normalize_output_ext(ext: &str) -> String {
+    match ext.trim().to_ascii_lowercase().as_str() {
+        "png" => "png",
+        "jpg" | "jpeg" => "jpg",
+        "bmp" => "bmp",
+        _ => "webp",
+    }
+    .to_string()
 }
 
 impl Engine for SdCppEngine {
@@ -1173,5 +1189,17 @@ mod tests {
             "webp"
         );
         assert_eq!(init_image_extension("https://x/y/no-ext"), "webp");
+    }
+
+    #[test]
+    fn normalize_output_ext_honours_known_and_defaults_webp() {
+        assert_eq!(normalize_output_ext("png"), "png");
+        assert_eq!(normalize_output_ext("PNG"), "png");
+        assert_eq!(normalize_output_ext("jpg"), "jpg");
+        assert_eq!(normalize_output_ext("jpeg"), "jpg");
+        assert_eq!(normalize_output_ext("bmp"), "bmp");
+        assert_eq!(normalize_output_ext("webp"), "webp");
+        assert_eq!(normalize_output_ext(""), "webp");
+        assert_eq!(normalize_output_ext("gif"), "webp");
     }
 }
