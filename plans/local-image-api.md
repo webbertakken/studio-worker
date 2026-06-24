@@ -57,8 +57,8 @@ Architecture notes (verified):
       /healthz 200, /models seeded with Z-Image, models.json written
 
 ### UI: local queue
-- [ ] Jobs view shows a `local` badge / source column; verify the local jobs
-      ring renders (egui test like the existing jobs-tab tests)
+- [x] Jobs tab shows a "Local queue" section (API url + local job cards) built
+      from `observers.local_jobs` / `local_api_url`; egui-free JobsView test
 
 ### Docs + CI
 - [ ] `docs/` page for the local API + catalog; README mention
