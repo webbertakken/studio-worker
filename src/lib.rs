@@ -19,6 +19,7 @@ pub mod cli;
 pub mod config;
 pub mod engine;
 pub mod http;
+pub mod local;
 pub mod runtime;
 pub mod service;
 pub mod sys;

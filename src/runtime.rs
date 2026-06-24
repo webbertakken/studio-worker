@@ -103,6 +103,9 @@ pub struct HeartbeatStatus {
 pub struct WorkerObservers {
     pub current_job: Arc<Mutex<Option<CurrentJob>>>,
     pub recent_jobs: Arc<Mutex<VecDeque<RecentJob>>>,
+    /// Finished jobs submitted to the local API (the in-app "local queue"),
+    /// kept separate from studio-claimed jobs.
+    pub local_jobs: Arc<Mutex<VecDeque<RecentJob>>>,
     pub last_heartbeat: Arc<Mutex<Option<HeartbeatStatus>>>,
     /// Bounded ring of every log entry the worker has emitted, kept
     /// for the UI's Logs tab.  Separate from the WS ship queue
@@ -122,6 +125,15 @@ pub fn truncate_prompt(s: &str) -> String {
 
 pub fn record_recent_job(observers: &WorkerObservers, entry: RecentJob) {
     let mut ring = observers.recent_jobs.lock();
+    ring.push_front(entry);
+    while ring.len() > RECENT_JOBS_CAP {
+        ring.pop_back();
+    }
+}
+
+/// Record a finished local-API job into the local-queue ring.
+pub fn record_local_job(observers: &WorkerObservers, entry: RecentJob) {
+    let mut ring = observers.local_jobs.lock();
     ring.push_front(entry);
     while ring.len() > RECENT_JOBS_CAP {
         ring.pop_back();

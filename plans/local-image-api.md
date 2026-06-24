@@ -31,12 +31,13 @@ Architecture notes (verified):
 - [x] Unit tests (round-trip, seed, CRUD, load-missing-seeds) — 7 green
 
 ### Local job execution (mirror the studio path)
-- [ ] `local::run_job(engine, catalog, observers, LocalImageRequest) ->
-      Result<TaskResult>`: resolve model from catalog, build `Task::Image` +
-      `ModelSource`, dispatch, record a `RecentJob` tagged `source = Local`
-- [ ] Add `JobSource { Studio, Local }` to `RecentJob` (default Studio for the
-      existing studio path) so the UI can show a local queue
-- [ ] Tests against the synthetic engine (no GPU): submit -> bytes -> recorded
+- [x] `local::run_image(engine, catalog, observers, LocalImageRequest) ->
+      Result<TaskResult>`: resolve model, build `Task::Image` + `ModelSource`,
+      dispatch, record into the local-queue ring
+- [x] Dedicated `WorkerObservers::local_jobs` ring + `record_local_job`
+      (separate "local queue", no churn to the studio path)
+- [x] Tests against the synthetic engine (no GPU): submit -> bytes -> recorded;
+      unknown/non-image/no-default error paths (5 green)
 
 ### Local HTTP API (inbound, 127.0.0.1, always on)
 - [ ] Pick a light server (tiny_http, pure-Rust, sync — matches blocking engine)
