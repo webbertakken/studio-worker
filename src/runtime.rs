@@ -106,6 +106,8 @@ pub struct WorkerObservers {
     /// Finished jobs submitted to the local API (the in-app "local queue"),
     /// kept separate from studio-claimed jobs.
     pub local_jobs: Arc<Mutex<VecDeque<RecentJob>>>,
+    /// URL the always-on local image API is reachable at, once bound.
+    pub local_api_url: Arc<Mutex<Option<String>>>,
     pub last_heartbeat: Arc<Mutex<Option<HeartbeatStatus>>>,
     /// Bounded ring of every log entry the worker has emitted, kept
     /// for the UI's Logs tab.  Separate from the WS ship queue
@@ -383,25 +385,40 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     // before approval is a clean shutdown (the pre-approval wait is the
     // normal state of a fresh worker), so exit Ok rather than letting
     // `run_cli` log it at error and exit non-zero.
-    if ensure_registered(&cfg, &path, &registration, &stop).await? == RegistrationGate::Stopped {
-        info!(
-            target: TRACE_TARGET,
-            op = "shutdown",
-            "stopped before registration completed; exiting cleanly"
-        );
-        return Ok(());
-    }
+    // Start the always-on local image API before the registration gate so it
+    // works even when the worker is not (yet) registered with a studio.
+    let local_api = spawn_local_api(cfg.clone(), observers.clone(), stop.clone());
 
-    run_loops(
-        cfg,
-        stop,
-        logs,
-        busy,
-        paused,
-        observers,
-        LoopSchedule::default(),
-    )
-    .await
+    let outcome = match ensure_registered(&cfg, &path, &registration, &stop).await {
+        Ok(RegistrationGate::Stopped) => {
+            info!(
+                target: TRACE_TARGET,
+                op = "shutdown",
+                "stopped before registration completed; exiting cleanly"
+            );
+            Ok(())
+        }
+        Ok(_) => {
+            run_loops(
+                cfg,
+                stop.clone(),
+                logs,
+                busy,
+                paused,
+                observers,
+                LoopSchedule::default(),
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
+
+    // Shutting down: ensure the local API thread observes `stop` and joins.
+    stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = local_api {
+        let _ = handle.join();
+    }
+    outcome
 }
 
 /// Flip the `stop` flag and emit a shutdown breadcrumb so an operator
@@ -565,6 +582,73 @@ pub async fn run_loops(
     );
     let (session_result, _) = tokio::join!(session, auto_updater);
     session_result
+}
+
+/// Default port for the always-on local image API. Override with
+/// `STUDIO_WORKER_LOCAL_API_PORT`.
+pub const DEFAULT_LOCAL_API_PORT: u16 = 4787;
+
+/// Build the engine + catalog and start the local image API server on a
+/// background thread. Returns the thread handle, or `None` when it could not
+/// start (logged, non-fatal — the studio session keeps running).
+pub fn spawn_local_api(
+    cfg: SharedConfig,
+    observers: WorkerObservers,
+    stop: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let engine: Arc<dyn crate::engine::Engine> = match crate::engine::build(&cfg.lock()) {
+        Ok(engine) => engine.into(),
+        Err(err) => {
+            tracing::warn!(target: "studio_worker::local_api", error = %err, "local api: engine build failed");
+            return None;
+        }
+    };
+
+    let catalog_path = crate::config::default_catalog_path().ok();
+    let catalog = match &catalog_path {
+        Some(path) => crate::catalog::Catalog::load_or_seed(path).unwrap_or_else(|err| {
+            tracing::warn!(target: "studio_worker::local_api", error = %err, "local api: catalog load failed; seeding in-memory");
+            crate::catalog::Catalog::seed()
+        }),
+        None => crate::catalog::Catalog::seed(),
+    };
+    let catalog = Arc::new(Mutex::new(catalog));
+
+    let port = std::env::var("STUDIO_WORKER_LOCAL_API_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_LOCAL_API_PORT);
+
+    let api = crate::local_api::LocalApi::bind(
+        &format!("127.0.0.1:{port}"),
+        engine.clone(),
+        catalog.clone(),
+        catalog_path.clone(),
+        observers.clone(),
+    )
+    .or_else(|_| {
+        crate::local_api::LocalApi::bind(
+            "127.0.0.1:0",
+            engine,
+            catalog,
+            catalog_path,
+            observers.clone(),
+        )
+    });
+
+    let api = match api {
+        Ok(api) => api,
+        Err(err) => {
+            tracing::warn!(target: "studio_worker::local_api", error = %err, "local api: bind failed");
+            return None;
+        }
+    };
+
+    let url = api.url();
+    *observers.local_api_url.lock() = Some(url.clone());
+    tracing::info!(target: "studio_worker::local_api", url = %url, "local image API listening");
+
+    Some(std::thread::spawn(move || api.serve(&stop)))
 }
 
 // ---------------------------------------------------------------------------

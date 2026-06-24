@@ -45,13 +45,16 @@ Architecture notes (verified):
       /models/:id`; `GET /jobs`, `GET /healthz`
 - [x] Integration tests (synthetic engine): image, model add/list, bad model
       -> 400, bad json -> 400, healthz, jobs (7 green, real reqwest)
-- [ ] Config: `[local_api] enabled=true, port` (default), bind `127.0.0.1`
-      — wiring step
+- [x] Always-on (no config flag, per request): default port 4787, env override
+      `STUDIO_WORKER_LOCAL_API_PORT`, ephemeral fallback; bind `127.0.0.1`
 
 ### Wire into the running worker
-- [ ] Start the server thread from `runtime::run` and `ui::run`, sharing the
-      engine + observers + catalog; graceful shutdown
-- [ ] Ensure it never blocks the studio session loop
+- [x] `spawn_local_api` started from `runtime::run` (before the registration
+      gate, so it works without a studio) and from `ui::run`; catalog at
+      `config dir/models.json`; graceful join on stop
+- [x] Runs on its own thread; never blocks the studio session loop
+- [x] E2E verified in the real binary: listening on 4787 pre-registration,
+      /healthz 200, /models seeded with Z-Image, models.json written
 
 ### UI: local queue
 - [ ] Jobs view shows a `local` badge / source column; verify the local jobs

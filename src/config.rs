@@ -187,6 +187,14 @@ fn default_config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("config.toml"))
 }
 
+/// Path to the local model catalog (`models.json`), in the config dir next to
+/// `config.toml`. The local image API seeds this on first use.
+pub fn default_catalog_path() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("gg", "minis", "minis-studio-worker")
+        .ok_or_else(|| anyhow!("cannot resolve config directory"))?;
+    Ok(dirs.config_dir().join("models.json"))
+}
+
 pub fn resolve_path(override_path: Option<&str>) -> Result<PathBuf> {
     if let Some(p) = override_path {
         Ok(PathBuf::from(p))
