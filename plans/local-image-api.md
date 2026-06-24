@@ -40,15 +40,13 @@ Architecture notes (verified):
       unknown/non-image/no-default error paths (5 green)
 
 ### Local HTTP API (inbound, 127.0.0.1, always on)
-- [ ] Pick a light server (tiny_http, pure-Rust, sync — matches blocking engine)
-- [ ] `POST /image` { prompt, model?, width?, height?, steps?, seed?,
-      negativePrompt?, ext? } -> image bytes (sync)
-- [ ] `GET /models`, `POST /models` (add a model, like studio), `DELETE
-      /models/:id`
-- [ ] `GET /jobs` (recent local jobs), `GET /healthz`
+- [x] tiny_http (pure-Rust, sync) local server module `local_api`
+- [x] `POST /image` -> image bytes (sync); `GET/POST /models`, `DELETE
+      /models/:id`; `GET /jobs`, `GET /healthz`
+- [x] Integration tests (synthetic engine): image, model add/list, bad model
+      -> 400, bad json -> 400, healthz, jobs (7 green, real reqwest)
 - [ ] Config: `[local_api] enabled=true, port` (default), bind `127.0.0.1`
-- [ ] Integration tests (synthetic engine): image happy-path, model add/list,
-      bad model -> 400, bad json -> 400
+      — wiring step
 
 ### Wire into the running worker
 - [ ] Start the server thread from `runtime::run` and `ui::run`, sharing the
