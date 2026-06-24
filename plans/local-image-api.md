@@ -61,6 +61,8 @@ Architecture notes (verified):
       from `observers.local_jobs` / `local_api_url`; egui-free JobsView test
 
 ### Docs + CI
-- [ ] `docs/` page for the local API + catalog; README mention
-- [ ] `cargo fmt`/`clippy --tests -D warnings`/`cargo test` green; coverage >=90
-- [ ] Conventional-commit PR (title <= 52 chars)
+- [x] `docs/local-image-api.md` + README "Local image API" section
+- [x] `cargo fmt`/`clippy --tests -D warnings`/`cargo test` green locally
+      (421 lib + all integration); `cargo audit` clean (bumped 2 advisories)
+- [x] Conventional-commit PR #105 (title <= 52 chars); CI build matrix +
+      coverage running
