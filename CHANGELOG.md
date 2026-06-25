@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.8](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.7...studio-worker-v0.4.8) (2026-06-25)
+
+
+### Features
+
+* local image API + catalog + local queue ([#105](https://github.com/webbertakken/studio-worker/issues/105)) ([67155e3](https://github.com/webbertakken/studio-worker/commit/67155e392616b01aaddb0a1339ecdf40aaca2571))
+
 ## [0.4.7](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.6...studio-worker-v0.4.7) (2026-06-17)
 
 
