@@ -82,6 +82,9 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         }
     });
 
+    // Always-on local image API (127.0.0.1), independent of studio registration.
+    let local_api = runtime::spawn_local_api(cfg.clone(), observers.clone(), stop.clone());
+
     let cfg_loops = cfg.clone();
     let stop_loops = stop.clone();
     let logs_loops = logs.clone();
@@ -179,6 +182,9 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
 
     // Signal loops to wind down once the window closes.
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(handle) = local_api {
+        let _ = handle.join();
+    }
     Ok(())
 }
 

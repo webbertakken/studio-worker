@@ -395,7 +395,7 @@ pub enum ModelEngine {
     Synthetic,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelFile {
     pub role: ModelFileRole,
@@ -411,7 +411,7 @@ pub struct ModelFile {
     pub sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCliDefaults {
     pub cfg_scale: f32,
@@ -431,7 +431,7 @@ pub struct ModelCliDefaults {
     pub offload_to_cpu: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSource {
     pub engine: ModelEngine,

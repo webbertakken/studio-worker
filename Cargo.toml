@@ -21,6 +21,9 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
+# Tiny synchronous HTTP server for the always-on local image API
+# (127.0.0.1 only). Pure-Rust, no native deps.
+tiny_http = "0.12"
 # rustls instead of the default native-tls so a source build needs no
 # OpenSSL dev headers on Linux (`cargo install studio-worker` must work
 # on a bare box).  webpki-roots ships a baked CA bundle so we don't

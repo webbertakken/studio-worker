@@ -45,6 +45,22 @@ what the unattended CI suite uses.  Real high-performance backends
 feature flags and are deferred to a follow-up iteration (the trait,
 contract, and dispatch are already in place).
 
+## Local image API (no studio)
+
+The worker also runs an always-on local HTTP API (`127.0.0.1:4787`) so you can
+generate images locally — e.g. Z-Image — without going through the studio:
+
+```bash
+curl -s http://127.0.0.1:4787/image \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"a red fox in snow"}' --output fox.webp
+```
+
+Models come from a local catalog (`<config dir>/models.json`, seeded with
+Z-Image) that you can extend the same way the studio adds models. Local jobs
+show up in the desktop UI's **Local queue**. See
+[`docs/local-image-api.md`](docs/local-image-api.md).
+
 ## Desktop UI (on by default)
 
 The worker ships a native desktop window built on `egui`/`eframe` that

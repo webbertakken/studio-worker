@@ -204,6 +204,36 @@ impl OnnxImageEngine {
         })
     }
 
+    /// Run LaMa over an arbitrary-size RGB region + its mask, returning the
+    /// inpainted region at the *same* size. Resizes the region to LaMa's fixed
+    /// 512² for inference then back; with the HD crop the region is small, so
+    /// this round-trip is near-lossless (sharp fill).
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn run_lama_region(
+        &self,
+        model_path: &Path,
+        rgb: &RgbImage,
+        mask: &GrayImage,
+    ) -> Result<RgbImage> {
+        let (rw, rh) = rgb.dimensions();
+        let lama_rgb = DynamicImage::ImageRgb8(rgb.clone())
+            .resize_exact(LAMA_SIZE, LAMA_SIZE, FilterType::Triangle)
+            .to_rgb8();
+        let lama_mask = DynamicImage::ImageLuma8(mask.clone())
+            .resize_exact(LAMA_SIZE, LAMA_SIZE, FilterType::Triangle)
+            .to_luma8();
+        let out_raw = self.run_session(
+            model_path,
+            image_to_chw(&lama_rgb),
+            mask_to_binary(&lama_mask),
+        )?;
+        let scale = detect_scale(&out_raw);
+        let lama_512 = chw_to_rgb(&out_raw, LAMA_SIZE, scale)?;
+        Ok(DynamicImage::ImageRgb8(lama_512)
+            .resize_exact(rw.max(1), rh.max(1), FilterType::Triangle)
+            .to_rgb8())
+    }
+
     /// Load init + mask, run LaMa, composite, encode to `params.ext`.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn remove(
@@ -230,25 +260,30 @@ impl OnnxImageEngine {
             .resize_exact(w, h, FilterType::Triangle)
             .to_luma8();
 
-        // LaMa inputs at fixed 512².
-        let lama_rgb = DynamicImage::ImageRgb8(original.clone())
-            .resize_exact(LAMA_SIZE, LAMA_SIZE, FilterType::Triangle)
-            .to_rgb8();
-        let lama_mask = DynamicImage::ImageLuma8(mask_full.clone())
-            .resize_exact(LAMA_SIZE, LAMA_SIZE, FilterType::Triangle)
-            .to_luma8();
-
-        let out_raw = self.run_session(
-            model_path,
-            image_to_chw(&lama_rgb),
-            mask_to_binary(&lama_mask),
-        )?;
-        let scale = detect_scale(&out_raw);
-        let lama_512 = chw_to_rgb(&out_raw, LAMA_SIZE, scale)?;
-        // Back to output resolution.
-        let fill = DynamicImage::ImageRgb8(lama_512)
-            .resize_exact(w, h, FilterType::Triangle)
-            .to_rgb8();
+        // HD crop strategy: LaMa is exported at a fixed 512². Downscaling the
+        // *whole* image to 512 (then back up) makes the fill effectively
+        // half-resolution and soft — invisible on a flat colour, but a faint
+        // smudge on any subtly-lit / textured / large region. Instead, inpaint
+        // a native-resolution crop around the mask: a small object then runs at
+        // ~1:1, so the fill stays sharp and the removal is genuinely invisible.
+        // `fill` differs from `original` only inside the crop; the feathered
+        // composite below still keeps everything outside the mask byte-identical.
+        let fill = match hd_crop_box(&mask_full, w, h) {
+            Some((cx, cy, cw, ch)) => {
+                let crop_rgb = image::imageops::crop_imm(&original, cx, cy, cw, ch).to_image();
+                let crop_mask = image::imageops::crop_imm(&mask_full, cx, cy, cw, ch).to_image();
+                let inpainted = self.run_lama_region(model_path, &crop_rgb, &crop_mask)?;
+                let mut f = original.clone();
+                image::imageops::replace(&mut f, &inpainted, cx as i64, cy as i64);
+                debug!(
+                    target: TRACE_TARGET, op = "remove", crop_w = cw, crop_h = ch,
+                    full_w = w, full_h = h, "lama HD crop inpaint"
+                );
+                f
+            }
+            // Empty or full-frame mask: fall back to the whole-image pass.
+            None => self.run_lama_region(model_path, &original, &mask_full)?,
+        };
         // Feathered alpha = blurred mask; composite the fill into the
         // original only inside the (feathered) masked region.
         let alpha = image::imageops::blur(&mask_full, FEATHER_SIGMA);
@@ -380,6 +415,47 @@ fn chw_to_rgb(out: &[f32], size: u32, scale: f32) -> Result<RgbImage> {
     Ok(img)
 }
 
+/// Square crop box around the mask's white region, expanded by a context
+/// margin, clamped to the image. The crop is the unit of HD inpainting: small
+/// enough that the object runs near 1:1 through LaMa's 512², large enough to
+/// give the model surrounding background context. Returns `None` when the mask
+/// is empty (nothing to do) or the box would span the whole frame (no win over
+/// the plain full-image pass).
+fn hd_crop_box(mask: &GrayImage, w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0_u32, 0_u32);
+    let mut any = false;
+    for (x, y, p) in mask.enumerate_pixels() {
+        if p.0[0] > 128 {
+            any = true;
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    if !any {
+        return None;
+    }
+    let bw = x1 - x0 + 1;
+    let bh = y1 - y0 + 1;
+    let max_dim = bw.max(bh);
+    // Context margin: a quarter of the hole plus a small fixed pad. Keeps the
+    // crop close to the object so it runs near native resolution.
+    let margin = (max_dim as f32 * 0.25).round() as u32 + 32;
+    let limit = w.min(h);
+    let side = (max_dim + 2 * margin).clamp(256, limit);
+    // No benefit if the crop would cover the whole frame.
+    if side >= w && side >= h {
+        return None;
+    }
+    let centre_x = x0 + bw / 2;
+    let centre_y = y0 + bh / 2;
+    let half = side / 2;
+    let x = centre_x.saturating_sub(half).min(w - side);
+    let y = centre_y.saturating_sub(half).min(h - side);
+    Some((x, y, side, side))
+}
+
 /// `result = base*(1-a) + fill*a` where `a = alpha/255`.  All three
 /// images must share dimensions; the result keeps `base`'s size.
 fn alpha_composite(base: &RgbImage, fill: &RgbImage, alpha: &GrayImage) -> RgbImage {
@@ -446,6 +522,52 @@ mod tests {
         assert_eq!(bin[1], 0.0); // 128 is not > 128
         assert_eq!(bin[2], 1.0);
         assert_eq!(bin[3], 1.0);
+    }
+
+    fn mask_with_rect(w: u32, h: u32, x0: u32, y0: u32, rw: u32, rh: u32) -> GrayImage {
+        let mut m = GrayImage::new(w, h);
+        for y in y0..(y0 + rh) {
+            for x in x0..(x0 + rw) {
+                m.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn hd_crop_box_is_none_for_an_empty_mask() {
+        assert_eq!(hd_crop_box(&GrayImage::new(1024, 768), 1024, 768), None);
+    }
+
+    #[test]
+    fn hd_crop_box_brackets_a_small_object_with_a_square_in_bounds_crop() {
+        // A 200px object near the centre of a 1024x768 frame.
+        let mask = mask_with_rect(1024, 768, 412, 284, 200, 200);
+        let (x, y, cw, ch) = hd_crop_box(&mask, 1024, 768).expect("should crop");
+        // Square, and much smaller than the full frame so the inpaint runs near
+        // native resolution rather than downscaling the whole image to 512.
+        assert_eq!(cw, ch);
+        assert!(
+            cw < 1024,
+            "crop {cw} should be smaller than the frame width"
+        );
+        assert!(cw >= 200, "crop must at least contain the object");
+        // Fully inside the frame.
+        assert!(x + cw <= 1024 && y + ch <= 768);
+    }
+
+    #[test]
+    fn hd_crop_box_clamps_a_corner_object_inside_the_frame() {
+        let mask = mask_with_rect(1024, 768, 0, 0, 180, 180);
+        let (x, y, cw, ch) = hd_crop_box(&mask, 1024, 768).expect("should crop");
+        assert_eq!((x, y), (0, 0));
+        assert!(x + cw <= 1024 && y + ch <= 768);
+    }
+
+    #[test]
+    fn hd_crop_box_falls_back_to_none_when_the_mask_spans_the_frame() {
+        let mask = mask_with_rect(512, 512, 0, 0, 512, 512);
+        assert_eq!(hd_crop_box(&mask, 512, 512), None);
     }
 
     #[test]

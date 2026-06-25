@@ -11,6 +11,10 @@ use crate::runtime::{CurrentJob, JobOutcome, RecentJob, WorkerObservers};
 pub struct JobsView {
     pub current: Option<JobCard>,
     pub recent: Vec<JobCard>,
+    /// Jobs submitted to the always-on local API (the local queue).
+    pub local: Vec<JobCard>,
+    /// URL the local API is reachable at, if it bound.
+    pub local_api_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,7 +49,19 @@ impl JobsView {
             .iter()
             .map(JobCard::from_recent)
             .collect();
-        Self { current, recent }
+        let local: Vec<JobCard> = observers
+            .local_jobs
+            .lock()
+            .iter()
+            .map(JobCard::from_recent)
+            .collect();
+        let local_api_url = observers.local_api_url.lock().clone();
+        Self {
+            current,
+            recent,
+            local,
+            local_api_url,
+        }
     }
 }
 
@@ -127,6 +143,25 @@ pub fn render(ui: &mut egui::Ui, view: &JobsView) {
             ui.add_space(4.0);
         }
     }
+
+    ui.add_space(16.0);
+    ui.heading(format!("Local queue ({})", view.local.len()));
+    if let Some(url) = &view.local_api_url {
+        ui.label(
+            egui::RichText::new(format!("API: {url}"))
+                .color(egui::Color32::from_gray(140))
+                .small(),
+        );
+    }
+    ui.add_space(4.0);
+    if view.local.is_empty() {
+        ui.label(egui::RichText::new("No local jobs yet.").italics());
+    } else {
+        for card in &view.local {
+            render_card(ui, card, now, false);
+            ui.add_space(4.0);
+        }
+    }
 }
 
 fn render_card(ui: &mut egui::Ui, card: &JobCard, now: DateTime<Utc>, emphasised: bool) {
@@ -190,6 +225,8 @@ mod tests {
         WorkerObservers {
             current_job: Arc::new(Mutex::new(None)),
             recent_jobs: Arc::new(Mutex::new(VecDeque::new())),
+            local_jobs: Arc::new(Mutex::new(VecDeque::new())),
+            local_api_url: Arc::new(Mutex::new(None)),
             last_heartbeat: Arc::new(Mutex::new(None)),
             recent_logs: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -260,6 +297,30 @@ mod tests {
     // build() call.
     fn empty_observers_with_data(o: WorkerObservers) -> WorkerObservers {
         o
+    }
+
+    #[test]
+    fn build_includes_local_jobs_and_url() {
+        let observers = empty_observers();
+        *observers.local_api_url.lock() = Some("http://127.0.0.1:4787".into());
+        {
+            let now = Utc::now();
+            observers.local_jobs.lock().push_front(RecentJob {
+                job_id: "local-1".into(),
+                kind: TaskKind::Image,
+                model: "z-image-turbo-q4_k_m.gguf".into(),
+                prompt: "a fox".into(),
+                outcome: JobOutcome::Completed,
+                started_at: now,
+                finished_at: now,
+            });
+        }
+        let view = JobsView::build(&empty_observers_with_data(observers), Utc::now());
+        assert_eq!(view.local.len(), 1);
+        assert_eq!(view.local[0].job_id, "local-1");
+        assert_eq!(view.local_api_url.as_deref(), Some("http://127.0.0.1:4787"));
+        // Local jobs do not leak into the studio recent ring.
+        assert!(view.recent.is_empty());
     }
 
     #[test]

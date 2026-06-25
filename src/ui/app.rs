@@ -410,6 +410,8 @@ mod tests {
         let observers = WorkerObservers {
             current_job: Arc::new(Mutex::new(None)),
             recent_jobs: Arc::new(Mutex::new(VecDeque::new())),
+            local_jobs: Arc::new(Mutex::new(VecDeque::new())),
+            local_api_url: Arc::new(Mutex::new(None)),
             last_heartbeat: Arc::new(Mutex::new(None)),
             recent_logs: Arc::new(Mutex::new(VecDeque::new())),
         };
