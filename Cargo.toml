@@ -167,9 +167,14 @@ llama-cpp-2 = { version = "0.1.124", optional = true, default-features = false }
 encoding_rs = { version = "0.8", optional = true }
 
 [features]
-# UI on by default: `cargo install studio-worker` is windowed + tray and
-# builds on a bare Linux box (rustls, no GTK, dlopen GL — no pkg-config).
-default = ["ui"]
+# Turnkey by default: `cargo install studio-worker` (and the prebuilt
+# installer) ship the full engine set — UI + llama.cpp LLM + onnx LaMa
+# image removal + media — so the worker "just works" with no `--features`.
+# A from-source `cargo install` needs a C/C++ toolchain (cmake/cc) for
+# llama.cpp; bare boxes can use the prebuilt installer script, or
+# `--no-default-features` for the headless core. Conflicting engines
+# (whisper, image-candle) stay opt-in.
+default = ["ui", "llama", "video", "tts", "image-onnx"]
 llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
 whisper = ["dep:whisper-rs"]
 image-candle = [

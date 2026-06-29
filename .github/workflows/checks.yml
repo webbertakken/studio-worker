@@ -17,9 +17,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Default build is now the windowed UI (rustls + ksni, no GTK,
-          # dlopen GL) — the exact `cargo install studio-worker` path.
-          - label: default-ui
+          # Default build is turnkey: UI + llama.cpp + onnx LaMa + media —
+          # the exact `cargo install studio-worker` path (needs cmake/cc).
+          - label: default-turnkey
             flags: ""
             fmt: true
           # Headless core (service / `run`), no UI deps.
