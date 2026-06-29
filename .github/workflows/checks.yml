@@ -34,8 +34,10 @@ jobs:
             fmt: false
           # whisper static-links a second ggml that can't coexist with
           # llama's, so it ships in its own bundle — keep it compiling.
+          # `--no-default-features` drops the now-turnkey default's llama so
+          # the two ggml copies never collide at link time.
           - label: stt-backend
-            flags: "--features all-engines-stt"
+            flags: "--no-default-features --features all-engines-stt"
             fmt: false
     steps:
       - uses: actions/checkout@v6
