@@ -227,3 +227,13 @@ Repo secrets required:
 - Don't add hard dependencies that pull in heavy native libs (CUDA,
   Torch, etc.) at the top level — they belong behind a feature flag if
   ever needed.
+- `default` features ship the full turnkey engine set (`ui`, `llama`,
+  `video`, `tts`, `image-onnx`) so `cargo install studio-worker` and the
+  prebuilt installer both "just work" with no `--features`. Never shrink
+  `default` to `ui`-only: a worker without `image-onnx` cannot run the
+  LaMa removals Find-the-Differences needs (it fails with "no `onnx`
+  engine compiled into this worker"). Only conflicting engines (`whisper`,
+  `image-candle`) stay opt-in.
+- The prebuilt installer script is the recommended end-user install (no
+  toolchain needed). `cargo install` builds from source and needs a
+  C/C++ toolchain (cmake/cc) for llama.cpp.
