@@ -22,6 +22,7 @@ pub mod http;
 pub mod local;
 pub mod local_api;
 pub mod runtime;
+pub mod secrets;
 pub mod service;
 pub mod sys;
 pub mod telemetry;
