@@ -387,7 +387,7 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     // `run_cli` log it at error and exit non-zero.
     // Start the always-on local image API before the registration gate so it
     // works even when the worker is not (yet) registered with a studio.
-    let local_api = spawn_local_api(cfg.clone(), observers.clone(), stop.clone());
+    let local_api = spawn_local_api(cfg.clone(), &path, observers.clone(), stop.clone());
 
     let outcome = match ensure_registered(&cfg, &path, &registration, &stop).await {
         Ok(RegistrationGate::Stopped) => {
@@ -588,11 +588,63 @@ pub async fn run_loops(
 /// `STUDIO_WORKER_LOCAL_API_PORT`.
 pub const DEFAULT_LOCAL_API_PORT: u16 = 4787;
 
+/// Resolve the local API port: a valid `STUDIO_WORKER_LOCAL_API_PORT`
+/// env value wins, then the config's `local_api_port`, then the
+/// built-in default.  An *invalid* env value used to be silently
+/// ignored; now it warn-logs what it fell back to so a typo'd unit
+/// file can't quietly move the API.  Pure so every branch is
+/// unit-testable.
+pub fn resolve_local_api_port(env_value: Option<&str>, cfg_port: Option<u16>) -> u16 {
+    let fallback = cfg_port.unwrap_or(DEFAULT_LOCAL_API_PORT);
+    match env_value {
+        Some(raw) => match raw.parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => {
+                warn!(
+                    target: "studio_worker::local_api",
+                    op = "resolve_port",
+                    invalid = raw,
+                    fallback,
+                    "STUDIO_WORKER_LOCAL_API_PORT is not a valid port; falling back"
+                );
+                fallback
+            }
+        },
+        None => fallback,
+    }
+}
+
+/// Ensure the per-install local API bearer token exists, minting and
+/// persisting one on first launch.  A failed persist is warn-logged
+/// but non-fatal: the in-memory token still guards this session and
+/// the discovery file still tells clients what it is.
+pub fn ensure_local_api_token(cfg: &SharedConfig, config_path: &std::path::Path) -> String {
+    let mut snap = cfg.lock();
+    if let Some(token) = snap.local_api_token.clone() {
+        return token;
+    }
+    let token = crate::secrets::new_secret_hex();
+    snap.local_api_token = Some(token.clone());
+    let snapshot = snap.clone();
+    drop(snap);
+    if let Err(e) = config::save(&snapshot, config_path) {
+        warn!(
+            target: "studio_worker::local_api",
+            op = "ensure_token",
+            config_path = %config_path.display(),
+            error = %e,
+            "failed to persist the local api token; a fresh one will be minted next launch"
+        );
+    }
+    token
+}
+
 /// Build the engine + catalog and start the local image API server on a
 /// background thread. Returns the thread handle, or `None` when it could not
 /// start (logged, non-fatal — the studio session keeps running).
 pub fn spawn_local_api(
     cfg: SharedConfig,
+    config_path: &std::path::Path,
     observers: WorkerObservers,
     stop: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
@@ -614,10 +666,13 @@ pub fn spawn_local_api(
     };
     let catalog = Arc::new(Mutex::new(catalog));
 
-    let port = std::env::var("STUDIO_WORKER_LOCAL_API_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_LOCAL_API_PORT);
+    let token = ensure_local_api_token(&cfg, config_path);
+    let port = resolve_local_api_port(
+        std::env::var("STUDIO_WORKER_LOCAL_API_PORT")
+            .ok()
+            .as_deref(),
+        cfg.lock().local_api_port,
+    );
 
     let api = crate::local_api::LocalApi::bind(
         &format!("127.0.0.1:{port}"),
@@ -625,6 +680,7 @@ pub fn spawn_local_api(
         catalog.clone(),
         catalog_path.clone(),
         observers.clone(),
+        token.clone(),
     )
     .or_else(|_| {
         crate::local_api::LocalApi::bind(
@@ -633,6 +689,7 @@ pub fn spawn_local_api(
             catalog,
             catalog_path,
             observers.clone(),
+            token.clone(),
         )
     });
 
@@ -648,7 +705,26 @@ pub fn spawn_local_api(
     *observers.local_api_url.lock() = Some(url.clone());
     tracing::info!(target: "studio_worker::local_api", url = %url, "local image API listening");
 
-    Some(std::thread::spawn(move || api.serve(&stop)))
+    // Publish URL + token for local clients; removed again after the
+    // serve loop exits so a stale file can't point at a dead port.
+    let discovery_path = crate::config::default_local_api_discovery_path().ok();
+    if let Some(path) = &discovery_path {
+        if let Err(e) = crate::local_api::write_discovery_file(path, &url, &token) {
+            tracing::warn!(
+                target: "studio_worker::local_api",
+                error = %e,
+                path = %path.display(),
+                "failed to write the local api discovery file"
+            );
+        }
+    }
+
+    Some(std::thread::spawn(move || {
+        api.serve(&stop);
+        if let Some(path) = &discovery_path {
+            crate::local_api::remove_discovery_file(path);
+        }
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1623,5 +1699,95 @@ mod tests {
             .await
             .expect("auto-updater did not observe stop promptly")
             .expect("auto-updater task panicked");
+    }
+
+    // -----------------------------------------------------------------
+    // Local API bootstrap helpers.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_local_api_port_prefers_env_then_config_then_default() {
+        assert_eq!(resolve_local_api_port(Some("5000"), Some(4000)), 5000);
+        assert_eq!(resolve_local_api_port(None, Some(4000)), 4000);
+        assert_eq!(resolve_local_api_port(None, None), DEFAULT_LOCAL_API_PORT);
+    }
+
+    #[test]
+    fn resolve_local_api_port_warns_on_invalid_env_and_falls_back() {
+        // An invalid env value used to be silently ignored; it must
+        // fall back *and* leave a warn naming the bad value.
+        let logs = crate::test_support::capture(|| {
+            assert_eq!(
+                resolve_local_api_port(Some("not-a-port"), None),
+                DEFAULT_LOCAL_API_PORT
+            );
+            assert_eq!(resolve_local_api_port(Some("99999"), Some(4001)), 4001);
+        });
+        assert!(logs.contains("WARN"), "expected a WARN, got: {logs}");
+        assert!(
+            logs.contains("not-a-port"),
+            "the warn must name the invalid value, got: {logs}"
+        );
+        assert!(
+            logs.contains("STUDIO_WORKER_LOCAL_API_PORT"),
+            "the warn must name the env var, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn ensure_local_api_token_mints_once_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = config::shared(Config::default());
+
+        let minted = ensure_local_api_token(&cfg, &path);
+        assert_eq!(minted.len(), 64, "expected a 64-hex token");
+        assert!(minted.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Persisted to disk…
+        let (loaded, _) = config::load(Some(&path.to_string_lossy())).unwrap();
+        assert_eq!(loaded.local_api_token.as_deref(), Some(minted.as_str()));
+
+        // …and stable across calls (no re-mint).
+        let again = ensure_local_api_token(&cfg, &path);
+        assert_eq!(again, minted);
+    }
+
+    #[test]
+    fn ensure_local_api_token_keeps_an_existing_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = config::shared(Config {
+            local_api_token: Some("pre-existing".into()),
+            ..Config::default()
+        });
+        assert_eq!(ensure_local_api_token(&cfg, &path), "pre-existing");
+        assert!(!path.exists(), "no save when nothing changed");
+    }
+
+    #[test]
+    fn ensure_local_api_token_survives_a_failed_persist() {
+        // Unwritable config path: the token must still be minted (the
+        // session stays guarded) and a warn must surface the failure.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"a file, not a dir").unwrap();
+        let path = blocked.join("config.toml");
+        let cfg = config::shared(Config::default());
+        let logs = crate::test_support::capture({
+            let cfg = cfg.clone();
+            move || {
+                let token = ensure_local_api_token(&cfg, &path);
+                assert_eq!(token.len(), 64);
+            }
+        });
+        assert!(
+            logs.contains("failed to persist the local api token"),
+            "a failed persist must warn: {logs}"
+        );
+        assert!(
+            cfg.lock().local_api_token.is_some(),
+            "the in-memory token must survive the failed persist"
+        );
     }
 }
