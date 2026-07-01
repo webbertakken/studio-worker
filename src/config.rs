@@ -200,22 +200,22 @@ fn default_config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("config.toml"))
 }
 
-/// Path to the local model catalog (`models.json`), in the config dir next to
-/// `config.toml`. The local image API seeds this on first use.
-pub fn default_catalog_path() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("gg", "minis", "minis-studio-worker")
-        .ok_or_else(|| anyhow!("cannot resolve config directory"))?;
-    Ok(dirs.config_dir().join("models.json"))
+/// Path to the local model catalog (`models.json`), next to the
+/// **active** config file.  Deriving from the config path (rather
+/// than the ProjectDirs singleton) keeps `--config` overrides — and
+/// the test suites that use temp configs — fully isolated from the
+/// real per-user state.
+pub fn catalog_path_for(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent().map(|dir| dir.join("models.json"))
 }
 
-/// Path to the local API discovery file (`local-api.json`), in the
-/// config dir next to `config.toml`.  Written on every successful
-/// bind so local clients can find the URL + bearer token without
-/// parsing logs; owner-only because it carries the token.
-pub fn default_local_api_discovery_path() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("gg", "minis", "minis-studio-worker")
-        .ok_or_else(|| anyhow!("cannot resolve config directory"))?;
-    Ok(dirs.config_dir().join("local-api.json"))
+/// Path to the local API discovery file (`local-api.json`), next to
+/// the active config file.  Written on every successful bind so local
+/// clients can find the URL + bearer token without parsing logs;
+/// owner-only because it carries the token.  Sibling-of-config for
+/// the same isolation reason as [`catalog_path_for`].
+pub fn local_api_discovery_path_for(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent().map(|dir| dir.join("local-api.json"))
 }
 
 pub fn resolve_path(override_path: Option<&str>) -> Result<PathBuf> {
@@ -534,14 +534,21 @@ mod tests {
     }
 
     #[test]
-    fn discovery_path_lives_next_to_the_config() {
-        let p = default_local_api_discovery_path().unwrap();
-        assert!(p.ends_with("local-api.json"), "got {}", p.display());
+    fn catalog_and_discovery_paths_are_siblings_of_the_active_config() {
+        // Deriving from the config path (not a ProjectDirs singleton)
+        // is what keeps `--config` runs and test suites from touching
+        // the real user's `models.json` / `local-api.json`.
+        let cfg = Path::new("/tmp/custom-dir/config.toml");
         assert_eq!(
-            p.parent(),
-            default_catalog_path().unwrap().parent(),
-            "discovery file must live in the config dir"
+            catalog_path_for(cfg),
+            Some(PathBuf::from("/tmp/custom-dir/models.json"))
         );
+        assert_eq!(
+            local_api_discovery_path_for(cfg),
+            Some(PathBuf::from("/tmp/custom-dir/local-api.json"))
+        );
+        // A parentless path yields None rather than a panic.
+        assert_eq!(catalog_path_for(Path::new("/")), None);
     }
 
     #[test]

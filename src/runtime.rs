@@ -656,7 +656,7 @@ pub fn spawn_local_api(
         }
     };
 
-    let catalog_path = crate::config::default_catalog_path().ok();
+    let catalog_path = crate::config::catalog_path_for(config_path);
     let catalog = match &catalog_path {
         Some(path) => crate::catalog::Catalog::load_or_seed(path).unwrap_or_else(|err| {
             tracing::warn!(target: "studio_worker::local_api", error = %err, "local api: catalog load failed; seeding in-memory");
@@ -707,7 +707,7 @@ pub fn spawn_local_api(
 
     // Publish URL + token for local clients; removed again after the
     // serve loop exits so a stale file can't point at a dead port.
-    let discovery_path = crate::config::default_local_api_discovery_path().ok();
+    let discovery_path = crate::config::local_api_discovery_path_for(config_path);
     if let Some(path) = &discovery_path {
         if let Err(e) = crate::local_api::write_discovery_file(path, &url, &token) {
             tracing::warn!(

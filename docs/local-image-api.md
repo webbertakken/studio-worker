@@ -5,23 +5,34 @@ The worker exposes an always-on local HTTP API so you can generate images
 worker runs (`run` or the desktop UI), before the studio-registration gate, so
 it works even when the worker is not registered with any studio.
 
-- Bind: `127.0.0.1` only, no auth (local-only by design).
-- Port: `4787` by default. Override with `STUDIO_WORKER_LOCAL_API_PORT`; if the
+- Bind: `127.0.0.1` only.
+- Auth: every route except `GET /healthz` requires
+  `Authorization: Bearer <token>`.  The token is generated once per
+  install and published — together with the bound URL — in the
+  owner-only discovery file `<config dir>/local-api.json`
+  (`~/.config/minis-studio-worker/local-api.json` on Linux), so local
+  clients can pick both up without parsing logs.  Requests with a
+  non-loopback `Host` or `Origin` header are rejected with `403`
+  (DNS-rebinding / CSRF guards — loopback alone is not enough against
+  a hostile web page).
+- Port: `4787` by default. Override with `STUDIO_WORKER_LOCAL_API_PORT`
+  (or `local_api_port` in `config.toml`; the env var wins); if the
   preferred port is taken the worker falls back to an ephemeral port and logs
-  the chosen URL (also published in the UI's Jobs tab).
+  the chosen URL (also published in the UI's Jobs tab and the discovery file).
+- Request bodies are capped at 1 MiB (`413` beyond that).
 - Synchronous: `POST /image` blocks until the engine finishes and returns the
   image bytes. Each job is recorded in the in-app **Local queue**.
 
 ## Endpoints
 
-| Method | Path            | Body / params                              | Returns |
-| ------ | --------------- | ------------------------------------------ | ------- |
-| POST   | `/image`        | JSON image request (below)                 | image bytes (`image/webp` etc.) |
-| GET    | `/models`       | —                                          | catalog as JSON array |
-| POST   | `/models`       | a catalog model (same `ModelSource` shape) | `{"ok":true}` |
-| DELETE | `/models/:id`   | —                                          | `{"ok":true}` / 404 |
-| GET    | `/jobs`         | —                                          | recent local jobs as JSON |
-| GET    | `/healthz`      | —                                          | `{"ok":true}` |
+| Method | Path            | Auth | Body / params                              | Returns |
+| ------ | --------------- | ---- | ------------------------------------------ | ------- |
+| POST   | `/image`        | yes  | JSON image request (below)                 | image bytes (`image/webp` etc.) |
+| GET    | `/models`       | yes  | —                                          | catalog as JSON array |
+| POST   | `/models`       | yes  | a catalog model (same `ModelSource` shape) | `{"ok":true}` |
+| DELETE | `/models/:id`   | yes  | —                                          | `{"ok":true}` / 404 |
+| GET    | `/jobs`         | yes  | —                                          | recent local jobs as JSON |
+| GET    | `/healthz`      | no   | —                                          | `{"ok":true}` |
 
 ### Image request
 
@@ -37,16 +48,19 @@ it works even when the worker is not registered with any studio.
 }
 ```
 
-Example:
+Example (reading the URL + token from the discovery file with `jq`):
 
 ```bash
-curl -s http://127.0.0.1:4787/image \
+DISCOVERY=~/.config/minis-studio-worker/local-api.json
+curl -s "$(jq -r .url $DISCOVERY)/image" \
+  -H "authorization: Bearer $(jq -r .token $DISCOVERY)" \
   -H 'content-type: application/json' \
   -d '{"prompt":"a red fox in snow"}' --output fox.webp
 ```
 
-Errors: unknown / non-image model or a bad request body return `400`; an engine
-failure returns `500`.
+Errors: unknown / non-image model or a bad request body return `400`; a
+missing/wrong token returns `401`; a non-loopback `Host`/`Origin` returns
+`403`; a body over 1 MiB returns `413`; an engine failure returns `500`.
 
 ## Local model catalog
 
@@ -63,6 +77,7 @@ metadata), either by editing `models.json` or via the API:
 
 ```bash
 curl -s http://127.0.0.1:4787/models \
+  -H "authorization: Bearer $(jq -r .token ~/.config/minis-studio-worker/local-api.json)" \
   -H 'content-type: application/json' \
   -d '{
     "id": "my-model.gguf",
