@@ -1,9 +1,31 @@
-//! Always-on local HTTP API for image generation (127.0.0.1 only, no auth).
+//! Always-on local HTTP API for image generation (127.0.0.1 only).
 //!
 //! Synchronous: `POST /image` blocks until the engine finishes and returns the
 //! image bytes. Models come from the local [`Catalog`], which the operator can
 //! extend at runtime via `POST /models` — the same `ModelSource` shape the
 //! studio uses. Every job is recorded into the in-app local queue.
+//!
+//! ## Security model
+//!
+//! Binding loopback alone is **not** enough:
+//!
+//! * Browsers happily fire cross-site `text/plain` POSTs at
+//!   `127.0.0.1` without a CORS preflight, and this API parses bodies
+//!   as JSON regardless of content type — so without a guard any web
+//!   page could inject catalog models (with attacker-controlled
+//!   download URLs) or burn the GPU.  DNS rebinding additionally lets
+//!   a page *read* responses.
+//! * Any other local OS user can reach the port.
+//!
+//! Defence, checked in order on every route except `GET /healthz`:
+//!
+//! 1. **Host allow-list** — must be loopback (DNS-rebinding guard).
+//! 2. **Origin allow-list** — when present, must be a loopback origin
+//!    (CSRF guard; absent means a non-browser client and is allowed).
+//! 3. **Bearer token** — `Authorization: Bearer <token>`, compared in
+//!    constant time.  The token is generated per install, persisted in
+//!    `config.toml`, and published to local clients via the owner-only
+//!    `local-api.json` discovery file in the worker's config dir.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -24,6 +46,90 @@ use crate::types::TaskResult;
 const TRACE_TARGET: &str = "studio_worker::local_api";
 const POLL: Duration = Duration::from_millis(200);
 
+/// Maximum accepted request-body size.  `read_body` used to read to
+/// string unbounded, so a single request could OOM the worker.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Why a request was denied before reaching its handler.
+#[derive(Debug, PartialEq, Eq)]
+enum Denial {
+    /// `Host` header present but not loopback — DNS rebinding.
+    Host(String),
+    /// `Origin` header present but not a loopback origin — CSRF.
+    Origin(String),
+    /// Missing or wrong bearer token.
+    Token,
+}
+
+/// True when `host` (an HTTP `Host` header value, optionally with a
+/// `:port` suffix) names the loopback interface this API binds.
+fn host_is_loopback(host: &str) -> bool {
+    // `[::1]:port` — bracketed IPv6 keeps its colons, so strip the
+    // port only after the closing bracket.
+    let bare = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((addr, _port)) => addr,
+            None => return false,
+        }
+    } else {
+        host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+    };
+    bare.eq_ignore_ascii_case("localhost") || bare == "127.0.0.1" || bare == "::1"
+}
+
+/// True when an `Origin` header value is a loopback origin.  `null`
+/// (sandboxed iframes / redirects) and every remote origin are
+/// rejected; only `http(s)://<loopback>[:port]` passes.
+fn origin_is_loopback(origin: &str) -> bool {
+    let rest = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"));
+    match rest {
+        Some(host) => host_is_loopback(host),
+        None => false,
+    }
+}
+
+/// Constant-time bearer-token comparison so a local attacker can't
+/// binary-search the token through response timing.
+fn token_matches(presented: &str, expected: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The request gate, pure over extracted header values so every
+/// branch is unit-testable without a socket.  Checks run in
+/// cheapest-and-broadest-first order: Host (rebinding), Origin
+/// (CSRF), then the token.
+fn deny_reason(
+    host: Option<&str>,
+    origin: Option<&str>,
+    authorization: Option<&str>,
+    token: &str,
+) -> Option<Denial> {
+    if let Some(host) = host {
+        if !host_is_loopback(host) {
+            return Some(Denial::Host(host.to_string()));
+        }
+    }
+    if let Some(origin) = origin {
+        if !origin_is_loopback(origin) {
+            return Some(Denial::Origin(origin.to_string()));
+        }
+    }
+    let presented = authorization.and_then(|a| {
+        a.strip_prefix("Bearer ")
+            .or_else(|| a.strip_prefix("bearer "))
+    });
+    match presented {
+        Some(presented) if token_matches(presented, token) => None,
+        _ => Some(Denial::Token),
+    }
+}
+
 /// The local image API server, bound but not yet serving.
 pub struct LocalApi {
     engine: Arc<dyn Engine>,
@@ -32,6 +138,8 @@ pub struct LocalApi {
     observers: WorkerObservers,
     server: Server,
     addr: SocketAddr,
+    /// Bearer token every route except `GET /healthz` requires.
+    token: String,
 }
 
 #[derive(Deserialize)]
@@ -62,7 +170,12 @@ impl LocalApi {
         catalog: Arc<Mutex<Catalog>>,
         catalog_path: Option<PathBuf>,
         observers: WorkerObservers,
+        token: String,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !token.is_empty(),
+            "local api: refusing to serve with an empty token"
+        );
         let server =
             Server::http(addr).map_err(|e| anyhow::anyhow!("local api bind {addr}: {e}"))?;
         let addr = server
@@ -76,6 +189,7 @@ impl LocalApi {
             observers,
             server,
             addr,
+            token,
         })
     }
 
@@ -108,6 +222,55 @@ impl LocalApi {
         let url = request.url().to_string();
         let path = url.split('?').next().unwrap_or("/");
 
+        // `GET /healthz` stays open: liveness only, no secrets.  Every
+        // other route passes the Host / Origin / token gate first.
+        if !(method == Method::Get && path == "/healthz") {
+            let header = |name: &'static str| {
+                request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv(name))
+                    .map(|h| h.value.as_str().to_string())
+            };
+            let denial = deny_reason(
+                header("host").as_deref(),
+                header("origin").as_deref(),
+                header("authorization").as_deref(),
+                &self.token,
+            );
+            if let Some(denial) = denial {
+                let (status, body) = match &denial {
+                    Denial::Host(host) => {
+                        (403, format!("forbidden: non-loopback Host header {host:?}"))
+                    }
+                    Denial::Origin(origin) => (
+                        403,
+                        format!("forbidden: cross-site request from Origin {origin:?}"),
+                    ),
+                    Denial::Token => (
+                        401,
+                        "missing or invalid Authorization bearer token; local clients \
+                         can read the current token from the local-api.json discovery \
+                         file in the worker's config directory"
+                            .to_string(),
+                    ),
+                };
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    op = "deny",
+                    method = %method,
+                    path,
+                    status,
+                    reason = ?denial,
+                    "local api request denied"
+                );
+                if let Err(err) = respond(request, status, "text/plain", body.as_bytes()) {
+                    tracing::warn!(target: TRACE_TARGET, error = %err, "local api respond error");
+                }
+                return;
+            }
+        }
+
         let outcome = match (&method, path) {
             (Method::Get, "/healthz") => {
                 respond(request, 200, "application/json", b"{\"ok\":true}")
@@ -128,7 +291,10 @@ impl LocalApi {
     }
 
     fn handle_image(&self, mut request: Request) -> std::io::Result<()> {
-        let body = read_body(&mut request)?;
+        let body = match read_body(&mut request)? {
+            BodyOutcome::Ok(body) => body,
+            BodyOutcome::TooLarge => return respond_too_large(request),
+        };
         let parsed: ImageBody = match serde_json::from_str(&body) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -176,7 +342,10 @@ impl LocalApi {
     }
 
     fn handle_add_model(&self, mut request: Request) -> std::io::Result<()> {
-        let body = read_body(&mut request)?;
+        let body = match read_body(&mut request)? {
+            BodyOutcome::Ok(body) => body,
+            BodyOutcome::TooLarge => return respond_too_large(request),
+        };
         let model: CatalogModel = match serde_json::from_str(&body) {
             Ok(model) => model,
             Err(err) => {
@@ -251,10 +420,74 @@ impl LocalApi {
     }
 }
 
-fn read_body(request: &mut Request) -> std::io::Result<String> {
+/// A request body, or a refusal to read one past [`MAX_BODY_BYTES`].
+enum BodyOutcome {
+    Ok(String),
+    TooLarge,
+}
+
+fn read_body(request: &mut Request) -> std::io::Result<BodyOutcome> {
+    // Declared length first — reject without reading a byte.
+    if matches!(request.body_length(), Some(len) if len > MAX_BODY_BYTES) {
+        return Ok(BodyOutcome::TooLarge);
+    }
+    // Then a hard cap on the reader for chunked / lying senders: read
+    // at most one byte past the cap so overflow is detectable.
     let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
-    Ok(body)
+    use std::io::Read as _;
+    request
+        .as_reader()
+        .take(MAX_BODY_BYTES as u64 + 1)
+        .read_to_string(&mut body)?;
+    if body.len() > MAX_BODY_BYTES {
+        return Ok(BodyOutcome::TooLarge);
+    }
+    Ok(BodyOutcome::Ok(body))
+}
+
+fn respond_too_large(request: Request) -> std::io::Result<()> {
+    respond(
+        request,
+        413,
+        "text/plain",
+        format!("request body exceeds {MAX_BODY_BYTES} bytes").as_bytes(),
+    )
+}
+
+/// Publish the bound URL + bearer token for local clients, atomically
+/// and owner-only (the file carries the token).  Written on every
+/// successful bind; removed again by [`remove_discovery_file`] on
+/// clean shutdown so stale files can't point at a dead port.
+pub fn write_discovery_file(path: &std::path::Path, url: &str, token: &str) -> anyhow::Result<()> {
+    let body = serde_json::json!({ "url": url, "token": token });
+    let text = serde_json::to_string_pretty(&body)?;
+    crate::config::write_atomic(path, text.as_bytes())?;
+    tracing::info!(
+        target: TRACE_TARGET,
+        op = "discovery",
+        path = %path.display(),
+        url,
+        "local api discovery file written"
+    );
+    Ok(())
+}
+
+/// Best-effort removal of the discovery file on shutdown.  A missing
+/// file is the desired end state; any other failure is warn-logged so
+/// a stale token file never vanishes silently *and* never lingers
+/// silently.
+pub fn remove_discovery_file(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "discovery",
+                path = %path.display(),
+                error = %e,
+                "failed to remove local api discovery file"
+            );
+        }
+    }
 }
 
 fn content_type_for(ext: &str) -> &'static str {
@@ -305,6 +538,8 @@ mod tests {
         }
     }
 
+    const TEST_TOKEN: &str = "test-token-0123456789abcdef";
+
     struct Harness {
         url: String,
         observers: WorkerObservers,
@@ -322,6 +557,7 @@ mod tests {
                 Arc::new(Mutex::new(catalog)),
                 None,
                 observers.clone(),
+                TEST_TOKEN.to_string(),
             )
             .unwrap();
             let url = api.url();
@@ -334,6 +570,20 @@ mod tests {
                 stop,
                 handle: Some(handle),
             }
+        }
+
+        /// Authed POST builder — what a legitimate local client sends.
+        fn post(&self, path: &str) -> reqwest::blocking::RequestBuilder {
+            reqwest::blocking::Client::new()
+                .post(format!("{}{}", self.url, path))
+                .bearer_auth(TEST_TOKEN)
+        }
+
+        /// Authed GET.
+        fn get(&self, path: &str) -> reqwest::blocking::RequestBuilder {
+            reqwest::blocking::Client::new()
+                .get(format!("{}{}", self.url, path))
+                .bearer_auth(TEST_TOKEN)
         }
     }
 
@@ -355,10 +605,9 @@ mod tests {
     #[test]
     fn post_image_returns_image_bytes_and_records_job() {
         let h = Harness::start(seeded_catalog());
-        let client = reqwest::blocking::Client::new();
 
-        let res = client
-            .post(format!("{}/image", h.url))
+        let res = h
+            .post("/image")
             .json(&serde_json::json!({ "prompt": "a blue bird" }))
             .send()
             .unwrap();
@@ -373,9 +622,8 @@ mod tests {
     #[test]
     fn post_image_honours_requested_ext() {
         let h = Harness::start(seeded_catalog());
-        let client = reqwest::blocking::Client::new();
-        let res = client
-            .post(format!("{}/image", h.url))
+        let res = h
+            .post("/image")
             .json(&serde_json::json!({ "prompt": "x", "ext": "png" }))
             .send()
             .unwrap();
@@ -386,37 +634,29 @@ mod tests {
     #[test]
     fn get_models_lists_catalog() {
         let h = Harness::start(seeded_catalog());
-        let body = reqwest::blocking::get(format!("{}/models", h.url))
-            .unwrap()
-            .text()
-            .unwrap();
+        let body = h.get("/models").send().unwrap().text().unwrap();
         assert!(body.contains("synthetic-img"));
     }
 
     #[test]
     fn post_models_adds_a_model_then_lists_it() {
         let h = Harness::start(seeded_catalog());
-        let client = reqwest::blocking::Client::new();
-        let res = client
-            .post(format!("{}/models", h.url))
+        let res = h
+            .post("/models")
             .json(&synthetic_model("added-model"))
             .send()
             .unwrap();
         assert_eq!(res.status(), 200);
 
-        let body = reqwest::blocking::get(format!("{}/models", h.url))
-            .unwrap()
-            .text()
-            .unwrap();
+        let body = h.get("/models").send().unwrap().text().unwrap();
         assert!(body.contains("added-model"));
     }
 
     #[test]
     fn unknown_model_is_a_400() {
         let h = Harness::start(seeded_catalog());
-        let client = reqwest::blocking::Client::new();
-        let res = client
-            .post(format!("{}/image", h.url))
+        let res = h
+            .post("/image")
             .json(&serde_json::json!({ "prompt": "x", "model": "nope" }))
             .send()
             .unwrap();
@@ -426,9 +666,8 @@ mod tests {
     #[test]
     fn invalid_json_is_a_400() {
         let h = Harness::start(seeded_catalog());
-        let client = reqwest::blocking::Client::new();
-        let res = client
-            .post(format!("{}/image", h.url))
+        let res = h
+            .post("/image")
             .body("not json")
             .header("content-type", "application/json")
             .send()
@@ -446,17 +685,274 @@ mod tests {
     #[test]
     fn jobs_endpoint_reports_after_generation() {
         let h = Harness::start(seeded_catalog());
-        let client = reqwest::blocking::Client::new();
-        client
-            .post(format!("{}/image", h.url))
+        h.post("/image")
             .json(&serde_json::json!({ "prompt": "x" }))
             .send()
             .unwrap();
-        let body = reqwest::blocking::get(format!("{}/jobs", h.url))
-            .unwrap()
-            .text()
-            .unwrap();
+        let body = h.get("/jobs").send().unwrap().text().unwrap();
         assert!(body.contains("\"completed\""));
         assert!(body.contains("synthetic-img"));
+    }
+
+    // -----------------------------------------------------------------
+    // Auth gate: every route except GET /healthz requires the bearer
+    // token; Host / Origin headers must be loopback.  These pin the
+    // CSRF / DNS-rebinding / local-user defences end-to-end through a
+    // real socket.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn routes_reject_requests_without_a_token() {
+        let h = Harness::start(seeded_catalog());
+        let client = reqwest::blocking::Client::new();
+        let cases: Vec<(reqwest::blocking::RequestBuilder, &str)> = vec![
+            (
+                client
+                    .post(format!("{}/image", h.url))
+                    .json(&serde_json::json!({ "prompt": "x" })),
+                "POST /image",
+            ),
+            (client.get(format!("{}/models", h.url)), "GET /models"),
+            (
+                client
+                    .post(format!("{}/models", h.url))
+                    .json(&synthetic_model("evil")),
+                "POST /models",
+            ),
+            (
+                client.delete(format!("{}/models/synthetic-img", h.url)),
+                "DELETE /models",
+            ),
+            (client.get(format!("{}/jobs", h.url)), "GET /jobs"),
+        ];
+        for (req, name) in cases {
+            let res = req.send().unwrap();
+            assert_eq!(res.status(), 401, "{name} must require the token");
+            let body = res.text().unwrap();
+            assert!(
+                body.contains("local-api.json"),
+                "{name}: the 401 must point at the discovery file, got: {body}"
+            );
+        }
+        // Nothing was mutated by the unauthenticated attempts.
+        let body = h.get("/models").send().unwrap().text().unwrap();
+        assert!(!body.contains("evil"));
+        assert!(body.contains("synthetic-img"));
+    }
+
+    #[test]
+    fn routes_reject_a_wrong_token() {
+        let h = Harness::start(seeded_catalog());
+        let res = reqwest::blocking::Client::new()
+            .get(format!("{}/models", h.url))
+            .bearer_auth("wrong-token")
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 401);
+    }
+
+    #[test]
+    fn healthz_needs_no_token() {
+        let h = Harness::start(seeded_catalog());
+        let res = reqwest::blocking::get(format!("{}/healthz", h.url)).unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
+    #[test]
+    fn non_loopback_host_header_is_forbidden_even_with_a_token() {
+        // The DNS-rebinding shape: the TCP connection reaches loopback
+        // but the browser's Host header names the attacker's domain.
+        let h = Harness::start(seeded_catalog());
+        let res = h
+            .get("/models")
+            .header("host", "evil.example:4787")
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 403);
+        assert!(res.text().unwrap().contains("Host"));
+    }
+
+    #[test]
+    fn cross_site_origin_is_forbidden_even_with_a_token() {
+        // The CSRF shape: a browser always attaches the page's Origin
+        // to cross-site POSTs.
+        let h = Harness::start(seeded_catalog());
+        let res = h
+            .post("/image")
+            .header("origin", "https://evil.example")
+            .json(&serde_json::json!({ "prompt": "x" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 403);
+        assert!(res.text().unwrap().contains("Origin"));
+    }
+
+    #[test]
+    fn loopback_origin_is_allowed() {
+        // A local web app (e.g. a dashboard on localhost:5173) is a
+        // legitimate browser client.
+        let h = Harness::start(seeded_catalog());
+        let res = h
+            .get("/models")
+            .header("origin", "http://localhost:5173")
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
+    #[test]
+    fn oversized_body_is_a_413() {
+        let h = Harness::start(seeded_catalog());
+        let big = "x".repeat(MAX_BODY_BYTES + 1);
+        let res = h.post("/image").body(big).send().unwrap();
+        assert_eq!(res.status(), 413);
+    }
+
+    #[test]
+    fn body_at_the_cap_is_still_read() {
+        // Boundary: exactly MAX_BODY_BYTES must not be rejected as too
+        // large (it fails later as bad JSON, which is the point — the
+        // size gate stayed out of the way).
+        let h = Harness::start(seeded_catalog());
+        let exact = "x".repeat(MAX_BODY_BYTES);
+        let res = h.post("/image").body(exact).send().unwrap();
+        assert_eq!(res.status(), 400);
+    }
+
+    #[test]
+    fn bind_refuses_an_empty_token() {
+        let engine: Arc<dyn Engine> = Arc::new(SyntheticEngine::new());
+        let err = LocalApi::bind(
+            "127.0.0.1:0",
+            engine,
+            Arc::new(Mutex::new(seeded_catalog())),
+            None,
+            WorkerObservers::default(),
+            String::new(),
+        )
+        .err()
+        .expect("empty token must be refused")
+        .to_string();
+        assert!(err.contains("empty token"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Pure guards.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn host_is_loopback_accepts_only_loopback_shapes() {
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.1:4787",
+            "localhost",
+            "LOCALHOST:80",
+            "[::1]",
+            "[::1]:4787",
+        ] {
+            assert!(host_is_loopback(ok), "{ok} should be loopback");
+        }
+        for bad in [
+            "evil.example",
+            "evil.example:4787",
+            "127.0.0.1.evil.example",
+            "192.168.1.10:4787",
+            "[::2]:4787",
+            "[::1",
+            "",
+        ] {
+            assert!(!host_is_loopback(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn origin_is_loopback_accepts_only_loopback_origins() {
+        for ok in [
+            "http://127.0.0.1:4787",
+            "http://localhost:5173",
+            "https://localhost",
+            "http://[::1]:3000",
+        ] {
+            assert!(origin_is_loopback(ok), "{ok} should be allowed");
+        }
+        for bad in [
+            "https://evil.example",
+            "http://192.168.1.10",
+            "null",
+            "file://",
+            "chrome-extension://abc",
+            "",
+        ] {
+            assert!(!origin_is_loopback(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn deny_reason_orders_host_origin_then_token() {
+        let t = "tok";
+        // Bad host wins even when everything else is bad too.
+        assert!(matches!(
+            deny_reason(Some("evil.example"), Some("https://evil.example"), None, t),
+            Some(Denial::Host(_))
+        ));
+        // Good host, bad origin.
+        assert!(matches!(
+            deny_reason(Some("127.0.0.1"), Some("https://evil.example"), None, t),
+            Some(Denial::Origin(_))
+        ));
+        // Good host + origin, missing token.
+        assert_eq!(
+            deny_reason(Some("127.0.0.1"), None, None, t),
+            Some(Denial::Token)
+        );
+        // Malformed authorization schemes are a token failure.
+        assert_eq!(
+            deny_reason(None, None, Some("Basic dXNlcjpwdw=="), t),
+            Some(Denial::Token)
+        );
+        // Absent host + origin (curl-style) with the right token passes.
+        assert_eq!(deny_reason(None, None, Some("Bearer tok"), t), None);
+        // Lowercase scheme is tolerated.
+        assert_eq!(deny_reason(None, None, Some("bearer tok"), t), None);
+    }
+
+    #[test]
+    fn token_matches_is_exact() {
+        assert!(token_matches("abc", "abc"));
+        assert!(!token_matches("abd", "abc"));
+        assert!(!token_matches("ab", "abc"));
+        assert!(!token_matches("", "abc"));
+    }
+
+    // -----------------------------------------------------------------
+    // Discovery file.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn discovery_file_round_trips_and_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local-api.json");
+        write_discovery_file(&path, "http://127.0.0.1:4787", "tok-123").unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["url"], "http://127.0.0.1:4787");
+        assert_eq!(parsed["token"], "tok-123");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "discovery file carries the token and must be owner-only, got {mode:o}"
+            );
+        }
+
+        remove_discovery_file(&path);
+        assert!(!path.exists());
+        // Idempotent: removing a missing file is quiet.
+        remove_discovery_file(&path);
     }
 }

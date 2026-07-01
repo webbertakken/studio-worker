@@ -51,10 +51,17 @@ The worker also runs an always-on local HTTP API (`127.0.0.1:4787`) so you can
 generate images locally — e.g. Z-Image — without going through the studio:
 
 ```bash
-curl -s http://127.0.0.1:4787/image \
+DISCOVERY=~/.config/minis-studio-worker/local-api.json   # holds url + bearer token
+curl -s "$(jq -r .url $DISCOVERY)/image" \
+  -H "authorization: Bearer $(jq -r .token $DISCOVERY)" \
   -H 'content-type: application/json' \
   -d '{"prompt":"a red fox in snow"}' --output fox.webp
 ```
+
+The API requires a per-install bearer token (auto-generated; published in
+the owner-only `local-api.json` discovery file next to `config.toml`) and
+rejects non-loopback `Host`/`Origin` headers, so hostile web pages can't
+drive your GPU via CSRF or DNS rebinding.
 
 Models come from a local catalog (`<config dir>/models.json`, seeded with
 Z-Image) that you can extend the same way the studio adds models. Local jobs

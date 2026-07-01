@@ -79,6 +79,17 @@ pub struct Config {
     /// manager to restart it).  `0` = infinite.  Defaults to `5`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_reconnect_attempts: Option<u32>,
+    /// Preferred TCP port for the always-on local API
+    /// (`127.0.0.1`).  `None` uses the built-in default; the
+    /// `STUDIO_WORKER_LOCAL_API_PORT` env var overrides both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_api_port: Option<u16>,
+    /// Bearer token local API clients must present.  Generated once
+    /// on first launch and persisted.  Internal — never surfaced in
+    /// the UI and redacted from log events; local clients discover it
+    /// via the owner-only `local-api.json` file next to this config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_api_token: Option<String>,
     /// Per-install UUID written once on first launch.  Stable across
     /// worker restarts so the studio can dedup pending requests.
     /// Internal state, populated by the auto-register flow.
@@ -174,6 +185,8 @@ impl Default for Config {
             auto_update_prerelease: false,
             models_root: default_models_root(),
             ws_reconnect_attempts: None,
+            local_api_port: None,
+            local_api_token: None,
             install_id: None,
             registration_request_id: None,
             registration_secret: None,
@@ -187,12 +200,22 @@ fn default_config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("config.toml"))
 }
 
-/// Path to the local model catalog (`models.json`), in the config dir next to
-/// `config.toml`. The local image API seeds this on first use.
-pub fn default_catalog_path() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("gg", "minis", "minis-studio-worker")
-        .ok_or_else(|| anyhow!("cannot resolve config directory"))?;
-    Ok(dirs.config_dir().join("models.json"))
+/// Path to the local model catalog (`models.json`), next to the
+/// **active** config file.  Deriving from the config path (rather
+/// than the ProjectDirs singleton) keeps `--config` overrides — and
+/// the test suites that use temp configs — fully isolated from the
+/// real per-user state.
+pub fn catalog_path_for(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent().map(|dir| dir.join("models.json"))
+}
+
+/// Path to the local API discovery file (`local-api.json`), next to
+/// the active config file.  Written on every successful bind so local
+/// clients can find the URL + bearer token without parsing logs;
+/// owner-only because it carries the token.  Sibling-of-config for
+/// the same isolation reason as [`catalog_path_for`].
+pub fn local_api_discovery_path_for(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent().map(|dir| dir.join("local-api.json"))
 }
 
 pub fn resolve_path(override_path: Option<&str>) -> Result<PathBuf> {
@@ -336,7 +359,7 @@ fn write_config(cfg: &Config, path: &Path) -> Result<usize> {
 ///   lands `0644`, exposing the secrets to every other local user.
 ///   `tempfile` creates the temp file `0600` on Unix and `persist`
 ///   keeps that mode through the rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -454,6 +477,78 @@ mod tests {
         assert_eq!(loaded.vram_threshold_gb, cfg.vram_threshold_gb);
         assert_eq!(loaded.auto_update_prerelease, cfg.auto_update_prerelease);
         assert_eq!(loaded.models_root, cfg.models_root);
+    }
+
+    #[test]
+    fn local_api_fields_round_trip_and_default_to_none() {
+        // Configs predating the local API auth fields must load with
+        // both unset (token generated later, port falling back to the
+        // built-in default).
+        let cfg: Config = toml::from_str(
+            r#"
+            api_base_url = "https://studio.minis.gg/"
+            vram_threshold_gb = 12.0
+            auto_start = true
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.local_api_token.is_none());
+        assert!(cfg.local_api_port.is_none());
+
+        // And once set, both persist across save/load.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            local_api_token: Some("tok-local-abc".into()),
+            local_api_port: Some(4123),
+            ..Config::default()
+        };
+        save(&cfg, &path).unwrap();
+        let (loaded, _) = load(Some(&path.to_string_lossy())).unwrap();
+        assert_eq!(loaded.local_api_token.as_deref(), Some("tok-local-abc"));
+        assert_eq!(loaded.local_api_port, Some(4123));
+    }
+
+    #[test]
+    fn load_and_save_tracing_never_leaks_the_local_api_token() {
+        // The config tracing breadcrumbs deliberately name individual
+        // fields; the local API token must never be one of them, or a
+        // shipped journal would hand every reader GPU access.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            local_api_token: Some("super-secret-local-token".into()),
+            ..Config::default()
+        };
+        let out = crate::test_support::capture({
+            let path = path.clone();
+            move || {
+                save(&cfg, &path).unwrap();
+                let _ = load(Some(&path.to_string_lossy())).unwrap();
+            }
+        });
+        assert!(
+            !out.contains("super-secret-local-token"),
+            "config tracing must not carry the local API token: {out}"
+        );
+    }
+
+    #[test]
+    fn catalog_and_discovery_paths_are_siblings_of_the_active_config() {
+        // Deriving from the config path (not a ProjectDirs singleton)
+        // is what keeps `--config` runs and test suites from touching
+        // the real user's `models.json` / `local-api.json`.
+        let cfg = Path::new("/tmp/custom-dir/config.toml");
+        assert_eq!(
+            catalog_path_for(cfg),
+            Some(PathBuf::from("/tmp/custom-dir/models.json"))
+        );
+        assert_eq!(
+            local_api_discovery_path_for(cfg),
+            Some(PathBuf::from("/tmp/custom-dir/local-api.json"))
+        );
+        // A parentless path yields None rather than a panic.
+        assert_eq!(catalog_path_for(Path::new("/")), None);
     }
 
     #[test]

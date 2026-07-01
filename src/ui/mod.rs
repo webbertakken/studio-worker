@@ -83,7 +83,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     });
 
     // Always-on local image API (127.0.0.1), independent of studio registration.
-    let local_api = runtime::spawn_local_api(cfg.clone(), observers.clone(), stop.clone());
+    let local_api = runtime::spawn_local_api(cfg.clone(), &path, observers.clone(), stop.clone());
 
     let cfg_loops = cfg.clone();
     let stop_loops = stop.clone();

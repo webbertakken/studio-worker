@@ -34,42 +34,42 @@ attacker-controlled download URL (`POST /models`), (b) delete models,
 responses (prompts in `/jobs`, catalog contents). Any other local OS
 user can do all of the above trivially.
 
-- [ ] 1.1.1 Generate a per-install local API token (32 random bytes hex
+- [x] 1.1.1 Generate a per-install local API token (32 random bytes hex
       via the existing `getrandom` path in `auto_register.rs`; extract
       `rand_bytes`/`new_secret_hex` into a shared helper). Persist it in
       `config.toml` (internal field, redacted from logs like
       `auth_token`) so it survives restarts. TDD: config round-trip +
       redaction tests mirroring `config_tracing.rs`.
-- [ ] 1.1.2 Require `Authorization: Bearer <token>` on every route
+- [x] 1.1.2 Require `Authorization: Bearer <token>` on every route
       except `GET /healthz`. Wrong/missing token → 401 with a
       one-line remedy pointing at the discovery file (1.1.4). TDD:
       table-driven tests per route × {no header, wrong token, good
       token}.
-- [ ] 1.1.3 Reject requests whose `Host` header is not
+- [x] 1.1.3 Reject requests whose `Host` header is not
       `127.0.0.1[:port]`, `localhost[:port]`, or `[::1][:port]`
       (DNS-rebinding guard), and reject any request carrying an
       `Origin` header that is not a loopback origin (CSRF guard;
       absent `Origin` = non-browser client = allowed). TDD: unit tests
       for the pure validators + integration tests through the bound
       server.
-- [ ] 1.1.4 Write a discovery file `<config_dir>/local-api.json`
+- [x] 1.1.4 Write a discovery file `<config_dir>/local-api.json`
       (owner-only 0600, atomic write reusing `config::write_atomic` —
       make it `pub(crate)`) containing `{ "url": ..., "token": ... }`
       on every successful bind; remove it on clean shutdown. This is
       how local clients find the port (which can be ephemeral after
       the port-0 fallback in `runtime::spawn_local_api`). TDD: bind →
       file exists with correct mode + contents; shutdown → gone.
-- [ ] 1.1.5 Update `README.md` and `docs/local-image-api.md`: curl
+- [x] 1.1.5 Update `README.md` and `docs/local-image-api.md`: curl
       examples gain the token header, document the discovery file and
       the threat model (why the token exists).
 
 ### 1.2 Local API: request-body and robustness limits
 
-- [ ] 1.2.1 `read_body` (`src/local_api.rs`) reads to string unbounded
+- [x] 1.2.1 `read_body` (`src/local_api.rs`) reads to string unbounded
       — a request can OOM the worker. Cap at 1 MiB (413 on overflow),
       using `Request::body_length()` when present plus a hard cap on
       the reader. TDD: oversized body → 413, boundary body → 200.
-- [ ] 1.2.2 `STUDIO_WORKER_LOCAL_API_PORT` parse failures fall back
+- [x] 1.2.2 `STUDIO_WORKER_LOCAL_API_PORT` parse failures fall back
       silently (`.ok().and_then(...)` in `runtime::spawn_local_api`).
       Warn-log the invalid value + the fallback port. Also add
       `local_api_port` as a proper optional `Config` field (env var
