@@ -264,22 +264,9 @@ impl UpdateRunner for RealRunner {
 }
 
 fn validate_installer_download_url(raw: &str) -> Result<()> {
-    let url = url::Url::parse(raw).with_context(|| format!("invalid installer URL {raw:?}"))?;
-    if url.scheme() == "https" {
-        return Ok(());
-    }
-    if url.scheme() == "http" {
-        if let Some(host) = url.host_str() {
-            if host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-            {
-                return Ok(());
-            }
-        }
-    }
-    bail!("installer URL must use https (loopback http is allowed for tests): {raw}");
+    // Shared with the model/asset downloaders — one audited transport
+    // gate instead of per-module copies drifting apart.
+    crate::net::validate_download_url(raw, "installer")
 }
 
 /// Where a parked (renamed-aside) running executable lives: the full

@@ -21,6 +21,7 @@ pub mod engine;
 pub mod http;
 pub mod local;
 pub mod local_api;
+pub mod net;
 pub mod runtime;
 pub mod service;
 pub mod sys;

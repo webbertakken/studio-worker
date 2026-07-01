@@ -51,6 +51,50 @@ pub fn model_cache_path(dir: &Path, filename: &str) -> Result<PathBuf> {
     }
 }
 
+/// Pure core of the disk-space preflight: given the free bytes on the
+/// cache filesystem and a file's declared size, refuse the download
+/// when it cannot fit (with 10% headroom for the `.part` → rename
+/// dance and concurrent growth).  Failing here — with both numbers in
+/// the message — beats streaming gigabytes into ENOSPC and surfacing
+/// an inscrutable io error mid-body.
+pub fn check_disk_space(available: u64, approx_bytes: u64, filename: &str) -> Result<()> {
+    let required = approx_bytes.saturating_add(approx_bytes / 10);
+    if available < required {
+        bail!(
+            "not enough disk space for {filename}: need ~{required} bytes \
+             (declared {approx_bytes} + 10% headroom) but only {available} \
+             bytes are free on the models filesystem — free up space or \
+             move models_root"
+        );
+    }
+    Ok(())
+}
+
+/// IO half of the preflight: probe the free space under `dir` and run
+/// [`check_disk_space`].  A file with no (or zero) declared size, or a
+/// failed probe (exotic filesystems), skips the check — the preflight
+/// is an early-warning gate, not a correctness gate; the length +
+/// sha256 verification after the stream stays authoritative.
+pub fn preflight_disk_space(dir: &Path, filename: &str, approx_bytes: Option<u64>) -> Result<()> {
+    let Some(needed) = approx_bytes.filter(|b| *b > 0) else {
+        return Ok(());
+    };
+    match fs4::available_space(dir) {
+        Ok(available) => check_disk_space(available, needed, filename),
+        Err(e) => {
+            warn!(
+                target: TRACE_TARGET,
+                op = "preflight",
+                dir = %dir.display(),
+                filename,
+                error = %e,
+                "free-space probe failed; skipping the disk preflight"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Verify a streamed download wrote exactly the body the server
 /// promised.  `expected` is the response's `Content-Length`; it is
 /// `None` for chunked transfers, where there's nothing to check and we
@@ -252,9 +296,23 @@ pub fn ensure_file(dir: &Path, file: &ModelFile) -> Result<PathBuf> {
         );
         return Ok(local);
     }
+    preflight_disk_space(dir, filename, file.approx_bytes)?;
     download_file_verified(url, &local, file.sha256.as_deref())
         .with_context(|| format!("downloading {filename} ({url}) -> {}", local.display()))?;
     Ok(local)
+}
+
+/// Parse the start offset out of a `Content-Range: bytes <start>-<end>/<total>`
+/// header.  Returns `None` for anything that doesn't match that shape
+/// (the caller then falls back to a fresh full download).
+pub fn content_range_start(header: &str) -> Option<u64> {
+    header
+        .trim()
+        .strip_prefix("bytes ")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Stream `url` into `dest` (atomic via a `.part` rename so a killed
@@ -272,8 +330,19 @@ pub fn download_file(url: &str, dest: &Path) -> Result<()> {
 /// [`download_file`] with an optional expected sha256 — the body is
 /// hashed while it streams and a mismatch is rejected before the
 /// rename, so a bad body never lands in the cache.
+///
+/// A leftover `<dest>.part` from an interrupted run is **resumed** via
+/// an HTTP `Range` request instead of re-fetching multi-GiB models
+/// from byte zero: the existing prefix is hashed, the remainder is
+/// appended, and the final sha256 covers the assembled whole.  Servers
+/// that ignore the range (200) fall back to a fresh full download;
+/// `416` or a `Content-Range` that doesn't start where we asked drops
+/// the stale part and restarts clean.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
+    // Transport gate first: a plaintext-http model URL is a MITM away
+    // from model poisoning, so it never gets a request at all.
+    crate::net::validate_download_url(url, "model file")?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -283,15 +352,25 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
         .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
         .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
         .build()?;
+    let resume_from = std::fs::metadata(&part)
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .unwrap_or(0);
     info!(
         target: TRACE_TARGET,
         op = "download",
         url,
         dest = %dest.display(),
+        resume_from,
         "starting"
     );
     let started = Instant::now();
-    let mut response = match client.get(url).send() {
+    let mut request = client.get(url);
+    if resume_from > 0 {
+        request = request.header("range", format!("bytes={resume_from}-"));
+    }
+    let mut response = match request.send() {
         Ok(response) => response,
         Err(e) => {
             // A connection-level failure (DNS, TLS, timeout, or a
@@ -312,6 +391,20 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
         }
     };
     let status = response.status();
+    if resume_from > 0 && status.as_u16() == 416 {
+        // The server can't satisfy the range (stale / already-complete
+        // part, or the remote file changed) — drop it and start clean.
+        info!(
+            target: TRACE_TARGET,
+            op = "download",
+            url,
+            dest = %dest.display(),
+            resume_from,
+            "range not satisfiable; restarting the download from scratch"
+        );
+        remove_temp_file(&part);
+        return download_file_verified(url, dest, expected_sha256);
+    }
     if !status.is_success() {
         warn!(
             target: TRACE_TARGET,
@@ -324,12 +417,60 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
         );
         bail!("GET {url} -> {status}");
     }
+    let resuming = resume_from > 0 && status.as_u16() == 206;
+    if resuming {
+        // A compliant 206 answers exactly the range we asked for; a
+        // Content-Range starting anywhere else would silently corrupt
+        // the assembled file, so verify before appending a byte.
+        let range_start = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(content_range_start);
+        if range_start != Some(resume_from) {
+            warn!(
+                target: TRACE_TARGET,
+                op = "download",
+                url,
+                dest = %dest.display(),
+                resume_from,
+                content_range_start = range_start,
+                "206 Content-Range does not start at our offset; restarting from scratch"
+            );
+            remove_temp_file(&part);
+            return download_file_verified(url, dest, expected_sha256);
+        }
+    }
+    // For a 206 this is the *remainder* length — exactly what we are
+    // about to stream, so the post-stream length check stays valid.
     let expected_len = response.content_length();
-    let file =
-        std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
+    let mut hasher = Sha256::new();
+    let file = if resuming {
+        // Fold the existing prefix into the digest so the final hash
+        // covers the assembled whole, then append.
+        let mut existing = std::fs::File::open(&part)
+            .with_context(|| format!("opening partial download {}", part.display()))?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            use std::io::Read as _;
+            let read = existing
+                .read(&mut buf)
+                .with_context(|| format!("hashing partial download {}", part.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&part)
+            .with_context(|| format!("reopening {} for append", part.display()))?
+    } else {
+        std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?
+    };
     let mut writer = HashingWriter {
         inner: file,
-        hasher: Sha256::new(),
+        hasher,
     };
     let copied = std::io::copy(&mut response, &mut writer);
     let digest = writer.hasher.finalize();
@@ -390,6 +531,7 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
         url,
         dest = %dest.display(),
         bytes,
+        resumed_from = if resuming { resume_from } else { 0 },
         elapsed_ms,
         "done"
     );
@@ -507,6 +649,73 @@ mod tests {
         assert!(model_cache_path(root, "/tmp/model.gguf").is_err());
         assert!(model_cache_path(root, r"nested\model.gguf").is_err());
         assert!(model_cache_path(root, "").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Disk-space preflight — refuses a download that cannot fit before
+    // any bytes stream, instead of dying on ENOSPC mid-body.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn check_disk_space_accepts_a_fit_with_headroom() {
+        // 100 declared + 10% headroom = 110 required.
+        assert!(check_disk_space(110, 100, "m.gguf").is_ok());
+        assert!(check_disk_space(1_000, 100, "m.gguf").is_ok());
+    }
+
+    #[test]
+    fn check_disk_space_rejects_when_it_cannot_fit() {
+        let err = check_disk_space(109, 100, "m.gguf")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("m.gguf"), "must name the file: {err}");
+        assert!(err.contains("109"), "must name the available bytes: {err}");
+        assert!(err.contains("100"), "must name the declared size: {err}");
+        assert!(
+            err.contains("models_root"),
+            "must tell the operator what to change: {err}"
+        );
+    }
+
+    #[test]
+    fn check_disk_space_survives_huge_declared_sizes() {
+        // The +10% headroom saturates instead of overflowing near
+        // u64::MAX — an overflow would wrap `required` to a tiny number
+        // and wave an impossible download through.
+        assert!(check_disk_space(u64::MAX - 1, u64::MAX, "m.gguf").is_err());
+        assert!(check_disk_space(u64::MAX, u64::MAX, "m.gguf").is_ok());
+    }
+
+    #[test]
+    fn preflight_skips_unknown_or_zero_sizes_and_checks_known_ones() {
+        let dir = tempdir().unwrap();
+        // Unknown / zero sizes: nothing to check.
+        preflight_disk_space(dir.path(), "m.gguf", None).unwrap();
+        preflight_disk_space(dir.path(), "m.gguf", Some(0)).unwrap();
+        // A tiny known size passes on any real filesystem.
+        preflight_disk_space(dir.path(), "m.gguf", Some(1024)).unwrap();
+        // An absurd size fails against real free space.
+        assert!(preflight_disk_space(dir.path(), "m.gguf", Some(u64::MAX / 2)).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Content-Range parsing — the resume-safety check that stops a
+    // server answering the wrong range from corrupting the assembly.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn content_range_start_parses_the_standard_shape() {
+        assert_eq!(content_range_start("bytes 10-19/20"), Some(10));
+        assert_eq!(content_range_start(" bytes 0-99/1000 "), Some(0));
+        assert_eq!(content_range_start("bytes 5-9/*"), Some(5));
+    }
+
+    #[test]
+    fn content_range_start_rejects_other_shapes() {
+        assert_eq!(content_range_start("bytes */20"), None);
+        assert_eq!(content_range_start("items 10-19/20"), None);
+        assert_eq!(content_range_start("garbage"), None);
+        assert_eq!(content_range_start(""), None);
     }
 
     #[test]

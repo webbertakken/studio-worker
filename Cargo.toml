@@ -74,6 +74,10 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # cryptic sd-cli linker crash.  Tiny dlopen/LoadLibrary wrapper, no
 # native libs.
 libloading = "0.8"
+# Free-disk-space probe for the model-download preflight (statvfs /
+# GetDiskFreeSpaceExW).  `sync` only — no async runtime; rustix +
+# windows-sys are already in the tree (tempfile / everything).
+fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # Direct rustls dep so we can call `crypto::ring::default_provider`.
 # rustls 0.23 stopped auto-picking a CryptoProvider from cargo

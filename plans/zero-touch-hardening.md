@@ -78,26 +78,26 @@ user can do all of the above trivially.
 
 ### 1.3 Model download integrity + transport
 
-- [ ] 1.3.1 `engine::download::download_file_verified` accepts any URL
+- [x] 1.3.1 `engine::download::download_file_verified` accepts any URL
       scheme — a plain-`http` model URL is silently fetched and is
       MITM-poisonable. Enforce `https` (loopback `http` allowed for
       wiremock tests), mirroring `update::validate_installer_download_url`.
       Extract one shared validator used by both. TDD: http remote URL
       → clear error before any request; loopback http still works in
       `engine_download.rs`.
-- [ ] 1.3.2 The seeded catalog (`src/catalog.rs::zimage_turbo`) ships
+- [x] 1.3.2 The seeded catalog (`src/catalog.rs::zimage_turbo`) ships
       `sha256: None` for all three files — the out-of-the-box model
       downloads have zero integrity pinning. Compute the real sha256
       of the three published HF files and pin them in the seed. TDD:
       seed test asserts every file carries a 64-hex sha256.
-- [ ] 1.3.3 Add a disk-space preflight to `ensure_file`: when
+- [x] 1.3.3 Add a disk-space preflight to `ensure_file`: when
       `approx_bytes` is known and the free space on `models_root`'s
       filesystem is below `approx_bytes` + 10% headroom, fail fast
       with an actionable message (needed vs available) instead of
       streaming gigabytes into ENOSPC. Use a mockable free-space seam
       so it's unit-testable. TDD: injected low free space → error
       naming both numbers; unknown `approx_bytes` → no preflight.
-- [ ] 1.3.4 Resume interrupted downloads: on start, if `<dest>.part`
+- [x] 1.3.4 Resume interrupted downloads: on start, if `<dest>.part`
       exists and the server supports ranges (probe via `Accept-Ranges`
       on the GET response / a HEAD first), resume with a `Range`
       header instead of restarting a multi-GiB fetch; hash-verify the
