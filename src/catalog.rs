@@ -145,26 +145,36 @@ fn zimage_turbo() -> CatalogModel {
         source: ModelSource {
             engine: ModelEngine::SdCpp,
             files: vec![
+                // sha256 pins sourced from the HF LFS oids
+                // (`/api/models/<repo>/tree/main`) and cross-checked
+                // against freshly downloaded copies — the out-of-the-box
+                // model must never be swappable in transit or at rest.
                 ModelFile {
                     role: ModelFileRole::DiffusionModel,
                     url: "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q4_K.gguf".into(),
                     filename: "z_image_turbo-Q4_K.gguf".into(),
-                    approx_bytes: Some(2_700_000_000),
-                    sha256: None,
+                    approx_bytes: Some(3_864_250_304),
+                    sha256: Some(
+                        "14b375ab4f226bc5378f68f37e899ef3c2242b8541e61e2bc1aff40976086fbd".into(),
+                    ),
                 },
                 ModelFile {
                     role: ModelFileRole::TextEncoder,
                     url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf".into(),
                     filename: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf".into(),
-                    approx_bytes: Some(2_500_000_000),
-                    sha256: None,
+                    approx_bytes: Some(2_497_281_120),
+                    sha256: Some(
+                        "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597".into(),
+                    ),
                 },
                 ModelFile {
                     role: ModelFileRole::Vae,
                     url: "https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors".into(),
                     filename: "ae.safetensors".into(),
-                    approx_bytes: Some(335_000_000),
-                    sha256: None,
+                    approx_bytes: Some(335_304_388),
+                    sha256: Some(
+                        "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38".into(),
+                    ),
                 },
             ],
             cli_defaults: ModelCliDefaults {
@@ -197,6 +207,33 @@ mod tests {
         assert_eq!(model.source.files.len(), 3);
         assert_eq!(model.source.cli_defaults.steps, 8);
         assert!(model.enabled);
+    }
+
+    #[test]
+    fn every_seeded_file_is_https_and_integrity_pinned() {
+        // The out-of-the-box downloads must be tamper-evident: each
+        // file carries a 64-hex sha256 and a true byte count (used by
+        // the disk-space preflight), served over https.
+        for model in Catalog::seed().list() {
+            for file in &model.source.files {
+                assert!(
+                    file.url.starts_with("https://"),
+                    "{} must be https",
+                    file.url
+                );
+                let sha = file
+                    .sha256
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{} has no sha256 pin", file.filename));
+                assert_eq!(sha.len(), 64, "{} pin must be 64 hex", file.filename);
+                assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+                assert!(
+                    file.approx_bytes.unwrap_or(0) > 0,
+                    "{} needs a real approx_bytes for the disk preflight",
+                    file.filename
+                );
+            }
+        }
     }
 
     #[test]

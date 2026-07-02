@@ -423,3 +423,167 @@ async fn ensure_file_downloads_when_missing_then_reuses_the_cache() {
     assert_eq!(first, second);
     // `server` drops here; wiremock asserts the `expect(1)` was met.
 }
+
+// ---------------------------------------------------------------------------
+// Resume: a leftover `.part` continues via an HTTP Range request instead of
+// re-fetching multi-GiB models from byte zero, and the final sha256 covers
+// the *assembled* file.
+// ---------------------------------------------------------------------------
+
+const FULL_BODY: &[u8] = b"a tiny pretend model";
+
+#[tokio::test]
+async fn download_resumes_a_partial_file_via_range() {
+    let server = MockServer::start().await;
+    let (prefix, remainder) = FULL_BODY.split_at(10);
+    Mock::given(method("GET"))
+        .and(match_path("/resume.gguf"))
+        .and(wiremock::matchers::header("range", "bytes=10-"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 10-19/20")
+                .set_body_bytes(remainder.to_vec()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!("{}/resume.gguf", server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("resume.gguf");
+    std::fs::write(dest.with_extension("part"), prefix).unwrap();
+
+    let dest_for_thread = dest.clone();
+    detached(move || {
+        download::download_file_verified(&url, &dest_for_thread, Some(BODY_SHA256)).unwrap()
+    });
+
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        FULL_BODY,
+        "the assembled file must be prefix + remainder"
+    );
+    assert!(
+        !dest.with_extension("part").exists(),
+        "the part file is consumed by the rename"
+    );
+}
+
+#[tokio::test]
+async fn download_restarts_fresh_when_the_server_ignores_the_range() {
+    let server = MockServer::start().await;
+    // 200 with the full body regardless of the Range header.
+    Mock::given(method("GET"))
+        .and(match_path("/noresume.gguf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(FULL_BODY.to_vec()))
+        .mount(&server)
+        .await;
+    let url = format!("{}/noresume.gguf", server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("noresume.gguf");
+    // A stale prefix that must NOT be duplicated into the result.
+    std::fs::write(dest.with_extension("part"), &FULL_BODY[..10]).unwrap();
+
+    let dest_for_thread = dest.clone();
+    detached(move || {
+        download::download_file_verified(&url, &dest_for_thread, Some(BODY_SHA256)).unwrap()
+    });
+
+    assert_eq!(std::fs::read(&dest).unwrap(), FULL_BODY);
+}
+
+#[tokio::test]
+async fn download_drops_the_part_and_restarts_on_416() {
+    let server = MockServer::start().await;
+    // The ranged request is refused; the fresh full request succeeds.
+    Mock::given(method("GET"))
+        .and(match_path("/gone.gguf"))
+        .and(wiremock::matchers::header_exists("range"))
+        .respond_with(ResponseTemplate::new(416))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(match_path("/gone.gguf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(FULL_BODY.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!("{}/gone.gguf", server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("gone.gguf");
+    std::fs::write(
+        dest.with_extension("part"),
+        b"stale bytes the server no longer has",
+    )
+    .unwrap();
+
+    let dest_for_thread = dest.clone();
+    detached(move || {
+        download::download_file_verified(&url, &dest_for_thread, Some(BODY_SHA256)).unwrap()
+    });
+
+    assert_eq!(std::fs::read(&dest).unwrap(), FULL_BODY);
+}
+
+#[tokio::test]
+async fn download_restarts_when_the_206_answers_the_wrong_range() {
+    let server = MockServer::start().await;
+    // A broken server 206s from byte 0 despite our bytes=10- request;
+    // appending that would corrupt the assembly, so the worker must
+    // drop the part and re-fetch from scratch.
+    Mock::given(method("GET"))
+        .and(match_path("/liar.gguf"))
+        .and(wiremock::matchers::header_exists("range"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 0-19/20")
+                .set_body_bytes(FULL_BODY.to_vec()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(match_path("/liar.gguf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(FULL_BODY.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!("{}/liar.gguf", server.uri());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("liar.gguf");
+    std::fs::write(dest.with_extension("part"), &FULL_BODY[..10]).unwrap();
+
+    let dest_for_thread = dest.clone();
+    detached(move || {
+        download::download_file_verified(&url, &dest_for_thread, Some(BODY_SHA256)).unwrap()
+    });
+
+    assert_eq!(std::fs::read(&dest).unwrap(), FULL_BODY);
+}
+
+// ---------------------------------------------------------------------------
+// Transport gate: plaintext-http model URLs never get a request.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn download_rejects_a_remote_http_url_before_any_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("evil.gguf");
+    let dest_for_thread = dest.clone();
+    let err = detached(move || {
+        download::download_file_verified(
+            "http://models.example.com/evil.gguf",
+            &dest_for_thread,
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+    });
+    assert!(err.contains("https"), "got: {err}");
+    assert!(!dest.exists(), "nothing may be cached");
+    assert!(!dest.with_extension("part").exists());
+}
