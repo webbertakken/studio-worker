@@ -597,6 +597,12 @@ mod tests {
         assert_eq!(detect_vram_gb_from_sysfs(&missing), 0.0);
     }
 
+    // The NVIDIA proc-sysfs tree only exists on Linux, and its bus-id
+    // directory names contain colons — an illegal filename character on
+    // Windows — so these fixtures can only be built there.  The pure
+    // parsers (`parse_mib`, `parse_nvidia_smi_mib`) are tested
+    // cross-platform above.
+    #[cfg(target_os = "linux")]
     #[test]
     fn detect_vram_gb_from_sysfs_sums_parseable_gpus() {
         let dir = tempfile::tempdir().unwrap();
@@ -614,6 +620,7 @@ mod tests {
         assert!((gb - 36.0).abs() < 1e-3, "got {gb}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn detect_vram_gb_from_sysfs_sums_only_survivors_when_one_gpu_is_unreadable() {
         // A healthy card next to one whose `information` can't be read
