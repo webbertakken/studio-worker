@@ -102,6 +102,10 @@ pub mod download;
 // `llama` feature is a no-op there even when enabled via `--features all`.
 #[cfg(all(feature = "llama", not(target_os = "windows")))]
 pub mod llama;
+// Always compiled so its pure argv/response logic + provisioner are
+// unit-tested on every platform; only *registered* on Windows (below),
+// where the in-process `llama-cpp-2` backend can't link.
+pub mod llama_subprocess;
 pub mod multi;
 #[cfg(feature = "image-onnx")]
 pub mod onnx;
@@ -155,6 +159,13 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
         let mut v: Vec<Box<dyn Engine>> = Vec::new();
         #[cfg(all(feature = "llama", not(target_os = "windows")))]
         v.push(Box::new(llama::LlamaEngine::new(cfg.models_root.clone())?));
+        // Windows can't link in-process llama-cpp-2, so it reaches LLM
+        // parity through a subprocess `llama-cli` (auto-provisioned on
+        // first use), mirroring the sd-cli image path.
+        #[cfg(all(feature = "llama", target_os = "windows"))]
+        v.push(Box::new(llama_subprocess::LlamaSubprocessEngine::new(
+            cfg.models_root.clone(),
+        )));
         #[cfg(feature = "whisper")]
         v.push(Box::new(whisper::WhisperEngine::new(
             cfg.models_root.clone(),

@@ -279,7 +279,7 @@ the install ends with a running, auto-starting worker.
       with the exact per-distro remedy (`apt install libvulkan1`,
       etc.). Job-time behaviour unchanged. TDD: probe seam injected,
       status text asserted.
-- [ ] 3.2.2 Bundle `libvulkan.so.1` into **our** `sdcpp-prebuilt`
+- [~] 3.2.2 (descoped, see note) Bundle `libvulkan.so.1` into **our** `sdcpp-prebuilt`
       Linux zips (loader is Apache-2.0 — redistributable; confirm
       licence file included) and extend `sd_provision` to extract it
       next to `sd-cli` (LD_LIBRARY_PATH already points there). Result:
@@ -291,13 +291,23 @@ the install ends with a running, auto-starting worker.
       from a fixture zip; loader preflight passes when the bundled lib
       is present (point the probe at it).
 
+      DESCOPED: `extract_zip` already flattens any bundled lib next to
+      `sd-cli` and the per-job Command already sets `LD_LIBRARY_PATH`
+      there, so the provisioner side is automatic. The remaining value
+      is marginal: the Vulkan *loader* alone does not provide a driver
+      ICD, and any box with a working GPU driver already ships
+      `libvulkan1`. The startup preflight (3.2.1) surfaces the exact
+      remedy when it is genuinely missing. Not worth an unverifiable
+      prebuilt-workflow re-run for the narrow driver-present /
+      loader-absent case.
+
 ### 3.3 Windows LLM parity
 
 `llama-cpp-2` is compiled out on Windows (MSVC CRT clash, documented in
 `Cargo.toml`), so Windows workers silently can't serve LLM jobs —
 platform parity broken for the turnkey story.
 
-- [ ] 3.3.1 Add a subprocess llama engine for Windows mirroring the
+- [x] 3.3.1 Add a subprocess llama engine for Windows mirroring the
       sd-cli pattern: auto-provision the official
       `llama.cpp` release binary (`llama-server` or `llama-cli`,
       pinned tag, Vulkan build) into `<models_root>/bin/`, drive
