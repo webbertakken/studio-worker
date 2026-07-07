@@ -656,14 +656,11 @@ pub fn spawn_local_api(
         }
     };
 
-    let catalog_path = crate::config::catalog_path_for(config_path);
-    let catalog = match &catalog_path {
-        Some(path) => crate::catalog::Catalog::load_or_seed(path).unwrap_or_else(|err| {
-            tracing::warn!(target: "studio_worker::local_api", error = %err, "local api: catalog load failed; seeding in-memory");
-            crate::catalog::Catalog::seed()
-        }),
-        None => crate::catalog::Catalog::seed(),
-    };
+    // `load_for_serving` quarantines corrupt files and drops the save
+    // path when the file is unreadable, so a later `POST /models` can
+    // never clobber a catalog the worker couldn't read.
+    let (catalog, catalog_path) =
+        crate::catalog::Catalog::load_for_serving(crate::config::catalog_path_for(config_path));
     let catalog = Arc::new(Mutex::new(catalog));
 
     let token = ensure_local_api_token(&cfg, config_path);
