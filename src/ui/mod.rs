@@ -83,7 +83,11 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     });
 
     // Always-on local image API (127.0.0.1), independent of studio registration.
-    let local_api = runtime::spawn_local_api(cfg.clone(), &path, observers.clone(), stop.clone());
+    // Shares the one-job gate with the WS session so local + studio jobs
+    // never run concurrently on the same GPU.
+    let gate = crate::job_gate::JobGate::from_shared(busy.clone());
+    let local_api =
+        runtime::spawn_local_api(cfg.clone(), &path, observers.clone(), gate, stop.clone());
 
     let cfg_loops = cfg.clone();
     let stop_loops = stop.clone();

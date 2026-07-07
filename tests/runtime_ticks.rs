@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use studio_worker::config::Config;
+use studio_worker::job_gate::JobGate;
 use studio_worker::runtime::{
     auto_update_tick, spawn_auto_updater, AutoUpdateDecision, LoopSchedule,
 };
@@ -44,7 +45,7 @@ async fn auto_update_tick_reports_up_to_date() {
     cfg.auto_update_enabled = true;
     cfg.auto_update_feed = format!("{}/releases", feed.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let decision = auto_update_tick(&cfg, false, &logs).await;
+    let decision = auto_update_tick(&cfg, &JobGate::new(), &logs).await;
     assert_eq!(decision, AutoUpdateDecision::UpToDate);
 }
 
@@ -60,7 +61,7 @@ async fn auto_update_tick_reports_check_error_on_bad_feed() {
     cfg.auto_update_enabled = true;
     cfg.auto_update_feed = format!("{}/releases", feed.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let decision = auto_update_tick(&cfg, false, &logs).await;
+    let decision = auto_update_tick(&cfg, &JobGate::new(), &logs).await;
     assert!(matches!(decision, AutoUpdateDecision::CheckError(_)));
 }
 
@@ -84,7 +85,7 @@ async fn auto_update_tick_reports_update_error_when_apply_fails() {
     cfg.auto_update_enabled = true;
     cfg.auto_update_feed = format!("{}/releases", feed.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let decision = auto_update_tick(&cfg, false, &logs).await;
+    let decision = auto_update_tick(&cfg, &JobGate::new(), &logs).await;
     assert!(matches!(decision, AutoUpdateDecision::UpdateError(_)));
     let entries = logs.lock();
     assert!(entries
@@ -97,7 +98,10 @@ async fn auto_update_tick_skips_when_busy() {
     let mut cfg = registered_cfg("http://api.invalid");
     cfg.auto_update_enabled = true;
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let decision = auto_update_tick(&cfg, true, &logs).await;
+    // A held reservation on the shared gate models an in-flight job.
+    let gate = JobGate::new();
+    let _held = gate.try_reserve().expect("hold the slot");
+    let decision = auto_update_tick(&cfg, &gate, &logs).await;
     assert_eq!(decision, AutoUpdateDecision::SkippedBusy);
     let entries = logs.lock();
     assert!(entries.iter().any(|e| e.message.contains("worker is busy")));
@@ -108,7 +112,7 @@ async fn auto_update_tick_returns_disabled_when_turned_off() {
     let mut cfg = registered_cfg("http://api.invalid");
     cfg.auto_update_enabled = false;
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let decision = auto_update_tick(&cfg, false, &logs).await;
+    let decision = auto_update_tick(&cfg, &JobGate::new(), &logs).await;
     assert_eq!(decision, AutoUpdateDecision::Disabled);
 }
 

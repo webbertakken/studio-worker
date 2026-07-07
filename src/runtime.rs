@@ -387,7 +387,10 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     // `run_cli` log it at error and exit non-zero.
     // Start the always-on local image API before the registration gate so it
     // works even when the worker is not (yet) registered with a studio.
-    let local_api = spawn_local_api(cfg.clone(), &path, observers.clone(), stop.clone());
+    // It shares the one-job gate with the WS session so a local job and
+    // a studio job never run concurrently on the same GPU.
+    let gate = crate::job_gate::JobGate::from_shared(busy.clone());
+    let local_api = spawn_local_api(cfg.clone(), &path, observers.clone(), gate, stop.clone());
 
     let outcome = match ensure_registered(&cfg, &path, &registration, &stop).await {
         Ok(RegistrationGate::Stopped) => {
@@ -646,6 +649,7 @@ pub fn spawn_local_api(
     cfg: SharedConfig,
     config_path: &std::path::Path,
     observers: WorkerObservers,
+    gate: crate::job_gate::JobGate,
     stop: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let engine: Arc<dyn crate::engine::Engine> = match crate::engine::build(&cfg.lock()) {
@@ -678,6 +682,7 @@ pub fn spawn_local_api(
         catalog_path.clone(),
         observers.clone(),
         token.clone(),
+        gate.clone(),
     )
     .or_else(|_| {
         crate::local_api::LocalApi::bind(
@@ -687,6 +692,7 @@ pub fn spawn_local_api(
             catalog_path,
             observers.clone(),
             token.clone(),
+            gate.clone(),
         )
     });
 
@@ -752,13 +758,16 @@ pub enum AutoUpdateDecision {
 
 pub async fn auto_update_tick(
     cfg: &Config,
-    busy: bool,
+    gate: &crate::job_gate::JobGate,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
 ) -> AutoUpdateDecision {
     if !cfg.auto_update_enabled {
         return AutoUpdateDecision::Disabled;
     }
-    if busy {
+    // A job in flight: skip the whole check.  The network probe is
+    // cheap but restarting mid-job is not, and we'd only reject the
+    // apply below anyway.
+    if gate.is_busy() {
         push_log(
             logs,
             "info",
@@ -771,6 +780,7 @@ pub async fn auto_update_tick(
     let feed = cfg.auto_update_feed.clone();
     let prerelease = cfg.auto_update_prerelease;
     let logs_for_task = logs.clone();
+    let gate = gate.clone();
     let outcome = tokio::task::spawn_blocking(move || -> Result<AutoUpdateDecision> {
         let current = semver::Version::parse(AGENT_VERSION)
             .map_err(|e| anyhow!("invalid AGENT_VERSION {AGENT_VERSION}: {e}"))?;
@@ -786,6 +796,22 @@ pub async fn auto_update_tick(
                 Ok(AutoUpdateDecision::UpToDate)
             }
             Ok(update::CheckOutcome::NewerAvailable { current, latest }) => {
+                // Reserve the one-job slot *before* touching the
+                // installer, so an offer arriving mid-install is
+                // rejected as busy (the WS session shares this gate)
+                // and `restart_self` can never kill an in-flight job.
+                // A job that started between the is_busy() check and
+                // here loses the race here and we defer to next tick.
+                let Some(_reservation) = gate.try_reserve() else {
+                    push_log(
+                        &logs_for_task,
+                        "info",
+                        "auto-update",
+                        "update available but a job started; deferring install",
+                        None,
+                    );
+                    return Ok(AutoUpdateDecision::SkippedBusy);
+                };
                 push_log(
                     &logs_for_task,
                     "info",
@@ -886,8 +912,8 @@ pub fn spawn_auto_updater(
                 continue;
             }
             elapsed = Duration::from_secs(0);
-            let busy_now = busy.load(Ordering::SeqCst);
-            let decision = auto_update_tick(&snapshot, busy_now, &logs).await;
+            let gate = crate::job_gate::JobGate::from_shared(busy.clone());
+            let decision = auto_update_tick(&snapshot, &gate, &logs).await;
             if matches!(decision, AutoUpdateDecision::Updated) {
                 stop.store(true, Ordering::SeqCst);
                 update::restart_self();
@@ -1641,7 +1667,7 @@ mod tests {
             ..Config::default()
         };
         let logs = Arc::new(Mutex::new(Vec::new()));
-        let decision = auto_update_tick(&cfg, false, &logs).await;
+        let decision = auto_update_tick(&cfg, &crate::job_gate::JobGate::new(), &logs).await;
         assert_eq!(decision, AutoUpdateDecision::Disabled);
     }
 
@@ -1652,7 +1678,10 @@ mod tests {
             ..Config::default()
         };
         let logs = Arc::new(Mutex::new(Vec::new()));
-        let decision = auto_update_tick(&cfg, true, &logs).await;
+        // A held reservation on the shared gate = an in-flight job.
+        let gate = crate::job_gate::JobGate::new();
+        let _held = gate.try_reserve().expect("hold the slot");
+        let decision = auto_update_tick(&cfg, &gate, &logs).await;
         assert_eq!(decision, AutoUpdateDecision::SkippedBusy);
         let entries = logs.lock();
         assert!(entries.iter().any(|e| e.message.contains("busy on a job")));
