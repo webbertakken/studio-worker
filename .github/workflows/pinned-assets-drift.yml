@@ -16,6 +16,7 @@ on:
     paths:
       - "src/engine/sd_provision.rs"
       - "src/engine/onnx_provision.rs"
+      - "src/engine/llama_subprocess.rs"
       - ".github/workflows/pinned-assets-drift.yml"
   schedule:
     # Weekly, so an upstream deletion is caught even without a code change.
@@ -38,11 +39,13 @@ jobs:
           tag=$(grep -oP 'DEFAULT_RELEASE_TAG: &str = "\K[^"]+' src/engine/sd_provision.rs)
           sha=${tag##*-}
           ort=$(grep -oP 'ORT_VERSION: &str = "\K[^"]+' src/engine/onnx_provision.rs)
-          echo "sd.cpp tag=$tag (sha=$sha), ORT=$ort"
+          llama=$(grep -oP 'DEFAULT_BUILD: &str = "\K[^"]+' src/engine/llama_subprocess.rs)
+          echo "sd.cpp tag=$tag (sha=$sha), ORT=$ort, llama=$llama"
           urls=(
             "https://github.com/leejet/stable-diffusion.cpp/releases/download/${tag}/sd-master-${sha}-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip"
             "https://github.com/webbertakken/studio-worker/releases/download/sdcpp-prebuilt-${tag}/sd-master-${sha}-bin-Linux-aarch64-vulkan.zip"
             "https://github.com/microsoft/onnxruntime/releases/download/v${ort}/onnxruntime-linux-x64-${ort}.tgz"
+            "https://github.com/ggml-org/llama.cpp/releases/download/${llama}/llama-${llama}-bin-win-vulkan-x64.zip"
           )
           fail=0
           for u in "${urls[@]}"; do
