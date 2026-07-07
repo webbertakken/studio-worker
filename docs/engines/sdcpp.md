@@ -170,14 +170,19 @@ The legacy `with_builtin(models_root)` returned a hardcoded
 
 ## Models root
 
-`cfg.models_root` defaults to `~/models`.  Every file from every
-`ModelSource.files` lands directly in that directory — there's no
-per-model subdirectory.  Two models that name the same `filename`
-will collide; in practice the registry uses distinguishing filenames
-(e.g. `z_image_turbo-Q4_K.gguf` vs `Qwen3-4B-Instruct-2507-Q4_K_M.gguf`).
+`cfg.models_root` defaults to `~/models`.  Each file from a
+`ModelSource.files` lands under a **per-model subdirectory**
+`<models_root>/<sanitised-model-id>/<filename>` (`download::ensure_file_for_model`),
+so two models that name the same `filename` no longer collide.  A file
+already present in the legacy flat `<models_root>/<filename>` (from a
+worker that predates this layout) is reused in place, so upgrading
+never re-downloads a multi-GiB weight that's already on disk.  The
+model id is sanitised to a single safe path segment (`org/model` →
+`org_model`, leading dots neutralised) so it can't escape the root.
 
-A future enhancement is per-model subdirs + a manifest file with
-sha256 verification.  Tracked in [`plans/real-models-on-demand.md`](../../plans/real-models-on-demand.md).
+sha256 verification already happens on every download
+(`ModelFile.sha256`).  A per-model manifest file is a future
+enhancement tracked in [`plans/real-models-on-demand.md`](../../plans/real-models-on-demand.md).
 
 ## Performance
 

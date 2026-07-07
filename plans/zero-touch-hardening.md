@@ -236,7 +236,7 @@ up as a zombie worker. That breaks "never touch it again".
 
 ### 2.5 Models-root layout (collision safety)
 
-- [ ] 2.5.1 Flat `models_root` collides filenames across models
+- [x] 2.5.1 Flat `models_root` collides filenames across models
       (documented in `docs/engines/sdcpp.md`). Move downloads to
       per-model subdirs: `<models_root>/<sanitised-model-id>/<file>`
       with a `manifest.json` (url, sha256, bytes, downloaded-at) per
