@@ -111,18 +111,18 @@ user can do all of the above trivially.
 hands the file to `sh` / `powershell`. A compromised release (or a
 tampered feed) is remote code execution on every worker.
 
-- [ ] 1.4.1 Verify the installer's sha256 against the checksum asset
+- [x] 1.4.1 Verify the installer's sha256 against the checksum asset
       cargo-dist publishes in the same release (each artifact has a
       sibling `.sha256`; confirm exact naming from a real release via
       `gh release view`). Download checksum + installer, verify before
       `run_installer`. TDD: wiremock feed + assets; mismatch → error,
       installer never executed (assert via fake runner).
-- [ ] 1.4.2 Pin allowed installer/checksum download hosts to
+- [x] 1.4.2 Pin allowed installer/checksum download hosts to
       `github.com` and `objects.githubusercontent.com` (still https),
       on top of the existing scheme check, so a poisoned feed can't
       redirect the download elsewhere. Keep the loopback-http test
       escape hatch. TDD: https non-GitHub host → rejected.
-- [ ] 1.4.3 (Stretch, separate PR) Sign releases with minisign in
+- [ ] 1.4.3 (Stretch, separate PR — deferred: checksum verification + host pinning landed in PR chunk 3; minisign left for a follow-up) Sign releases with minisign in
       `release.yml` (key in repo secrets, public key baked into the
       binary) and verify the signature before executing the installer.
       Fall back to checksum-only with a warn when the release predates
