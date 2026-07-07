@@ -219,12 +219,12 @@ up as a zombie worker. That breaks "never touch it again".
 
 ### 2.4 Registration polish
 
-- [ ] 2.4.1 `Pending.since` is reset to `Utc::now()` on every poll
+- [x] 2.4.1 `Pending.since` is reset to `Utc::now()` on every poll
       (`auto_register::poll_existing`), so "pending since" lies.
       Preserve the first-seen instant: read the previous state from
       `observers` and keep its `since` when already Pending. TDD:
       two consecutive pending polls → same `since`.
-- [ ] 2.4.2 First-run VRAM-aware default threshold: `Config::default`
+- [x] 2.4.2 First-run VRAM-aware default threshold: `Config::default`
       hardcodes `vram_threshold_gb: 12.0`; on an 8 GB card the worker
       over-advertises and OOMs (currently only a warning at
       handshake). When bootstrapping a fresh config (the

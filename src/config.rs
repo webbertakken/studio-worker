@@ -229,10 +229,31 @@ pub fn resolve_path(override_path: Option<&str>) -> Result<PathBuf> {
     }
 }
 
+/// Lower a freshly-bootstrapped VRAM threshold to the card's detected
+/// capacity.  Pure over the probe so it's testable without a GPU.
+/// Only *lowers* (never raises) and only when the probe found real
+/// VRAM (`> 0`): the default 12 GB on an 8 GB card would otherwise make
+/// the worker advertise a budget it can't fit and OOM on the first
+/// job.  A failed probe (0) leaves the default — the threshold is then
+/// the only capacity signal we have.
+pub fn clamp_initial_threshold(default_threshold: f32, detected_vram: f32) -> f32 {
+    if detected_vram > 0.0 && default_threshold > detected_vram {
+        detected_vram
+    } else {
+        default_threshold
+    }
+}
+
 pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
     let path = resolve_path(override_path)?;
     if !path.exists() {
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        // First launch only: clamp the initial threshold to the GPU we
+        // can see, so a small card doesn't over-advertise out of the
+        // box.  The probe is cached (OnceLock) and returns 0 quickly on
+        // hosts with no NVIDIA tooling, where the default stands.
+        let detected = crate::sys::detect_vram_gb().unwrap_or(0.0);
+        cfg.vram_threshold_gb = clamp_initial_threshold(cfg.vram_threshold_gb, detected);
         save(&cfg, &path)?;
         tracing::info!(
             target: TRACE_TARGET,
@@ -427,6 +448,18 @@ mod tests {
         // headless boxes without UserDirs).
         let m = cfg.models_root.to_string_lossy().to_string();
         assert!(m.ends_with("models") || m.contains("studio-worker-models"));
+    }
+
+    #[test]
+    fn clamp_initial_threshold_lowers_to_a_small_card_only() {
+        // 12 GB default on an 8 GB card → clamped to 8.
+        assert_eq!(clamp_initial_threshold(12.0, 8.0), 8.0);
+        // A big card leaves the conservative default alone.
+        assert_eq!(clamp_initial_threshold(12.0, 24.0), 12.0);
+        // Exact match: no change (boundary).
+        assert_eq!(clamp_initial_threshold(12.0, 12.0), 12.0);
+        // Failed probe (0): the default stands — it's our only signal.
+        assert_eq!(clamp_initial_threshold(12.0, 0.0), 12.0);
     }
 
     #[test]

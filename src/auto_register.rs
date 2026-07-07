@@ -240,6 +240,21 @@ async fn create_request(
     state
 }
 
+/// The instant this `request_id` first entered the Pending state, read
+/// back from the shared observer.  Falls back to `now` for a fresh
+/// request (or a different id), so the UI's "pending since Xs ago"
+/// counts up from the real first sighting instead of resetting every
+/// poll.
+fn pending_since(observers: &SharedRegistration, request_id: &str) -> DateTime<Utc> {
+    match &*observers.lock() {
+        RegistrationState::Pending {
+            request_id: prev,
+            since,
+        } if prev == request_id => *since,
+        _ => Utc::now(),
+    }
+}
+
 async fn poll_existing(
     cfg: &SharedConfig,
     config_path: &Path,
@@ -257,6 +272,12 @@ async fn poll_existing(
     })
     .await;
 
+    // Preserve the instant we first saw *this* request go Pending, so
+    // the UI's "pending since" is the real wait time.  Resetting it to
+    // `now` on every 30s poll (the old behaviour) made it perpetually
+    // read "0s ago".
+    let since = pending_since(observers, &request_id);
+
     let outcome = match result {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
@@ -266,10 +287,7 @@ async fn poll_existing(
                 error = %e,
                 "poll failed; will retry next tick"
             );
-            let state = RegistrationState::Pending {
-                request_id,
-                since: Utc::now(),
-            };
+            let state = RegistrationState::Pending { request_id, since };
             *observers.lock() = state.clone();
             return state;
         }
@@ -280,10 +298,7 @@ async fn poll_existing(
                 error = %e,
                 "poll task panic; will retry next tick"
             );
-            let state = RegistrationState::Pending {
-                request_id,
-                since: Utc::now(),
-            };
+            let state = RegistrationState::Pending { request_id, since };
             *observers.lock() = state.clone();
             return state;
         }
@@ -313,10 +328,7 @@ async fn poll_existing(
             RegistrationState::Pristine
         }
         Some(RegisterStatus::Pending) => {
-            let state = RegistrationState::Pending {
-                request_id,
-                since: Utc::now(),
-            };
+            let state = RegistrationState::Pending { request_id, since };
             *observers.lock() = state.clone();
             state
         }
@@ -383,4 +395,33 @@ fn build_payload(
         capabilities,
         user_agent: format!("studio-worker/{AGENT_VERSION}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_since_preserves_the_first_sighting_for_the_same_request() {
+        let observers = shared_initial();
+        let first = Utc::now() - chrono::Duration::seconds(90);
+        *observers.lock() = RegistrationState::Pending {
+            request_id: "rr-1".into(),
+            since: first,
+        };
+        // Same request id: the original instant is preserved so the
+        // UI's "pending since" counts up from the real first sighting
+        // instead of resetting to 0 on every 30s poll.
+        assert_eq!(pending_since(&observers, "rr-1"), first);
+        // A different request id: fresh clock, not the stale instant.
+        assert_ne!(pending_since(&observers, "rr-2"), first);
+    }
+
+    #[test]
+    fn pending_since_starts_fresh_from_non_pending_states() {
+        let observers = shared_initial(); // Pristine
+        let before = Utc::now();
+        let since = pending_since(&observers, "rr-1");
+        assert!(since >= before, "a fresh pending starts from ~now");
+    }
 }
