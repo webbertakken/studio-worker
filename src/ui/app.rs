@@ -359,6 +359,7 @@ impl App {
             let busy = self.deps.busy.load(std::sync::atomic::Ordering::SeqCst);
             let paused = paused_flag.load(std::sync::atomic::Ordering::SeqCst);
             let hb = self.deps.observers.last_heartbeat.lock().clone();
+            let session_state = self.deps.observers.session_state.lock().clone();
             status_tab::StatusView::build(
                 &cfg,
                 &registration_snapshot,
@@ -366,6 +367,7 @@ impl App {
                 paused,
                 hb.as_ref(),
                 self.vram_total_gb,
+                &session_state,
             )
         };
         status_tab::render(ui, &view, &paused_flag);
@@ -413,7 +415,7 @@ mod tests {
             local_jobs: Arc::new(Mutex::new(VecDeque::new())),
             local_api_url: Arc::new(Mutex::new(None)),
             last_heartbeat: Arc::new(Mutex::new(None)),
-            recent_logs: Arc::new(Mutex::new(VecDeque::new())),
+            ..Default::default()
         };
         let stop = Arc::new(AtomicBool::new(false));
         AppDeps {

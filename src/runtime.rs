@@ -89,6 +89,52 @@ pub enum HeartbeatOutcome {
     Err { reason: String },
 }
 
+/// Where the WS session is in its lifecycle, surfaced to the UI so a
+/// worker that can't reach the studio shows *why* instead of sitting
+/// silently.  Terminal states (`AuthFailed`, `Fatal`) carry a
+/// call-to-action the Status tab renders.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SessionState {
+    /// No credentials yet — waiting for the studio operator to approve.
+    #[default]
+    WaitingForApproval,
+    /// Opening / re-opening the socket.
+    Connecting,
+    /// Welcomed by the studio; claiming jobs.
+    Connected,
+    /// Lost the connection; backing off before the next attempt.
+    Reconnecting { attempt: u32 },
+    /// Studio rejected our auth — the worker must be re-registered.
+    AuthFailed { reason: String },
+    /// A fatal server error ended the session.
+    Fatal { reason: String },
+    /// Clean shutdown.
+    Stopped,
+}
+
+impl SessionState {
+    /// One-line operator-facing summary for the UI Status tab,
+    /// including the recovery action for terminal states.
+    pub fn summary(&self) -> String {
+        match self {
+            SessionState::WaitingForApproval => "waiting for studio operator approval".into(),
+            SessionState::Connecting => "connecting to the studio…".into(),
+            SessionState::Connected => "connected — ready for jobs".into(),
+            SessionState::Reconnecting { attempt } => {
+                format!("reconnecting (attempt {attempt})…")
+            }
+            SessionState::AuthFailed { reason } => format!(
+                "authentication failed: {reason}. Re-register with \
+                 `studio-worker register --reset`."
+            ),
+            SessionState::Fatal { reason } => {
+                format!("session ended: {reason}")
+            }
+            SessionState::Stopped => "stopped".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HeartbeatStatus {
     pub last_attempt_at: DateTime<Utc>,
@@ -109,11 +155,19 @@ pub struct WorkerObservers {
     /// URL the always-on local image API is reachable at, once bound.
     pub local_api_url: Arc<Mutex<Option<String>>>,
     pub last_heartbeat: Arc<Mutex<Option<HeartbeatStatus>>>,
+    /// Current WS lifecycle state, so the UI can show a connecting /
+    /// reconnecting / auth-failed status instead of silent nothing.
+    pub session_state: Arc<Mutex<SessionState>>,
     /// Bounded ring of every log entry the worker has emitted, kept
     /// for the UI's Logs tab.  Separate from the WS ship queue
     /// (which is drained every second) so the display doesn't blank
     /// out between ticks.
     pub recent_logs: Arc<Mutex<VecDeque<LogEntry>>>,
+}
+
+/// Record the WS lifecycle state for the UI to read.
+pub fn set_session_state(observers: &WorkerObservers, state: SessionState) {
+    *observers.session_state.lock() = state;
 }
 
 pub fn truncate_prompt(s: &str) -> String {
@@ -1279,6 +1333,39 @@ mod tests {
             Some(format!("entry {overflow}").as_str()),
             "the oldest surviving entry must be entry #overflow (older evicted)"
         );
+    }
+
+    #[test]
+    fn session_state_summaries_carry_recovery_actions_for_terminal_states() {
+        assert!(SessionState::default() == SessionState::WaitingForApproval);
+        assert!(SessionState::Connected.summary().contains("connected"));
+        assert!(SessionState::Reconnecting { attempt: 3 }
+            .summary()
+            .contains("attempt 3"));
+        // The two terminal states must name the fix so a stranded
+        // worker isn't a silent dead end.
+        let auth = SessionState::AuthFailed {
+            reason: "bad token".into(),
+        }
+        .summary();
+        assert!(auth.contains("register --reset"), "got: {auth}");
+        assert!(auth.contains("bad token"));
+        assert!(SessionState::Fatal {
+            reason: "boom".into()
+        }
+        .summary()
+        .contains("boom"));
+    }
+
+    #[test]
+    fn set_session_state_updates_the_observer_slot() {
+        let observers = WorkerObservers::default();
+        assert_eq!(
+            *observers.session_state.lock(),
+            SessionState::WaitingForApproval
+        );
+        set_session_state(&observers, SessionState::Connected);
+        assert_eq!(*observers.session_state.lock(), SessionState::Connected);
     }
 
     #[test]
