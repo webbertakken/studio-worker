@@ -238,6 +238,9 @@ async fn apply_with_fake_runner_runs_full_flow() {
             std::fs::write(dest, b"#!/bin/sh\necho ok\n").unwrap();
             Ok(())
         }
+        fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
         fn run_installer(&self, p: &Path) -> anyhow::Result<()> {
             self.installs.lock().unwrap().push(p.to_path_buf());
             Ok(())
@@ -277,6 +280,9 @@ async fn apply_with_errors_when_release_missing() {
         fn download(&self, _u: &str, _d: &Path) -> anyhow::Result<()> {
             Ok(())
         }
+        fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
         fn run_installer(&self, _p: &Path) -> anyhow::Result<()> {
             Ok(())
         }
@@ -305,6 +311,9 @@ async fn apply_with_propagates_download_errors() {
     impl UpdateRunner for DownloadFails {
         fn download(&self, _u: &str, _d: &Path) -> anyhow::Result<()> {
             anyhow::bail!("simulated download fail")
+        }
+        fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
         }
         fn run_installer(&self, _p: &Path) -> anyhow::Result<()> {
             Ok(())
@@ -335,6 +344,9 @@ async fn apply_with_propagates_run_installer_errors() {
         fn download(&self, _u: &str, dest: &Path) -> anyhow::Result<()> {
             std::fs::write(dest, b"#!/bin/sh\n").unwrap();
             Ok(())
+        }
+        fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
         }
         fn run_installer(&self, _p: &Path) -> anyhow::Result<()> {
             anyhow::bail!("simulated installer fail")
@@ -515,6 +527,9 @@ async fn apply_with_emits_info_events_for_every_state_transition() {
             std::fs::write(dest, b"#!/bin/sh\necho ok\n").unwrap();
             Ok(())
         }
+        fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
         fn run_installer(&self, p: &Path) -> anyhow::Result<()> {
             self.installs.lock().unwrap().push(p.to_path_buf());
             Ok(())
@@ -569,6 +584,9 @@ async fn apply_with_errors_when_installer_asset_missing() {
         fn download(&self, _u: &str, _d: &Path) -> anyhow::Result<()> {
             Ok(())
         }
+        fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
         fn run_installer(&self, _p: &Path) -> anyhow::Result<()> {
             Ok(())
         }
@@ -595,4 +613,166 @@ async fn apply_with_errors_when_installer_asset_missing() {
         .unwrap()
         .unwrap_err();
     assert!(err.to_string().contains("installer asset"));
+}
+
+// ---------------------------------------------------------------------------
+// Installer checksum gate: apply_with verifies the downloaded installer
+// against the release's `<asset>.sha256` sidecar before executing it.
+// ---------------------------------------------------------------------------
+
+/// sha256 of the b"#!/bin/sh\necho ok\n" body the checksum fakes write.
+const OK_BODY_SHA256: &str = "b4d644d4279594903f1a9911956432d9473041f2984fc6014c14d7402c7d126c";
+
+struct ChecksumRunner {
+    checksum: Option<String>,
+    installs: std::sync::Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl studio_worker::update::UpdateRunner for ChecksumRunner {
+    fn download(&self, _u: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+        std::fs::write(dest, b"#!/bin/sh\necho ok\n").unwrap();
+        Ok(())
+    }
+    fn fetch_checksum(&self, url: &str) -> anyhow::Result<Option<String>> {
+        assert!(
+            url.ends_with(".sha256"),
+            "checksum must be fetched from the sidecar URL, got {url}"
+        );
+        Ok(self.checksum.clone())
+    }
+    fn run_installer(&self, p: &std::path::Path) -> anyhow::Result<()> {
+        self.installs.lock().unwrap().push(p.to_path_buf());
+        Ok(())
+    }
+}
+
+async fn feed_with_v020() -> (MockServer, String) {
+    let server = MockServer::start().await;
+    let body = serde_json::json!([release("v0.2.0", false, false)]);
+    Mock::given(method("GET"))
+        .and(path("/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let feed = format!("{}/releases", server.uri());
+    (server, feed)
+}
+
+#[tokio::test]
+async fn apply_runs_the_installer_when_the_sidecar_matches() {
+    let (_server, feed) = feed_with_v020().await;
+    let runner = std::sync::Arc::new(ChecksumRunner {
+        checksum: Some(format!("{OK_BODY_SHA256}  studio-worker-installer.sh\n")),
+        installs: std::sync::Mutex::new(Vec::new()),
+    });
+    let runner_clone = runner.clone();
+    std::thread::spawn(move || update::apply_with(&feed, &Version::new(0, 2, 0), &*runner_clone))
+        .join()
+        .unwrap()
+        .unwrap();
+    assert_eq!(runner.installs.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn apply_refuses_to_run_an_installer_with_a_wrong_checksum() {
+    let (_server, feed) = feed_with_v020().await;
+    let runner = std::sync::Arc::new(ChecksumRunner {
+        checksum: Some(format!("{}  studio-worker-installer.sh", "0".repeat(64))),
+        installs: std::sync::Mutex::new(Vec::new()),
+    });
+    let runner_clone = runner.clone();
+    let err = std::thread::spawn(move || {
+        update::apply_with(&feed, &Version::new(0, 2, 0), &*runner_clone)
+    })
+    .join()
+    .unwrap()
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("sha256 mismatch"), "got: {err}");
+    assert!(
+        runner.installs.lock().unwrap().is_empty(),
+        "a mismatched installer must never execute"
+    );
+}
+
+#[tokio::test]
+async fn apply_refuses_an_unparseable_sidecar() {
+    let (_server, feed) = feed_with_v020().await;
+    let runner = std::sync::Arc::new(ChecksumRunner {
+        checksum: Some("total garbage, no digest here".into()),
+        installs: std::sync::Mutex::new(Vec::new()),
+    });
+    let runner_clone = runner.clone();
+    let err = std::thread::spawn(move || {
+        update::apply_with(&feed, &Version::new(0, 2, 0), &*runner_clone)
+    })
+    .join()
+    .unwrap()
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("no parseable sha256"), "got: {err}");
+    assert!(runner.installs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn apply_warns_but_proceeds_when_no_sidecar_is_published() {
+    // Older releases predate the sidecar; the transport is still https
+    // pinned to GitHub, so the update must go ahead — with a warn.
+    let (_server, feed) = feed_with_v020().await;
+    let runner = std::sync::Arc::new(ChecksumRunner {
+        checksum: None,
+        installs: std::sync::Mutex::new(Vec::new()),
+    });
+    let runner_clone = runner.clone();
+    let feed_clone = feed.clone();
+    let logs = std::thread::spawn(move || {
+        captured_logs_for(move || {
+            update::apply_with(&feed_clone, &Version::new(0, 2, 0), &*runner_clone).unwrap();
+        })
+    })
+    .join()
+    .unwrap();
+    assert_eq!(runner.installs.lock().unwrap().len(), 1);
+    assert!(
+        logs.contains("no installer checksum sidecar"),
+        "skipping verification must leave a breadcrumb: {logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RealRunner::fetch_checksum against a live loopback server.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn real_runner_fetch_checksum_distinguishes_present_absent_and_broken() {
+    use studio_worker::update::{RealRunner, UpdateRunner};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/i.sh.sha256"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("abc  i.sh"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/broken.sha256"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let base = server.uri();
+
+    let (present, absent, broken) = std::thread::spawn(move || {
+        (
+            RealRunner.fetch_checksum(&format!("{base}/i.sh.sha256")),
+            RealRunner.fetch_checksum(&format!("{base}/missing.sha256")),
+            RealRunner.fetch_checksum(&format!("{base}/broken.sha256")),
+        )
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(present.unwrap(), Some("abc  i.sh".to_string()));
+    assert_eq!(absent.unwrap(), None, "404 means no sidecar, not an error");
+    assert!(
+        broken.is_err(),
+        "a 5xx must be a hard error so a blocked fetch can't pass for an absent sidecar"
+    );
 }

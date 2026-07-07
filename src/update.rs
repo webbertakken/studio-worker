@@ -198,6 +198,12 @@ pub fn apply(feed_url: &str, latest: &Version) -> Result<()> {
 /// that records calls.
 pub trait UpdateRunner {
     fn download(&self, url: &str, dest: &Path) -> Result<()>;
+    /// Fetch the published sha256 sidecar for an asset (the
+    /// `<asset-url>.sha256` convention).  `Ok(None)` means the release
+    /// simply doesn't publish one (older releases); an HTTP/transport
+    /// failure is a hard `Err` so a blocked checksum fetch can't be
+    /// mistaken for an absent one.
+    fn fetch_checksum(&self, url: &str) -> Result<Option<String>>;
     fn run_installer(&self, installer_path: &Path) -> Result<()>;
 }
 
@@ -235,6 +241,23 @@ impl UpdateRunner for RealRunner {
         Ok(())
     }
 
+    fn fetch_checksum(&self, url: &str) -> Result<Option<String>> {
+        validate_installer_download_url(url)?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        let response = client
+            .get(url)
+            .send()
+            .with_context(|| format!("GET {url}"))?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let response = response.error_for_status()?;
+        Ok(Some(response.text()?))
+    }
+
     fn run_installer(&self, installer_path: &Path) -> Result<()> {
         if cfg!(target_os = "windows") {
             let status = std::process::Command::new("powershell")
@@ -263,10 +286,67 @@ impl UpdateRunner for RealRunner {
     }
 }
 
+/// Hosts an installer (or its checksum) may be fetched from.  The
+/// release feed is data an attacker may try to tamper with; even a
+/// poisoned feed must not be able to point the updater at an arbitrary
+/// https server.  GitHub serves release assets from `github.com`
+/// (redirecting to `objects.githubusercontent.com`, which reqwest
+/// follows transparently — both are pinned for direct links too).
+const ALLOWED_INSTALLER_HOSTS: [&str; 2] = ["github.com", "objects.githubusercontent.com"];
+
 fn validate_installer_download_url(raw: &str) -> Result<()> {
-    // Shared with the model/asset downloaders — one audited transport
-    // gate instead of per-module copies drifting apart.
-    crate::net::validate_download_url(raw, "installer")
+    // Shared transport gate (https-or-loopback) first…
+    crate::net::validate_download_url(raw, "installer")?;
+    // …then the host pin.  Loopback stays allowed so wiremock tests
+    // and air-gapped mirrors keep working.
+    let url = url::Url::parse(raw).with_context(|| format!("invalid installer URL {raw:?}"))?;
+    match url.host() {
+        Some(url::Host::Domain(d))
+            if ALLOWED_INSTALLER_HOSTS
+                .iter()
+                .any(|allowed| d.eq_ignore_ascii_case(allowed)) =>
+        {
+            Ok(())
+        }
+        Some(url::Host::Domain(d)) if d.eq_ignore_ascii_case("localhost") => Ok(()),
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Ok(()),
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Ok(()),
+        _ => bail!(
+            "installer URL host is not an allowed release host \
+             (github.com / objects.githubusercontent.com): {raw}"
+        ),
+    }
+}
+
+/// Parse the hex digest out of a checksum sidecar (`<hex>  <name>` /
+/// `<hex> *<name>` / bare `<hex>`).  Returns `None` when no 64-hex
+/// token leads the first non-empty line.
+pub fn parse_checksum_file(text: &str) -> Option<String> {
+    let first = text.lines().find(|l| !l.trim().is_empty())?;
+    let token = first.split_whitespace().next()?;
+    (token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| token.to_ascii_lowercase())
+}
+
+/// sha256 a file on disk and compare against the expected hex digest.
+pub fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hashing {}", path.display()))?;
+    let actual: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !actual.eq_ignore_ascii_case(expected_hex.trim()) {
+        bail!(
+            "installer sha256 mismatch: downloaded file hashes to {actual} but the \
+             release publishes {expected_hex} (corrupted or tampered download)"
+        );
+    }
+    Ok(())
 }
 
 /// Where a parked (renamed-aside) running executable lives: the full
@@ -407,6 +487,34 @@ pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R)
         "downloading installer"
     );
     runner.download(url, &installer_path)?;
+    // Integrity gate: verify the downloaded installer against the
+    // release's published `<asset>.sha256` sidecar before handing it
+    // to `sh` / `powershell`.  Releases that predate the sidecar are
+    // tolerated with a warn (the transport is still https + pinned to
+    // GitHub); a *published* checksum that doesn't match is a hard
+    // stop — running a tampered installer is remote code execution.
+    match runner.fetch_checksum(&format!("{url}.sha256"))? {
+        Some(text) => match parse_checksum_file(&text) {
+            Some(expected) => {
+                verify_file_sha256(&installer_path, &expected)?;
+                info!(
+                    target: TRACE_TARGET,
+                    latest = %latest,
+                    "installer checksum verified against the release sidecar"
+                );
+            }
+            None => bail!(
+                "the release publishes an installer checksum sidecar but it \
+                 contains no parseable sha256 — refusing to run the installer"
+            ),
+        },
+        None => warn!(
+            target: TRACE_TARGET,
+            latest = %latest,
+            "release publishes no installer checksum sidecar; skipping \
+             verification (transport is https pinned to GitHub)"
+        ),
+    }
     info!(
         target: TRACE_TARGET,
         installer = %installer_path.display(),
@@ -1021,6 +1129,81 @@ mod tests {
     }
 
     #[test]
+    fn validate_installer_download_url_pins_the_release_host() {
+        // Even a poisoned feed must not be able to point the updater at
+        // an arbitrary https server — only GitHub's release hosts (and
+        // loopback, for tests) may serve installers.
+        for bad in [
+            "https://evil.example/installer.sh",
+            "https://github.com.evil.example/i.sh",
+            "https://raw.githubusercontent.com/o/r/i.sh",
+        ] {
+            let err = validate_installer_download_url(bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("allowed release host"),
+                "{bad} must be rejected by the host pin: {err}"
+            );
+        }
+        validate_installer_download_url(
+            "https://objects.githubusercontent.com/github-production-release-asset/x",
+        )
+        .unwrap();
+        validate_installer_download_url("https://GITHUB.COM/o/r/releases/download/v1/i.sh")
+            .unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Checksum sidecar parsing + file hashing — the integrity gate in
+    // front of `run_installer`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_checksum_file_accepts_common_shapes() {
+        let hex = "1f2eef5fe020e81929161910fba1dea68e0baf62c6d3067dd7e996bf4a7ea508";
+        assert_eq!(parse_checksum_file(hex), Some(hex.to_string()));
+        assert_eq!(
+            parse_checksum_file(&format!("{hex}  studio-worker-installer.sh\n")),
+            Some(hex.to_string())
+        );
+        assert_eq!(
+            parse_checksum_file(&format!("{hex} *studio-worker-installer.sh")),
+            Some(hex.to_string())
+        );
+        assert_eq!(
+            parse_checksum_file(&format!("\n\n{}  x", hex.to_uppercase())),
+            Some(hex.to_string()),
+            "uppercase digests normalise to lowercase"
+        );
+    }
+
+    #[test]
+    fn parse_checksum_file_rejects_garbage() {
+        assert_eq!(parse_checksum_file(""), None);
+        assert_eq!(parse_checksum_file("not a checksum"), None);
+        assert_eq!(parse_checksum_file("abc123  file"), None, "too short");
+        assert_eq!(
+            parse_checksum_file(&"g".repeat(64)),
+            None,
+            "non-hex characters"
+        );
+    }
+
+    #[test]
+    fn verify_file_sha256_accepts_match_and_rejects_mismatch() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("installer.sh");
+        std::fs::write(&file, b"#!/bin/sh\necho fake installer\n").unwrap();
+        verify_file_sha256(&file, FAKE_INSTALLER_SHA256).unwrap();
+        verify_file_sha256(&file, &FAKE_INSTALLER_SHA256.to_uppercase()).unwrap();
+        let err = verify_file_sha256(&file, &"0".repeat(64))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sha256 mismatch"), "got: {err}");
+    }
+
+    #[test]
     fn validate_installer_download_url_rejects_a_malformed_url() {
         // A feed entry that doesn't parse as a URL at all must error at
         // the parse step (carrying the `invalid installer URL` context)
@@ -1078,11 +1261,19 @@ mod tests {
     // apply_with — exercised via a fake runner that records calls.
     // -----------------------------------------------------------------
 
+    /// sha256 of the fake installer body the FakeRunner writes.
+    const FAKE_INSTALLER_SHA256: &str =
+        "1f2eef5fe020e81929161910fba1dea68e0baf62c6d3067dd7e996bf4a7ea508";
+
+    #[derive(Default)]
     struct FakeRunner {
         downloaded: RefCell<Vec<(String, PathBuf)>>,
+        checksum_fetches: RefCell<Vec<String>>,
         ran: RefCell<Vec<PathBuf>>,
         fail_download: bool,
         fail_run: bool,
+        /// What `fetch_checksum` hands back (`None` = no sidecar).
+        checksum: Option<String>,
     }
 
     impl UpdateRunner for FakeRunner {
@@ -1097,6 +1288,10 @@ mod tests {
             std::fs::write(dest, b"#!/bin/sh\necho fake installer\n").unwrap();
             Ok(())
         }
+        fn fetch_checksum(&self, url: &str) -> Result<Option<String>> {
+            self.checksum_fetches.borrow_mut().push(url.to_string());
+            Ok(self.checksum.clone())
+        }
         fn run_installer(&self, installer_path: &Path) -> Result<()> {
             self.ran.borrow_mut().push(installer_path.to_path_buf());
             if self.fail_run {
@@ -1104,6 +1299,17 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn fake_installer_sha_constant_matches_the_body() {
+        // Guard the fixture: every checksum test below depends on it.
+        use sha2::{Digest, Sha256};
+        let hex: String = Sha256::digest(b"#!/bin/sh\necho fake installer\n")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hex, FAKE_INSTALLER_SHA256);
     }
 
     fn write_fixture_feed(dir: &tempfile::TempDir, releases: serde_json::Value) -> String {
@@ -1159,12 +1365,7 @@ mod tests {
 
     #[test]
     fn fake_runner_records_download_and_run() {
-        let runner = FakeRunner {
-            downloaded: RefCell::new(Vec::new()),
-            ran: RefCell::new(Vec::new()),
-            fail_download: false,
-            fail_run: false,
-        };
+        let runner = FakeRunner::default();
         let dir = tempdir().unwrap();
         let dest = dir.path().join("installer.sh");
         runner.download("https://example.com/a", &dest).unwrap();
@@ -1177,10 +1378,8 @@ mod tests {
     #[test]
     fn fake_runner_surfaces_download_errors() {
         let runner = FakeRunner {
-            downloaded: RefCell::new(Vec::new()),
-            ran: RefCell::new(Vec::new()),
             fail_download: true,
-            fail_run: false,
+            ..FakeRunner::default()
         };
         let dir = tempdir().unwrap();
         let dest = dir.path().join("installer.sh");
@@ -1191,10 +1390,8 @@ mod tests {
     #[test]
     fn fake_runner_surfaces_install_errors() {
         let runner = FakeRunner {
-            downloaded: RefCell::new(Vec::new()),
-            ran: RefCell::new(Vec::new()),
-            fail_download: false,
             fail_run: true,
+            ..FakeRunner::default()
         };
         let dir = tempdir().unwrap();
         let dest = dir.path().join("installer.sh");

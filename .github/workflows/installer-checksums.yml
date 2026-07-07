@@ -1,0 +1,50 @@
+# Publish `<installer>.sha256` sidecars for the cargo-dist installer
+# scripts on every release.
+#
+# cargo-dist checksums the platform archives (`*.tar.xz.sha256`,
+# `*.zip.sha256`, `sha256.sum`) but NOT the shell/PowerShell installer
+# scripts — and the auto-updater downloads and *executes* exactly those
+# scripts.  The updater (`update::apply_with`) verifies the installer
+# against its `<asset>.sha256` sidecar when one is published, so this
+# workflow closes the loop for every release going forward.  Releases
+# that predate it are tolerated by the updater with a warning.
+
+name: Installer checksums
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  checksums:
+    name: Upload installer sha256 sidecars
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute + upload sidecars
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          uploaded=0
+          for name in studio-worker-installer.sh studio-worker-installer.ps1; do
+            if gh release download "$TAG" --repo "$REPO" --pattern "$name" --clobber; then
+              sha256sum "$name" > "$name.sha256"
+              gh release upload "$TAG" "$name.sha256" --repo "$REPO" --clobber
+              echo "uploaded $name.sha256"
+              uploaded=$((uploaded + 1))
+            else
+              echo "::warning::no $name asset on $TAG; skipping its sidecar"
+            fi
+          done
+          # A studio-worker release without either installer is broken —
+          # fail loudly rather than leave the updater unverifiable.
+          if [ "$uploaded" -eq 0 ]; then
+            echo "::error::release $TAG has no installer assets at all"
+            exit 1
+          fi
