@@ -315,14 +315,14 @@ platform parity broken for the turnkey story.
 Intel and Apple report 0.0, which disables the threshold sanity warning
 and blinds studio matching.
 
-- [ ] 3.4.1 Add an AMD probe: sum
+- [x] 3.4.1 Add an AMD probe: sum
       `/sys/class/drm/card*/device/mem_info_vram_total` (bytes) on
       Linux. TDD: fixture sysfs tree like the existing NVIDIA sysfs
       tests.
-- [ ] 3.4.2 Add an Apple probe: unified memory via
+- [x] 3.4.2 Add an Apple probe: unified memory via
       `sysctl hw.memsize` scaled (document the heuristic — e.g. 75% of
       unified memory usable as VRAM); macOS only. TDD: parse seam.
-- [ ] 3.4.3 Windows non-NVIDIA: query
+- [x] 3.4.3 Windows non-NVIDIA: query
       `Win32_VideoController.AdapterRAM` via `wmic`/PowerShell CIM as
       a fallback after `nvidia-smi`. TDD: stdout-parser seam.
 

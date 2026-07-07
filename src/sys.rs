@@ -79,7 +79,7 @@ pub fn detect_vram_gb() -> Result<f32> {
 }
 
 fn probe_vram_gb() -> f32 {
-    // Linux exposes a cheap, dependency-free sysfs probe; try it first
+    // Linux exposes cheap, dependency-free sysfs probes; try them first
     // so the common case never spawns a subprocess.
     #[cfg(target_os = "linux")]
     {
@@ -87,10 +87,115 @@ fn probe_vram_gb() -> f32 {
         if from_sysfs > 0.0 {
             return from_sysfs;
         }
+        // AMD (and Intel discrete) expose VRAM via the DRM sysfs tree.
+        let from_amd = detect_vram_gb_from_amd_sysfs(Path::new("/sys/class/drm"));
+        if from_amd > 0.0 {
+            return from_amd;
+        }
     }
-    // Fallback for every platform: `nvidia-smi`.  On a host with no
-    // NVIDIA tooling the command simply fails to spawn and we return 0.
-    detect_vram_gb_via_nvidia_smi().unwrap_or(0.0)
+    // Apple Silicon / Intel Macs: unified memory, sized via sysctl.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(gb) = detect_vram_gb_via_sysctl() {
+            return gb;
+        }
+    }
+    // NVIDIA on any platform: `nvidia-smi`.  Absent on a non-NVIDIA
+    // host, where the command simply fails to spawn.
+    if let Some(gb) = detect_vram_gb_via_nvidia_smi() {
+        return gb;
+    }
+    // Windows non-NVIDIA (AMD / Intel): CIM `Win32_VideoController`.
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(gb) = detect_vram_gb_via_wmic() {
+            return gb;
+        }
+    }
+    0.0
+}
+
+/// Bytes → GiB (matching the NVIDIA MiB/1024 path, so every vendor
+/// reports the same unit).
+fn bytes_to_gib(bytes: u64) -> f32 {
+    (bytes as f64 / (1024.0 * 1024.0 * 1024.0)) as f32
+}
+
+/// True for a DRM primary-node dir name (`card0`, `card1`, …) but not
+/// the connector (`card0-DP-1`) or render (`renderD128`) siblings.
+fn is_drm_card_dir(name: &str) -> bool {
+    name.strip_prefix("card")
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Sum VRAM across every AMD/Intel-discrete GPU exposed under the DRM
+/// sysfs tree (`<root>/card*/device/mem_info_vram_total`, a byte
+/// count).  Integrated GPUs and drivers that don't publish the file
+/// simply contribute nothing, so an iGPU-only box returns 0 and the
+/// caller keeps the configured threshold as its only signal.
+pub fn detect_vram_gb_from_amd_sysfs(root: &Path) -> f32 {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return 0.0,
+    };
+    let mut total_bytes: u64 = 0;
+    let mut cards: u32 = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_drm_card_dir(&name) {
+            continue;
+        }
+        let vram_file = entry.path().join("device").join("mem_info_vram_total");
+        if let Ok(content) = std::fs::read_to_string(&vram_file) {
+            if let Some(bytes) = parse_amd_vram_total_bytes(&content) {
+                total_bytes = total_bytes.saturating_add(bytes);
+                cards += 1;
+            }
+        }
+    }
+    let gib = bytes_to_gib(total_bytes);
+    if cards > 0 {
+        tracing::info!(
+            target: "studio_worker::sys",
+            op = "probe_vram",
+            source = "amd_drm_sysfs",
+            vram_gb = gib,
+            cards,
+            "detected VRAM via AMD/DRM sysfs"
+        );
+    }
+    gib
+}
+
+/// Parse an AMD `mem_info_vram_total` file: a single decimal byte
+/// count, possibly with trailing whitespace.
+pub fn parse_amd_vram_total_bytes(content: &str) -> Option<u64> {
+    content.trim().parse::<u64>().ok().filter(|b| *b > 0)
+}
+
+/// Parse `sysctl -n hw.memsize` (total RAM in bytes) into a usable VRAM
+/// figure for Apple unified memory.  `fraction` is the share of unified
+/// memory we treat as GPU-addressable (macOS lets the GPU use most of
+/// it; 0.75 is a conservative, widely-cited figure).
+pub fn parse_sysctl_memsize(stdout: &str, fraction: f64) -> Option<f32> {
+    let bytes = stdout.trim().parse::<u64>().ok().filter(|b| *b > 0)?;
+    Some((bytes_to_gib(bytes) as f64 * fraction) as f32)
+}
+
+/// Sum the `AdapterRAM` values from a Windows CIM/WMIC
+/// `Win32_VideoController` dump (one integer per adapter, bytes).
+/// Ignores non-numeric lines (headers, blanks) so it tolerates both
+/// `wmic` and PowerShell `Get-CimInstance` output shapes.
+pub fn parse_wmic_adapter_ram(stdout: &str) -> Option<f32> {
+    let mut total: u64 = 0;
+    let mut found = false;
+    for line in stdout.lines() {
+        if let Some(bytes) = line.trim().parse::<u64>().ok().filter(|b| *b > 0) {
+            total = total.saturating_add(bytes);
+            found = true;
+        }
+    }
+    found.then(|| bytes_to_gib(total))
 }
 
 /// Probe VRAM via `nvidia-smi --query-gpu=memory.total`.  Returns `None`
@@ -130,6 +235,44 @@ fn detect_vram_gb_via_nvidia_smi() -> Option<f32> {
             None
         }
     }
+}
+
+/// Live Apple unified-memory probe via `sysctl -n hw.memsize`.
+/// Coverage-off: host-dependent; the parse is unit-tested via
+/// [`parse_sysctl_memsize`].
+#[cfg(target_os = "macos")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn detect_vram_gb_via_sysctl() -> Option<f32> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sysctl_memsize(&String::from_utf8_lossy(&output.stdout), 0.75)
+}
+
+/// Live Windows non-NVIDIA probe via PowerShell CIM
+/// (`Win32_VideoController.AdapterRAM`).  Coverage-off: host-dependent;
+/// the parse is unit-tested via [`parse_wmic_adapter_ram`].  Note
+/// `AdapterRAM` is a UInt32 and saturates at ~4 GiB on larger cards — a
+/// documented Windows limitation, but a conservative floor beats 0.
+#[cfg(target_os = "windows")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn detect_vram_gb_via_wmic() -> Option<f32> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_VideoController).AdapterRAM",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_wmic_adapter_ram(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Summed VRAM (MiB) from an `nvidia-smi` memory query plus the count of
@@ -486,6 +629,90 @@ mod tests {
         // Only the healthy card's 12288 MiB / 1024 = 12 GiB counts.
         let gb = detect_vram_gb_from_sysfs(dir.path());
         assert!((gb - 12.0).abs() < 1e-3, "got {gb}");
+    }
+
+    // -----------------------------------------------------------------
+    // AMD / Intel-discrete VRAM via the DRM sysfs tree, and the Apple /
+    // Windows non-NVIDIA parsers.  These give the threshold sanity
+    // check + studio matching a real number on non-NVIDIA GPUs, which
+    // all reported 0 before.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn is_drm_card_dir_matches_only_primary_nodes() {
+        assert!(is_drm_card_dir("card0"));
+        assert!(is_drm_card_dir("card12"));
+        assert!(!is_drm_card_dir("card0-DP-1"));
+        assert!(!is_drm_card_dir("renderD128"));
+        assert!(!is_drm_card_dir("card"));
+        assert!(!is_drm_card_dir("controlD64"));
+    }
+
+    #[test]
+    fn parse_amd_vram_total_bytes_reads_a_byte_count() {
+        assert_eq!(
+            parse_amd_vram_total_bytes("17163091968\n"),
+            Some(17163091968)
+        );
+        assert_eq!(
+            parse_amd_vram_total_bytes("0"),
+            None,
+            "zero = no VRAM file value"
+        );
+        assert_eq!(parse_amd_vram_total_bytes("N/A"), None);
+        assert_eq!(parse_amd_vram_total_bytes(""), None);
+    }
+
+    #[test]
+    fn detect_vram_gb_from_amd_sysfs_sums_cards_and_ignores_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        // card0 = 16 GiB, card1 = 8 GiB.
+        for (card, bytes) in [
+            ("card0", 16u64 * 1024 * 1024 * 1024),
+            ("card1", 8 * 1024 * 1024 * 1024),
+        ] {
+            let dev = dir.path().join(card).join("device");
+            std::fs::create_dir_all(&dev).unwrap();
+            std::fs::write(dev.join("mem_info_vram_total"), bytes.to_string()).unwrap();
+        }
+        // A connector node + a render node must be ignored.
+        std::fs::create_dir_all(dir.path().join("card0-DP-1")).unwrap();
+        std::fs::create_dir_all(dir.path().join("renderD128")).unwrap();
+        // An iGPU card with no VRAM file contributes nothing.
+        std::fs::create_dir_all(dir.path().join("card2").join("device")).unwrap();
+
+        let gb = detect_vram_gb_from_amd_sysfs(dir.path());
+        assert!((gb - 24.0).abs() < 1e-3, "expected 24 GiB, got {gb}");
+    }
+
+    #[test]
+    fn detect_vram_gb_from_amd_sysfs_returns_zero_without_a_tree() {
+        let missing = std::path::Path::new("/definitely/no/drm/here");
+        assert_eq!(detect_vram_gb_from_amd_sysfs(missing), 0.0);
+    }
+
+    #[test]
+    fn parse_sysctl_memsize_scales_unified_memory() {
+        // 32 GiB unified memory, 75% GPU-addressable = 24 GiB.
+        let bytes = (32u64 * 1024 * 1024 * 1024).to_string();
+        let gb = parse_sysctl_memsize(&bytes, 0.75).unwrap();
+        assert!((gb - 24.0).abs() < 1e-2, "got {gb}");
+        assert_eq!(parse_sysctl_memsize("0", 0.75), None);
+        assert_eq!(parse_sysctl_memsize("garbage", 0.75), None);
+    }
+
+    #[test]
+    fn parse_wmic_adapter_ram_sums_adapters_and_ignores_noise() {
+        // Two adapters: 8 GiB + 4 GiB, with a header + blank lines.
+        let out = format!(
+            "AdapterRAM\n\n{}\n{}\n",
+            8u64 * 1024 * 1024 * 1024,
+            4u64 * 1024 * 1024 * 1024
+        );
+        let gb = parse_wmic_adapter_ram(&out).unwrap();
+        assert!((gb - 12.0).abs() < 1e-2, "got {gb}");
+        assert_eq!(parse_wmic_adapter_ram("AdapterRAM\n\n"), None, "no numbers");
+        assert_eq!(parse_wmic_adapter_ram(""), None);
     }
 
     // -----------------------------------------------------------------
