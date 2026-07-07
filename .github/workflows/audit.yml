@@ -7,6 +7,7 @@ on:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - ".cargo/audit.toml"
+      - "deny.toml"
       - ".github/workflows/audit.yml"
   pull_request:
     branches: [main]
@@ -14,6 +15,7 @@ on:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - ".cargo/audit.toml"
+      - "deny.toml"
       - ".github/workflows/audit.yml"
   schedule:
     # Weekly sweep so newly disclosed advisories are caught even when
@@ -40,3 +42,19 @@ jobs:
       # trips on something new that nobody has reviewed yet.
       - name: Scan dependencies for security advisories
         run: cargo audit --deny warnings
+
+  deny:
+    name: cargo deny (licences + supply chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Licence allow-list (a new copyleft / unknown-licence dependency
+      # trips this) + duplicate-version report + registry pinning.
+      # Security advisories stay with cargo-audit above.
+      - name: Check licences, bans, and sources
+        run: cargo deny check licenses bans sources
