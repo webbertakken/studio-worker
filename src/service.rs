@@ -735,12 +735,15 @@ mod tests {
             logs.contains("error="),
             "expected structured error field, got: {logs}"
         );
-        // The concrete wording differs per OS (Unix: "... (os error 2)";
-        // Windows: "The system cannot find the file specified. (os
-        // error 2)"), so assert the structured error carries *some*
-        // underlying detail rather than a Unix-specific phrase.
+        // The concrete wording differs per OS — Unix renders "... (os
+        // error 2)", Windows renders `error="program not found"` — so
+        // assert the structured error field carries *some* underlying
+        // detail rather than any one platform's phrasing.
+        let lower = logs.to_lowercase();
         assert!(
-            logs.contains("os error") || logs.to_lowercase().contains("cannot find"),
+            lower.contains("os error")
+                || lower.contains("not found")
+                || lower.contains("cannot find"),
             "expected the underlying io::Error text, got: {logs}"
         );
     }
