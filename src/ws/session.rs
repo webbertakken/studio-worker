@@ -24,8 +24,9 @@ use crate::config::SharedConfig;
 use crate::engine::Engine;
 use crate::http::ApiClient;
 use crate::runtime::{
-    is_unsupported_kind, prompt_for, push_log_with_observers, record_recent_job, truncate_prompt,
-    wait_with_stop, CurrentJob, JobOutcome, RecentJob, WorkerObservers,
+    is_unsupported_kind, prompt_for, push_log_with_observers, record_recent_job, set_session_state,
+    truncate_prompt, wait_with_stop, CurrentJob, JobOutcome, RecentJob, SessionState,
+    WorkerObservers,
 };
 use crate::types::{LogEntry, TaskResult};
 use crate::ws::client::{connect, WsClientError, WsResult, WsSender};
@@ -39,7 +40,18 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const SHUTDOWN_TICK: Duration = Duration::from_millis(250);
 const BASE_BACKOFF_MS: u64 = 1_000;
 const MAX_BACKOFF_MS: u64 = 30_000;
-const DEFAULT_RECONNECT_ATTEMPTS: u32 = 5;
+/// Reconnect attempts before giving up, when the operator hasn't
+/// pinned `ws_reconnect_attempts`.  `0` = retry forever.
+///
+/// A zero-touch worker must never permanently give up while
+/// unattended: the turnkey install runs the UI (or an autostart tray)
+/// with **no** service manager to restart a process that exits, so a
+/// laptop that sleeps through a wifi outage used to wake as a dead
+/// worker after 5 failed reconnects.  Infinite-with-capped-backoff is
+/// the only default that keeps "approve once, never touch again" true.
+/// Operators who want fail-fast under systemd can still set a finite
+/// `ws_reconnect_attempts`.
+const DEFAULT_RECONNECT_ATTEMPTS: u32 = 0;
 /// Extra attempts for the multipart result upload when the studio
 /// returns a 5xx / transport error.  A blip is far cheaper to retry
 /// than the full GPU regeneration a reported `Fail` causes.
@@ -143,6 +155,7 @@ pub async fn spawn_ws_session(
         // what lets the UI's parallel auto-register + WS flow work.
         if !has_credentials(&cfg) {
             if !waiting_for_creds_logged {
+                set_session_state(&observers, SessionState::WaitingForApproval);
                 push_log_with_observers(
                     &logs,
                     Some(&observers),
@@ -158,14 +171,24 @@ pub async fn spawn_ws_session(
         }
         waiting_for_creds_logged = false;
 
+        set_session_state(&observers, SessionState::Connecting);
         let welcomed = AtomicBool::new(false);
         match run_one_session(
             &cfg, &stop, &logs, &busy, &paused, &observers, schedule, &welcomed,
         )
         .await
         {
-            Ok(SessionOutcome::Stopped) => return Ok(()),
+            Ok(SessionOutcome::Stopped) => {
+                set_session_state(&observers, SessionState::Stopped);
+                return Ok(());
+            }
             Ok(SessionOutcome::AuthFailed(reason)) => {
+                set_session_state(
+                    &observers,
+                    SessionState::AuthFailed {
+                        reason: reason.clone(),
+                    },
+                );
                 push_log_with_observers(
                     &logs,
                     Some(&observers),
@@ -177,6 +200,12 @@ pub async fn spawn_ws_session(
                 return Err(anyhow!("ws auth failed: {reason}"));
             }
             Ok(SessionOutcome::Fatal(reason)) => {
+                set_session_state(
+                    &observers,
+                    SessionState::Fatal {
+                        reason: reason.clone(),
+                    },
+                );
                 push_log_with_observers(
                     &logs,
                     Some(&observers),
@@ -195,7 +224,13 @@ pub async fn spawn_ws_session(
                     attempt = 0;
                 }
                 attempt += 1;
-                if max_attempts > 0 && attempt > max_attempts {
+                if reconnect_exhausted(max_attempts, attempt) {
+                    set_session_state(
+                        &observers,
+                        SessionState::Fatal {
+                            reason: format!("gave up after {attempt} reconnect attempts"),
+                        },
+                    );
                     push_log_with_observers(
                         &logs,
                         Some(&observers),
@@ -206,6 +241,7 @@ pub async fn spawn_ws_session(
                     );
                     return Err(anyhow!("ws reconnect cap reached"));
                 }
+                set_session_state(&observers, SessionState::Reconnecting { attempt });
                 let backoff = backoff_for(attempt, schedule);
                 push_log_with_observers(
                     &logs,
@@ -420,7 +456,10 @@ async fn run_one_session(
     // session.
     let mut event_rx = event_rx;
     match wait_for_welcome(&mut event_rx, logs, observers).await {
-        WelcomeOutcome::Welcomed => welcomed.store(true, Ordering::SeqCst),
+        WelcomeOutcome::Welcomed => {
+            welcomed.store(true, Ordering::SeqCst);
+            set_session_state(observers, SessionState::Connected);
+        }
         WelcomeOutcome::AuthFailed(reason) => {
             let _ = sender.close(1000, "auth failed").await;
             let _ = reader.await;
@@ -1136,6 +1175,13 @@ fn spawn_shutdown_observer(
     })
 }
 
+/// Whether the reconnect loop should stop trying.  `max_attempts == 0`
+/// means retry forever (the default) — see [`DEFAULT_RECONNECT_ATTEMPTS`].
+/// A finite cap gives up once `attempt` exceeds it.
+fn reconnect_exhausted(max_attempts: u32, attempt: u32) -> bool {
+    max_attempts > 0 && attempt > max_attempts
+}
+
 fn backoff_for(attempt: u32, schedule: SessionSchedule) -> Duration {
     let factor = 2u64.saturating_pow(attempt.saturating_sub(1));
     let raw_ms = schedule.base_backoff_ms.saturating_mul(factor);
@@ -1426,6 +1472,22 @@ mod tests {
         // Capped.
         assert_eq!(backoff_for(5, schedule), Duration::from_millis(1_000));
         assert_eq!(backoff_for(10, schedule), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn reconnect_is_infinite_by_default_and_finite_only_when_pinned() {
+        // The default (max_attempts == 0) must never give up — an
+        // unattended worker with no service manager has to keep
+        // reconnecting through a long outage instead of dying.
+        assert!(!reconnect_exhausted(0, 1));
+        assert!(!reconnect_exhausted(0, 10_000));
+        // Regression guard: the old default of 5 killed the worker on
+        // the 6th failure; the current default must not.
+        assert!(!reconnect_exhausted(DEFAULT_RECONNECT_ATTEMPTS, 6));
+        assert_eq!(DEFAULT_RECONNECT_ATTEMPTS, 0, "default must be infinite");
+        // A pinned finite cap still gives up past the cap.
+        assert!(!reconnect_exhausted(5, 5));
+        assert!(reconnect_exhausted(5, 6));
     }
 
     #[test]

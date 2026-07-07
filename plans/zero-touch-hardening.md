@@ -203,13 +203,13 @@ caller.
 permanently dead session. A laptop that sleeps through wifi loss wakes
 up as a zombie worker. That breaks "never touch it again".
 
-- [ ] 2.3.1 Default to infinite reconnects with the existing capped
+- [x] 2.3.1 Default to infinite reconnects with the existing capped
       backoff (`ws_reconnect_attempts: 0` semantics) for **both**
       modes; keep the config knob for operators who want fail-fast
       under a service manager. Adjust docs + `config` default comment.
       TDD: session test asserting attempts keep going past 5 with
       backoff capped.
-- [ ] 2.3.2 Surface connection state in the UI: `WorkerObservers`
+- [x] 2.3.2 Surface connection state in the UI: `WorkerObservers`
       gains a `session_state: Arc<Mutex<SessionState>>`
       (Connecting/Connected/Backoff{until}/AuthFailed) written by the
       session loop; Status tab renders it. AuthFailed stays terminal

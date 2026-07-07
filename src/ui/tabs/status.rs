@@ -14,7 +14,7 @@ use eframe::egui;
 use crate::{
     auto_register::RegistrationState,
     config::Config,
-    runtime::{HeartbeatOutcome, HeartbeatStatus},
+    runtime::{HeartbeatOutcome, HeartbeatStatus, SessionState},
 };
 
 /// Pure-data view of the Status tab.  Constructed each frame from
@@ -50,6 +50,9 @@ pub enum StatusView {
         paused: bool,
         busy: bool,
         last_heartbeat: Option<HeartbeatSummary>,
+        /// One-line WS lifecycle summary (connected / reconnecting /
+        /// auth-failed + recovery action).
+        session: String,
     },
 }
 
@@ -85,6 +88,7 @@ impl StatusView {
         paused: bool,
         last_heartbeat: Option<&HeartbeatStatus>,
         vram_total_gb: f32,
+        session_state: &SessionState,
     ) -> Self {
         let registered = cfg.worker_id.is_some() && cfg.auth_token.is_some();
         if registered {
@@ -96,6 +100,7 @@ impl StatusView {
                 paused,
                 busy,
                 last_heartbeat: last_heartbeat.map(HeartbeatSummary::from),
+                session: session_state.summary(),
             };
         }
         match registration {
@@ -250,6 +255,7 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
         paused,
         busy,
         last_heartbeat,
+        session,
     } = view
     else {
         unreachable!();
@@ -311,6 +317,16 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
 
             ui.label("VRAM threshold");
             ui.label(format!("{vram_threshold_gb:.1} GB per claim"));
+            ui.end_row();
+
+            ui.label("Connection");
+            // Auth-failed / fatal states carry a recovery action — draw
+            // them red so a stranded worker is impossible to miss.
+            if session.contains("failed") || session.contains("ended") {
+                ui.colored_label(egui::Color32::LIGHT_RED, session);
+            } else {
+                ui.label(session);
+            }
             ui.end_row();
 
             ui.label("Last heartbeat");
@@ -375,7 +391,15 @@ mod tests {
     #[test]
     fn build_initialising_when_pristine_and_unregistered() {
         let cfg = Config::default();
-        let view = StatusView::build(&cfg, &RegistrationState::Pristine, false, false, None, 0.0);
+        let view = StatusView::build(
+            &cfg,
+            &RegistrationState::Pristine,
+            false,
+            false,
+            None,
+            0.0,
+            &SessionState::default(),
+        );
         match view {
             StatusView::Initialising { api_base_url } => {
                 assert_eq!(api_base_url, cfg.api_base_url);
@@ -398,6 +422,7 @@ mod tests {
             false,
             None,
             0.0,
+            &SessionState::default(),
         );
         match view {
             StatusView::Pending {
@@ -424,6 +449,7 @@ mod tests {
             false,
             None,
             0.0,
+            &SessionState::default(),
         );
         match view {
             StatusView::Rejected { reason, .. } => assert_eq!(reason, "unknown contributor"),
@@ -446,6 +472,7 @@ mod tests {
             false,
             None,
             24.0,
+            &SessionState::default(),
         );
         assert!(matches!(view, StatusView::Registered { .. }));
     }
@@ -453,7 +480,15 @@ mod tests {
     #[test]
     fn build_registered_when_worker_id_and_token_present() {
         let cfg = registered_cfg();
-        let view = StatusView::build(&cfg, &RegistrationState::Approved, false, false, None, 24.0);
+        let view = StatusView::build(
+            &cfg,
+            &RegistrationState::Approved,
+            false,
+            false,
+            None,
+            24.0,
+            &SessionState::default(),
+        );
         match view {
             StatusView::Registered {
                 worker_id,
@@ -463,6 +498,7 @@ mod tests {
                 paused,
                 busy,
                 last_heartbeat,
+                session: _,
             } => {
                 assert_eq!(worker_id, "w-abc");
                 assert_eq!(api_base_url, "https://studio.example");
@@ -479,7 +515,15 @@ mod tests {
     #[test]
     fn build_registered_propagates_paused() {
         let cfg = registered_cfg();
-        let view = StatusView::build(&cfg, &RegistrationState::Approved, false, true, None, 24.0);
+        let view = StatusView::build(
+            &cfg,
+            &RegistrationState::Approved,
+            false,
+            true,
+            None,
+            24.0,
+            &SessionState::default(),
+        );
         match view {
             StatusView::Registered { paused, .. } => assert!(paused),
             _ => panic!("expected Registered"),
@@ -500,6 +544,7 @@ mod tests {
             false,
             Some(&hb),
             24.0,
+            &SessionState::default(),
         );
         match view {
             StatusView::Registered {
@@ -529,6 +574,7 @@ mod tests {
             false,
             Some(&hb),
             24.0,
+            &SessionState::default(),
         );
         match view {
             StatusView::Registered {
