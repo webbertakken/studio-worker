@@ -123,14 +123,20 @@ impl SdCppEngine {
         Ok(resolved)
     }
 
-    /// Ensure each file in `source.files` is present under
-    /// `self.models_root`.  Downloads anything missing.  Returns the
-    /// resolved local path for each file (in the same order).
+    /// Ensure each file in `source.files` is present under a per-model
+    /// subdir of `self.models_root` (so two models naming the same file
+    /// don't collide).  Downloads anything missing; reuses a legacy
+    /// flat-cache copy in place.  Returns the resolved local path for
+    /// each file (in the same order).
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn ensure_files(&self, source: &ModelSource) -> Result<Vec<(ModelFileRole, PathBuf)>> {
+    fn ensure_files(
+        &self,
+        model: &str,
+        source: &ModelSource,
+    ) -> Result<Vec<(ModelFileRole, PathBuf)>> {
         let mut out = Vec::with_capacity(source.files.len());
         for file in &source.files {
-            let local = download::ensure_file(&self.models_root, file)?;
+            let local = download::ensure_file_for_model(&self.models_root, model, file)?;
             out.push((file.role, local));
         }
         Ok(out)
@@ -166,7 +172,7 @@ impl SdCppEngine {
             );
             return Err(e);
         }
-        let files = self.ensure_files(source)?;
+        let files = self.ensure_files(model, source)?;
         // A `diffusion-model` file is the standalone diffusion weights (sd-cli `--diffusion-model`,
         // used with split vae/clip); a `model` file is a full checkpoint (sd-cli `-m`/`--model`).
         // Prefer the explicit diffusion-model role; fall back to a full checkpoint.
@@ -729,7 +735,11 @@ mod tests {
             approx_bytes: None,
             sha256: None,
         }]);
-        let resolved = engine.ensure_files(&source).expect("cached file used");
+        // The file sits in the legacy flat cache; ensure_files must
+        // reuse it in place (no per-model-dir re-download).
+        let resolved = engine
+            .ensure_files("z-image-turbo", &source)
+            .expect("cached file used");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, ModelFileRole::DiffusionModel);
         assert_eq!(resolved[0].1, cached);

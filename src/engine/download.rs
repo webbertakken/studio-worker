@@ -35,6 +35,90 @@ const TRACE_TARGET: &str = "studio_worker::engine::download";
 /// a few GiB so a 30-minute ceiling is generous.
 const DOWNLOAD_TIMEOUT_SECS: u64 = 30 * 60;
 
+/// Map a model id onto a safe single directory-segment name: every
+/// character outside `[A-Za-z0-9._-]` becomes `_`, and a leading `.`
+/// is neutralised so an id like `..` or `.hidden` can't escape or hide.
+/// Two models that share a `filename` (e.g. `model.safetensors`) then
+/// live under distinct `<models_root>/<id>/` dirs instead of
+/// overwriting each other in one flat cache.
+pub fn sanitise_model_dir(model_id: &str) -> String {
+    let mut out: String = model_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push('_');
+    }
+    // Neutralise a leading dot so `.` / `..` / `.git` can't act as a
+    // relative segment or a hidden dir.
+    if out.starts_with('.') {
+        out.replace_range(0..1, "_");
+    }
+    out
+}
+
+/// Per-model cache directory: `<models_root>/<sanitised-model-id>/`.
+pub fn model_dir(models_root: &Path, model_id: &str) -> PathBuf {
+    models_root.join(sanitise_model_dir(model_id))
+}
+
+/// Like [`ensure_file`] but scopes the download to a per-model subdir
+/// so two models naming the same file don't collide.  A file already
+/// present in the **legacy flat** `<models_root>/<filename>` (from a
+/// worker that predates this layout) is reused in place, so upgrading
+/// never re-downloads a multi-GiB weight that's already on disk.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn ensure_file_for_model(
+    models_root: &Path,
+    model_id: &str,
+    file: &ModelFile,
+) -> Result<PathBuf> {
+    let filename = file.filename.as_str();
+    let subdir = model_dir(models_root, model_id);
+    let target = model_cache_path(&subdir, filename)?;
+    if target.is_file() {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            op = "ensure_file",
+            model_id,
+            filename,
+            path = %target.display(),
+            "cached (per-model)"
+        );
+        return Ok(target);
+    }
+    // Legacy flat cache: reuse an existing download rather than re-pull.
+    let legacy = model_cache_path(models_root, filename)?;
+    if legacy.is_file() {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            op = "ensure_file",
+            model_id,
+            filename,
+            path = %legacy.display(),
+            "cached (legacy flat layout)"
+        );
+        return Ok(legacy);
+    }
+    preflight_disk_space(&subdir, filename, file.approx_bytes)?;
+    download_file_verified(file.url.as_str(), &target, file.sha256.as_deref()).with_context(
+        || {
+            format!(
+                "downloading {filename} ({}) -> {}",
+                file.url,
+                target.display()
+            )
+        },
+    )?;
+    Ok(target)
+}
+
 /// Resolve `filename` to a path inside `dir`, refusing anything that
 /// is not a plain file name (no `/`, `\`, `..`, or absolute paths) so a
 /// malicious or buggy `ModelSource` can't write outside the cache.
@@ -635,6 +719,41 @@ mod tests {
         std::fs::write(&unknown, [0x00, 0x01, 0x02, 0x03]).unwrap();
         assert_eq!(ensure_correct_image_extension(&unknown).unwrap(), unknown);
         assert!(unknown.exists());
+    }
+
+    #[test]
+    fn sanitise_model_dir_neutralises_separators_and_dot_segments() {
+        // A plain id is unchanged.
+        assert_eq!(
+            sanitise_model_dir("z-image-turbo-q4_k_m.gguf"),
+            "z-image-turbo-q4_k_m.gguf"
+        );
+        // HF-style repo ids and any other separators collapse to `_`.
+        assert_eq!(sanitise_model_dir("org/model:v2"), "org_model_v2");
+        assert_eq!(sanitise_model_dir("a\\b c"), "a_b_c");
+        // Traversal / hidden segments are neutralised at the front.
+        assert_eq!(sanitise_model_dir(".."), "_.");
+        assert_eq!(sanitise_model_dir(".git"), "_git");
+        assert_eq!(sanitise_model_dir(""), "_");
+        // The result is always a single, safe path segment.
+        for id in ["../../etc/passwd", "a/b/c", "..", "."] {
+            let dir = sanitise_model_dir(id);
+            assert!(!dir.contains('/') && !dir.contains('\\'));
+            assert!(!dir.starts_with('.'));
+        }
+    }
+
+    #[test]
+    fn model_dir_is_a_single_child_of_models_root() {
+        let root = Path::new("/models");
+        assert_eq!(
+            model_dir(root, "my-model"),
+            PathBuf::from("/models/my-model")
+        );
+        // A traversal id can't escape the root.
+        let escaped = model_dir(root, "../../etc");
+        assert!(escaped.starts_with("/models"), "got {}", escaped.display());
+        assert_eq!(escaped.components().count(), 3, "root + one segment");
     }
 
     #[test]

@@ -72,13 +72,13 @@ impl OnnxImageEngine {
     /// Resolve + download the single `.onnx` weights file (role
     /// `model`) from the model source.
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn ensure_model(&self, source: &ModelSource) -> Result<PathBuf> {
+    fn ensure_model(&self, model: &str, source: &ModelSource) -> Result<PathBuf> {
         let file = source
             .files
             .iter()
             .find(|f| f.role == ModelFileRole::Model)
             .ok_or_else(|| anyhow!("onnx modelSource has no `model` file (the .onnx weights)"))?;
-        download::ensure_file(&self.models_root, file)
+        download::ensure_file_for_model(&self.models_root, model, file)
             .with_context(|| format!("downloading onnx model {}", file.url))
     }
 
@@ -144,7 +144,12 @@ impl OnnxImageEngine {
 
     /// Full LaMa removal for one image job.
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn dispatch_removal(&self, params: &ImageParams, source: &ModelSource) -> Result<TaskResult> {
+    fn dispatch_removal(
+        &self,
+        model: &str,
+        params: &ImageParams,
+        source: &ModelSource,
+    ) -> Result<TaskResult> {
         let init_url = params
             .init_image_url
             .as_deref()
@@ -160,7 +165,7 @@ impl OnnxImageEngine {
                 anyhow!("onnx/LaMa removal requires `maskUrl` (the region to remove)")
             })?;
 
-        let model_path = self.ensure_model(source)?;
+        let model_path = self.ensure_model(model, source)?;
 
         let work_dir = std::env::temp_dir().join("studio-worker-onnx");
         std::fs::create_dir_all(&work_dir)
@@ -334,7 +339,7 @@ impl Engine for OnnxImageEngine {
                 // generic "engine dispatch failed", which never names the
                 // engine, model, or elapsed time.
                 let started = Instant::now();
-                self.dispatch_removal(&p, source).inspect_err(|e| {
+                self.dispatch_removal(model, &p, source).inspect_err(|e| {
                     warn!(
                         target: TRACE_TARGET,
                         op = "dispatch",
