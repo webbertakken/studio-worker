@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.4.9](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.8...studio-worker-v0.4.9) (2026-07-07)
+
+
+### Features
+
+* AMD/Apple/Windows VRAM detection ([#123](https://github.com/webbertakken/studio-worker/issues/123)) ([1c97e18](https://github.com/webbertakken/studio-worker/commit/1c97e188a6027baa02281675bd35cdfba556a615))
+* generic local API (chat/tts/stt/video) ([#124](https://github.com/webbertakken/studio-worker/issues/124)) ([95e6776](https://github.com/webbertakken/studio-worker/commit/95e67762893133a4efd023d07ff269aed58be5f9))
+* GPU runtime preflight at startup ([#122](https://github.com/webbertakken/studio-worker/issues/122)) ([de22409](https://github.com/webbertakken/studio-worker/commit/de22409bd71d207c3f86ca7d103c73a4ff127ac5))
+* infinite reconnect default + session state ([#118](https://github.com/webbertakken/studio-worker/issues/118)) ([dc4d8c3](https://github.com/webbertakken/studio-worker/commit/dc4d8c3ce7c4cef3ca0766be1b5c2ac63a6fffe5))
+* local API auth + request hardening ([#110](https://github.com/webbertakken/studio-worker/issues/110)) ([a4dcbca](https://github.com/webbertakken/studio-worker/commit/a4dcbca8e2d6b86353749284e853c80472bb68d9))
+* local API worker pool + honest healthz ([#117](https://github.com/webbertakken/studio-worker/issues/117)) ([fe2b286](https://github.com/webbertakken/studio-worker/commit/fe2b286d1053db49409453d9e437529645e381f7))
+* mirror studio models into local catalog ([#125](https://github.com/webbertakken/studio-worker/issues/125)) ([c5ac537](https://github.com/webbertakken/studio-worker/commit/c5ac537efa64fe951401f1e915d11c00fe4cbacc))
+* model download integrity + resume ([#112](https://github.com/webbertakken/studio-worker/issues/112)) ([e723373](https://github.com/webbertakken/studio-worker/commit/e723373f3aed47dbfdd2df57200b4bcffe90934e))
+* per-model download subdirs (sdcpp+onnx) ([#120](https://github.com/webbertakken/studio-worker/issues/120)) ([8b11209](https://github.com/webbertakken/studio-worker/commit/8b1120964b7ec174828f6478a9b744286f478970))
+* shared one-job gate across all paths ([#116](https://github.com/webbertakken/studio-worker/issues/116)) ([236707b](https://github.com/webbertakken/studio-worker/commit/236707b9196e0707ed6d0f3ea78ff7d115cb456b))
+* turnkey setup command ([#121](https://github.com/webbertakken/studio-worker/issues/121)) ([33fc4d8](https://github.com/webbertakken/studio-worker/commit/33fc4d8fc5ce4a5d00d1db50ea4b105f8a401896))
+* verify auto-update installers by checksum ([#114](https://github.com/webbertakken/studio-worker/issues/114)) ([d5b7c0b](https://github.com/webbertakken/studio-worker/commit/d5b7c0bf28963d1e33fb059e6674d546bdd0638e))
+* Windows LLM via subprocess llama-cli ([#127](https://github.com/webbertakken/studio-worker/issues/127)) ([252097c](https://github.com/webbertakken/studio-worker/commit/252097c092b48fb010d24e660c330e31e8107223))
+
+
+### Bug Fixes
+
+* atomic catalog saves + corrupt quarantine ([#115](https://github.com/webbertakken/studio-worker/issues/115)) ([a9943f1](https://github.com/webbertakken/studio-worker/commit/a9943f1d97cc46057c9c73bfc1cbe761b4b83288))
+* **deps:** clear new advisories (crossbeam-epoch, quick-xml) ([#128](https://github.com/webbertakken/studio-worker/issues/128)) ([444ff0d](https://github.com/webbertakken/studio-worker/commit/444ff0dfd84f09c5640d42ee4135715895184a5a))
+* pending-since + VRAM-clamped threshold ([#119](https://github.com/webbertakken/studio-worker/issues/119)) ([34ab1ec](https://github.com/webbertakken/studio-worker/commit/34ab1ecdd83fd1cc68c4583f9c16355cc6060d2e))
+* **test:** accept Windows 'program not found' wording ([#130](https://github.com/webbertakken/studio-worker/issues/130)) ([ffd00fd](https://github.com/webbertakken/studio-worker/commit/ffd00fd53d5b615f83f87e2c827c9d05f2998e55))
+* **test:** gate exe-park + colon-dir tests off Windows ([#131](https://github.com/webbertakken/studio-worker/issues/131)) ([66ac19e](https://github.com/webbertakken/studio-worker/commit/66ac19ede15977c53a3e9a63cc9b35add8810c08))
+* **test:** make sysfs/service tests Windows-portable ([#129](https://github.com/webbertakken/studio-worker/issues/129)) ([7924f88](https://github.com/webbertakken/studio-worker/commit/7924f88c9dd90c4a211db8703527e959650ee5f7))
+* **test:** separator-agnostic config_path assertion ([#132](https://github.com/webbertakken/studio-worker/issues/132)) ([abd8c11](https://github.com/webbertakken/studio-worker/commit/abd8c116e93ab9927a5eea0edb852ef3d7e6c98c))
+
 ## [0.4.8](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.7...studio-worker-v0.4.8) (2026-06-25)
 
 
