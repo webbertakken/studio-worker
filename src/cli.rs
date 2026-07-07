@@ -34,6 +34,10 @@ pub enum Command {
     },
     /// Print local config + last heartbeat info.
     Status,
+    /// Turnkey finish line: install + start the auto-start service and
+    /// print the studio-approval + local-API guidance.  Run this once
+    /// after installing.
+    Setup,
     /// Install platform-appropriate auto-start service.
     InstallService,
     /// Uninstall the auto-start service.
@@ -56,6 +60,7 @@ impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Command::Run => "run",
+            Command::Setup => "setup",
             Command::Register { .. } => "register",
             Command::Status => "status",
             Command::InstallService => "install-service",
@@ -155,6 +160,7 @@ mod tests {
             "register"
         );
         assert_eq!(Command::Status.name(), "status");
+        assert_eq!(Command::Setup.name(), "setup");
         assert_eq!(Command::InstallService.name(), "install-service");
         assert_eq!(Command::UninstallService.name(), "uninstall-service");
         assert_eq!(Command::SetThreshold { gb: 1.0 }.name(), "set-threshold");
@@ -167,6 +173,7 @@ mod tests {
     fn parses_all_simple_subcommands() {
         let cases = [
             ("status", Command::Status),
+            ("setup", Command::Setup),
             ("install-service", Command::InstallService),
             ("uninstall-service", Command::UninstallService),
             ("config", Command::Config),

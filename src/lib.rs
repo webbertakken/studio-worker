@@ -83,6 +83,7 @@ pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {
             .await
         }
         cli::Command::Status => runtime::status(args.config.as_deref()).await,
+        cli::Command::Setup => service::setup(args.config.as_deref()),
         cli::Command::InstallService => service::install(args.config.as_deref()),
         cli::Command::UninstallService => service::uninstall(),
         cli::Command::SetThreshold { gb } => runtime::set_threshold(args.config.as_deref(), gb),

@@ -222,6 +222,62 @@ pub fn install(config_path: Option<&str>) -> Result<()> {
     install_with(&RealOps, config_path)
 }
 
+/// One-shot turnkey finish line: persist `auto_start`, install +
+/// activate the OS service (so the worker runs now and at every login),
+/// then print exactly what the operator needs — the machine name the
+/// studio admin will approve, the studio URL, and the local API
+/// discovery file.  Idempotent: safe to re-run.
+pub fn setup(config_path: Option<&str>) -> Result<()> {
+    setup_with(&RealOps, config_path)
+}
+
+/// The operator-facing summary [`setup`] prints once the service is
+/// installed.  Pure so its wording is unit-tested without touching the
+/// OS.  `discovery_path` is where local clients read the API URL +
+/// token; `machine_name` is what the studio admin sees in the approval
+/// queue.
+pub fn setup_summary(machine_name: &str, api_base_url: &str, discovery_path: &str) -> String {
+    let base = api_base_url.trim_end_matches('/');
+    format!(
+        "\nstudio-worker is installed and running.\n\n\
+         Next step — approve this worker in the studio:\n\
+         \u{2022} open {base}/graphics and find this machine in the workers list\n\
+         \u{2022} it appears as: {machine_name}\n\
+         \u{2022} once an admin approves it, the worker starts claiming jobs automatically\n\n\
+         Local image API (no studio needed):\n\
+         \u{2022} URL + bearer token are written to: {discovery_path}\n\
+         \u{2022} POST /image there to generate locally\n\n\
+         Nothing else to do — models and GPU runtimes download on demand.\n"
+    )
+}
+
+pub fn setup_with<O: ServiceOps>(ops: &O, config_path: Option<&str>) -> Result<()> {
+    // Persist auto_start so the desktop UI (which reconciles its
+    // login-autostart entry from this flag) also comes back on login.
+    let (mut cfg, path) = crate::config::load(config_path)?;
+    cfg.auto_start = true;
+    crate::config::save(&cfg, &path)?;
+
+    // Install + activate the OS service (idempotent — overwrites the
+    // unit and re-enables it).
+    install_with(ops, config_path)?;
+
+    let discovery = crate::config::local_api_discovery_path_for(&path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<config dir>/local-api.json".to_string());
+    print!(
+        "{}",
+        setup_summary(&crate::sys::machine_name(), &cfg.api_base_url, &discovery)
+    );
+    info!(
+        target: TRACE_TARGET,
+        op = "setup",
+        config_path = %path.display(),
+        "setup completed"
+    );
+    Ok(())
+}
+
 pub fn uninstall() -> Result<()> {
     uninstall_with(&RealOps)
 }
@@ -691,5 +747,62 @@ mod tests {
         assert!(!StepOutcome::Failed { code: Some(1) }.is_success());
         assert!(!StepOutcome::Failed { code: None }.is_success());
         assert!(!StepOutcome::SpawnFailed.is_success());
+    }
+
+    #[test]
+    fn setup_summary_names_machine_studio_and_discovery() {
+        let s = setup_summary(
+            "alices-rig",
+            "https://studio.minis.gg/",
+            "/home/alice/.config/minis-studio-worker/local-api.json",
+        );
+        // What the admin approves.
+        assert!(s.contains("alices-rig"), "must name the machine: {s}");
+        // Studio URL, trailing slash trimmed before the path.
+        assert!(s.contains("https://studio.minis.gg/graphics"), "got: {s}");
+        assert!(
+            !s.contains(".gg//graphics"),
+            "trailing slash not trimmed: {s}"
+        );
+        // Where the local API token lives.
+        assert!(
+            s.contains("local-api.json"),
+            "must point at discovery file: {s}"
+        );
+        // The turnkey promise.
+        assert!(s.contains("download on demand"), "got: {s}");
+    }
+
+    #[test]
+    fn setup_with_persists_auto_start_installs_and_prints_guidance() {
+        let cfgdir = tempdir().unwrap();
+        let cfg_path = cfgdir.path().join("config.toml");
+        // Start from a config with auto_start disabled to prove setup
+        // flips it on.
+        let cfg = crate::config::Config {
+            auto_start: false,
+            ..crate::config::Config::default()
+        };
+        crate::config::save(&cfg, &cfg_path).unwrap();
+
+        let unitdir = tempdir().unwrap();
+        let ops = fake_ops(unitdir.path().to_path_buf(), true);
+        let cfg_arg = cfg_path.to_string_lossy().to_string();
+        let logs = capture({
+            let cfg_arg = cfg_arg.clone();
+            move || {
+                setup_with(&ops, Some(&cfg_arg)).unwrap();
+            }
+        });
+        // Service was installed + the setup breadcrumb fired.
+        assert!(
+            logs.contains("op=\"setup\""),
+            "expected setup event: {logs}"
+        );
+        // The unit file landed.
+        assert!(unitdir.path().join(SERVICE_FILENAME).exists());
+        // auto_start persisted true.
+        let (reloaded, _) = crate::config::load(Some(&cfg_arg)).unwrap();
+        assert!(reloaded.auto_start, "setup must persist auto_start=true");
     }
 }
