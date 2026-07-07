@@ -42,10 +42,19 @@ pub struct CatalogModel {
     /// Whether the model is selectable.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Where this entry came from: `"local"` (operator-added / seeded)
+    /// or `"studio"` (mirrored from a studio job offer).  A studio
+    /// re-offer refreshes studio-origin entries; a local-origin entry
+    /// of the same id is never clobbered by the sync.
+    #[serde(default = "default_origin")]
+    pub origin: String,
 }
 
 fn default_true() -> bool {
     true
+}
+fn default_origin() -> String {
+    "local".into()
 }
 
 /// A collection of locally-available models.
@@ -168,6 +177,28 @@ impl Catalog {
         }
     }
 
+    /// Mirror a model seen on a studio job offer into the catalog so
+    /// the local API can serve it too.  Returns whether the catalog
+    /// changed (a no-op returns `false`, so the caller can skip the
+    /// disk write).  A **local-origin** entry of the same id is never
+    /// clobbered — the operator's own edits win; an unchanged
+    /// studio-origin entry is left alone so a re-offer every job
+    /// doesn't churn the file.
+    pub fn sync_studio_model(&mut self, incoming: CatalogModel) -> bool {
+        if let Some(existing) = self.models.iter_mut().find(|m| m.id == incoming.id) {
+            if existing.origin == "local" {
+                return false; // never overwrite operator-owned entries
+            }
+            if *existing == incoming {
+                return false; // already up to date
+            }
+            *existing = incoming;
+            return true;
+        }
+        self.models.push(incoming);
+        true
+    }
+
     /// Remove a model by id. Returns whether it existed.
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.models.len();
@@ -263,6 +294,7 @@ fn zimage_turbo() -> CatalogModel {
             },
         },
         enabled: true,
+        origin: "local".into(),
     }
 }
 
@@ -487,5 +519,58 @@ mod tests {
         let (catalog, save_path) = Catalog::load_for_serving(None);
         assert_eq!(catalog, Catalog::seed());
         assert_eq!(save_path, None);
+    }
+
+    // -----------------------------------------------------------------
+    // sync_studio_model — mirror studio-offered models into the catalog
+    // without clobbering the operator's own entries.
+    // -----------------------------------------------------------------
+
+    /// Clone a model with a different id (test helper).
+    fn with_id(mut m: CatalogModel, id: &str) -> CatalogModel {
+        m.id = id.to_string();
+        m
+    }
+
+    fn studio_model(id: &str) -> CatalogModel {
+        with_id(
+            CatalogModel {
+                origin: "studio".into(),
+                ..zimage_turbo()
+            },
+            id,
+        )
+    }
+
+    #[test]
+    fn sync_adds_a_new_studio_model_and_reports_change() {
+        let mut cat = Catalog::default();
+        assert!(cat.sync_studio_model(studio_model("m1")));
+        assert_eq!(cat.get("m1").unwrap().origin, "studio");
+        // Re-syncing the identical model is a no-op (no file churn).
+        assert!(!cat.sync_studio_model(studio_model("m1")));
+    }
+
+    #[test]
+    fn sync_refreshes_a_changed_studio_model() {
+        let mut cat = Catalog::default();
+        cat.sync_studio_model(studio_model("m1"));
+        let mut updated = studio_model("m1");
+        updated.display_name = "Renamed by studio".into();
+        assert!(cat.sync_studio_model(updated));
+        assert_eq!(cat.get("m1").unwrap().display_name, "Renamed by studio");
+    }
+
+    #[test]
+    fn sync_never_clobbers_a_local_origin_entry() {
+        let mut cat = Catalog::default();
+        let mut local = with_id(zimage_turbo(), "m1");
+        local.display_name = "my hand-tuned model".into();
+        // origin defaults to "local".
+        cat.upsert(local);
+        // A studio offer for the same id must not overwrite it.
+        assert!(!cat.sync_studio_model(studio_model("m1")));
+        assert_eq!(cat.get("m1").unwrap().display_name, "my hand-tuned model");
+        assert_eq!(cat.get("m1").unwrap().origin, "local");
     }
 }

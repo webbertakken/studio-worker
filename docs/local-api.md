@@ -85,6 +85,15 @@ missing/wrong token returns `401`; a non-loopback `Host`/`Origin` returns
 job already running) returns `503` with `Retry-After`; an engine failure
 returns `500`.
 
+### Studio-synced models
+
+When the worker is registered with a studio and claims a job, the
+model on that offer is mirrored into the local catalog (marked
+`origin: "studio"`), so a model a studio admin adds from Hugging Face
+becomes usable through the local API too. Your own entries
+(`origin: "local"`, the default for anything you `POST /models` or edit
+by hand) are never overwritten by this sync.
+
 ### Non-image kinds
 
 Every endpoint resolves a catalog model of the matching kind (an
