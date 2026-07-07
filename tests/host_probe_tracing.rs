@@ -43,6 +43,8 @@ fn vram_probe_emits_info_with_source_no_nvidia_sysfs_when_root_missing() {
 // detect_vram_gb_from_sysfs — sysfs present with a single GPU
 // ---------------------------------------------------------------------------
 
+// NVIDIA proc-sysfs bus-id dirs contain colons (illegal Windows filenames); Linux-only fixture.
+#[cfg(target_os = "linux")]
 #[test]
 fn vram_probe_emits_info_with_gpu_count_and_total_when_sysfs_populated() {
     let dir = tempdir().unwrap();
@@ -87,6 +89,8 @@ fn vram_probe_emits_info_with_gpu_count_and_total_when_sysfs_populated() {
 // to know the directory was there but unparseable.
 // ---------------------------------------------------------------------------
 
+// NVIDIA proc-sysfs bus-id dirs contain colons (illegal Windows filenames); Linux-only fixture.
+#[cfg(target_os = "linux")]
 #[test]
 fn vram_probe_emits_warn_when_sysfs_present_but_unparseable() {
     let dir = tempdir().unwrap();
@@ -124,6 +128,8 @@ fn vram_probe_emits_warn_when_sysfs_present_but_unparseable() {
 // and refuses jobs it could actually run, with no log evidence.
 // ---------------------------------------------------------------------------
 
+// NVIDIA proc-sysfs bus-id dirs contain colons (illegal Windows filenames); Linux-only fixture.
+#[cfg(target_os = "linux")]
 #[test]
 fn vram_probe_warns_and_counts_a_partially_dropped_gpu() {
     let dir = tempdir().unwrap();
@@ -183,6 +189,8 @@ fn vram_probe_warns_and_counts_a_partially_dropped_gpu() {
 // was right there.
 // ---------------------------------------------------------------------------
 
+// NVIDIA proc-sysfs bus-id dirs contain colons (illegal Windows filenames); Linux-only fixture.
+#[cfg(target_os = "linux")]
 #[test]
 fn vram_probe_warns_with_content_when_video_memory_line_is_unparseable() {
     let dir = tempdir().unwrap();

@@ -222,6 +222,7 @@ async fn check_surfaces_5xx_from_feed() {
     assert!(err.to_string().contains("503"));
 }
 
+#[cfg(not(target_os = "windows"))] // apply_with parks the real exe on Windows; ExeReplaceGuard is unit-tested in update.rs
 #[tokio::test]
 async fn apply_with_fake_runner_runs_full_flow() {
     use std::path::{Path, PathBuf};
@@ -335,6 +336,7 @@ async fn apply_with_propagates_download_errors() {
     assert!(err.to_string().contains("simulated download"));
 }
 
+#[cfg(not(target_os = "windows"))] // apply_with parks the real exe on Windows; ExeReplaceGuard is unit-tested in update.rs
 #[tokio::test]
 async fn apply_with_propagates_run_installer_errors() {
     use std::path::Path;
@@ -441,6 +443,7 @@ async fn restart_argv_returns_current_exe() {
     assert!(!bin.as_os_str().is_empty());
 }
 
+#[cfg(not(target_os = "windows"))] // apply_with parks the real exe on Windows; ExeReplaceGuard is unit-tested in update.rs
 #[tokio::test]
 async fn apply_helper_wraps_real_runner() {
     // `apply` calls `apply_with(&RealRunner)`; we only verify it errors
@@ -513,6 +516,7 @@ async fn fetch_releases_emits_warn_event_on_non_2xx() {
     assert!(logs.contains("/releases"), "expected feed url: {logs}");
 }
 
+#[cfg(not(target_os = "windows"))] // apply_with parks the real exe on Windows; ExeReplaceGuard is unit-tested in update.rs
 #[tokio::test]
 async fn apply_with_emits_info_events_for_every_state_transition() {
     use std::path::{Path, PathBuf};
@@ -658,6 +662,7 @@ async fn feed_with_v020() -> (MockServer, String) {
     (server, feed)
 }
 
+#[cfg(not(target_os = "windows"))] // apply_with parks the real exe on Windows; ExeReplaceGuard is unit-tested in update.rs
 #[tokio::test]
 async fn apply_runs_the_installer_when_the_sidecar_matches() {
     let (_server, feed) = feed_with_v020().await;
@@ -714,6 +719,7 @@ async fn apply_refuses_an_unparseable_sidecar() {
     assert!(runner.installs.lock().unwrap().is_empty());
 }
 
+#[cfg(not(target_os = "windows"))] // apply_with parks the real exe on Windows; ExeReplaceGuard is unit-tested in update.rs
 #[tokio::test]
 async fn apply_warns_but_proceeds_when_no_sidecar_is_published() {
     // Older releases predate the sidecar; the transport is still https
