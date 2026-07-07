@@ -32,7 +32,24 @@ it works even when the worker is not registered with any studio.
 | POST   | `/models`       | yes  | a catalog model (same `ModelSource` shape) | `{"ok":true}` |
 | DELETE | `/models/:id`   | yes  | —                                          | `{"ok":true}` / 404 |
 | GET    | `/jobs`         | yes  | —                                          | recent local jobs as JSON |
-| GET    | `/healthz`      | no   | —                                          | `{"ok":true}` |
+| GET    | `/healthz`      | no   | —                                          | runtime snapshot (below) |
+
+### Health snapshot
+
+`GET /healthz` is unauthenticated (liveness + a read-only snapshot, no
+secrets or prompts) and answers even while a generation is in flight
+(requests are served on a small worker pool):
+
+```jsonc
+{
+  "ok": true,
+  "version": "0.4.9",
+  "busy": false,                 // true while a job (studio or local) runs
+  "engine": "multi",
+  "modelsRoot": "/home/you/models",
+  "modelsRootFreeBytes": 812345678900
+}
+```
 
 ### Image request
 
