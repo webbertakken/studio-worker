@@ -360,6 +360,7 @@ impl App {
             let paused = paused_flag.load(std::sync::atomic::Ordering::SeqCst);
             let hb = self.deps.observers.last_heartbeat.lock().clone();
             let session_state = self.deps.observers.session_state.lock().clone();
+            let gpu = self.deps.observers.gpu_runtime.lock().clone();
             status_tab::StatusView::build(
                 &cfg,
                 &registration_snapshot,
@@ -368,6 +369,7 @@ impl App {
                 hb.as_ref(),
                 self.vram_total_gb,
                 &session_state,
+                gpu.as_ref(),
             )
         };
         status_tab::render(ui, &view, &paused_flag);

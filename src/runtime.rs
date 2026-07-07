@@ -158,6 +158,9 @@ pub struct WorkerObservers {
     /// Current WS lifecycle state, so the UI can show a connecting /
     /// reconnecting / auth-failed status instead of silent nothing.
     pub session_state: Arc<Mutex<SessionState>>,
+    /// GPU-runtime readiness, probed once at startup.  `None` until
+    /// probed.
+    pub gpu_runtime: Arc<Mutex<Option<GpuRuntimeStatus>>>,
     /// Bounded ring of every log entry the worker has emitted, kept
     /// for the UI's Logs tab.  Separate from the WS ship queue
     /// (which is drained every second) so the display doesn't blank
@@ -168,6 +171,44 @@ pub struct WorkerObservers {
 /// Record the WS lifecycle state for the UI to read.
 pub fn set_session_state(observers: &WorkerObservers, state: SessionState) {
     *observers.session_state.lock() = state;
+}
+
+/// GPU-runtime readiness, probed once at startup so a missing Vulkan
+/// loader surfaces as an actionable status (UI + `/healthz`) *before*
+/// the first image job fails, not after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuRuntimeStatus {
+    /// True when the runtime sd-cli needs is present (always true on
+    /// macOS/Metal).
+    pub ok: bool,
+    /// Human-readable detail: "available" or the exact remedy.
+    pub detail: String,
+}
+
+/// Probe the GPU runtime and record it in `observers`, warn-logging the
+/// remedy when it's missing.  `status` is injected (the live caller
+/// passes `sd_provision::vulkan_runtime_status()`) so the
+/// observer-write + logging are testable without a real GPU stack.
+pub fn set_gpu_runtime_status(observers: &WorkerObservers, status: Result<()>) {
+    let value = match &status {
+        Ok(()) => GpuRuntimeStatus {
+            ok: true,
+            detail: "GPU runtime available".into(),
+        },
+        Err(e) => {
+            warn!(
+                target: TRACE_TARGET,
+                op = "gpu_preflight",
+                error = %e,
+                "GPU runtime missing at startup; image jobs will fail until it is installed"
+            );
+            GpuRuntimeStatus {
+                ok: false,
+                detail: e.to_string(),
+            }
+        }
+    };
+    *observers.gpu_runtime.lock() = Some(value);
 }
 
 pub fn truncate_prompt(s: &str) -> String {
@@ -760,6 +801,14 @@ pub fn spawn_local_api(
             return None;
         }
     };
+
+    // One-shot GPU-runtime preflight at startup so a missing Vulkan
+    // loader shows up in the UI + /healthz immediately, instead of
+    // only when the first image job crashes sd-cli.
+    set_gpu_runtime_status(
+        &observers,
+        crate::engine::sd_provision::vulkan_runtime_status(),
+    );
 
     let url = api.url();
     *observers.local_api_url.lock() = Some(url.clone());
@@ -1366,6 +1415,48 @@ mod tests {
         );
         set_session_state(&observers, SessionState::Connected);
         assert_eq!(*observers.session_state.lock(), SessionState::Connected);
+    }
+
+    #[test]
+    fn set_gpu_runtime_status_records_ok_without_warning() {
+        let observers = WorkerObservers::default();
+        assert!(observers.gpu_runtime.lock().is_none(), "unprobed at first");
+        let out = crate::test_support::capture({
+            let observers = observers.clone();
+            move || set_gpu_runtime_status(&observers, Ok(()))
+        });
+        let status = observers.gpu_runtime.lock().clone().unwrap();
+        assert!(status.ok);
+        assert!(status.detail.contains("available"));
+        assert!(
+            !out.contains("GPU runtime missing"),
+            "the ok path must not warn: {out}"
+        );
+    }
+
+    #[test]
+    fn set_gpu_runtime_status_records_and_warns_the_remedy_when_missing() {
+        let observers = WorkerObservers::default();
+        let out = crate::test_support::capture({
+            let observers = observers.clone();
+            move || {
+                set_gpu_runtime_status(
+                    &observers,
+                    Err(anyhow!("Vulkan runtime not available: install libvulkan1")),
+                )
+            }
+        });
+        let status = observers.gpu_runtime.lock().clone().unwrap();
+        assert!(!status.ok);
+        assert!(
+            status.detail.contains("libvulkan1"),
+            "got: {}",
+            status.detail
+        );
+        assert!(
+            out.contains("GPU runtime missing") && out.contains("WARN"),
+            "a missing runtime must warn with the remedy: {out}"
+        );
     }
 
     #[test]

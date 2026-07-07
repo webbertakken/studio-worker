@@ -271,7 +271,7 @@ the install ends with a running, auto-starting worker.
 
 ### 3.2 GPU runtime provisioning ("install missing SDKs")
 
-- [ ] 3.2.1 Vulkan-loader preflight currently happens on the **first
+- [x] 3.2.1 Vulkan-loader preflight currently happens on the **first
       image job** (`sd_provision` / `sdcpp.rs`), failing a real user
       job. Move a non-fatal probe to startup: run the loader check at
       engine build, log + expose the result in `WorkerObservers` (and
