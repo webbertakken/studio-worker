@@ -675,6 +675,7 @@ pub fn spawn_local_api(
         cfg.lock().local_api_port,
     );
 
+    let models_root = Some(cfg.lock().models_root.clone());
     let api = crate::local_api::LocalApi::bind(
         &format!("127.0.0.1:{port}"),
         engine.clone(),
@@ -683,6 +684,7 @@ pub fn spawn_local_api(
         observers.clone(),
         token.clone(),
         gate.clone(),
+        models_root.clone(),
     )
     .or_else(|_| {
         crate::local_api::LocalApi::bind(
@@ -693,6 +695,7 @@ pub fn spawn_local_api(
             observers.clone(),
             token.clone(),
             gate.clone(),
+            models_root,
         )
     });
 

@@ -144,6 +144,9 @@ pub struct LocalApi {
     /// Shared one-job-at-a-time gate.  A local generation reserves it
     /// so it can't run concurrently with a studio job on the same GPU.
     gate: JobGate,
+    /// Root the engine downloads models into.  Reported (with its free
+    /// space) on `/healthz` so a stuck first-use download is visible.
+    models_root: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -168,6 +171,10 @@ struct ImageBody {
 
 impl LocalApi {
     /// Bind to `addr` (e.g. `127.0.0.1:0` for an ephemeral port).
+    // A constructor wiring the API's collaborators (engine, catalog,
+    // observers, auth, gate, models-root); grouping them into a struct
+    // would only move the argument list, not reduce it.
+    #[allow(clippy::too_many_arguments)]
     pub fn bind(
         addr: &str,
         engine: Arc<dyn Engine>,
@@ -176,6 +183,7 @@ impl LocalApi {
         observers: WorkerObservers,
         token: String,
         gate: JobGate,
+        models_root: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !token.is_empty(),
@@ -196,6 +204,7 @@ impl LocalApi {
             addr,
             token,
             gate,
+            models_root,
         })
     }
 
@@ -210,17 +219,33 @@ impl LocalApi {
     }
 
     /// Serve requests until `stop` is set.
+    ///
+    /// Requests are handled on a small pool of worker threads (tiny_http's
+    /// `Server` is `Sync`, so several threads can `recv_timeout`
+    /// concurrently).  A single generation can take ~10 s, and a
+    /// first-use model download minutes — on the old single-threaded
+    /// loop that blocked `/healthz`, `/models`, and every other caller.
+    /// The pool keeps the cheap routes responsive while a job runs.
+    /// `std::thread::scope` lets the workers borrow `&self` + `stop`
+    /// without an `Arc`, so the public signature is unchanged.
     pub fn serve(&self, stop: &AtomicBool) {
-        while !stop.load(Ordering::Relaxed) {
-            match self.server.recv_timeout(POLL) {
-                Ok(Some(request)) => self.route(request),
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(target: TRACE_TARGET, error = %err, "local api recv error");
-                    break;
-                }
+        const WORKERS: usize = 4;
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        match self.server.recv_timeout(POLL) {
+                            Ok(Some(request)) => self.route(request),
+                            Ok(None) => {}
+                            Err(err) => {
+                                tracing::warn!(target: TRACE_TARGET, error = %err, "local api recv error");
+                                break;
+                            }
+                        }
+                    }
+                });
             }
-        }
+        });
     }
 
     fn route(&self, request: Request) {
@@ -278,9 +303,7 @@ impl LocalApi {
         }
 
         let outcome = match (&method, path) {
-            (Method::Get, "/healthz") => {
-                respond(request, 200, "application/json", b"{\"ok\":true}")
-            }
+            (Method::Get, "/healthz") => self.handle_healthz(request),
             (Method::Post, "/image") => self.handle_image(request),
             (Method::Get, "/models") => self.handle_list_models(request),
             (Method::Post, "/models") => self.handle_add_model(request),
@@ -293,6 +316,31 @@ impl LocalApi {
         };
         if let Err(err) = outcome {
             tracing::warn!(target: TRACE_TARGET, error = %err, "local api respond error");
+        }
+    }
+
+    /// Liveness + a read-only runtime snapshot for operators and local
+    /// tooling.  Unauthenticated (no secrets, no prompts): the worker
+    /// version, whether a job is in flight, the engine name, and the
+    /// models-root free space so a stuck first-use download is
+    /// diagnosable without shelling into the box.
+    fn handle_healthz(&self, request: Request) -> std::io::Result<()> {
+        let free_bytes = self
+            .models_root
+            .as_deref()
+            .and_then(|root| fs4::available_space(root).ok());
+        let body = serde_json::json!({
+            "ok": true,
+            "version": crate::AGENT_VERSION,
+            "busy": self.gate.is_busy(),
+            "engine": self.engine.name(),
+            "modelsRoot": self.models_root.as_ref().map(|p| p.display().to_string()),
+            "modelsRootFreeBytes": free_bytes,
+        });
+        match serde_json::to_vec(&body) {
+            Ok(bytes) => respond(request, 200, "application/json", &bytes),
+            // Never let a serialisation slip break liveness.
+            Err(_) => respond(request, 200, "application/json", b"{\"ok\":true}"),
         }
     }
 
@@ -544,8 +592,29 @@ fn respond(request: Request, status: u16, content_type: &str, body: &[u8]) -> st
 mod tests {
     use super::*;
     use crate::catalog::CatalogModel;
-    use crate::engine::SyntheticEngine;
-    use crate::types::{ModelCliDefaults, ModelEngine, ModelSource, TaskKind};
+    use crate::engine::{EngineCapabilities, SyntheticEngine};
+    use crate::types::{ModelCliDefaults, ModelEngine, ModelSource, Task, TaskKind};
+
+    /// An engine that sleeps in `dispatch` so a generation stays
+    /// in-flight long enough to prove the pool keeps `/healthz`
+    /// answering while a job runs.
+    struct SlowEngine {
+        inner: SyntheticEngine,
+        delay: std::time::Duration,
+    }
+
+    impl Engine for SlowEngine {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn capabilities(&self) -> EngineCapabilities {
+            self.inner.capabilities()
+        }
+        fn dispatch(&self, model: &str, task: Task) -> anyhow::Result<TaskResult> {
+            std::thread::sleep(self.delay);
+            self.inner.dispatch(model, task)
+        }
+    }
 
     fn synthetic_model(id: &str) -> CatalogModel {
         CatalogModel {
@@ -594,6 +663,7 @@ mod tests {
                 observers.clone(),
                 TEST_TOKEN.to_string(),
                 gate.clone(),
+                None,
             )
             .unwrap();
             let url = api.url();
@@ -712,10 +782,22 @@ mod tests {
     }
 
     #[test]
-    fn healthz_ok() {
+    fn healthz_reports_a_runtime_snapshot() {
         let h = Harness::start(seeded_catalog());
-        let res = reqwest::blocking::get(format!("{}/healthz", h.url)).unwrap();
-        assert_eq!(res.status(), 200);
+        let body: serde_json::Value = reqwest::blocking::get(format!("{}/healthz", h.url))
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["version"], crate::AGENT_VERSION);
+        assert_eq!(body["busy"], false);
+        assert_eq!(body["engine"], "synthetic");
+        // No secrets / prompts leak into the unauthenticated snapshot.
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(
+            !raw.contains(TEST_TOKEN),
+            "healthz must not carry the token"
+        );
     }
 
     #[test]
@@ -795,6 +877,67 @@ mod tests {
     }
 
     #[test]
+    fn healthz_answers_while_a_generation_is_in_flight() {
+        // The whole point of the worker pool: a slow (~400 ms) job must
+        // not block liveness / cheap routes.  On the old
+        // single-threaded loop this `/healthz` would queue behind the
+        // generation and only answer after it finished.
+        let engine: Arc<dyn Engine> = Arc::new(SlowEngine {
+            inner: SyntheticEngine::new(),
+            delay: std::time::Duration::from_millis(400),
+        });
+        let observers = WorkerObservers::default();
+        let api = LocalApi::bind(
+            "127.0.0.1:0",
+            engine,
+            Arc::new(Mutex::new(seeded_catalog())),
+            None,
+            observers,
+            TEST_TOKEN.to_string(),
+            JobGate::new(),
+            None,
+        )
+        .unwrap();
+        let url = api.url();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = std::thread::spawn(move || api.serve(&stop_thread));
+
+        // Kick off the slow generation on a background thread.
+        let gen_url = url.clone();
+        let gen = std::thread::spawn(move || {
+            reqwest::blocking::Client::new()
+                .post(format!("{gen_url}/image"))
+                .bearer_auth(TEST_TOKEN)
+                .json(&serde_json::json!({ "prompt": "slow" }))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+
+        // Give the generation time to occupy a worker, then time a
+        // /healthz: it must answer well within the generation's 400 ms.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        let health = reqwest::blocking::get(format!("{url}/healthz")).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(health.status(), 200);
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "healthz blocked behind the generation ({elapsed:?}); the pool isn't concurrent"
+        );
+        // While the job runs, healthz reports busy=true.
+        let body: serde_json::Value = health.json().unwrap();
+        assert_eq!(body["busy"], true, "a running job must show busy=true");
+
+        assert_eq!(gen.join().unwrap(), 200, "the generation still succeeds");
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    #[test]
     fn non_loopback_host_header_is_forbidden_even_with_a_token() {
         // The DNS-rebinding shape: the TCP connection reaches loopback
         // but the browser's Host header names the attacker's domain.
@@ -866,6 +1009,7 @@ mod tests {
             WorkerObservers::default(),
             String::new(),
             JobGate::new(),
+            None,
         )
         .err()
         .expect("empty token must be refused")

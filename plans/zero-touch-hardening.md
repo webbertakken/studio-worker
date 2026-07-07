@@ -181,14 +181,14 @@ image generation (~10 s) or a first-use model download (minutes,
 multi-GiB) blocks `/healthz`, `/models`, `/jobs` and every other
 caller.
 
-- [ ] 2.2.1 Dispatch each request on a small thread pool (e.g. 4
+- [x] 2.2.1 Dispatch each request on a small thread pool (e.g. 4
       threads; `tiny_http::Server` is `Sync`, requests are `Send` —
       the standard tiny_http pattern of N worker threads looping on
       `server.recv_timeout`). Generation stays synchronous per
       request; cheap routes stay responsive. TDD: start a slow
       generation (synthetic engine + injected sleep or a blocking test
       engine), assert `/healthz` answers concurrently.
-- [ ] 2.2.2 Make `/healthz` honest: include `version`,
+- [x] 2.2.2 Make `/healthz` honest: include `version`,
       `registrationState` (from `SharedRegistration`), `engines`
       roster, `busy`, and models-root free space. Keep it
       unauthenticated but read-only-minimal (no prompts, no token).
