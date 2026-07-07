@@ -40,9 +40,11 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use crate::catalog::{Catalog, CatalogModel};
 use crate::engine::Engine;
 use crate::job_gate::JobGate;
-use crate::local::{run_image, LocalError, LocalImageRequest};
+use crate::local::{run_image, run_kind, LocalError, LocalImageRequest};
 use crate::runtime::{JobOutcome, WorkerObservers};
-use crate::types::TaskResult;
+use crate::types::{
+    AudioSttParams, AudioTtsParams, ChatMessage, LlmParams, Task, TaskKind, TaskResult, VideoParams,
+};
 
 const TRACE_TARGET: &str = "studio_worker::local_api";
 const POLL: Duration = Duration::from_millis(200);
@@ -165,6 +167,72 @@ struct ImageBody {
     steps: Option<u32>,
     #[serde(default)]
     seed: Option<u64>,
+    #[serde(default)]
+    ext: Option<String>,
+}
+
+/// OpenAI-compatible chat-completions request (non-streaming subset).
+#[derive(Deserialize)]
+struct ChatBody {
+    #[serde(default)]
+    model: Option<String>,
+    messages: Vec<ChatMessageBody>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    stop: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct ChatMessageBody {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TtsBody {
+    text: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    voice: Option<String>,
+    #[serde(default)]
+    speed: Option<f32>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    ext: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SttBody {
+    input_url: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoBody {
+    prompt: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    negative_prompt: Option<String>,
+    #[serde(default)]
+    seconds: Option<f32>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
     #[serde(default)]
     ext: Option<String>,
 }
@@ -305,6 +373,10 @@ impl LocalApi {
         let outcome = match (&method, path) {
             (Method::Get, "/healthz") => self.handle_healthz(request),
             (Method::Post, "/image") => self.handle_image(request),
+            (Method::Post, "/v1/chat/completions") => self.handle_chat(request),
+            (Method::Post, "/tts") => self.handle_tts(request),
+            (Method::Post, "/stt") => self.handle_stt(request),
+            (Method::Post, "/video") => self.handle_video(request),
             (Method::Get, "/models") => self.handle_list_models(request),
             (Method::Post, "/models") => self.handle_add_model(request),
             (Method::Get, "/jobs") => self.handle_jobs(request),
@@ -391,13 +463,210 @@ impl LocalApi {
                 respond(request, 200, content_type_for(&ext), &bytes)
             }
             Ok(_) => respond(request, 500, "text/plain", b"unexpected non-image result"),
+            Err(err) => respond_local_err(request, err),
+        }
+    }
+
+    /// OpenAI-compatible chat completions.  Resolves an LLM model from
+    /// the catalog (explicit `model` or the default), dispatches, and
+    /// returns the engine's JSON verbatim (the synthetic + llama
+    /// engines already emit a `chat.completion`-shaped body).
+    fn handle_chat(&self, mut request: Request) -> std::io::Result<()> {
+        let body = match read_body(&mut request)? {
+            BodyOutcome::Ok(body) => body,
+            BodyOutcome::TooLarge => return respond_too_large(request),
+        };
+        let parsed: ChatBody = match serde_json::from_str(&body) {
+            Ok(p) => p,
             Err(err) => {
-                let status = match err {
-                    LocalError::Engine(_) => 500,
-                    _ => 400,
-                };
-                respond(request, status, "text/plain", err.to_string().as_bytes())
+                return respond(
+                    request,
+                    400,
+                    "text/plain",
+                    format!("bad json: {err}").as_bytes(),
+                )
             }
+        };
+        let prompt_preview = parsed
+            .messages
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let params = LlmParams {
+            messages: parsed
+                .messages
+                .into_iter()
+                .map(|m| ChatMessage {
+                    role: m.role,
+                    content: m.content,
+                })
+                .collect(),
+            max_tokens: parsed.max_tokens.unwrap_or(512),
+            temperature: parsed.temperature.unwrap_or(0.7),
+            top_p: parsed.top_p,
+            stop: parsed.stop,
+            ..Default::default()
+        };
+        let Some(_reservation) = self.gate.try_reserve() else {
+            return respond_busy(request);
+        };
+        let catalog = self.catalog.lock().clone();
+        match run_kind(
+            self.engine.as_ref(),
+            &catalog,
+            &self.observers,
+            TaskKind::Llm,
+            parsed.model.as_deref(),
+            &prompt_preview,
+            Task::Llm(params),
+        ) {
+            Ok(TaskResult::Llm { json }) => match serde_json::to_vec(&json) {
+                Ok(bytes) => respond(request, 200, "application/json", &bytes),
+                Err(e) => respond(request, 500, "text/plain", e.to_string().as_bytes()),
+            },
+            Ok(_) => respond(request, 500, "text/plain", b"unexpected non-llm result"),
+            Err(err) => respond_local_err(request, err),
+        }
+    }
+
+    fn handle_tts(&self, mut request: Request) -> std::io::Result<()> {
+        let body = match read_body(&mut request)? {
+            BodyOutcome::Ok(body) => body,
+            BodyOutcome::TooLarge => return respond_too_large(request),
+        };
+        let parsed: TtsBody = match serde_json::from_str(&body) {
+            Ok(p) => p,
+            Err(err) => {
+                return respond(
+                    request,
+                    400,
+                    "text/plain",
+                    format!("bad json: {err}").as_bytes(),
+                )
+            }
+        };
+        let preview = parsed.text.clone();
+        let params = AudioTtsParams {
+            text: parsed.text,
+            voice: parsed.voice.unwrap_or_else(|| "default".into()),
+            speed: parsed.speed,
+            language: parsed.language,
+            ext: parsed.ext.unwrap_or_else(|| "wav".into()),
+        };
+        let Some(_reservation) = self.gate.try_reserve() else {
+            return respond_busy(request);
+        };
+        let catalog = self.catalog.lock().clone();
+        match run_kind(
+            self.engine.as_ref(),
+            &catalog,
+            &self.observers,
+            TaskKind::AudioTts,
+            parsed.model.as_deref(),
+            &preview,
+            Task::AudioTts(params),
+        ) {
+            Ok(TaskResult::AudioTts { bytes, ext }) => {
+                respond(request, 200, content_type_for(&ext), &bytes)
+            }
+            Ok(_) => respond(request, 500, "text/plain", b"unexpected non-audio result"),
+            Err(err) => respond_local_err(request, err),
+        }
+    }
+
+    fn handle_stt(&self, mut request: Request) -> std::io::Result<()> {
+        let body = match read_body(&mut request)? {
+            BodyOutcome::Ok(body) => body,
+            BodyOutcome::TooLarge => return respond_too_large(request),
+        };
+        let parsed: SttBody = match serde_json::from_str(&body) {
+            Ok(p) => p,
+            Err(err) => {
+                return respond(
+                    request,
+                    400,
+                    "text/plain",
+                    format!("bad json: {err}").as_bytes(),
+                )
+            }
+        };
+        let preview = parsed.input_url.clone();
+        let params = AudioSttParams {
+            input_url: parsed.input_url,
+            language: parsed.language,
+            ..Default::default()
+        };
+        let Some(_reservation) = self.gate.try_reserve() else {
+            return respond_busy(request);
+        };
+        let catalog = self.catalog.lock().clone();
+        match run_kind(
+            self.engine.as_ref(),
+            &catalog,
+            &self.observers,
+            TaskKind::AudioStt,
+            parsed.model.as_deref(),
+            &preview,
+            Task::AudioStt(params),
+        ) {
+            Ok(TaskResult::AudioStt { json }) => match serde_json::to_vec(&json) {
+                Ok(bytes) => respond(request, 200, "application/json", &bytes),
+                Err(e) => respond(request, 500, "text/plain", e.to_string().as_bytes()),
+            },
+            Ok(_) => respond(
+                request,
+                500,
+                "text/plain",
+                b"unexpected non-transcript result",
+            ),
+            Err(err) => respond_local_err(request, err),
+        }
+    }
+
+    fn handle_video(&self, mut request: Request) -> std::io::Result<()> {
+        let body = match read_body(&mut request)? {
+            BodyOutcome::Ok(body) => body,
+            BodyOutcome::TooLarge => return respond_too_large(request),
+        };
+        let parsed: VideoBody = match serde_json::from_str(&body) {
+            Ok(p) => p,
+            Err(err) => {
+                return respond(
+                    request,
+                    400,
+                    "text/plain",
+                    format!("bad json: {err}").as_bytes(),
+                )
+            }
+        };
+        let preview = parsed.prompt.clone();
+        let params = VideoParams {
+            prompt: parsed.prompt,
+            negative_prompt: parsed.negative_prompt,
+            seconds: parsed.seconds.unwrap_or(2.0),
+            width: parsed.width.unwrap_or(256),
+            height: parsed.height.unwrap_or(256),
+            ext: parsed.ext.unwrap_or_else(|| "mp4".into()),
+            ..Default::default()
+        };
+        let Some(_reservation) = self.gate.try_reserve() else {
+            return respond_busy(request);
+        };
+        let catalog = self.catalog.lock().clone();
+        match run_kind(
+            self.engine.as_ref(),
+            &catalog,
+            &self.observers,
+            TaskKind::Video,
+            parsed.model.as_deref(),
+            &preview,
+            Task::Video(params),
+        ) {
+            Ok(TaskResult::Video { bytes, ext }) => {
+                respond(request, 200, content_type_for(&ext), &bytes)
+            }
+            Ok(_) => respond(request, 500, "text/plain", b"unexpected non-video result"),
+            Err(err) => respond_local_err(request, err),
         }
     }
 
@@ -582,8 +851,25 @@ fn content_type_for(ext: &str) -> &'static str {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg",
+        "flac" => "audio/flac",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
         _ => "application/octet-stream",
     }
+}
+
+/// Map a [`LocalError`] onto an HTTP response: catalog/contract errors
+/// (unknown or wrong-kind model, none configured) are the caller's
+/// fault → 400 with the message; an engine failure is 500.
+fn respond_local_err(request: Request, err: LocalError) -> std::io::Result<()> {
+    let status = match err {
+        LocalError::Engine(_) => 500,
+        _ => 400,
+    };
+    respond(request, status, "text/plain", err.to_string().as_bytes())
 }
 
 fn respond(request: Request, status: u16, content_type: &str, body: &[u8]) -> std::io::Result<()> {
@@ -620,6 +906,27 @@ mod tests {
         fn dispatch(&self, model: &str, task: Task) -> anyhow::Result<TaskResult> {
             std::thread::sleep(self.delay);
             self.inner.dispatch(model, task)
+        }
+    }
+
+    fn synthetic_model_of(id: &str, kind: TaskKind) -> CatalogModel {
+        CatalogModel {
+            kind,
+            ..synthetic_model(id)
+        }
+    }
+
+    /// A catalog with one synthetic model per kind, so every local
+    /// endpoint has a default to resolve.
+    fn multi_kind_catalog() -> Catalog {
+        Catalog {
+            models: vec![
+                synthetic_model_of("img", TaskKind::Image),
+                synthetic_model_of("chat", TaskKind::Llm),
+                synthetic_model_of("tts", TaskKind::AudioTts),
+                synthetic_model_of("stt", TaskKind::AudioStt),
+                synthetic_model_of("vid", TaskKind::Video),
+            ],
         }
     }
 
@@ -826,6 +1133,106 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("libvulkan1"));
+    }
+
+    // -----------------------------------------------------------------
+    // Generic per-kind endpoints (chat / tts / stt / video) — the local
+    // API serves every modality the worker's engines support, not just
+    // image.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn chat_completions_returns_an_openai_shaped_body() {
+        let h = Harness::start(multi_kind_catalog());
+        let res = h
+            .post("/v1/chat/completions")
+            .json(&serde_json::json!({
+                "messages": [{"role": "user", "content": "hello there"}],
+                "max_tokens": 16
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "application/json");
+        let body: serde_json::Value = res.json().unwrap();
+        // The synthetic engine emits a chat.completion-shaped object.
+        assert!(
+            body.get("choices").is_some() || body.get("object").is_some(),
+            "expected an OpenAI-ish body, got: {body}"
+        );
+        // The local job was recorded.
+        assert!(h
+            .observers
+            .local_jobs
+            .lock()
+            .iter()
+            .any(|j| j.kind == TaskKind::Llm));
+    }
+
+    #[test]
+    fn tts_returns_audio_bytes() {
+        let h = Harness::start(multi_kind_catalog());
+        let res = h
+            .post("/tts")
+            .json(&serde_json::json!({ "text": "read this aloud" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "audio/wav");
+        assert!(!res.bytes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stt_returns_a_transcript_json() {
+        let h = Harness::start(multi_kind_catalog());
+        let res = h
+            .post("/stt")
+            .json(&serde_json::json!({ "inputUrl": "https://example.com/a.wav" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "application/json");
+    }
+
+    #[test]
+    fn video_returns_bytes() {
+        let h = Harness::start(multi_kind_catalog());
+        let res = h
+            .post("/video")
+            .json(&serde_json::json!({ "prompt": "a tiny dragon" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(!res.bytes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chat_without_an_llm_model_is_a_400() {
+        // Only an image model in the catalog: a chat request has no
+        // model to resolve and must say so (400), not 500.
+        let h = Harness::start(seeded_catalog());
+        let res = h
+            .post("/v1/chat/completions")
+            .json(&serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        assert!(res.text().unwrap().contains("llm"));
+    }
+
+    #[test]
+    fn chat_endpoint_respects_the_busy_gate() {
+        let gate = JobGate::new();
+        let h = Harness::start_with_gate(multi_kind_catalog(), gate.clone());
+        let _held = gate.try_reserve().unwrap();
+        let res = h
+            .post("/v1/chat/completions")
+            .json(&serde_json::json!({ "messages": [{"role":"user","content":"x"}] }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 503);
     }
 
     #[test]

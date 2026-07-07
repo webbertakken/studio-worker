@@ -59,7 +59,7 @@ user can do all of the above trivially.
       how local clients find the port (which can be ephemeral after
       the port-0 fallback in `runtime::spawn_local_api`). TDD: bind →
       file exists with correct mode + contents; shutdown → gone.
-- [x] 1.1.5 Update `README.md` and `docs/local-image-api.md`: curl
+- [x] 1.1.5 Update `README.md` and `docs/local-api.md`: curl
       examples gain the token header, document the discovery file and
       the threat model (why the token exists).
 
@@ -331,22 +331,22 @@ and blinds studio matching.
 Only `POST /image` exists. The goal says the worker is generically
 callable locally for whatever engines are compiled in.
 
-- [ ] 3.5.1 `POST /v1/chat/completions` (OpenAI-compatible subset:
+- [x] 3.5.1 `POST /v1/chat/completions` (OpenAI-compatible subset:
       `model`, `messages`, `max_tokens`, `temperature`; non-streaming
       first) routed to the llama engine via the catalog; 501 with a
       clear message when no LLM engine is compiled in. Reuses the
       shared `JobGate`. TDD: synthetic-engine round-trip asserting the
       OpenAI response shape.
-- [ ] 3.5.2 `POST /tts` (text → audio) and `POST /stt` (audio →
+- [x] 3.5.2 `POST /tts` (text → audio) and `POST /stt` (audio →
       text) mirroring the studio task params, gated on compiled
       engines; `POST /video` likewise. Keep each endpoint thin —
       resolve catalog model, build `Task`, dispatch, map result. TDD:
       per-kind round-trips through `SyntheticEngine` (mirrors
       `multi_modal.rs`).
-- [ ] 3.5.3 Catalog: add per-kind defaults (`default_image_model` →
+- [x] 3.5.3 Catalog: add per-kind defaults (`default_image_model` →
       `default_model_for(kind)`) and seed sensible entries for kinds
       whose engines self-provision. TDD: default resolution per kind.
-- [ ] 3.5.4 Update `docs/local-image-api.md` → `docs/local-api.md`
+- [x] 3.5.4 Update `docs/local-api.md` → `docs/local-api.md`
       covering all endpoints, auth, discovery file, and the busy/503
       contract; link from README.
 

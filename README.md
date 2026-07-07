@@ -66,7 +66,7 @@ drive your GPU via CSRF or DNS rebinding.
 Models come from a local catalog (`<config dir>/models.json`, seeded with
 Z-Image) that you can extend the same way the studio adds models. Local jobs
 show up in the desktop UI's **Local queue**. See
-[`docs/local-image-api.md`](docs/local-image-api.md).
+[`docs/local-api.md`](docs/local-api.md).
 
 ## Desktop UI (on by default)
 

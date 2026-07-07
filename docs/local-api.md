@@ -28,6 +28,10 @@ it works even when the worker is not registered with any studio.
 | Method | Path            | Auth | Body / params                              | Returns |
 | ------ | --------------- | ---- | ------------------------------------------ | ------- |
 | POST   | `/image`        | yes  | JSON image request (below)                 | image bytes (`image/webp` etc.) |
+| POST   | `/v1/chat/completions` | yes | OpenAI-compatible chat body (`model?`, `messages`, `max_tokens?`, `temperature?`, `top_p?`, `stop?`) | `chat.completion` JSON |
+| POST   | `/tts`          | yes  | `{text, model?, voice?, speed?, language?, ext?}` | audio bytes (`audio/wav` etc.) |
+| POST   | `/stt`          | yes  | `{inputUrl, model?, language?}`            | transcript JSON |
+| POST   | `/video`        | yes  | `{prompt, model?, negativePrompt?, seconds?, width?, height?, ext?}` | video bytes (`video/mp4` etc.) |
 | GET    | `/models`       | yes  | —                                          | catalog as JSON array |
 | POST   | `/models`       | yes  | a catalog model (same `ModelSource` shape) | `{"ok":true}` |
 | DELETE | `/models/:id`   | yes  | —                                          | `{"ok":true}` / 404 |
@@ -75,9 +79,21 @@ curl -s "$(jq -r .url $DISCOVERY)/image" \
   -d '{"prompt":"a red fox in snow"}' --output fox.webp
 ```
 
-Errors: unknown / non-image model or a bad request body return `400`; a
+Errors: unknown / wrong-kind model or a bad request body return `400`; a
 missing/wrong token returns `401`; a non-loopback `Host`/`Origin` returns
-`403`; a body over 1 MiB returns `413`; an engine failure returns `500`.
+`403`; a body over 1 MiB returns `413`; a busy worker (a studio or local
+job already running) returns `503` with `Retry-After`; an engine failure
+returns `500`.
+
+### Non-image kinds
+
+Every endpoint resolves a catalog model of the matching kind (an
+explicit `model`, else the first enabled model of that kind).  Add
+per-kind models the same way as image models via `POST /models`; a
+request with no model of that kind in the catalog returns `400`.  The
+`/v1/chat/completions` endpoint returns the engine's JSON verbatim, so
+an OpenAI-style client can point straight at
+`http://127.0.0.1:4787/v1/chat/completions` with the bearer token.
 
 ## Local model catalog
 
