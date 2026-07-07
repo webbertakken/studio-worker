@@ -14,7 +14,7 @@ use eframe::egui;
 use crate::{
     auto_register::RegistrationState,
     config::Config,
-    runtime::{HeartbeatOutcome, HeartbeatStatus, SessionState},
+    runtime::{GpuRuntimeStatus, HeartbeatOutcome, HeartbeatStatus, SessionState},
 };
 
 /// Pure-data view of the Status tab.  Constructed each frame from
@@ -53,6 +53,8 @@ pub enum StatusView {
         /// One-line WS lifecycle summary (connected / reconnecting /
         /// auth-failed + recovery action).
         session: String,
+        /// GPU-runtime readiness: `None` = not probed, else (ok, detail).
+        gpu: Option<(bool, String)>,
     },
 }
 
@@ -81,6 +83,10 @@ impl HeartbeatSummary {
 }
 
 impl StatusView {
+    // A pure-data view assembled from the several independent runtime
+    // signals the Status tab shows; grouping them would only rename the
+    // list, not shorten it.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         cfg: &Config,
         registration: &RegistrationState,
@@ -89,6 +95,7 @@ impl StatusView {
         last_heartbeat: Option<&HeartbeatStatus>,
         vram_total_gb: f32,
         session_state: &SessionState,
+        gpu_runtime: Option<&GpuRuntimeStatus>,
     ) -> Self {
         let registered = cfg.worker_id.is_some() && cfg.auth_token.is_some();
         if registered {
@@ -101,6 +108,7 @@ impl StatusView {
                 busy,
                 last_heartbeat: last_heartbeat.map(HeartbeatSummary::from),
                 session: session_state.summary(),
+                gpu: gpu_runtime.map(|g| (g.ok, g.detail.clone())),
             };
         }
         match registration {
@@ -256,6 +264,7 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
         busy,
         last_heartbeat,
         session,
+        gpu,
     } = view
     else {
         unreachable!();
@@ -329,6 +338,18 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
             }
             ui.end_row();
 
+            // GPU runtime: red when missing, with the exact remedy, so a
+            // box that can't run image jobs says why up front.
+            if let Some((ok, detail)) = gpu {
+                ui.label("GPU runtime");
+                if *ok {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, detail);
+                } else {
+                    ui.colored_label(egui::Color32::LIGHT_RED, detail);
+                }
+                ui.end_row();
+            }
+
             ui.label("Last heartbeat");
             match last_heartbeat {
                 None => ui.label("never"),
@@ -399,6 +420,7 @@ mod tests {
             None,
             0.0,
             &SessionState::default(),
+            None,
         );
         match view {
             StatusView::Initialising { api_base_url } => {
@@ -423,6 +445,7 @@ mod tests {
             None,
             0.0,
             &SessionState::default(),
+            None,
         );
         match view {
             StatusView::Pending {
@@ -450,6 +473,7 @@ mod tests {
             None,
             0.0,
             &SessionState::default(),
+            None,
         );
         match view {
             StatusView::Rejected { reason, .. } => assert_eq!(reason, "unknown contributor"),
@@ -473,6 +497,7 @@ mod tests {
             None,
             24.0,
             &SessionState::default(),
+            None,
         );
         assert!(matches!(view, StatusView::Registered { .. }));
     }
@@ -488,6 +513,7 @@ mod tests {
             None,
             24.0,
             &SessionState::default(),
+            None,
         );
         match view {
             StatusView::Registered {
@@ -499,6 +525,7 @@ mod tests {
                 busy,
                 last_heartbeat,
                 session: _,
+                gpu: _,
             } => {
                 assert_eq!(worker_id, "w-abc");
                 assert_eq!(api_base_url, "https://studio.example");
@@ -523,6 +550,7 @@ mod tests {
             None,
             24.0,
             &SessionState::default(),
+            None,
         );
         match view {
             StatusView::Registered { paused, .. } => assert!(paused),
@@ -545,6 +573,7 @@ mod tests {
             Some(&hb),
             24.0,
             &SessionState::default(),
+            None,
         );
         match view {
             StatusView::Registered {
@@ -575,6 +604,7 @@ mod tests {
             Some(&hb),
             24.0,
             &SessionState::default(),
+            None,
         );
         match view {
             StatusView::Registered {

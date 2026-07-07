@@ -329,6 +329,12 @@ impl LocalApi {
             .models_root
             .as_deref()
             .and_then(|root| fs4::available_space(root).ok());
+        let gpu = self
+            .observers
+            .gpu_runtime
+            .lock()
+            .clone()
+            .map(|g| serde_json::json!({ "ok": g.ok, "detail": g.detail }));
         let body = serde_json::json!({
             "ok": true,
             "version": crate::AGENT_VERSION,
@@ -336,6 +342,7 @@ impl LocalApi {
             "engine": self.engine.name(),
             "modelsRoot": self.models_root.as_ref().map(|p| p.display().to_string()),
             "modelsRootFreeBytes": free_bytes,
+            "gpuRuntime": gpu,
         });
         match serde_json::to_vec(&body) {
             Ok(bytes) => respond(request, 200, "application/json", &bytes),
@@ -798,6 +805,27 @@ mod tests {
             !raw.contains(TEST_TOKEN),
             "healthz must not carry the token"
         );
+    }
+
+    #[test]
+    fn healthz_surfaces_gpu_runtime_when_probed() {
+        let h = Harness::start(seeded_catalog());
+        // Simulate the startup probe having found a missing runtime.
+        crate::runtime::set_gpu_runtime_status(
+            &h.observers,
+            Err(anyhow::anyhow!(
+                "Vulkan runtime not available: install libvulkan1"
+            )),
+        );
+        let body: serde_json::Value = reqwest::blocking::get(format!("{}/healthz", h.url))
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(body["gpuRuntime"]["ok"], false);
+        assert!(body["gpuRuntime"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("libvulkan1"));
     }
 
     #[test]
