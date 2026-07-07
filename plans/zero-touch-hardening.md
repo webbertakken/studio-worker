@@ -256,13 +256,13 @@ After `curl … installer.sh | sh` the user still has to know to run
 `studio-worker ui` and optionally `install-service`. Zero-touch means
 the install ends with a running, auto-starting worker.
 
-- [ ] 3.1.1 Add `studio-worker setup`: one-shot that (a) installs the
+- [x] 3.1.1 Add `studio-worker setup`: one-shot that (a) installs the
       OS autostart (service on headless/`--headless`, autostart entry
       + tray UI otherwise), (b) starts the worker now, (c) prints the
       approval hint (studio URL + machine name the admin will see) and
       the local API URL. Idempotent — safe to re-run. TDD: drive
       through the `ServiceOps` seam like `service.rs` tests.
-- [ ] 3.1.2 Document `setup` as **the** post-install step in README's
+- [x] 3.1.2 Document `setup` as **the** post-install step in README's
       quick-install section (one copy-paste block per OS: install +
       setup). Explore cargo-dist's installer hooks (`install-success-msg`
       or postinstall) to at least print "now run: studio-worker setup"

@@ -135,13 +135,23 @@ C++ compiler are on `PATH`.
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/webbertakken/studio-worker/releases/latest/download/studio-worker-installer.sh | sh
+studio-worker setup      # install + start the service, print approval guidance
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
 irm https://github.com/webbertakken/studio-worker/releases/latest/download/studio-worker-installer.ps1 | iex
+studio-worker setup      # install + start the service, print approval guidance
 ```
+
+`studio-worker setup` is the one post-install step: it installs and
+starts the auto-start service (so the worker runs now and at every
+login), then prints the machine name the studio admin approves, the
+studio URL, and where the local API's URL + token are written. It is
+idempotent — safe to re-run. After an admin approves the worker it
+claims jobs automatically and downloads its own models + GPU runtimes
+on demand; there is nothing else to do.
 
 ### From cargo
 
