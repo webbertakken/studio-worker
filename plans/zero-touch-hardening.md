@@ -356,7 +356,7 @@ Models the studio admin adds from Hugging Face reach the worker only
 inside job offers; the local catalog never learns them, so local API
 users can't use studio-registered models.
 
-- [ ] 3.6.1 On every offer carrying a `ModelSource`, upsert a
+- [x] 3.6.1 On every offer carrying a `ModelSource`, upsert a
       catalog entry (id = offered model id, `origin: "studio"` — new
       optional field, default `"local"`) unless a local entry with the
       same id exists. Persist via the atomic save (1.5.1). Studio

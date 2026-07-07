@@ -700,6 +700,11 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     };
     let job = claim.into_job_claim();
     let task_kind = job.task.kind();
+    // Mirror the studio's model into the local catalog so the local
+    // API can serve it too (studio admins add models from HF; a local
+    // API user then gets the same models).  Best-effort, never fails
+    // the job.
+    crate::runtime::sync_studio_model(&ctx.observers, &job.model, task_kind, &job.model_source);
     // The FULL prompt goes back to the studio (and to the engine).
     // The bounded preview (`truncate_prompt`) is only for the UI's
     // Jobs tab so the in-memory observer ring stays small even when

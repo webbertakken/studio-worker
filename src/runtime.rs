@@ -161,6 +161,13 @@ pub struct WorkerObservers {
     /// GPU-runtime readiness, probed once at startup.  `None` until
     /// probed.
     pub gpu_runtime: Arc<Mutex<Option<GpuRuntimeStatus>>>,
+    /// The local model catalog, shared between the local API (which
+    /// serves from it) and the WS session (which mirrors studio-offered
+    /// models into it).  Empty until `spawn_local_api` loads it.
+    pub catalog: Arc<Mutex<crate::catalog::Catalog>>,
+    /// Where the catalog persists (`None` = don't persist, e.g. an
+    /// unreadable file).
+    pub catalog_path: Arc<Mutex<Option<std::path::PathBuf>>>,
     /// Bounded ring of every log entry the worker has emitted, kept
     /// for the UI's Logs tab.  Separate from the WS ship queue
     /// (which is drained every second) so the display doesn't blank
@@ -183,6 +190,54 @@ pub struct GpuRuntimeStatus {
     pub ok: bool,
     /// Human-readable detail: "available" or the exact remedy.
     pub detail: String,
+}
+
+/// Mirror a model seen on a studio job offer into the shared local
+/// catalog so the local API can serve it too.  Persists atomically
+/// when the catalog changed; a local-origin entry of the same id is
+/// never clobbered.  Best-effort: a persist failure is warn-logged but
+/// never fails the job.
+pub fn sync_studio_model(
+    observers: &WorkerObservers,
+    model_id: &str,
+    kind: TaskKind,
+    source: &ModelSource,
+) {
+    let incoming = crate::catalog::CatalogModel {
+        id: model_id.to_string(),
+        display_name: model_id.to_string(),
+        kind,
+        vram_gb_estimate: 0.0,
+        description: None,
+        source: source.clone(),
+        enabled: true,
+        origin: "studio".into(),
+    };
+    let changed = observers.catalog.lock().sync_studio_model(incoming);
+    if !changed {
+        return;
+    }
+    let path = observers.catalog_path.lock().clone();
+    if let Some(path) = path {
+        let snapshot = observers.catalog.lock().clone();
+        if let Err(e) = snapshot.save(&path) {
+            warn!(
+                target: TRACE_TARGET,
+                op = "catalog_sync",
+                model_id,
+                error = %e,
+                "failed to persist studio model into the local catalog"
+            );
+        } else {
+            info!(
+                target: TRACE_TARGET,
+                op = "catalog_sync",
+                model_id,
+                kind = kind.as_str(),
+                "mirrored studio model into the local catalog"
+            );
+        }
+    }
 }
 
 /// Probe the GPU runtime and record it in `observers`, warn-logging the
@@ -757,10 +812,14 @@ pub fn spawn_local_api(
 
     // `load_for_serving` quarantines corrupt files and drops the save
     // path when the file is unreadable, so a later `POST /models` can
-    // never clobber a catalog the worker couldn't read.
-    let (catalog, catalog_path) =
+    // never clobber a catalog the worker couldn't read.  The loaded
+    // catalog is published into the observers so the WS session can
+    // mirror studio-offered models into the same shared instance.
+    let (loaded, catalog_path) =
         crate::catalog::Catalog::load_for_serving(crate::config::catalog_path_for(config_path));
-    let catalog = Arc::new(Mutex::new(catalog));
+    *observers.catalog.lock() = loaded;
+    *observers.catalog_path.lock() = catalog_path.clone();
+    let catalog = observers.catalog.clone();
 
     let token = ensure_local_api_token(&cfg, config_path);
     let port = resolve_local_api_port(
@@ -1415,6 +1474,47 @@ mod tests {
         );
         set_session_state(&observers, SessionState::Connected);
         assert_eq!(*observers.session_state.lock(), SessionState::Connected);
+    }
+
+    #[test]
+    fn sync_studio_model_mirrors_into_the_shared_catalog_and_persists() {
+        use crate::types::{ModelCliDefaults, ModelEngine, ModelSource};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        let observers = WorkerObservers::default();
+        *observers.catalog_path.lock() = Some(path.clone());
+
+        let source = ModelSource {
+            engine: ModelEngine::Synthetic,
+            files: vec![],
+            cli_defaults: ModelCliDefaults::default(),
+        };
+        sync_studio_model(&observers, "studio-llm", TaskKind::Llm, &source);
+
+        // In-memory catalog gained the studio model…
+        assert!(observers.catalog.lock().get("studio-llm").is_some());
+        assert_eq!(
+            observers.catalog.lock().get("studio-llm").unwrap().origin,
+            "studio"
+        );
+        // …and it was persisted to disk.
+        let reloaded = crate::catalog::Catalog::load_or_seed(&path).unwrap();
+        assert!(reloaded.get("studio-llm").is_some());
+    }
+
+    #[test]
+    fn sync_studio_model_without_a_path_stays_in_memory_only() {
+        use crate::types::{ModelCliDefaults, ModelEngine, ModelSource};
+        let observers = WorkerObservers::default();
+        // No catalog_path set (unreadable file / None): must not panic,
+        // just updates the in-memory catalog.
+        let source = ModelSource {
+            engine: ModelEngine::Synthetic,
+            files: vec![],
+            cli_defaults: ModelCliDefaults::default(),
+        };
+        sync_studio_model(&observers, "m", TaskKind::Image, &source);
+        assert!(observers.catalog.lock().get("m").is_some());
     }
 
     #[test]
