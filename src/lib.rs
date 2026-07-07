@@ -19,6 +19,7 @@ pub mod cli;
 pub mod config;
 pub mod engine;
 pub mod http;
+pub mod job_gate;
 pub mod local;
 pub mod local_api;
 pub mod net;

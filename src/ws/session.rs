@@ -637,25 +637,28 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         );
         return;
     }
-    if !try_reserve_worker(&ctx.busy) {
-        push_log_with_observers(
-            &ctx.logs,
-            Some(&ctx.observers),
-            "info",
-            "ws",
-            &format!("rejecting offer {job_id}: worker is already busy"),
-            Some(job_id.clone()),
-        );
-        spawn_reject_offer(
-            ctx.sender.clone(),
-            ctx.logs.clone(),
-            ctx.observers.clone(),
-            job_id,
-            "worker already has an in-flight job",
-            crate::ws::types::RejectCode::Busy,
-        );
-        return;
-    }
+    let reservation = match crate::job_gate::JobGate::from_shared(ctx.busy.clone()).try_reserve() {
+        Some(reservation) => reservation,
+        None => {
+            push_log_with_observers(
+                &ctx.logs,
+                Some(&ctx.observers),
+                "info",
+                "ws",
+                &format!("rejecting offer {job_id}: worker is already busy"),
+                Some(job_id.clone()),
+            );
+            spawn_reject_offer(
+                ctx.sender.clone(),
+                ctx.logs.clone(),
+                ctx.observers.clone(),
+                job_id,
+                "worker already has an in-flight job",
+                crate::ws::types::RejectCode::Busy,
+            );
+            return;
+        }
+    };
     let job = claim.into_job_claim();
     let task_kind = job.task.kind();
     // The FULL prompt goes back to the studio (and to the engine).
@@ -671,6 +674,9 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
 
     let ctx = ctx.clone();
     tokio::spawn(async move {
+        // Held for the whole job; its Drop frees the worker slot on
+        // every exit path (accept failure, success, or a panic).
+        let _reservation = reservation;
         let accept_result = ctx
             .sender
             .send(&WorkerInbound::Accept {
@@ -689,7 +695,6 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             );
         }
         if accept_result.is_err() {
-            ctx.busy.store(false, Ordering::SeqCst);
             return;
         }
 
@@ -711,13 +716,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             prompt_preview,
         )
         .await;
-        ctx.busy.store(false, Ordering::SeqCst);
     });
-}
-
-fn try_reserve_worker(busy: &AtomicBool) -> bool {
-    busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
 }
 
 fn spawn_reject_offer(
@@ -1333,12 +1332,7 @@ mod tests {
         assert!(offer_response_breadcrumb("reject", "j-2", &Ok(())).is_none());
     }
 
-    #[test]
-    fn try_reserve_worker_only_allows_one_in_flight_job() {
-        let busy = AtomicBool::new(false);
-        assert!(try_reserve_worker(&busy));
-        assert!(!try_reserve_worker(&busy));
-    }
+    // (worker-reservation exclusivity now lives in `job_gate::tests`.)
 
     #[test]
     fn heartbeat_current_job_id_uses_actual_job_id() {

@@ -157,18 +157,18 @@ also only *reads* `busy` once before a minutes-long download/install
 (`runtime::auto_update_tick`), so a job accepted mid-apply is killed by
 `restart_self()`.
 
-- [ ] 2.1.1 Introduce a `JobGate` (wrap the existing
+- [x] 2.1.1 Introduce a `JobGate` (wrap the existing
       `Arc<AtomicBool> busy` in a small struct with
       `try_reserve() -> Option<Guard>`; RAII release). Move
       `try_reserve_worker` into it. TDD: contention tests incl. drop
       releasing the slot and panic-safety.
-- [ ] 2.1.2 Wire the gate into the local API: `POST /image` reserves
+- [x] 2.1.2 Wire the gate into the local API: `POST /image` reserves
       before dispatch; when busy, respond `503` with `Retry-After` and
       a JSON body naming the current job kind (studio vs local). Pass
       the shared `busy` from `runtime::run` / `ui::run` into
       `spawn_local_api`. TDD: hold the gate, POST → 503; release →
       200.
-- [ ] 2.1.3 Wire the gate into the auto-updater: reserve **before**
+- [x] 2.1.3 Wire the gate into the auto-updater: reserve **before**
       `update::apply` (offers arriving mid-install are rejected as
       busy, exactly like a job) and only `restart_self` while holding
       the reservation. TDD: updater holding the gate → simultaneous

@@ -39,6 +39,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::catalog::{Catalog, CatalogModel};
 use crate::engine::Engine;
+use crate::job_gate::JobGate;
 use crate::local::{run_image, LocalError, LocalImageRequest};
 use crate::runtime::{JobOutcome, WorkerObservers};
 use crate::types::TaskResult;
@@ -140,6 +141,9 @@ pub struct LocalApi {
     addr: SocketAddr,
     /// Bearer token every route except `GET /healthz` requires.
     token: String,
+    /// Shared one-job-at-a-time gate.  A local generation reserves it
+    /// so it can't run concurrently with a studio job on the same GPU.
+    gate: JobGate,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +175,7 @@ impl LocalApi {
         catalog_path: Option<PathBuf>,
         observers: WorkerObservers,
         token: String,
+        gate: JobGate,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !token.is_empty(),
@@ -190,6 +195,7 @@ impl LocalApi {
             server,
             addr,
             token,
+            gate,
         })
     }
 
@@ -315,6 +321,13 @@ impl LocalApi {
             steps: parsed.steps,
             seed: parsed.seed,
             ext: parsed.ext,
+        };
+
+        // One GPU, one job: reserve the shared gate so a local
+        // generation never runs alongside a studio job.  Busy → 503 +
+        // Retry-After so the caller backs off instead of OOMing.
+        let Some(_reservation) = self.gate.try_reserve() else {
+            return respond_busy(request);
         };
 
         let catalog = self.catalog.lock().clone();
@@ -454,6 +467,24 @@ fn respond_too_large(request: Request) -> std::io::Result<()> {
     )
 }
 
+/// 503 when the single job slot is taken by another job (studio or
+/// local).  Carries `Retry-After: 2` so a client polls back rather
+/// than hammering.
+fn respond_busy(request: Request) -> std::io::Result<()> {
+    let retry = Header::from_bytes(b"Retry-After".as_slice(), b"2".as_slice())
+        .expect("static Retry-After header is valid");
+    let response = Response::from_data(
+        b"worker is busy with another job (studio or local); retry shortly".to_vec(),
+    )
+    .with_status_code(503)
+    .with_header(retry)
+    .with_header(
+        Header::from_bytes(b"Content-Type".as_slice(), b"text/plain".as_slice())
+            .expect("static content-type header is valid"),
+    );
+    request.respond(response)
+}
+
 /// Publish the bound URL + bearer token for local clients, atomically
 /// and owner-only (the file carries the token).  Written on every
 /// successful bind; removed again by [`remove_discovery_file`] on
@@ -549,6 +580,10 @@ mod tests {
 
     impl Harness {
         fn start(catalog: Catalog) -> Self {
+            Self::start_with_gate(catalog, JobGate::new())
+        }
+
+        fn start_with_gate(catalog: Catalog, gate: JobGate) -> Self {
             let engine: Arc<dyn Engine> = Arc::new(SyntheticEngine::new());
             let observers = WorkerObservers::default();
             let api = LocalApi::bind(
@@ -558,6 +593,7 @@ mod tests {
                 None,
                 observers.clone(),
                 TEST_TOKEN.to_string(),
+                gate.clone(),
             )
             .unwrap();
             let url = api.url();
@@ -829,11 +865,39 @@ mod tests {
             None,
             WorkerObservers::default(),
             String::new(),
+            JobGate::new(),
         )
         .err()
         .expect("empty token must be refused")
         .to_string();
         assert!(err.contains("empty token"), "got: {err}");
+    }
+
+    #[test]
+    fn post_image_returns_503_when_the_shared_gate_is_held() {
+        // A studio job (or another local job) holds the one-job gate;
+        // a concurrent local generation must be refused with 503 +
+        // Retry-After rather than run a second job on the same GPU.
+        let gate = JobGate::new();
+        let h = Harness::start_with_gate(seeded_catalog(), gate.clone());
+        let reservation = gate.try_reserve().expect("pre-hold the slot");
+        let res = h
+            .post("/image")
+            .json(&serde_json::json!({ "prompt": "x" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 503);
+        assert_eq!(res.headers()["retry-after"], "2");
+
+        // Once the holder releases, the same request succeeds — proving
+        // the 503 was the gate, not a broken engine.
+        drop(reservation);
+        let res = h
+            .post("/image")
+            .json(&serde_json::json!({ "prompt": "x" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
     }
 
     // -----------------------------------------------------------------
