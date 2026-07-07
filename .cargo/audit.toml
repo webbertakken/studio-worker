@@ -36,4 +36,13 @@ ignore = [
     "RUSTSEC-2024-0370", # proc-macro-error — glib-macros build macro (ui)
     "RUSTSEC-2024-0436", # paste          — candle/gemm build macro (image-candle)
     "RUSTSEC-2025-0119", # number_prefix  — hf-hub → indicatif dep (image-candle)
+    # quick-xml quadratic-runtime parsing advisories.  quick-xml is
+    # pulled only by the desktop-notification / tray stack
+    # (tauri-winrt-notification → notify-rust, and zbus/muda), which
+    # pin `^0.37` / `^0.39` — the fix (>=0.41) needs an upstream bump.
+    # It is a `ui`-feature-only dependency and never parses untrusted
+    # external XML in this worker, so there is no reachable DoS surface.
+    # Drop these when notify-rust / the tray stack bump quick-xml.
+    "RUSTSEC-2026-0194", # quick-xml      — UI notification/tray XML (ui)
+    "RUSTSEC-2026-0195", # quick-xml      — UI notification/tray XML (ui)
 ]
