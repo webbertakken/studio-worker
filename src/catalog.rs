@@ -8,9 +8,13 @@
 //! studio. It ships seeded with Z-Image-Turbo (the studio's default image
 //! model) so a fresh install can generate out of the box.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// Tracing target for catalog persistence.  Stable so operators can
+/// filter with `RUST_LOG=studio_worker::catalog=debug`.
+const TRACE_TARGET: &str = "studio_worker::catalog";
 
 use crate::types::{
     ModelCliDefaults, ModelEngine, ModelFile, ModelFileRole, ModelSource, TaskKind,
@@ -69,12 +73,36 @@ impl Catalog {
         serde_json::to_string_pretty(self)
     }
 
-    /// Load the catalog from `path`. If the file does not exist it is seeded
-    /// with the built-in defaults and written to `path`.
+    /// Load the catalog from `path`.
+    ///
+    /// * Missing file → seeded with the built-in defaults and written.
+    /// * Corrupt JSON → the file is **quarantined** (renamed to
+    ///   `models.json.corrupt-<unix-ts>`) and a fresh seed written in
+    ///   its place.  The old behaviour — erroring so the caller fell
+    ///   back to an in-memory seed while keeping the save path — meant
+    ///   the next persist silently overwrote the operator's hand-edited
+    ///   catalog; quarantining preserves their bytes for recovery.
+    /// * Any other IO error propagates (nothing is renamed or written).
     pub fn load_or_seed(path: &Path) -> std::io::Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => Self::from_json(&contents)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Ok(contents) => match Self::from_json(&contents) {
+                Ok(catalog) => Ok(catalog),
+                Err(parse_err) => {
+                    let quarantine = quarantine_path(path);
+                    std::fs::rename(path, &quarantine)?;
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        op = "load",
+                        path = %path.display(),
+                        quarantine = %quarantine.display(),
+                        error = %parse_err,
+                        "catalog is not valid JSON; quarantined the file and reseeded"
+                    );
+                    let seeded = Self::seed();
+                    seeded.save(path)?;
+                    Ok(seeded)
+                }
+            },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let seeded = Self::seed();
                 seeded.save(path)?;
@@ -84,7 +112,33 @@ impl Catalog {
         }
     }
 
-    /// Write the catalog to `path` (creating parent dirs).
+    /// Load for serving: the catalog plus the path future saves may
+    /// write to.  A quarantine/seed recovery keeps the path (the file
+    /// is now healthy); an unreadable file (permissions, IO) drops it
+    /// so the worker can never overwrite a file it couldn't read.
+    pub fn load_for_serving(path: Option<PathBuf>) -> (Self, Option<PathBuf>) {
+        match path {
+            Some(path) => match Self::load_or_seed(&path) {
+                Ok(catalog) => (catalog, Some(path)),
+                Err(err) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        op = "load",
+                        path = %path.display(),
+                        error = %err,
+                        "catalog unreadable; serving the in-memory seed and \
+                         disabling persistence so the file is never clobbered"
+                    );
+                    (Self::seed(), None)
+                }
+            },
+            None => (Self::seed(), None),
+        }
+    }
+
+    /// Write the catalog to `path` (creating parent dirs) — atomically,
+    /// via the same temp-file + rename dance as `config.toml`, so a
+    /// crash mid-write can't truncate the operator's model catalog.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -92,7 +146,7 @@ impl Catalog {
         let json = self
             .to_json()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, json)
+        crate::config::write_atomic(path, json.as_bytes()).map_err(std::io::Error::other)
     }
 
     /// Look up a model by id.
@@ -127,6 +181,20 @@ impl Catalog {
             .iter()
             .find(|m| m.enabled && m.kind == TaskKind::Image)
     }
+}
+
+/// Where a corrupt catalog gets parked: `<name>.corrupt-<unix-ts>`,
+/// beside the original so the operator can recover their edits.
+fn quarantine_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "models.json".to_string());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    path.with_file_name(format!("{name}.corrupt-{ts}"))
 }
 
 /// The canonical Z-Image-Turbo entry, mirroring the studio seed
@@ -305,5 +373,113 @@ mod tests {
     #[test]
     fn equality_derives_hold_for_catalog_model() {
         assert_eq!(zimage_turbo(), zimage_turbo());
+    }
+
+    // -----------------------------------------------------------------
+    // Persistence safety: atomic writes + corrupt-file quarantine.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn save_atomically_replaces_without_temp_litter() {
+        // A second save must fully replace the file and leave no
+        // temp-file siblings from the write-then-rename dance — a crash
+        // mid-write must never truncate the operator's catalog.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        Catalog::seed().save(&path).unwrap();
+        let mut small = Catalog::default();
+        small.upsert(CatalogModel {
+            description: None,
+            ..zimage_turbo()
+        });
+        small.save(&path).unwrap();
+
+        let reloaded = Catalog::load_or_seed(&path).unwrap();
+        assert_eq!(reloaded, small);
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["models.json".to_string()],
+            "atomic save must leave only the target file, found: {names:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_catalog_is_quarantined_not_overwritten() {
+        // The exact data-loss shape this guards against: a corrupt
+        // models.json used to make the caller fall back to the seed
+        // while keeping the save path — the next persist silently
+        // destroyed the operator's hand-edited catalog.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        let operator_bytes = b"{ this is my hand-edited catalog, now corrupt";
+        std::fs::write(&path, operator_bytes).unwrap();
+
+        let logs = crate::test_support::capture({
+            let path = path.clone();
+            move || {
+                let recovered = Catalog::load_or_seed(&path).unwrap();
+                assert_eq!(recovered, Catalog::seed(), "reseeded in place");
+            }
+        });
+
+        // The original bytes survive in a quarantine sibling.
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("models.json.corrupt-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine file");
+        assert_eq!(
+            std::fs::read(dir.path().join(&quarantined[0])).unwrap(),
+            operator_bytes,
+            "the operator's bytes must survive verbatim"
+        );
+        // The live path now holds a healthy seed.
+        assert_eq!(Catalog::load_or_seed(&path).unwrap(), Catalog::seed());
+        // And the recovery left a breadcrumb naming both paths.
+        assert!(logs.contains("quarantined"), "got: {logs}");
+        assert!(logs.contains("models.json.corrupt-"), "got: {logs}");
+    }
+
+    #[test]
+    fn load_for_serving_keeps_the_path_after_quarantine_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, b"not json").unwrap();
+        let (catalog, save_path) = Catalog::load_for_serving(Some(path.clone()));
+        assert_eq!(catalog, Catalog::seed());
+        assert_eq!(
+            save_path,
+            Some(path),
+            "a quarantined-and-reseeded file is healthy; persistence stays on"
+        );
+    }
+
+    #[test]
+    fn load_for_serving_disables_persistence_when_the_file_is_unreadable() {
+        // A directory where the file should be makes the read fail with
+        // a non-NotFound error on every platform.  The worker must
+        // serve the seed but never gain a path it could clobber.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::create_dir(&path).unwrap();
+        let (catalog, save_path) = Catalog::load_for_serving(Some(path));
+        assert_eq!(catalog, Catalog::seed());
+        assert_eq!(
+            save_path, None,
+            "an unreadable catalog must not be writable"
+        );
+    }
+
+    #[test]
+    fn load_for_serving_without_a_path_serves_the_seed() {
+        let (catalog, save_path) = Catalog::load_for_serving(None);
+        assert_eq!(catalog, Catalog::seed());
+        assert_eq!(save_path, None);
     }
 }

@@ -131,11 +131,11 @@ tampered feed) is remote code execution on every worker.
 
 ### 1.5 Catalog persistence safety
 
-- [ ] 1.5.1 `Catalog::save` uses plain `std::fs::write` — non-atomic; a
+- [x] 1.5.1 `Catalog::save` uses plain `std::fs::write` — non-atomic; a
       crash mid-write corrupts `models.json`. Reuse the atomic
       temp-file writer from `config.rs`. TDD: mirror
       `save_atomically_replaces_existing_config_without_temp_litter`.
-- [ ] 1.5.2 Silent data loss: when `models.json` is corrupt,
+- [x] 1.5.2 Silent data loss: when `models.json` is corrupt,
       `runtime::spawn_local_api` falls back to `Catalog::seed()` while
       keeping `catalog_path` — the next `POST /models` persists the
       seed **over the user's file**. Instead: quarantine the corrupt
