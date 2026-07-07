@@ -177,9 +177,15 @@ impl Catalog {
 
     /// The first enabled image model — used when a request names no model.
     pub fn default_image_model(&self) -> Option<&CatalogModel> {
-        self.models
-            .iter()
-            .find(|m| m.enabled && m.kind == TaskKind::Image)
+        self.default_model_for(TaskKind::Image)
+    }
+
+    /// The first enabled model of `kind` — used when a request for that
+    /// kind names no explicit model.  Generalises
+    /// [`default_image_model`](Self::default_image_model) so the local
+    /// API can serve every modality the worker's engines support.
+    pub fn default_model_for(&self, kind: TaskKind) -> Option<&CatalogModel> {
+        self.models.iter().find(|m| m.enabled && m.kind == kind)
     }
 }
 

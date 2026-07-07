@@ -34,10 +34,18 @@ pub struct LocalImageRequest {
 pub enum LocalError {
     #[error("unknown model '{0}' (not in the local catalog)")]
     UnknownModel(String),
+    #[error("no {0} model configured in the local catalog")]
+    NoModelForKind(TaskKind),
     #[error("no image model configured in the local catalog")]
     NoDefaultModel,
     #[error("model '{0}' is not an image model")]
     NotImageModel(String),
+    #[error("model '{id}' is a {got} model, not {want}")]
+    WrongKind {
+        id: String,
+        want: TaskKind,
+        got: TaskKind,
+    },
     #[error("engine error: {0}")]
     Engine(String),
 }
@@ -82,9 +90,54 @@ pub fn run_image(
         ..Default::default()
     };
 
+    dispatch_and_record(engine, model, observers, &req.prompt, Task::Image(params))
+}
+
+/// Resolve a model of `kind` (an explicit id, else the catalog's
+/// default for that kind), dispatch `task`, record the local job, and
+/// return the result.  The generic core behind every non-image local
+/// endpoint (chat / tts / stt / video) so each stays a thin adapter.
+pub fn run_kind(
+    engine: &dyn Engine,
+    catalog: &Catalog,
+    observers: &WorkerObservers,
+    kind: TaskKind,
+    model_id: Option<&str>,
+    prompt_preview: &str,
+    task: Task,
+) -> Result<TaskResult, LocalError> {
+    let model = match model_id {
+        Some(id) => catalog
+            .get(id)
+            .ok_or_else(|| LocalError::UnknownModel(id.to_string()))?,
+        None => catalog
+            .default_model_for(kind)
+            .ok_or(LocalError::NoModelForKind(kind))?,
+    };
+    if model.kind != kind {
+        return Err(LocalError::WrongKind {
+            id: model.id.clone(),
+            want: kind,
+            got: model.kind,
+        });
+    }
+    dispatch_and_record(engine, model, observers, prompt_preview, task)
+}
+
+/// Dispatch `task` on `model` and record the finished job in the
+/// local-queue ring.  Shared by [`run_image`] and [`run_kind`] so the
+/// dispatch + bookkeeping lives in one place.
+fn dispatch_and_record(
+    engine: &dyn Engine,
+    model: &crate::catalog::CatalogModel,
+    observers: &WorkerObservers,
+    prompt_preview: &str,
+    task: Task,
+) -> Result<TaskResult, LocalError> {
+    let kind = task.kind();
     let job_id = next_job_id();
     let started_at = Utc::now();
-    let result = engine.dispatch_with_source(&model.id, Task::Image(params), &model.source);
+    let result = engine.dispatch_with_source(&model.id, task, &model.source);
     let finished_at = Utc::now();
 
     let outcome = match &result {
@@ -97,9 +150,9 @@ pub fn run_image(
         observers,
         RecentJob {
             job_id,
-            kind: TaskKind::Image,
+            kind,
             model: model.id.clone(),
-            prompt: truncate_prompt(&req.prompt),
+            prompt: truncate_prompt(prompt_preview),
             outcome,
             started_at,
             finished_at,
@@ -226,5 +279,80 @@ mod tests {
         };
         let err = run_image(&engine, &catalog, &observers, &req).unwrap_err();
         assert!(matches!(err, LocalError::NotImageModel(m) if m == "chat"));
+    }
+
+    #[test]
+    fn run_kind_dispatches_llm_and_records_the_job() {
+        let engine = SyntheticEngine::new();
+        let catalog = catalog_with(vec![synthetic_model("chat", TaskKind::Llm)]);
+        let observers = WorkerObservers::default();
+        let task = Task::Llm(crate::types::LlmParams {
+            messages: vec![crate::types::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            ..Default::default()
+        });
+        let out = run_kind(
+            &engine,
+            &catalog,
+            &observers,
+            TaskKind::Llm,
+            None,
+            "hi",
+            task,
+        )
+        .unwrap();
+        assert!(matches!(out, TaskResult::Llm { .. }));
+        assert_eq!(observers.local_jobs.lock()[0].kind, TaskKind::Llm);
+    }
+
+    #[test]
+    fn run_kind_rejects_a_wrong_kind_model() {
+        let engine = SyntheticEngine::new();
+        // An image model explicitly requested for an LLM job.
+        let catalog = catalog_with(vec![synthetic_model("img", TaskKind::Image)]);
+        let observers = WorkerObservers::default();
+        let task = Task::Llm(crate::types::LlmParams::default());
+        let err = run_kind(
+            &engine,
+            &catalog,
+            &observers,
+            TaskKind::Llm,
+            Some("img"),
+            "",
+            task,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LocalError::WrongKind { ref id, want, got }
+                if id == "img" && want == TaskKind::Llm && got == TaskKind::Image),
+            "got {err:?}"
+        );
+        assert!(
+            observers.local_jobs.lock().is_empty(),
+            "no job recorded on reject"
+        );
+    }
+
+    #[test]
+    fn run_kind_reports_no_model_for_kind() {
+        let engine = SyntheticEngine::new();
+        let catalog = catalog_with(vec![]);
+        let observers = WorkerObservers::default();
+        let err = run_kind(
+            &engine,
+            &catalog,
+            &observers,
+            TaskKind::AudioTts,
+            None,
+            "",
+            Task::AudioTts(crate::types::AudioTtsParams::default()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            LocalError::NoModelForKind(TaskKind::AudioTts)
+        ));
     }
 }

@@ -36,6 +36,12 @@ impl TaskKind {
     }
 }
 
+impl std::fmt::Display for TaskKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-kind task parameters
 // ---------------------------------------------------------------------------
