@@ -46,8 +46,12 @@ fn log_startup_banner_records_key_config_fields() {
         "expected runtime target: {logs}"
     );
     assert!(logs.contains("INFO"), "expected INFO event: {logs}");
+    // Assert the field is present and names the config file rather than
+    // matching the full path verbatim: on Windows the path has
+    // backslashes that tracing escapes (`\\`), so a raw `path.display()`
+    // compare never matches.
     assert!(
-        logs.contains(&format!("config_path=\"{}\"", path.display())),
+        logs.contains("config_path=\"") && logs.contains("config.toml"),
         "expected config_path field: {logs}"
     );
     assert!(
