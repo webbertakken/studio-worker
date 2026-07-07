@@ -1,0 +1,60 @@
+# Assert the prebuilt assets the worker downloads on demand still exist.
+#
+# `sd_provision.rs` pins a stable-diffusion.cpp release
+# (`DEFAULT_RELEASE_TAG`) and `onnx_provision.rs` pins an ONNX Runtime
+# version (`ORT_VERSION`).  If either constant is bumped without the
+# matching upstream / self-hosted release being published, the worker
+# 404s on a real user's first image / removal job.  This job fails in CI
+# (on any change to those files, plus weekly) instead — turning a
+# runtime outage into a red check.
+
+name: Pinned assets drift
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/engine/sd_provision.rs"
+      - "src/engine/onnx_provision.rs"
+      - ".github/workflows/pinned-assets-drift.yml"
+  schedule:
+    # Weekly, so an upstream deletion is caught even without a code change.
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Pinned prebuilt assets resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: HEAD every pinned prebuilt asset
+        run: |
+          set -euo pipefail
+          tag=$(grep -oP 'DEFAULT_RELEASE_TAG: &str = "\K[^"]+' src/engine/sd_provision.rs)
+          sha=${tag##*-}
+          ort=$(grep -oP 'ORT_VERSION: &str = "\K[^"]+' src/engine/onnx_provision.rs)
+          echo "sd.cpp tag=$tag (sha=$sha), ORT=$ort"
+          urls=(
+            "https://github.com/leejet/stable-diffusion.cpp/releases/download/${tag}/sd-master-${sha}-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip"
+            "https://github.com/webbertakken/studio-worker/releases/download/sdcpp-prebuilt-${tag}/sd-master-${sha}-bin-Linux-aarch64-vulkan.zip"
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ort}/onnxruntime-linux-x64-${ort}.tgz"
+          )
+          fail=0
+          for u in "${urls[@]}"; do
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' "$u")
+            if [ "$code" = "200" ]; then
+              echo "ok   $u"
+            else
+              echo "::error::pinned asset missing (HTTP $code): $u"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::A pinned prebuilt asset no longer resolves. If you bumped DEFAULT_RELEASE_TAG, re-run the sdcpp-prebuilt workflow for the Linux-arm64 build."
+          fi
+          exit $fail

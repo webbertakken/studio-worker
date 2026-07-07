@@ -369,7 +369,7 @@ users can't use studio-registered models.
 
 ## Phase 4 — CI + release integrity
 
-- [ ] 4.1 Tests run only on `ubuntu-latest` (`checks.yml`), yet the
+- [x] 4.1 Tests run only on `ubuntu-latest` (`checks.yml`), yet the
       worker ships platform-specific logic on three OSes (winreg
       autostart, scheduled-task XML, launchd plist, `ExeReplaceGuard`
       park/rename semantics on a real NTFS, path handling). Add
@@ -378,7 +378,7 @@ users can't use studio-registered models.
       (skip the heavy candle/whisper legs there to stay inside the
       free tier; measure minutes before/after). Fix whatever falls
       out.
-- [ ] 4.2 Add a pinned-release drift check: a tiny CI job (or a step
+- [x] 4.2 Add a pinned-release drift check: a tiny CI job (or a step
       in `checks.yml`) that asserts the `sdcpp-prebuilt-<ref>` release
       matching `DEFAULT_RELEASE_TAG` in `sd_provision.rs` exists and
       contains the linux-arm64 asset (plus, after 3.2.2, the bundled
@@ -388,10 +388,10 @@ users can't use studio-registered models.
       `onnx_provision.rs` (a HEAD against the Microsoft release URL).
       Network-dependent → run on a schedule + on changes to the
       pinned constants, not on every PR.
-- [ ] 4.3 After 1.4.1: add a release-time assertion in `release.yml`
+- [x] 4.3 After 1.4.1: add a release-time assertion in `release.yml`
       that checksum assets are present for every installer artifact
       (fail the release, not the updater in the field).
-- [ ] 4.4 Add `cargo-deny` (licence + duplicate-major gate) to the
+- [x] 4.4 Add `cargo-deny` (licence + duplicate-major gate) to the
       weekly audit workflow — low effort, catches licence drift in the
       big engine dep trees. Keep advisories in `cargo-audit` as-is.
 

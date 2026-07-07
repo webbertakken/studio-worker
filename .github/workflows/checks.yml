@@ -74,3 +74,26 @@ jobs:
 
       - name: Run tests
         run: cargo test ${{ matrix.flags }}
+
+  # The worker ships platform-specific code on three OSes (Windows
+  # HKCU-\Run autostart via winreg, the scheduled-task XML, the launchd
+  # plist, and the ExeReplaceGuard park/rename dance on real NTFS), but
+  # the matrix above only runs on Linux.  Exercise the headless core
+  # suite — which includes every one of those unit tests — on Windows +
+  # macOS too.  `--no-default-features` drops llama.cpp (cmake) so these
+  # legs stay fast and inside the free tier.
+  cross-platform:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: cross-${{ matrix.os }}
+      - name: Run tests (headless core)
+        run: cargo test --no-default-features
