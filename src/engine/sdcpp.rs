@@ -94,10 +94,11 @@ impl SdCppEngine {
 
     /// Resolve the `sd-cli` binary, provisioning it on first use.
     /// Resolution order (operator installs win): a cached path from a
-    /// previous job, then env / `<models_root>/bin` / `~/.local/bin` /
-    /// `$PATH`, then an auto-provisioned download into
-    /// `<models_root>/bin/`.  The result is cached for the worker's
-    /// lifetime.
+    /// previous job, then the env override, then the provisioner's own
+    /// `<models_root>/bin` slot (re-provisioned when its release marker
+    /// no longer matches the pin), then `~/.local/bin` / `$PATH`, then
+    /// a fresh auto-provisioned download into `<models_root>/bin/`.  The
+    /// result is cached for the worker's lifetime.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn ensure_sd_cli(&self) -> Result<PathBuf> {
         let mut guard = self.sd_cli.lock();
@@ -106,18 +107,41 @@ impl SdCppEngine {
                 return Ok(p.clone());
             }
         }
-        let resolved = match resolve_sd_cli(&self.models_root) {
+        let slot = self
+            .models_root
+            .join("bin")
+            .join(sd_provision::binary_name());
+        let resolved = match env_sd_cli() {
             Some(p) => {
-                info!(
-                    target: TRACE_TARGET,
-                    op = "resolve",
-                    sd_cli = %p.display(),
-                    "using existing sd-cli"
-                );
+                info!(target: TRACE_TARGET, op = "resolve", sd_cli = %p.display(), source = "env", "using existing sd-cli");
                 p
             }
-            None => sd_provision::provision(&self.models_root)
-                .context("auto-provisioning sd-cli (stable-diffusion.cpp)")?,
+            None if slot.is_file() => match sd_provision::provision(&self.models_root) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        target: TRACE_TARGET,
+                        op = "resolve",
+                        sd_cli = %slot.display(),
+                        error = %e,
+                        "could not refresh the provisioned sd-cli; keeping the installed one"
+                    );
+                    slot
+                }
+            },
+            None => match implicit_sd_cli() {
+                Some(p) => {
+                    info!(
+                        target: TRACE_TARGET,
+                        op = "resolve",
+                        sd_cli = %p.display(),
+                        "using existing sd-cli"
+                    );
+                    p
+                }
+                None => sd_provision::provision(&self.models_root)
+                    .context("auto-provisioning sd-cli (stable-diffusion.cpp)")?,
+            },
         };
         *guard = Some(resolved.clone());
         Ok(resolved)
@@ -624,25 +648,19 @@ fn apply_library_path(cmd: &mut Command, sd_cli: &Path) {
     cmd.env(var, value);
 }
 
-/// Look up `sd-cli` in env override -> `<models_root>/bin` ->
-/// `~/.local/bin` -> `$PATH`.  The `<models_root>/bin` slot is where a
-/// self-provisioned binary lands, so the auto-provisioner can drop it
-/// next to the cached models and have the worker pick it up with no
-/// PATH fiddling.  Excluded from coverage: touches several host paths
-/// only one of which matches per host, and CI doesn't ship `sd-cli`.
+/// The operator's explicit `STUDIO_WORKER_SD_CLI` override, when it names a file.
+/// Excluded from coverage: reads the process environment.
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn resolve_sd_cli(models_root: &Path) -> Option<PathBuf> {
+fn env_sd_cli() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var("STUDIO_WORKER_SD_CLI").ok()?);
+    path.is_file().then_some(path)
+}
+
+/// An implicitly installed `sd-cli`: `~/.local/bin`, then `$PATH`.  Excluded
+/// from coverage: touches host paths, and CI doesn't ship `sd-cli`.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn implicit_sd_cli() -> Option<PathBuf> {
     let bin = sd_provision::binary_name();
-    if let Ok(p) = std::env::var("STUDIO_WORKER_SD_CLI") {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let in_models = models_root.join("bin").join(bin);
-    if in_models.is_file() {
-        return Some(in_models);
-    }
     if let Some(home) = std::env::var_os("HOME") {
         let candidate = PathBuf::from(home).join(".local/bin").join(bin);
         if candidate.is_file() {
@@ -653,7 +671,7 @@ fn resolve_sd_cli(models_root: &Path) -> Option<PathBuf> {
 }
 
 /// `$PATH` lookup for a bare binary name.  Excluded from coverage
-/// for the same reason as `resolve_sd_cli`.
+/// for the same reason as `implicit_sd_cli`.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;

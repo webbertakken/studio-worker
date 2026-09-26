@@ -154,3 +154,63 @@ async fn provision_errors_when_zip_lacks_the_binary() {
         .join(sd_provision::binary_name())
         .exists());
 }
+
+#[tokio::test]
+async fn provision_replaces_a_binary_provisioned_from_another_release() {
+    let _guard = URL_ENV_LOCK.lock().await;
+    let server = MockServer::start().await;
+    // Each release URL is fetched exactly once: the pin bump re-provisions, a repeat does not.
+    Mock::given(method("GET"))
+        .and(match_path("/old.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_release_zip(true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(match_path("/new.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_release_zip(true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let models_root = dir.path().to_path_buf();
+
+    for release in ["old", "new", "new"] {
+        std::env::set_var(URL_ENV, format!("{}/{release}.zip", server.uri()));
+        let root = models_root.clone();
+        detached(move || sd_provision::provision(&root).unwrap());
+    }
+    std::env::remove_var(URL_ENV);
+
+    let marker = models_root.join("bin").join(sd_provision::RELEASE_MARKER);
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap().trim(),
+        format!("{}/new.zip", server.uri())
+    );
+}
+
+#[tokio::test]
+async fn provision_replaces_an_unmarked_binary_in_its_slot() {
+    let _guard = URL_ENV_LOCK.lock().await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(match_path("/sd.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fake_release_zip(true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // A binary provisioned before release markers existed: its release is unknown.
+    std::fs::write(bin.join(sd_provision::binary_name()), b"stale").unwrap();
+
+    std::env::set_var(URL_ENV, format!("{}/sd.zip", server.uri()));
+    let root = dir.path().to_path_buf();
+    let installed = detached(move || sd_provision::provision(&root).unwrap());
+    std::env::remove_var(URL_ENV);
+    assert_eq!(
+        std::fs::read(installed).unwrap(),
+        b"#!/bin/sh\necho fake-sd-cli\n"
+    );
+}

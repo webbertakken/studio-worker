@@ -38,6 +38,17 @@ const TRACE_TARGET: &str = "studio_worker::engine::sd_provision";
 /// known-good sd.cpp commit.
 const DEFAULT_RELEASE_TAG: &str = "master-920-2f88688";
 
+/// File next to a provisioned binary recording the release URL it came from.  A binary whose
+/// marker names a different release (a pin bump, an override) or has no marker (provisioned
+/// before markers existed) is re-provisioned, so bumping the pin reaches existing workers.
+pub const RELEASE_MARKER: &str = ".sd-cli-release";
+
+/// Whether the binary in the provisioner's slot must be (re)fetched to serve `wanted_url`.
+/// Pure over what is on disk so every branch is unit-testable.
+fn needs_provision(binary_present: bool, marker: Option<&str>, wanted_url: &str) -> bool {
+    !binary_present || marker.map(str::trim) != Some(wanted_url)
+}
+
 /// Env override for the release tag.
 const RELEASE_ENV: &str = "STUDIO_WORKER_SDCPP_RELEASE";
 /// Env override for the full zip URL (tests / air-gapped mirrors).
@@ -452,17 +463,19 @@ fn clean_scratch(zip_path: &Path, staging: &Path) {
 pub fn provision(models_root: &Path) -> Result<PathBuf> {
     let target_dir = models_root.join("bin");
     let binary = target_dir.join(binary_name());
-    if binary.is_file() {
+    let marker_path = target_dir.join(RELEASE_MARKER);
+    let url = resolve_url()?;
+    let marker = std::fs::read_to_string(&marker_path).ok();
+    if !needs_provision(binary.is_file(), marker.as_deref(), &url) {
         return Ok(binary);
     }
-
-    let url = resolve_url()?;
     info!(
         target: TRACE_TARGET,
         op = "provision",
         url = %url,
         dest = %target_dir.display(),
-        "sd-cli not found; provisioning stable-diffusion.cpp"
+        previous = marker.as_deref().map(str::trim).unwrap_or(if binary.is_file() { "unmarked" } else { "none" }),
+        "provisioning stable-diffusion.cpp"
     );
 
     std::fs::create_dir_all(models_root)
@@ -487,6 +500,8 @@ pub fn provision(models_root: &Path) -> Result<PathBuf> {
         if !binary.is_file() {
             bail!("sd-cli install left no binary at {}", binary.display());
         }
+        std::fs::write(&marker_path, format!("{url}\n"))
+            .with_context(|| format!("writing {}", marker_path.display()))?;
         Ok(binary.clone())
     })();
 
@@ -521,6 +536,15 @@ fn now_nanos() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn needs_provision_when_missing_unmarked_or_from_another_release() {
+        assert!(needs_provision(false, None, "u"));
+        assert!(needs_provision(false, Some("u"), "u"));
+        assert!(needs_provision(true, None, "u"));
+        assert!(needs_provision(true, Some("old"), "u"));
+        assert!(!needs_provision(true, Some("u\n"), "u"));
+    }
     use std::io::Write;
     use tempfile::tempdir;
 
