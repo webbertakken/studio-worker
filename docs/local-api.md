@@ -28,7 +28,7 @@ it works even when the worker is not registered with any studio.
 | Method | Path            | Auth | Body / params                              | Returns |
 | ------ | --------------- | ---- | ------------------------------------------ | ------- |
 | POST   | `/image`        | yes  | JSON image request (below)                 | image bytes (`image/webp` etc.) |
-| POST   | `/v1/chat/completions` | yes | OpenAI-compatible chat body (`model?`, `messages`, `max_tokens?`, `temperature?`, `top_p?`, `stop?`) | `chat.completion` JSON |
+| POST   | `/v1/chat/completions` | yes | OpenAI-compatible chat body (`model?`, `messages`, `max_tokens?`, `temperature?`, `top_p?`, `stop?`, `chat_template_kwargs?`) | `chat.completion` JSON |
 | POST   | `/tts`          | yes  | `{text, model?, voice?, speed?, language?, ext?}` | audio bytes (`audio/wav` etc.) |
 | POST   | `/stt`          | yes  | `{inputUrl, model?, language?}`            | transcript JSON |
 | POST   | `/video`        | yes  | `{prompt, model?, negativePrompt?, seconds?, width?, height?, ext?}` | video bytes (`video/mp4` etc.) |
@@ -126,6 +126,19 @@ request with no model of that kind in the catalog returns `400`.  The
 `/v1/chat/completions` endpoint returns the engine's JSON verbatim, so
 an OpenAI-style client can point straight at
 `http://127.0.0.1:4787/v1/chat/completions` with the bearer token.
+
+Chat renders the model's own chat template.  `chat_template_kwargs` (as in
+llama-server) overrides the model's `chatTemplateKwargs`, e.g.
+`{"enable_thinking": false}` for a hybrid-reasoning model; a `<think>` block
+in the answer is returned as `reasoning_content`.  `usage` carries real token
+counts, and `finish_reason` is `length` when the budget ran out.  A prompt that
+does not fit the model's `contextSize` is refused, never truncated.
+
+A **loaded** model answers on its own lane, next to any running job and
+without the one-job gate; an unloaded model runs as a transient job (loaded
+for the request, freed after).  Keep a chat model loaded
+(`POST /models/:id/load`) for warm answers.  GPU offload needs a build with
+the `cuda` feature; release builds run LLMs on the CPU.
 
 ## Local model catalog
 

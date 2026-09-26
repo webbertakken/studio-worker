@@ -80,6 +80,8 @@ Every catalogue model has exactly one state. Only the worker changes it.
 - Each loaded model serves on its own lane, alongside transient jobs and other lanes; admission,
   not the job gate, keeps them inside device memory.
 - A lane serves one request at a time; a streaming session holds its lane until it closes.
+- A transient job frees its model when it ends; nothing stays in memory that the host cannot
+  see. Keeping a model warm is what residency is for.
 - A transient job is admitted only if its model fits next to the loaded models; otherwise it is
   refused (`insufficient_memory`) and, for a studio offer, rejected so another worker takes it.
 

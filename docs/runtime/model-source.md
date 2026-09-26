@@ -43,6 +43,14 @@ JSON-serialised on the WS Offer, mirrored on both sides:
 }
 ```
 
+LLM models (`engine: "llama-cpp"`) read two more `cliDefaults`, both optional and
+worker-local (the studio does not send them today):
+
+| Field | Meaning |
+|---|---|
+| `contextSize` | context window in tokens (default 8192, capped at the model's training size) |
+| `chatTemplateKwargs` | variables for the model's chat template, e.g. `{"enable_thinking": false}` |
+
 - TS source of truth: `apps/studio/src/shared/types/worker.ts`
   (`WorkerModelSource` + `WorkerModelFile` + `WorkerModelCliDefaults`).
 - Rust mirror: [`src/types.rs`](../../src/types.rs) (`ModelSource`,
