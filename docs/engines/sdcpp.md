@@ -45,9 +45,11 @@ side is kind-based, not model-based.
 worker's lifetime) via `ensure_sd_cli`:
 
 1. A path cached from a previous job (if still a file).
-2. `$STUDIO_WORKER_SD_CLI` -> `<models_root>/bin/sd-cli` ->
-   `~/.local/bin/sd-cli` -> `$PATH` - any operator install wins.
-3. **Auto-provision**: if nothing resolves, download the platform's
+2. `$STUDIO_WORKER_SD_CLI` - the operator's explicit override.
+3. `<models_root>/bin/sd-cli` - the provisioner's own slot, re-provisioned
+   first when its release marker no longer matches the pinned release.
+4. `~/.local/bin/sd-cli` -> `$PATH` - an implicit operator install.
+5. **Auto-provision**: if nothing resolves, download the platform's
    prebuilt stable-diffusion.cpp Vulkan build and extract it into
    `<models_root>/bin/` (see [auto-provisioning](#auto-provisioning)).
 
@@ -66,7 +68,13 @@ On the first image job with no resolvable `sd-cli`, the engine:
    (`stable-diffusion.dll` / `libstable-diffusion.so` / `.dylib`)
    flat into `<models_root>/bin/` (the path-free slot the resolver
    prefers).  Flattening to bare file names also defuses zip-slip.
-3. On Linux / macOS the per-job `Command` gets `LD_LIBRARY_PATH` /
+3. Writes `<models_root>/bin/.sd-cli-release` with the release URL it
+   installed.  A later job whose pinned (or overridden) release differs
+   from the marker - or finds a binary with no marker - re-provisions,
+   so bumping `DEFAULT_RELEASE_TAG` reaches workers that provisioned an
+   older build.  If the refresh fails (offline) the installed binary
+   keeps serving and the failure is logged.
+4. On Linux / macOS the per-job `Command` gets `LD_LIBRARY_PATH` /
    `DYLD_LIBRARY_PATH` pointed at that dir so the loader finds the
    sibling library; Windows resolves sibling DLLs automatically.
 

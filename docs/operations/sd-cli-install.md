@@ -126,10 +126,12 @@ needed.
 
 On the first image job the engine resolves `sd-cli` in this order:
 
-1. `$STUDIO_WORKER_SD_CLI` env var (absolute path; operator override)
-2. `<models_root>/bin/sd-cli` - where the auto-provisioner installs,
-   and where you can drop your own binary (default `~/models/bin/`)
-   for a PATH-free override
+1. `$STUDIO_WORKER_SD_CLI` env var (absolute path; the operator override,
+   including a PATH-free one)
+2. `<models_root>/bin/sd-cli` - the auto-provisioner's slot (default
+   `~/models/bin/`); it records the release it installed in
+   `.sd-cli-release` and re-provisions when the pin changes, so do not
+   drop your own binary here
 3. `~/.local/bin/sd-cli` (matches the playbook above)
 4. `sd-cli` on `$PATH`
 
