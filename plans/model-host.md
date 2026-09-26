@@ -47,8 +47,9 @@ Design: [`docs/runtime/model-lifecycle.md`](../docs/runtime/model-lifecycle.md).
 
 ## Phase 4 - release
 
-- [ ] 4.1 PR, release through release-please, install, verify `/healthz` version.
+- [x] 4.1 PR, release through release-please, install, verify `/healthz` version (#133,
+      released in 0.4.9; 0.4.11 installed, `/healthz` 0.4.11).
 
 ## Fold-back
 
-- [ ] F.1 Docs match what shipped; symbols and links verified.
+- [x] F.1 Docs match what shipped; symbols and links verified.
