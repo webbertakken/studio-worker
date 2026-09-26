@@ -97,6 +97,7 @@ impl EngineCapabilities {
 
 #[cfg(feature = "image-candle")]
 pub mod candle_image;
+pub mod chat_template;
 pub mod download;
 // llama-cpp-2 doesn't link on Windows MSVC (see Cargo.toml), so the
 // `llama` feature is a no-op there even when enabled via `--features all`.
