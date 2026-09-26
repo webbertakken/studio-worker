@@ -12,6 +12,7 @@
 // `cargo +nightly llvm-cov` fails to compile the crate (E0658).
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod admission;
 pub mod auto_register;
 pub mod autostart;
 pub mod catalog;

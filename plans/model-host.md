@@ -21,7 +21,7 @@ Design: [`docs/runtime/model-lifecycle.md`](../docs/runtime/model-lifecycle.md).
 
 - [x] 1.1 Lifecycle state machine (pure): states, transitions, guards, exclusive groups.
 - [x] 1.2 Residency store (`residency.json`) with load/save and tracing breadcrumbs.
-- [ ] 1.3 Admission: free-memory probe + safety margin, named refusal.
+- [x] 1.3 Admission: free-memory probe + safety margin, named refusal.
 - [ ] 1.4 Model host: owns loaded models and lanes, drives the state machine, restores residents.
 - [ ] 1.5 Local API routes: state in `GET /models`, `GET /models/:id/state`, load, unload.
 - [ ] 1.6 LLM engine on the host: CUDA, the model's own chat template, configurable context,
