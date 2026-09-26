@@ -23,6 +23,7 @@ pub mod host;
 pub mod http;
 pub mod job_gate;
 pub mod job_log;
+pub mod job_run;
 pub mod lifecycle;
 pub mod loaders;
 pub mod local;
@@ -37,6 +38,7 @@ pub mod sys;
 pub mod telemetry;
 #[doc(hidden)]
 pub mod test_support;
+pub mod thumbnail;
 pub mod types;
 #[cfg(feature = "ui")]
 pub mod ui;

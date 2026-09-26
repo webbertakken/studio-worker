@@ -11,7 +11,8 @@ use chrono::Utc;
 
 use crate::catalog::Catalog;
 use crate::engine::Engine;
-use crate::runtime::{record_local_job, truncate_prompt, JobOutcome, RecentJob, WorkerObservers};
+use crate::job_run::JobRun;
+use crate::runtime::{truncate_prompt, CurrentJob, JobOutcome, JobSource, WorkerObservers};
 use crate::types::{ImageParams, Task, TaskKind, TaskResult};
 
 /// A local image-generation request. Optional fields fall back to the model's
@@ -142,37 +143,42 @@ pub fn chat_on_lane(
     if model.kind != TaskKind::Llm {
         return None;
     }
-    let job_id = next_job_id();
-    let started_at = Utc::now();
     let served = host.with_lane(&model.id, |loaded, lane| {
-        loaded
-            .as_chat()
-            .map(|chat| chat.chat(params, &|| lane.cancelled()))
+        let chat = loaded.as_chat()?;
+        let run = JobRun::begin(
+            observers,
+            CurrentJob {
+                job_id: next_job_id(),
+                kind: TaskKind::Llm,
+                model: model.id.clone(),
+                prompt: truncate_prompt(prompt_preview),
+                started_at: Utc::now(),
+                source: JobSource::Lane,
+            },
+        );
+        let result = run
+            .span()
+            .in_scope(|| chat.chat(params, &|| lane.cancelled()));
+        Some((run, result))
     });
-    let result = match served {
-        Ok(Some(result)) => result.map(|json| TaskResult::Llm { json }),
+    let (run, result) = match served {
+        Ok(Some(served)) => served,
         // Not loaded, or loaded but not a chat model: the transient path decides.
         Ok(None) | Err(_) => return None,
     };
-    let outcome = match &result {
+    let result = result.map(|json| TaskResult::Llm { json });
+    run.finish(outcome_of(&result));
+    Some(result.map_err(|err| LocalError::Engine(err.to_string())))
+}
+
+/// The outcome a finished job is recorded with.
+fn outcome_of<E: std::fmt::Display>(result: &Result<TaskResult, E>) -> JobOutcome {
+    match result {
         Ok(_) => JobOutcome::Completed,
         Err(err) => JobOutcome::Failed {
             reason: err.to_string(),
         },
-    };
-    record_local_job(
-        observers,
-        RecentJob {
-            job_id,
-            kind: TaskKind::Llm,
-            model: model.id.clone(),
-            prompt: truncate_prompt(prompt_preview),
-            outcome,
-            started_at,
-            finished_at: Utc::now(),
-        },
-    );
-    Some(result.map_err(|err| LocalError::Engine(err.to_string())))
+    }
 }
 
 /// Dispatch `task` on `model` and record the finished job in the
@@ -185,30 +191,24 @@ fn dispatch_and_record(
     prompt_preview: &str,
     task: Task,
 ) -> Result<TaskResult, LocalError> {
-    let kind = task.kind();
-    let job_id = next_job_id();
-    let started_at = Utc::now();
-    let result = engine.dispatch_with_source(&model.id, task, &model.source);
-    let finished_at = Utc::now();
-
-    let outcome = match &result {
-        Ok(_) => JobOutcome::Completed,
-        Err(err) => JobOutcome::Failed {
-            reason: err.to_string(),
-        },
-    };
-    record_local_job(
+    let run = JobRun::begin(
         observers,
-        RecentJob {
-            job_id,
-            kind,
+        CurrentJob {
+            job_id: next_job_id(),
+            kind: task.kind(),
             model: model.id.clone(),
             prompt: truncate_prompt(prompt_preview),
-            outcome,
-            started_at,
-            finished_at,
+            started_at: Utc::now(),
+            source: JobSource::Local,
         },
     );
+    let result = run
+        .span()
+        .in_scope(|| engine.dispatch_with_source(&model.id, task, &model.source));
+    if let Ok(result) = &result {
+        run.keep_thumbnail(result);
+    }
+    run.finish(outcome_of(&result));
 
     result.map_err(|err| LocalError::Engine(err.to_string()))
 }
@@ -278,6 +278,69 @@ mod tests {
         assert_eq!(job.prompt, "a red fox");
         // The studio ring stays empty — local jobs are their own queue.
         assert!(observers.recent_jobs.lock().is_empty());
+    }
+
+    #[test]
+    fn an_image_job_keeps_a_thumbnail_and_a_job_log() {
+        crate::test_support::install_job_log_capture();
+        let engine = SyntheticEngine::new();
+        let catalog = catalog_with(vec![synthetic_model("img", TaskKind::Image)]);
+        let observers = WorkerObservers::default();
+        let req = LocalImageRequest {
+            prompt: "a lighthouse".into(),
+            ..Default::default()
+        };
+        run_image(&engine, &catalog, &observers, &req).unwrap();
+
+        let job = observers.local_jobs.lock()[0].clone();
+        assert_eq!(job.source, JobSource::Local);
+        assert!(observers.thumbnails.contains(&job.job_id));
+        assert!(observers.active_jobs.lock().is_empty());
+        let log = crate::job_log::global().get(&job.job_id).expect("job log");
+        assert!(log.lines[0].message.starts_with("job started"));
+        assert!(log
+            .lines
+            .last()
+            .is_some_and(|l| l.message.starts_with("job finished")));
+    }
+
+    #[test]
+    fn a_chat_on_a_loaded_model_is_recorded_as_a_lane_job() {
+        let mut model = synthetic_model("chat", TaskKind::Llm);
+        model.source.engine = ModelEngine::LlamaCpp;
+        let catalog = catalog_with(vec![model]);
+        let shared = std::sync::Arc::new(parking_lot::Mutex::new(catalog.clone()));
+        let host = crate::host::ModelHost::new(
+            shared,
+            std::sync::Arc::new(crate::test_support::InstantRuntime),
+            std::sync::Arc::new(crate::test_support::FixedProbe(20.0)),
+            crate::residency::Residency::load_for_serving(None),
+        );
+        host.load("chat").unwrap();
+        host.wait_for(
+            "chat",
+            crate::lifecycle::ModelState::serves,
+            std::time::Duration::from_secs(5),
+        )
+        .expect("loaded");
+        let observers = WorkerObservers::default();
+        let params = crate::types::LlmParams {
+            messages: vec![crate::types::ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+            ..Default::default()
+        };
+
+        let answer = chat_on_lane(&host, &catalog, &observers, None, "hello", params)
+            .expect("served on the lane")
+            .unwrap();
+
+        assert!(matches!(answer, TaskResult::Llm { .. }));
+        let job = observers.local_jobs.lock()[0].clone();
+        assert_eq!(job.source, JobSource::Lane);
+        assert_eq!(job.outcome, JobOutcome::Completed);
+        assert!(observers.active_jobs.lock().is_empty());
     }
 
     #[test]

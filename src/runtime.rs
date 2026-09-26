@@ -51,15 +51,43 @@ pub const PROMPT_PREVIEW_CHARS: usize = 200;
 /// loss.
 pub const LOG_SHIP_QUEUE_CAP: usize = 5_000;
 
-/// Job in flight right now.  Populated by the WS session before
-/// dispatch, cleared once the job finishes (success or failure).
-#[derive(Debug, Clone)]
+/// Where a job came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobSource {
+    /// An offer from the studio.
+    #[default]
+    Studio,
+    /// A local API request run as a transient job.
+    Local,
+    /// A local API request served on a loaded model's lane.
+    Lane,
+    /// A streaming speech session on the LAN listener.
+    Stream,
+}
+
+impl JobSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobSource::Studio => "studio",
+            JobSource::Local => "local",
+            JobSource::Lane => "lane",
+            JobSource::Stream => "stream",
+        }
+    }
+}
+
+/// A job in flight.  The studio's job also sits in
+/// `WorkerObservers::current_job` (the heartbeat reports it); every running
+/// job, whatever its source, sits in `WorkerObservers::active_jobs`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CurrentJob {
     pub job_id: String,
     pub kind: TaskKind,
     pub model: String,
     pub prompt: String,
     pub started_at: DateTime<Utc>,
+    pub source: JobSource,
 }
 
 /// Outcome a finished job ended with.  Failures carry the human
@@ -71,7 +99,7 @@ pub enum JobOutcome {
 }
 
 /// One finished job, retained in the recent-jobs ring for the UI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecentJob {
     pub job_id: String,
     pub kind: TaskKind,
@@ -80,6 +108,7 @@ pub struct RecentJob {
     pub outcome: JobOutcome,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    pub source: JobSource,
 }
 
 /// Result of the most recent heartbeat the WS session sent.
@@ -148,6 +177,10 @@ pub struct HeartbeatStatus {
 #[derive(Clone, Default)]
 pub struct WorkerObservers {
     pub current_job: Arc<Mutex<Option<CurrentJob>>>,
+    /// Every running job, whatever its source (see [`crate::job_run::JobRun`]).
+    pub active_jobs: Arc<Mutex<Vec<CurrentJob>>>,
+    /// Thumbnails of recent image jobs.
+    pub thumbnails: crate::thumbnail::Thumbnails,
     pub recent_jobs: Arc<Mutex<VecDeque<RecentJob>>>,
     /// Finished jobs submitted to the local API (the in-app "local queue"),
     /// kept separate from studio-claimed jobs.
@@ -173,6 +206,22 @@ pub struct WorkerObservers {
     /// (which is drained every second) so the display doesn't blank
     /// out between ticks.
     pub recent_logs: Arc<Mutex<VecDeque<LogEntry>>>,
+    /// Entries ever pushed into `recent_logs`; the newest entry's sequence
+    /// number.  Written under the `recent_logs` lock.
+    pub recent_logs_seq: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Entries of `recent_logs` newer than sequence number `after`, and the
+/// newest sequence number.  A client passes the returned number back as
+/// `after` next time to receive only what is new; an `after` beyond the
+/// newest number (the daemon restarted) answers the whole ring.
+pub fn recent_logs_after(observers: &WorkerObservers, after: u64) -> (Vec<LogEntry>, u64) {
+    let ring = observers.recent_logs.lock();
+    let newest = observers.recent_logs_seq.load(Ordering::SeqCst);
+    let oldest = newest - ring.len() as u64;
+    let after = if after > newest { 0 } else { after.max(oldest) };
+    let skip = (after - oldest) as usize;
+    (ring.iter().skip(skip).cloned().collect(), newest)
 }
 
 /// Record the WS lifecycle state for the UI to read.
@@ -309,6 +358,7 @@ pub fn push_recent_job_for_tests(observers: &WorkerObservers, job_id: &str) {
             outcome: JobOutcome::Completed,
             started_at: now,
             finished_at: now,
+            source: JobSource::Studio,
         },
     );
 }
@@ -1362,6 +1412,7 @@ pub fn push_log_with_observers(
     }
     if let Some(o) = observers {
         let mut ring = o.recent_logs.lock();
+        o.recent_logs_seq.fetch_add(1, Ordering::SeqCst);
         ring.push_back(entry);
         while ring.len() > RECENT_LOGS_CAP {
             ring.pop_front();
@@ -1389,6 +1440,42 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::engine::SyntheticEngine;
+
+    fn push_messages(observers: &WorkerObservers, count: usize) {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        for i in 0..count {
+            push_log_with_observers(&logs, Some(observers), "info", "t", &format!("m{i}"), None);
+        }
+    }
+
+    #[test]
+    fn recent_logs_after_answers_only_newer_entries() {
+        let observers = WorkerObservers::default();
+        push_messages(&observers, 3);
+        let (all, newest) = recent_logs_after(&observers, 0);
+        assert_eq!((all.len(), newest), (3, 3));
+        let (newer, _) = recent_logs_after(&observers, 2);
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].message, "m2");
+        assert!(recent_logs_after(&observers, 3).0.is_empty());
+    }
+
+    #[test]
+    fn recent_logs_after_a_restart_answers_the_whole_ring() {
+        let observers = WorkerObservers::default();
+        push_messages(&observers, 2);
+        assert_eq!(recent_logs_after(&observers, 99).0.len(), 2);
+    }
+
+    #[test]
+    fn recent_logs_after_skips_entries_that_left_the_ring() {
+        let observers = WorkerObservers::default();
+        push_messages(&observers, RECENT_LOGS_CAP + 5);
+        let (all, newest) = recent_logs_after(&observers, 0);
+        assert_eq!(all.len(), RECENT_LOGS_CAP);
+        assert_eq!(all[0].message, "m5");
+        assert_eq!(newest, (RECENT_LOGS_CAP + 5) as u64);
+    }
 
     #[test]
     fn is_unsupported_kind_detects_typed_unsupported_task() {

@@ -18,15 +18,15 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument as _};
 
 use crate::config::SharedConfig;
 use crate::engine::Engine;
 use crate::http::ApiClient;
+use crate::job_run::JobRun;
 use crate::runtime::{
-    is_unsupported_kind, prompt_for, push_log_with_observers, record_recent_job, set_session_state,
-    truncate_prompt, wait_with_stop, CurrentJob, JobOutcome, RecentJob, SessionState,
-    WorkerObservers,
+    is_unsupported_kind, prompt_for, push_log_with_observers, set_session_state, truncate_prompt,
+    wait_with_stop, CurrentJob, JobOutcome, JobSource, SessionState, WorkerObservers,
 };
 use crate::types::{LogEntry, TaskResult};
 use crate::ws::client::{connect, WsClientError, WsResult, WsSender};
@@ -742,24 +742,23 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             return;
         }
 
-        // Surface the job to the UI's Jobs tab — bounded preview only.
-        *ctx.observers.current_job.lock() = Some(CurrentJob {
+        // Surface the job to the UI — bounded preview only.  The heartbeat
+        // reports `current_job`; `JobRun` lists it with every other job
+        // and scopes its log.
+        let current = CurrentJob {
             job_id: job_id.clone(),
             kind: task_kind,
             model: job.model.clone(),
-            prompt: prompt_preview.clone(),
+            prompt: prompt_preview,
             started_at,
-        });
-
-        run_offered_job(
-            &ctx,
-            job,
-            started_at,
-            task_kind,
-            full_prompt,
-            prompt_preview,
-        )
-        .await;
+            source: JobSource::Studio,
+        };
+        *ctx.observers.current_job.lock() = Some(current.clone());
+        let run = JobRun::begin(&ctx.observers, current);
+        let span = run.span().clone();
+        run_offered_job(&ctx, job, run, task_kind, full_prompt)
+            .instrument(span)
+            .await;
     });
 }
 
@@ -789,10 +788,9 @@ fn spawn_reject_offer(
 async fn run_offered_job(
     ctx: &SessionContext,
     job: crate::types::JobClaim,
-    started_at: chrono::DateTime<chrono::Utc>,
+    run: JobRun,
     task_kind: crate::types::TaskKind,
     full_prompt: String,
-    prompt_preview: String,
 ) {
     let start = std::time::Instant::now();
     // Pass the studio's `ModelSource` to the engine so sd-cpp /
@@ -804,8 +802,15 @@ async fn run_offered_job(
         let model_source = job.model_source.clone();
         let task_for_engine = job.task.clone();
         let engine = ctx.engine.clone();
+        let span = run.span().clone();
+        let thumbnail = run.thumbnail_keeper();
         move || -> Result<TaskResult> {
-            engine.dispatch_with_source(&model, task_for_engine, &model_source)
+            let result = span
+                .in_scope(|| engine.dispatch_with_source(&model, task_for_engine, &model_source));
+            if let Ok(result) = &result {
+                thumbnail.keep(result);
+            }
+            result
         }
     })
     .await;
@@ -874,20 +879,9 @@ async fn run_offered_job(
     };
 
     // Surface the finished job to the UI: clear the current-job slot
-    // and push a RecentJob entry into the ring.
+    // and record the job in the recent ring.
     *ctx.observers.current_job.lock() = None;
-    record_recent_job(
-        &ctx.observers,
-        RecentJob {
-            job_id: job_id.clone(),
-            kind: task_kind,
-            model: job.model.clone(),
-            prompt: prompt_preview,
-            outcome,
-            started_at,
-            finished_at: chrono::Utc::now(),
-        },
-    );
+    run.finish(outcome);
 }
 
 /// Deliver a successful engine result to the studio and return the
@@ -1395,6 +1389,7 @@ mod tests {
             model: "synthetic".into(),
             prompt: "prompt".into(),
             started_at: chrono::Utc::now(),
+            source: crate::runtime::JobSource::Studio,
         });
         assert_eq!(
             heartbeat_current_job_id(&observers).as_deref(),

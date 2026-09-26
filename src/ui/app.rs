@@ -531,6 +531,7 @@ mod tests {
             outcome: crate::runtime::JobOutcome::Completed,
             started_at: now,
             finished_at: now,
+            source: crate::runtime::JobSource::Studio,
         }
     }
 

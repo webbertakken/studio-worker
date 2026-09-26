@@ -9,7 +9,8 @@
 use super::session::{ClientFrame, Next, ServerFrame, StreamSession};
 pub use super::tokens::StreamTokens;
 use crate::host::{Lane, LoadedModel, ModelHost};
-use crate::runtime::{record_local_job, truncate_prompt, JobOutcome, RecentJob, WorkerObservers};
+use crate::job_run::JobRun;
+use crate::runtime::{CurrentJob, JobOutcome, JobSource, WorkerObservers};
 use crate::types::TaskKind;
 use chrono::Utc;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -169,37 +170,44 @@ fn session(
         return;
     }
     tracing::info!(target: TRACE_TARGET, op = "stream", %peer, model = %model, "stream opened");
-    match host.try_with_lane(&model, |loaded, lane| run(&mut ws, loaded, lane)) {
-        Ok(summary) => {
+    let served = host.try_with_lane(&model, |loaded, lane| {
+        let job = JobRun::begin(
+            observers,
+            CurrentJob {
+                job_id: crate::local::next_job_id(),
+                kind: TaskKind::AudioStt,
+                model: model.clone(),
+                prompt: String::new(),
+                started_at,
+                source: JobSource::Stream,
+            },
+        );
+        let summary = job.span().in_scope(|| run(&mut ws, loaded, lane));
+        (job, summary)
+    });
+    match served {
+        Ok((mut job, summary)) => {
             let outcome = match &summary.error {
                 Some(reason) => JobOutcome::Failed {
                     reason: reason.clone(),
                 },
                 None => JobOutcome::Completed,
             };
-            tracing::info!(
-                target: TRACE_TARGET,
-                op = "stream",
-                %peer,
-                model = %model,
-                audio_ms = summary.audio_bytes / 32,
-                final_chars = summary.final_text.as_ref().map_or(0, String::len),
-                error = summary.error.as_deref().unwrap_or(""),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "stream closed"
-            );
-            record_local_job(
-                observers,
-                RecentJob {
-                    job_id: crate::local::next_job_id(),
-                    kind: TaskKind::AudioStt,
-                    model,
-                    prompt: truncate_prompt(summary.final_text.as_deref().unwrap_or("")),
-                    outcome,
-                    started_at,
-                    finished_at: Utc::now(),
-                },
-            );
+            job.span().in_scope(|| {
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    op = "stream",
+                    %peer,
+                    model = %model,
+                    audio_ms = summary.audio_bytes / 32,
+                    final_chars = summary.final_text.as_ref().map_or(0, String::len),
+                    error = summary.error.as_deref().unwrap_or(""),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "stream closed"
+                );
+            });
+            job.set_prompt(summary.final_text.as_deref().unwrap_or(""));
+            job.finish(outcome);
         }
         Err(err) => {
             tracing::info!(target: TRACE_TARGET, op = "stream", %peer, model = %model, error = %err, "stream refused");
@@ -468,6 +476,8 @@ mod tests {
                 assert_eq!(job.kind, TaskKind::AudioStt);
                 assert_eq!(job.model, "stt-a");
                 assert_eq!(job.prompt, "w1");
+                assert_eq!(job.source, crate::runtime::JobSource::Stream);
+                assert!(h.observers.active_jobs.lock().is_empty());
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "never recorded");

@@ -248,6 +248,7 @@ mod tests {
             model: "synthetic".into(),
             prompt: "a tree".into(),
             started_at: Utc::now(),
+            source: crate::runtime::JobSource::Studio,
         });
         let view = JobsView::build(&observers, Utc::now());
         let current = view.current.expect("current must be Some");
@@ -272,6 +273,7 @@ mod tests {
                 outcome: JobOutcome::Completed,
                 started_at: now,
                 finished_at: now,
+                source: crate::runtime::JobSource::Studio,
             });
             ring.push_front(RecentJob {
                 job_id: "j-2".into(),
@@ -283,6 +285,7 @@ mod tests {
                 },
                 started_at: now,
                 finished_at: now,
+                source: crate::runtime::JobSource::Studio,
             });
         }
         let view = JobsView::build(&empty_observers_with_data(observers), Utc::now());
@@ -313,6 +316,7 @@ mod tests {
                 outcome: JobOutcome::Completed,
                 started_at: now,
                 finished_at: now,
+                source: crate::runtime::JobSource::Studio,
             });
         }
         let view = JobsView::build(&empty_observers_with_data(observers), Utc::now());
