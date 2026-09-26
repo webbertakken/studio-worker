@@ -39,6 +39,7 @@ it works even when the worker is not registered with any studio.
 | POST   | `/models`       | yes  | a catalog model (same `ModelSource` shape) | `{"ok":true}` |
 | DELETE | `/models/:id`   | yes  | —                                          | `{"ok":true}` / 404; unloads it first |
 | GET    | `/jobs`         | yes  | —                                          | recent local jobs as JSON |
+| POST   | `/stream-tokens` | yes | `{model, ttlSecs?}`                     | `{token, model, expiresAt, port, path}` for the LAN stream listener |
 | GET    | `/healthz`      | no   | —                                          | runtime snapshot (below) |
 
 ### Model lifecycle
@@ -60,6 +61,42 @@ curl -s -X POST "$(jq -r .url $DISCOVERY)/models/qwen3.5-0.8b/load" \
   -H "authorization: Bearer $(jq -r .token $DISCOVERY)"
 # {"id":"qwen3.5-0.8b","state":"loading","resident":true,"since":"..."}
 ```
+
+### Streaming speech-to-text
+
+Loaded streaming speech models (`engine: "parakeet"`) are served on a second
+listener that binds the **LAN** (`0.0.0.0:4798`; `stream_port` in config or
+`STUDIO_WORKER_STREAM_PORT`), so a phone on the same network can stream to it.
+It accepts only short-lived **stream tokens**, minted here with the install
+token, so the install token never leaves the host:
+
+```bash
+curl -s -X POST "$(jq -r .url $DISCOVERY)/stream-tokens" \
+  -H "authorization: Bearer $(jq -r .token $DISCOVERY)" \
+  -H 'content-type: application/json' -d '{"model":"nemotron-3.5-stream"}'
+# {"token":"…","model":"nemotron-3.5-stream","expiresAt":"…","port":4798,"path":"/transcribe"}
+```
+
+A token lives 10 minutes by default (`ttlSecs`, clamped to 30 s–1 h); the holder
+mints a fresh one before it expires.  Errors: `404 unknown_model`,
+`400 not_a_stream_model`, `503 stream_listener_down`.
+
+Then `ws://<host>:4798/transcribe?token=<token>`:
+
+| Direction | Frame | Meaning |
+| --- | --- | --- |
+| client -> worker | binary | 16 kHz mono s16le PCM |
+| client -> worker | text `end` | finalise: flush, send the final, close |
+| client -> worker | text `cancel` | close without a final |
+| worker -> client | `{"partial":true,"text":…}` | the transcript so far |
+| worker -> client | `{"final":true,"text":…}` | the settled transcript, then close |
+| worker -> client | `{"error":…}` | e.g. not loaded, busy, model unloaded |
+
+After speech, 1.5 s of silence finalises by itself (energy VAD, RMS 0.018 over
+200 ms windows).  One session per model at a time; a second gets
+`busy`.  Unloading the model ends a session with `model unloaded`.  A bad or
+expired token is refused at the handshake (401); any other path is 404.
+Every session is recorded in the local queue.
 
 ### Health snapshot
 
@@ -145,8 +182,11 @@ the `cuda` feature; release builds run LLMs on the CPU.
 Models live in a local catalog at `<config dir>/models.json`
 (`~/.config/minis-studio-worker/models.json` on Linux). It mirrors the studio's
 model registry: each entry carries the same `ModelSource` (engine + files +
-`cliDefaults`) the studio would send on a job. The catalog is **seeded with
-Z-Image-Turbo** on first run, and the files are downloaded on demand into
+`cliDefaults`) the studio would send on a job. The catalog is **seeded** with
+Z-Image-Turbo (image), Qwen3.5 0.8B (small LLM, reasoning off, 32K context),
+Nemotron 3.5 streaming and Parakeet EOU (streaming speech, one loaded at a time)
+— seeds a catalogue lacks are added at startup, except ones the operator deleted
+(`dismissedSeeds`) — and the files are downloaded on demand into
 `models_root` (`~/models`) the first time a model is used — exactly as a
 studio-driven job would.
 

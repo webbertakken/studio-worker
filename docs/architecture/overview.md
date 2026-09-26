@@ -148,6 +148,11 @@ src/
 ├── residency.rs      Persisted resident set (residency.json).
 ├── admission.rs      Free-device-memory probe + admission with a safety margin.
 ├── loaders.rs        In-process loaders per engine, behind the host's ModelRuntime.
+├── stt_stream/       Streaming speech-to-text served on the LAN.
+│   ├── session.rs    The /transcribe protocol over any streaming transcriber (pure).
+│   ├── vad.rs        Energy voice-activity detection (hands-free finalise).
+│   ├── tokens.rs     Short-lived stream tokens (stored hashed).
+│   └── server.rs     LAN WebSocket listener; one session per loaded model's lane.
 ├── service.rs        Per-OS service file writers (systemd --user / launchd / schtasks XML).
 ├── autostart.rs      Cross-OS "run in tray on login" toggle (logged; desktop UI calls it).
 ├── update.rs         GitHub release feed poll + installer script download + re-exec on success.
@@ -165,7 +170,9 @@ src/
 │   ├── chat_template.rs  The model's own Jinja chat template (minijinja + pycompat).
 │   ├── download.rs   Shared model-file provisioning (cache, size + sha256 checks).
 │   ├── sd_provision.rs  Auto-provisioned sd-cli binary + Vulkan preflight.
-│   ├── onnx.rs / onnx_provision.rs  (feature `image-onnx`) ONNX Runtime image engine.
+│   ├── onnx.rs       (feature `image-onnx`) ONNX Runtime image engine (LaMa).
+│   ├── onnx_provision.rs  Shared ONNX Runtime, provisioned at runtime (CPU or CUDA flavour).
+│   └── parakeet.rs   (feature `stt-stream`) streaming speech models (Nemotron, Parakeet EOU).
 │   ├── whisper.rs    (feature `whisper`) whisper-rs wrapper for STT.
 │   ├── candle_image.rs (feature `image-candle`) candle-transformers SD pipeline.
 │   ├── video.rs      (feature `video`) animated-GIF video stand-in (no ffmpeg).

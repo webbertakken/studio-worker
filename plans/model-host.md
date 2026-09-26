@@ -30,11 +30,11 @@ Design: [`docs/runtime/model-lifecycle.md`](../docs/runtime/model-lifecycle.md).
 
 ## Phase 2 - streaming speech-to-text
 
-- [ ] 2.1 `stt-stream` engine over `parakeet-rs` (Nemotron + EOU) as loadable models.
-- [ ] 2.2 Stream tokens: `POST /stream-tokens` mints a short-lived token for one model.
-- [ ] 2.3 LAN streaming listener (WebSocket, PCM16 16 kHz mono in, partial/final text out),
+- [x] 2.1 `stt-stream` engine over `parakeet-rs` (Nemotron + EOU) as loadable models.
+- [x] 2.2 Stream tokens: `POST /stream-tokens` mints a short-lived token for one model.
+- [x] 2.3 LAN streaming listener (WebSocket, PCM16 16 kHz mono in, partial/final text out),
       accepting stream tokens only.
-- [ ] 2.4 Catalogue seeds for both models with checksummed downloads.
+- [x] 2.4 Catalogue seeds for both models with checksummed downloads.
 
 ## Phase 3 - daemon and tray UI
 
