@@ -1,8 +1,10 @@
-//! Config tab — the operator-editable subset of [`Config`] as widgets.
+//! Config: the operator-editable subset of [`Config`] as widgets.
 //! The daemon owns the config: Save sends the edit to it
 //! (`PUT /daemon/config`), which validates, saves and applies it; the
 //! answer comes back through [`ConfigDraft::saved`] or
-//! [`ConfigDraft::save_failed`].
+//! [`ConfigDraft::save_failed`].  The window's own preferences (theme,
+//! reduce motion, notifications) sit on the same page but are applied and
+//! stored at once (see `ui::prefs`).
 //!
 //! Internal state (`worker_id`, `auth_token`, `install_id`,
 //! `registration_*`) is deliberately not surfaced here.  The
@@ -14,7 +16,9 @@ use eframe::egui;
 
 use crate::config::{self, default_models_root, Config};
 
-use super::super::notifier::NotificationPrefs;
+use super::super::prefs::UiPrefs;
+use super::super::theme::{Palette, ThemeChoice, Tone};
+use super::super::widgets;
 
 /// Buffer the user is editing.  `dirty` is true when any field
 /// differs from `original`; Save / Reset clear it.
@@ -86,133 +90,197 @@ fn configs_equal(a: &Config, b: &Config) -> bool {
     config::changed_fields(a, b).is_empty()
 }
 
-/// Draw the tab; answers the config to send to the daemon when the
-/// operator pressed Save.
+/// What the save footer says about the draft, and its tone.
+pub fn save_state(draft: &ConfigDraft) -> (String, Tone) {
+    if draft.pending {
+        ("Saving\u{2026}".into(), Tone::Busy)
+    } else if let Some(err) = &draft.last_save_error {
+        (format!("Not saved: {err}"), Tone::Bad)
+    } else if draft.dirty() {
+        ("Unsaved changes".into(), Tone::Busy)
+    } else {
+        ("Up to date".into(), Tone::Neutral)
+    }
+}
+
+/// What the operator did on the page.
+#[derive(Debug, Default)]
+pub struct ConfigOutcome {
+    /// The config to send to the daemon: Save was pressed.
+    pub save: Option<Config>,
+    /// A window preference changed: apply and store it.
+    pub prefs_changed: bool,
+}
+
+/// Draw the page.
 pub fn render(
     ui: &mut egui::Ui,
     draft: &mut ConfigDraft,
     config_path: &Path,
-    notification_prefs: &mut NotificationPrefs,
-) -> Option<Config> {
-    let mut save_requested = None;
-    ui.heading("Configuration");
-    ui.label(
-        egui::RichText::new(format!("{}", config_path.display()))
-            .color(egui::Color32::from_gray(150))
-            .small(),
-    );
-    ui.add_space(8.0);
+    prefs: &mut UiPrefs,
+) -> ConfigOutcome {
+    let mut outcome = ConfigOutcome::default();
+    egui::Panel::bottom("config-footer")
+        .frame(
+            egui::Frame::new()
+                .fill(Palette::of_ui(ui).page)
+                .inner_margin(egui::Margin::symmetric(0, 10)),
+        )
+        .exact_size(FOOTER_HEIGHT)
+        .show_inside(ui, |ui| {
+            outcome.save = footer(ui, draft);
+        });
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE)
+        .show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("config")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    widgets::page_title(
+                        ui,
+                        "Config",
+                        &format!(
+                            "The daemon keeps these in {}; Save sends them to it, and it \
+                             checks, saves and applies them.",
+                            config_path.display()
+                        ),
+                    );
+                    worker_sections(ui, draft);
+                    ui.add_space(12.0);
+                    outcome.prefs_changed = window_section(ui, prefs);
+                    ui.add_space(12.0);
+                });
+        });
+    outcome
+}
 
-    section(ui, "Connection", |ui| {
-        labeled_text(ui, "API base URL", &mut draft.current.api_base_url);
+/// Height of the save footer, in points: the same whatever it says.
+pub const FOOTER_HEIGHT: f32 = 52.0;
+
+fn footer(ui: &mut egui::Ui, draft: &mut ConfigDraft) -> Option<Config> {
+    let p = Palette::of_ui(ui);
+    let mut save = None;
+    ui.horizontal(|ui| {
+        let dirty = draft.dirty();
+        if widgets::primary_button(ui, "Save", dirty && !draft.pending, 96.0).clicked() {
+            draft.pending = true;
+            save = Some(draft.current.clone());
+        }
+        if widgets::button(ui, "Reset", dirty, 96.0)
+            .on_hover_text("go back to what the daemon has")
+            .clicked()
+        {
+            draft.reset();
+        }
+        ui.add_space(8.0);
+        let (text, tone) = save_state(draft);
+        if draft.pending {
+            ui.spinner();
+        }
+        ui.add(egui::Label::new(egui::RichText::new(text).color(p.tone(tone))).truncate());
     });
+    save
+}
 
-    section(ui, "Worker", |ui| {
+fn worker_sections(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
+    let c = &mut draft.current;
+    section(ui, "CONNECTION", "", |ui| {
+        labeled_text(ui, "Studio API base URL", &mut c.api_base_url);
+    });
+    section(ui, "WORKER", "", |ui| {
         labeled_slider(
             ui,
             "VRAM threshold (GB)",
-            &mut draft.current.vram_threshold_gb,
+            &mut c.vram_threshold_gb,
             0.0,
             96.0,
         );
+        hint_row(ui, "The most device memory one studio job may ask for.");
     });
-
-    section(ui, "Auto-update", |ui| {
-        labeled_bool(
-            ui,
-            "Auto-update enabled",
-            &mut draft.current.auto_update_enabled,
-        );
+    section(ui, "AUTO-UPDATE", "", |ui| {
+        labeled_bool(ui, "Update automatically", &mut c.auto_update_enabled);
         labeled_u64(
             ui,
-            "Interval (seconds)",
-            &mut draft.current.auto_update_interval_secs,
+            "Check every (seconds)",
+            &mut c.auto_update_interval_secs,
         );
-        labeled_text(ui, "Release feed URL", &mut draft.current.auto_update_feed);
-        labeled_bool(
+        labeled_text(ui, "Release feed URL", &mut c.auto_update_feed);
+        labeled_bool(ui, "Track pre-releases", &mut c.auto_update_prerelease);
+    });
+    section(ui, "MODELS", "", |ui| {
+        labeled_folder(ui, "Models folder", &mut c.models_root);
+        hint_row(
             ui,
-            "Track pre-releases",
-            &mut draft.current.auto_update_prerelease,
+            "Where model weights are stored.  Serving many kinds of jobs takes a fair bit of \
+             disk space.  A new folder applies after a restart.",
         );
     });
-
-    section(ui, "Models", |ui| {
-        labeled_folder(ui, "Models root", &mut draft.current.models_root);
-        ui.label("");
-        ui.label(
-            egui::RichText::new(
-                "This is where the models will be stored.  You might need a fair bit \
-                 of disk space to be able to satisfy different types of jobs.",
-            )
-            .italics()
-            .color(egui::Color32::from_gray(160)),
-        );
-        ui.end_row();
+    section(ui, "START-UP", "", |ui| {
+        labeled_bool(ui, "Start the window minimised", &mut c.start_minimised);
     });
+}
 
-    section(ui, "Notifications", |ui| {
-        ui.label("On job completion");
-        ui.checkbox(&mut notification_prefs.on_completion, "");
-        ui.end_row();
-        ui.label("On job failure");
-        ui.checkbox(&mut notification_prefs.on_failure, "");
-        ui.end_row();
-    });
-
-    section(ui, "Window", |ui| {
-        ui.label("Start minimised");
-        ui.checkbox(&mut draft.current.start_minimised, "");
-        ui.end_row();
-    });
-
-    ui.add_space(12.0);
-    ui.horizontal(|ui| {
-        let dirty = draft.dirty();
-        let save = ui.add_enabled(dirty && !draft.pending, egui::Button::new("Save"));
-        if save.clicked() {
-            draft.pending = true;
-            save_requested = Some(draft.current.clone());
-        }
-        if ui.add_enabled(dirty, egui::Button::new("Reset")).clicked() {
-            draft.reset();
-        }
-        if draft.pending {
-            ui.spinner();
-            ui.label("saving\u{2026}");
-        } else if let Some(err) = &draft.last_save_error {
-            ui.colored_label(egui::Color32::LIGHT_RED, format!("save failed: {err}"));
-        } else if !dirty && draft.last_save_error.is_none() {
-            ui.label(
-                egui::RichText::new("up to date")
-                    .italics()
-                    .color(egui::Color32::from_gray(150)),
+/// The window's own preferences, applied and stored at once.
+fn window_section(ui: &mut egui::Ui, prefs: &mut UiPrefs) -> bool {
+    let before = *prefs;
+    section(
+        ui,
+        "THIS WINDOW",
+        "Applied and stored at once, for this window only.",
+        |ui| {
+            ui.label("Theme");
+            ui.horizontal(|ui| {
+                for choice in ThemeChoice::ALL {
+                    ui.selectable_value(&mut prefs.theme, choice, choice.label());
+                }
+            });
+            ui.end_row();
+            labeled_bool(ui, "Reduce motion", &mut prefs.reduce_motion);
+            hint_row(ui, "Hold the glow of running work steady.");
+            labeled_bool(
+                ui,
+                "Notify when a job completes",
+                &mut prefs.notify_on_completion,
             );
-        }
-    });
-    save_requested
+            labeled_bool(ui, "Notify when a job fails", &mut prefs.notify_on_failure);
+        },
+    );
+    *prefs != before
 }
 
 // ---------------------------------------------------------------------------
 // Widget helpers
 // ---------------------------------------------------------------------------
 
-fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::CollapsingHeader::new(title)
-        .default_open(true)
-        .show(ui, |ui| {
-            egui::Grid::new(title)
-                .num_columns(2)
-                .spacing([12.0, 6.0])
-                .show(ui, |ui| {
-                    add(ui);
-                });
-        });
-    ui.add_space(4.0);
+fn section(ui: &mut egui::Ui, title: &str, note: &str, add: impl FnOnce(&mut egui::Ui)) {
+    widgets::card(ui, |ui| {
+        widgets::section_label(ui, title);
+        if !note.is_empty() {
+            ui.label(widgets::muted(ui, note));
+            ui.add_space(4.0);
+        }
+        egui::Grid::new(title)
+            .num_columns(2)
+            .spacing([20.0, 10.0])
+            .min_col_width(200.0)
+            .show(ui, |ui| {
+                add(ui);
+            });
+    });
+    ui.add_space(12.0);
+}
+
+fn hint_row(ui: &mut egui::Ui, text: &str) {
+    ui.label("");
+    let hint = widgets::muted(ui, text);
+    ui.add(egui::Label::new(hint).wrap());
+    ui.end_row();
 }
 
 fn labeled_text(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.label(label);
-    ui.add(egui::TextEdit::singleline(value).desired_width(360.0));
+    ui.add(egui::TextEdit::singleline(value).desired_width(380.0));
     ui.end_row();
 }
 
@@ -242,18 +310,19 @@ fn labeled_u64(ui: &mut egui::Ui, label: &str, value: &mut u64) {
     ui.end_row();
 }
 
-/// Path-with-folder-picker widget.  The text edit reflects the
-/// current value at all times; the "Browse…" button opens the
-/// native picker (rfd) and overwrites it on confirm.
+/// A path with a folder picker: the text edit shows the value; Browse
+/// opens the native picker (rfd) and replaces it on confirm.
+// The picker is a native dialog: nothing to drive in a headless test.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn labeled_folder(ui: &mut egui::Ui, label: &str, value: &mut PathBuf) {
     ui.label(label);
     ui.horizontal(|ui| {
         let mut buf = value.to_string_lossy().to_string();
-        let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(280.0));
+        let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(300.0));
         if r.changed() {
             *value = PathBuf::from(buf);
         }
-        if ui.button("Browse…").clicked() {
+        if ui.button("Browse\u{2026}").clicked() {
             let starting = if value.is_absolute() {
                 value.clone()
             } else {
@@ -358,5 +427,37 @@ mod tests {
         draft.save_failed("invalid config".into());
         assert!(draft.dirty() && !draft.pending);
         assert_eq!(draft.last_save_error.as_deref(), Some("invalid config"));
+    }
+
+    #[test]
+    fn the_footer_says_where_the_draft_stands() {
+        let mut draft = ConfigDraft::from(&Config::default());
+        assert_eq!(save_state(&draft), ("Up to date".into(), Tone::Neutral));
+        draft.current.vram_threshold_gb = 3.0;
+        assert_eq!(save_state(&draft), ("Unsaved changes".into(), Tone::Busy));
+        draft.pending = true;
+        assert_eq!(save_state(&draft).1, Tone::Busy);
+        draft.save_failed("vramThresholdGb: too big".into());
+        assert_eq!(
+            save_state(&draft),
+            ("Not saved: vramThresholdGb: too big".into(), Tone::Bad)
+        );
+    }
+
+    #[test]
+    fn the_page_draws_clean_dirty_and_pending() {
+        let mut draft = ConfigDraft::from(&Config::default());
+        let mut prefs = UiPrefs::default();
+        for step in 0..3 {
+            match step {
+                1 => draft.current.vram_threshold_gb = 3.0,
+                2 => draft.pending = true,
+                _ => {}
+            }
+            egui::__run_test_ui(|ui| {
+                let outcome = render(ui, &mut draft, Path::new("/tmp/c.toml"), &mut prefs);
+                assert!(outcome.save.is_none() && !outcome.prefs_changed);
+            });
+        }
     }
 }

@@ -1,10 +1,8 @@
-//! Per-tab modules.  Each module exposes a pure-data view model
-//! (testable without egui) and a thin `render` function that draws
-//! the view model into an `egui::Ui`.
+//! One module per page on the rail.  Each exposes a pure-data view model
+//! (testable without egui) and a thin `render` that draws it.
 
-pub mod about;
 pub mod config;
 pub mod jobs;
 pub mod logs;
 pub mod models;
-pub mod status;
+pub mod worker;

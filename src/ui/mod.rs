@@ -2,20 +2,29 @@
 //! daemon (`studio-worker run`).  See `docs/runtime/daemon-and-tray.md`.
 //!
 //! The UI never runs a job: a poller mirrors the daemon's state into a
-//! [`Replica`] the tabs render, and the operator's actions go back over the
-//! local API.  When no daemon runs, the poller starts one.
+//! [`Replica`] the pages render, and the operator's actions go back over the
+//! local API.  When no daemon runs, the poller starts one.  One tray UI runs
+//! per config directory (`single_instance`).
 //!
 //! Gated behind the `ui` cargo feature so headless installs and the
 //! service path don't pull in egui / eframe / the tray backends.
 
 pub mod actions;
 pub mod app;
+pub mod chrome;
+pub mod format;
+pub mod icons;
+pub mod log_view;
 pub mod notifier;
+pub mod page;
+pub mod pages;
+pub mod prefs;
+pub mod pulse;
 pub mod single_instance;
-pub mod tab;
-pub mod tabs;
+pub mod theme;
 pub mod tray;
 pub mod tray_host;
+pub mod widgets;
 
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
@@ -135,8 +144,8 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     // `ViewportCommand::Minimized` — egui 0.34's ViewportBuilder has
     // no `with_minimized`.
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([1000.0, 760.0])
-        .with_min_inner_size([640.0, 480.0])
+        .with_inner_size([1240.0, 820.0])
+        .with_min_inner_size([960.0, 600.0])
         .with_title("studio-worker");
     // In development, open on the left monitor instead of the
     // primary screen.  Override with STUDIO_WORKER_WINDOW_POS="x,y".
@@ -158,12 +167,14 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         Arc::new(move |paused| actions.run(Action::SetPaused(paused)))
     };
 
+    let app_theme = prefs::load(&prefs::path_for(&deps.config_path)).theme;
     let outcome = eframe::run_native(
         "studio-worker",
         native_options,
         Box::new(move |cc| {
-            // Dark mode by default (project design rule).
-            cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+            // Dark by default (project design rule); the operator's choice
+            // from ui.toml otherwise.
+            theme::apply(&cc.egui_ctx, app_theme);
             *repaint.lock() = Some(cc.egui_ctx.clone());
             actions.attach(cc.egui_ctx.clone());
             let mut app = app::App::with_notifier(deps, app::App::default_notifier_box());

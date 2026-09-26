@@ -98,7 +98,7 @@ pub fn ensure_action(existing: Option<&str>, wanted: &str) -> EnsureAction {
 
 // The three public entry points below are pure platform-dispatch shims
 // over the per-OS `backend`.  They are only ever called from the
-// `ui`-gated launch/config sync (`ui::mod`, `ui::tabs::config`), so the
+// `ui`-gated launch/config sync (`ui::mod`, `ui::pages::config`), so the
 // `--no-default-features` coverage build never reaches them; the logic
 // they forward to is the unit-tested `*_at` seams plus `autostart_path`.
 // Exclude them from the coverage number rather than leave permanent

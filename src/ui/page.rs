@@ -1,59 +1,76 @@
-//! The tabs the UI exposes.  Pure data + tiny enum impl so the
-//! contract is testable without egui in scope.
+//! The pages on the navigation rail.  Pure data so the contract is
+//! testable without egui in scope.
 
+/// Tracing-free, egui-free: which page the window shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Tab {
+pub enum Page {
+    /// What runs and what ran: the page the window opens on.
     #[default]
-    Status,
     Jobs,
     Models,
-    Config,
+    /// The worker's state, registration, hardware and version.
+    Worker,
     Logs,
-    About,
+    Config,
 }
 
-impl Tab {
-    pub const ALL: [Tab; 6] = [
-        Tab::Status,
-        Tab::Jobs,
-        Tab::Models,
-        Tab::Config,
-        Tab::Logs,
-        Tab::About,
+impl Page {
+    /// Rail order; `Ctrl+1` … `Ctrl+5` follow it.
+    pub const ALL: [Page; 5] = [
+        Page::Jobs,
+        Page::Models,
+        Page::Worker,
+        Page::Logs,
+        Page::Config,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Tab::Status => "Status",
-            Tab::Jobs => "Jobs",
-            Tab::Models => "Models",
-            Tab::Config => "Config",
-            Tab::Logs => "Logs",
-            Tab::About => "About",
+            Page::Jobs => "Jobs",
+            Page::Models => "Models",
+            Page::Worker => "Worker",
+            Page::Logs => "Logs",
+            Page::Config => "Config",
         }
     }
 
-    /// Parse a tab name (case-insensitive).  Used by the
-    /// `STUDIO_WORKER_UI_TAB` debug env var to seed the initial tab
-    /// during screenshot capture and headless UI inspection.
+    /// One line for the rail's hover text.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Page::Jobs => "What runs now and what ran",
+            Page::Models => "Load and unload models",
+            Page::Worker => "State, registration, hardware and version",
+            Page::Logs => "Everything the daemon logs",
+            Page::Config => "Worker settings and this window",
+        }
+    }
+
+    /// The page `Ctrl+<digit>` picks (1-based).
+    pub fn from_digit(digit: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(digit).checked_sub(1)?).copied()
+    }
+
+    /// 1-based position on the rail.
+    pub fn digit(self) -> u8 {
+        Self::ALL.iter().position(|p| *p == self).unwrap_or(0) as u8 + 1
+    }
+
+    /// Parse a page name (case-insensitive), for `STUDIO_WORKER_UI_PAGE`.
     pub fn parse(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "status" => Some(Self::Status),
-            "jobs" => Some(Self::Jobs),
-            "models" => Some(Self::Models),
-            "config" => Some(Self::Config),
-            "logs" => Some(Self::Logs),
-            "about" => Some(Self::About),
-            _ => None,
-        }
+        let name = name.trim();
+        Self::ALL
+            .into_iter()
+            .find(|p| p.label().eq_ignore_ascii_case(name))
     }
 
-    /// Resolve the initial tab on app launch: env override or default.
+    /// The page on open: `STUDIO_WORKER_UI_PAGE` (screenshots, headless
+    /// inspection) or [`Page::Jobs`].
     pub fn initial() -> Self {
-        std::env::var("STUDIO_WORKER_UI_TAB")
-            .ok()
-            .and_then(|s| Self::parse(&s))
-            .unwrap_or_default()
+        Self::initial_from(std::env::var("STUDIO_WORKER_UI_PAGE").ok().as_deref())
+    }
+
+    pub fn initial_from(env: Option<&str>) -> Self {
+        env.and_then(Self::parse).unwrap_or_default()
     }
 }
 
@@ -62,49 +79,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_returns_every_tab_in_render_order() {
-        let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
-        assert_eq!(
-            labels,
-            ["Status", "Jobs", "Models", "Config", "Logs", "About"],
-            "tab labels + order are part of the UI contract"
-        );
+    fn the_rail_lists_every_page_in_order() {
+        let labels: Vec<&str> = Page::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels, ["Jobs", "Models", "Worker", "Logs", "Config"]);
     }
 
     #[test]
-    fn default_is_status() {
-        assert_eq!(Tab::default(), Tab::Status);
+    fn the_window_opens_on_jobs() {
+        assert_eq!(Page::default(), Page::Jobs);
+        assert_eq!(Page::initial_from(None), Page::Jobs);
+        assert_eq!(Page::initial_from(Some("nonsense")), Page::Jobs);
+        assert_eq!(Page::initial_from(Some("worker")), Page::Worker);
     }
 
     #[test]
-    fn parse_round_trips_with_label_case_insensitively() {
-        for tab in Tab::ALL {
-            assert_eq!(Tab::parse(tab.label()), Some(tab));
-            assert_eq!(Tab::parse(&tab.label().to_uppercase()), Some(tab));
+    fn names_parse_case_insensitively_and_old_tabs_are_gone() {
+        for page in Page::ALL {
+            assert_eq!(Page::parse(page.label()), Some(page));
+            assert_eq!(Page::parse(&page.label().to_uppercase()), Some(page));
+            assert!(!page.hint().is_empty());
         }
-        assert!(Tab::parse("").is_none());
-        assert!(Tab::parse("nope").is_none());
+        assert_eq!(Page::parse(" logs "), Some(Page::Logs));
+        assert_eq!(Page::parse("status"), None);
+        assert_eq!(Page::parse("about"), None);
     }
 
     #[test]
-    fn initial_falls_back_to_default_when_env_unset() {
-        // SAFETY: the Rust test harness runs tests concurrently, so this
-        // mutates the process-global STUDIO_WORKER_UI_TAB. Safe because
-        // this is the only test that touches that var; we snapshot it and
-        // restore it afterwards. (A panic here would skip the restore, but
-        // it also fails the run and no other test reads the var.)
-        let prev = std::env::var("STUDIO_WORKER_UI_TAB").ok();
-        std::env::remove_var("STUDIO_WORKER_UI_TAB");
-        assert_eq!(Tab::initial(), Tab::default());
-        if let Some(v) = prev {
-            std::env::set_var("STUDIO_WORKER_UI_TAB", v);
+    fn digits_pick_pages_in_rail_order() {
+        for page in Page::ALL {
+            assert_eq!(Page::from_digit(page.digit()), Some(page));
         }
-    }
-
-    #[test]
-    fn labels_are_unique() {
-        use std::collections::HashSet;
-        let unique: HashSet<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
-        assert_eq!(unique.len(), Tab::ALL.len());
+        assert_eq!(Page::from_digit(1), Some(Page::Jobs));
+        assert_eq!(Page::from_digit(0), None);
+        assert_eq!(Page::from_digit(6), None);
     }
 }
