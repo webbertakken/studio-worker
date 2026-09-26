@@ -6,7 +6,7 @@
 //! All system side-effects (Command::status, fs writes) flow through the
 //! `ServiceOps` trait so the public install/uninstall functions can be
 //! unit-tested without touching the real OS.
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
@@ -106,7 +106,8 @@ fn binary_path() -> Result<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn default_unit_dir() -> Result<PathBuf> {
-    let dirs = directories::BaseDirs::new().ok_or_else(|| anyhow!("cannot resolve user dirs"))?;
+    let dirs =
+        directories::BaseDirs::new().ok_or_else(|| anyhow::anyhow!("cannot resolve user dirs"))?;
     let path = dirs.config_dir().join("systemd").join("user");
     std::fs::create_dir_all(&path)?;
     Ok(path)

@@ -292,9 +292,14 @@ mod tests {
 
     #[test]
     fn a_config_that_cannot_be_saved_is_not_applied() {
+        // A config whose directory would have to be a file: unsaveable on
+        // every platform.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
         let control = DaemonControl::new(
             crate::config::shared(Config::default()),
-            PathBuf::from("/proc/no-such-dir/config.toml"),
+            blocker.join("config.toml"),
             0.0,
         );
         let mut edit = control.editable_config();

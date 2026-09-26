@@ -67,7 +67,7 @@ impl TrayVariant {
 /// Pure so the byte-order contract is unit-tested without a live tray.
 pub fn rgba_to_argb32(rgba: &[u8]) -> Vec<u8> {
     let mut out = rgba.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0 {
         px.rotate_right(1);
     }
     out

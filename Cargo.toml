@@ -84,6 +84,8 @@ libloading = "0.8"
 # windows-sys are already in the tree (tempfile / everything).
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Streaming ASR (Nemotron / Parakeet EOU) over the same load-dynamic ort.
+parakeet-rs = { version = "=0.3.8", optional = true, default-features = false, features = ["load-dynamic", "api-24"] }
 # LAN streaming speech listener (sync, thread per session, like the local API).
 tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
 # Direct rustls dep so we can call `crypto::ring::default_provider`.
@@ -175,8 +177,6 @@ winreg = "0.52"
 # feature's `dep:` edges below are simply inactive on Windows.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 llama-cpp-2 = { version = "0.1.157", optional = true, default-features = false }
-# Streaming ASR (Nemotron / Parakeet EOU) over the same load-dynamic ort.
-parakeet-rs = { version = "=0.3.8", optional = true, default-features = false, features = ["load-dynamic", "api-24"] }
 encoding_rs = { version = "0.8", optional = true }
 
 [features]

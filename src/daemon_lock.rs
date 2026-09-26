@@ -14,6 +14,10 @@ const TRACE_TARGET: &str = "studio_worker::daemon";
 
 /// The lock file's name, next to `config.toml`.
 pub const LOCK_FILE_NAME: &str = "daemon.lock";
+/// Where the daemon writes its pid, next to the lock.  Separate from the
+/// lock file because Windows locks are mandatory: a locked file cannot be
+/// read, even by the process that holds it through another handle.
+pub const PID_FILE_NAME: &str = "daemon.pid";
 
 /// How often [`acquire`] tries before concluding another daemon runs, and
 /// the pause between tries.  Covers the instant the tray UI's
@@ -27,6 +31,11 @@ pub fn lock_path_for(config_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(LOCK_FILE_NAME)
+}
+
+/// The pid file for the config at `config_path`.
+pub fn pid_path_for(config_path: &Path) -> PathBuf {
+    lock_path_for(config_path).with_file_name(PID_FILE_NAME)
 }
 
 /// The held daemon lock; dropping it releases the lock.
@@ -76,13 +85,21 @@ pub fn acquire_with(
     pause: Duration,
 ) -> std::io::Result<Acquired> {
     let path = lock_path_for(config_path);
-    let mut file = open(&path)?;
+    let file = open(&path)?;
     for attempt in 1..=attempts.max(1) {
         match file.try_lock() {
             Ok(()) => {
                 // Informational only: operators can see which pid is the daemon.
-                let _ = file.set_len(0);
-                let _ = writeln!(file, "{}", std::process::id());
+                let pid_path = path.with_file_name(PID_FILE_NAME);
+                if let Err(e) = write_pid(&pid_path) {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        op = "daemon_lock",
+                        path = %pid_path.display(),
+                        error = %e,
+                        "could not write the daemon pid file"
+                    );
+                }
                 tracing::info!(
                     target: TRACE_TARGET,
                     op = "daemon_lock",
@@ -104,6 +121,11 @@ pub fn acquire_with(
         "another daemon is already running for this config"
     );
     Ok(Acquired::HeldElsewhere)
+}
+
+fn write_pid(path: &Path) -> std::io::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(file, "{}", std::process::id())
 }
 
 /// Whether a daemon holds the lock for the config at `config_path`.
@@ -148,7 +170,9 @@ mod tests {
             acquire_with(&config, 2, FAST).unwrap(),
             Acquired::HeldElsewhere
         ));
-        let pid = std::fs::read_to_string(lock.path()).unwrap();
+        // Readable while the lock is held (Windows locks are mandatory, so
+        // the pid cannot live in the locked file itself).
+        let pid = std::fs::read_to_string(pid_path_for(&config)).unwrap();
         assert_eq!(pid.trim(), std::process::id().to_string());
 
         drop(lock);
