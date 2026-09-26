@@ -64,17 +64,44 @@ fn default_origin() -> String {
 
 /// A collection of locally-available models.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Catalog {
     #[serde(default)]
     pub models: Vec<CatalogModel>,
+    /// Seed ids the operator deleted; startup seeding never re-adds them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_seeds: Vec<String>,
 }
 
 impl Catalog {
     /// The built-in catalog: every model the worker ships seeded with.
     pub fn seed() -> Self {
         Catalog {
-            models: vec![zimage_turbo()],
+            models: vec![
+                zimage_turbo(),
+                qwen35_08b(),
+                nemotron_stream(),
+                parakeet_eou(),
+            ],
+            dismissed_seeds: Vec::new(),
         }
+    }
+
+    /// Add every seed this catalogue lacks (an install that predates it),
+    /// never replacing the operator's entry and never re-adding a seed they
+    /// deleted.  `true` when anything was added.
+    pub fn ensure_seeds(&mut self) -> bool {
+        let missing: Vec<CatalogModel> = Self::seed()
+            .models
+            .into_iter()
+            .filter(|m| self.get(&m.id).is_none() && !self.dismissed_seeds.contains(&m.id))
+            .collect();
+        for model in &missing {
+            tracing::info!(target: TRACE_TARGET, op = "seed", model = %model.id, "added a seed model the catalogue lacked");
+        }
+        let added = !missing.is_empty();
+        self.models.extend(missing);
+        added
     }
 
     /// Parse a catalog from a JSON string.
@@ -100,7 +127,12 @@ impl Catalog {
     pub fn load_or_seed(path: &Path) -> std::io::Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(contents) => match Self::from_json(&contents) {
-                Ok(catalog) => Ok(catalog),
+                Ok(mut catalog) => {
+                    if catalog.ensure_seeds() {
+                        catalog.save(path)?;
+                    }
+                    Ok(catalog)
+                }
                 Err(parse_err) => {
                     let quarantine = quarantine_path(path);
                     std::fs::rename(path, &quarantine)?;
@@ -175,6 +207,7 @@ impl Catalog {
 
     /// Insert a model, replacing any existing entry with the same id.
     pub fn upsert(&mut self, model: CatalogModel) {
+        self.dismissed_seeds.retain(|d| *d != model.id);
         if let Some(existing) = self.models.iter_mut().find(|m| m.id == model.id) {
             *existing = model;
         } else {
@@ -208,7 +241,12 @@ impl Catalog {
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.models.len();
         self.models.retain(|m| m.id != id);
-        self.models.len() != before
+        let removed = self.models.len() != before;
+        let is_seed = Self::seed().models.iter().any(|m| m.id == id);
+        if removed && is_seed && !self.dismissed_seeds.iter().any(|d| d == id) {
+            self.dismissed_seeds.push(id.to_string());
+        }
+        removed
     }
 
     /// The first enabled image model — used when a request names no model.
@@ -237,6 +275,156 @@ pub(crate) fn quarantine_path(path: &Path) -> PathBuf {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     path.with_file_name(format!("{name}.corrupt-{ts}"))
+}
+
+/// A model file on Hugging Face, pinned to a repository revision.
+fn hf_file(repo: &str, revision: &str, path: &str, bytes: u64, sha256: &str) -> ModelFile {
+    ModelFile {
+        role: ModelFileRole::Model,
+        url: format!("https://huggingface.co/{repo}/resolve/{revision}/{path}"),
+        filename: path.rsplit('/').next().unwrap_or(path).to_string(),
+        approx_bytes: Some(bytes),
+        sha256: Some(sha256.into()),
+    }
+}
+
+/// Revision of `altunenes/parakeet-rs` the streaming speech seeds pin.
+const PARAKEET_RS_REVISION: &str = "4d2a8bc71f5c896ec40faa59732e6716295edaf2";
+
+/// Qwen3.5 0.8B instruct (unsloth Q8_0): a small chat model for one-shot
+/// jobs such as titles and summaries.  Reasoning off (the template thinks
+/// only when asked; a small model left to think runs to its token cap);
+/// 32K context for long transcripts.  Apache-2.0.
+fn qwen35_08b() -> CatalogModel {
+    let mut kwargs = serde_json::Map::new();
+    kwargs.insert("enable_thinking".into(), serde_json::Value::Bool(false));
+    CatalogModel {
+        id: "qwen3.5-0.8b".into(),
+        display_name: "Qwen3.5 0.8B instruct (Q8_0)".into(),
+        kind: TaskKind::Llm,
+        vram_gb_estimate: 1.5,
+        description: Some("Small chat model: reasoning off, 32K context".into()),
+        source: ModelSource {
+            engine: ModelEngine::LlamaCpp,
+            files: vec![hf_file(
+                "unsloth/Qwen3.5-0.8B-GGUF",
+                "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+                "Qwen3.5-0.8B-Q8_0.gguf",
+                811_843_840,
+                "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
+            )],
+            cli_defaults: ModelCliDefaults {
+                context_size: Some(32_768),
+                chat_template_kwargs: Some(kwargs),
+                ..Default::default()
+            },
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: None,
+    }
+}
+
+/// Nemotron 3.5 streaming ASR (0.6B, multilingual, punctuated): 560 ms
+/// chunks.  Measured ~3.5 GiB on CUDA.  NVIDIA Open Model License.
+fn nemotron_stream() -> CatalogModel {
+    let dir = "nemotron-3.5-asr-streaming-0.6b-onnx";
+    let f = |name: &str, bytes: u64, sha: &str| {
+        hf_file(
+            "altunenes/parakeet-rs",
+            PARAKEET_RS_REVISION,
+            &format!("{dir}/{name}"),
+            bytes,
+            sha,
+        )
+    };
+    CatalogModel {
+        id: "nemotron-3.5-stream".into(),
+        display_name: "Nemotron 3.5 streaming (0.6B, multilingual)".into(),
+        kind: TaskKind::AudioStt,
+        vram_gb_estimate: 3.5,
+        description: Some("Streaming speech-to-text with punctuation".into()),
+        source: ModelSource {
+            engine: ModelEngine::Parakeet,
+            files: vec![
+                f(
+                    "config.json",
+                    2_979,
+                    "b0289e196d11a17e3c661bbadfe455c87de4baffc1a5e652a5779f5d687c5db0",
+                ),
+                f(
+                    "decoder_joint.onnx",
+                    97_590_054,
+                    "634dfadf24cb4f73c2fae170b36611d68db48186426882cbc8f7e02ed9f2bb29",
+                ),
+                f(
+                    "encoder.onnx",
+                    42_164_972,
+                    "d569fbe78b48fbb04e169d324f5d25463838ceed7b5fc3bfe209872441979bd9",
+                ),
+                f(
+                    "encoder.onnx.data",
+                    2_454_405_120,
+                    "7584f85df76bc9ae6fbdfa53aa8d97b07a842525d1c501d536d77fd9e4f57ac7",
+                ),
+                f(
+                    "tokenizer.model",
+                    406_554,
+                    "ce3895e40806f02a26c3a225161b96ef682d6c0054bae32a245dec4258d7d291",
+                ),
+            ],
+            cli_defaults: ModelCliDefaults::default(),
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: Some("stt".into()),
+    }
+}
+
+/// Parakeet realtime EOU (120M, English): 160 ms chunks with
+/// end-of-utterance detection.  Measured ~1.1 GiB on CUDA.  CC-BY-4.0.
+fn parakeet_eou() -> CatalogModel {
+    let dir = "realtime_eou_120m-v1-onnx";
+    let f = |name: &str, bytes: u64, sha: &str| {
+        hf_file(
+            "altunenes/parakeet-rs",
+            PARAKEET_RS_REVISION,
+            &format!("{dir}/{name}"),
+            bytes,
+            sha,
+        )
+    };
+    CatalogModel {
+        id: "parakeet-eou-120m".into(),
+        display_name: "Parakeet EOU (120M, English)".into(),
+        kind: TaskKind::AudioStt,
+        vram_gb_estimate: 1.2,
+        description: Some("Light streaming speech-to-text, English".into()),
+        source: ModelSource {
+            engine: ModelEngine::Parakeet,
+            files: vec![
+                f(
+                    "decoder_joint.onnx",
+                    21_347_639,
+                    "9d2553ac043c2fc5f69e970769b0fb8ab9103fbfdeb7d26a1ea9729d4bd2dddd",
+                ),
+                f(
+                    "encoder.onnx",
+                    459_341_289,
+                    "d472887cc38a784a5bfc21c2dbe247639edc3b3f9992388d8ceceaec07256b5b",
+                ),
+                f(
+                    "tokenizer.json",
+                    20_053,
+                    "f6b0ad8690559351fa478116fe0985a203b76f7c040f3a9381f485c99c0325f8",
+                ),
+            ],
+            cli_defaults: ModelCliDefaults::default(),
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: Some("stt".into()),
+    }
 }
 
 /// The canonical Z-Image-Turbo entry, mirroring the studio seed
@@ -309,6 +497,141 @@ fn zimage_turbo() -> CatalogModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(c: &Catalog) -> Vec<&str> {
+        c.models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn the_seed_carries_image_llm_and_both_streaming_speech_models() {
+        assert_eq!(
+            ids(&Catalog::seed()),
+            [
+                "z-image-turbo-q4_k_m.gguf",
+                "qwen3.5-0.8b",
+                "nemotron-3.5-stream",
+                "parakeet-eou-120m"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_seed_file_is_pinned_and_checksummed() {
+        for model in Catalog::seed().models {
+            for file in &model.source.files {
+                assert!(
+                    file.sha256.as_deref().is_some_and(|h| h.len() == 64),
+                    "{} {}",
+                    model.id,
+                    file.filename
+                );
+                assert!(
+                    file.approx_bytes.is_some_and(|b| b > 0),
+                    "{} {}",
+                    model.id,
+                    file.filename
+                );
+                if model.id != "z-image-turbo-q4_k_m.gguf" {
+                    // Z-Image mirrors the studio's seed; the rest pin a revision.
+                    assert!(
+                        !file.url.contains("/resolve/main/"),
+                        "{} pins a revision",
+                        file.url
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_streaming_seeds_swap_with_each_other() {
+        let seed = Catalog::seed();
+        for id in ["nemotron-3.5-stream", "parakeet-eou-120m"] {
+            let m = seed.get(id).unwrap();
+            assert_eq!(m.kind, TaskKind::AudioStt);
+            assert_eq!(m.source.engine, ModelEngine::Parakeet);
+            assert_eq!(m.exclusive_group.as_deref(), Some("stt"));
+        }
+    }
+
+    #[test]
+    fn the_llm_seed_answers_without_reasoning_in_a_long_context() {
+        let seed = Catalog::seed();
+        let m = seed.get("qwen3.5-0.8b").unwrap();
+        assert_eq!(m.kind, TaskKind::Llm);
+        assert_eq!(m.source.engine, ModelEngine::LlamaCpp);
+        assert_eq!(m.source.cli_defaults.context_size, Some(32768));
+        assert_eq!(
+            m.source.cli_defaults.chat_template_kwargs.as_ref().unwrap()["enable_thinking"],
+            false
+        );
+    }
+
+    #[test]
+    fn missing_seeds_are_added_to_an_existing_catalogue() {
+        let mut c = Catalog {
+            models: vec![zimage_turbo()],
+            ..Default::default()
+        };
+        assert!(c.ensure_seeds());
+        assert_eq!(ids(&c), ids(&Catalog::seed()));
+        assert!(!c.ensure_seeds(), "idempotent");
+    }
+
+    #[test]
+    fn seeding_never_overwrites_the_operators_entry() {
+        let mut mine = Catalog::seed().get("qwen3.5-0.8b").unwrap().clone();
+        mine.display_name = "my tuned qwen".into();
+        let mut c = Catalog {
+            models: vec![mine],
+            ..Default::default()
+        };
+        c.ensure_seeds();
+        assert_eq!(c.get("qwen3.5-0.8b").unwrap().display_name, "my tuned qwen");
+    }
+
+    #[test]
+    fn a_deleted_seed_stays_deleted() {
+        let mut c = Catalog::seed();
+        assert!(c.remove("parakeet-eou-120m"));
+        assert_eq!(c.dismissed_seeds, ["parakeet-eou-120m"]);
+        assert!(!c.ensure_seeds());
+        assert!(c.get("parakeet-eou-120m").is_none());
+        let reloaded = Catalog::from_json(&c.to_json().unwrap()).unwrap();
+        assert_eq!(reloaded.dismissed_seeds, ["parakeet-eou-120m"]);
+    }
+
+    #[test]
+    fn re_adding_a_dismissed_seed_forgets_the_dismissal() {
+        let mut c = Catalog::seed();
+        let eou = c.get("parakeet-eou-120m").unwrap().clone();
+        c.remove("parakeet-eou-120m");
+        c.upsert(eou);
+        assert!(c.dismissed_seeds.is_empty());
+    }
+
+    #[test]
+    fn removing_a_non_seed_records_nothing() {
+        let mut c = Catalog::seed();
+        c.upsert(studio_model("mine"));
+        c.remove("mine");
+        assert!(c.dismissed_seeds.is_empty());
+    }
+
+    #[test]
+    fn loading_an_older_catalogue_adds_the_new_seeds_and_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        let old = Catalog {
+            models: vec![zimage_turbo()],
+            ..Default::default()
+        };
+        std::fs::write(&path, old.to_json().unwrap()).unwrap();
+        let loaded = Catalog::load_or_seed(&path).unwrap();
+        assert_eq!(ids(&loaded), ids(&Catalog::seed()));
+        let on_disk = Catalog::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(ids(&on_disk), ids(&Catalog::seed()));
+    }
 
     #[test]
     fn seed_contains_zimage_with_three_files() {
@@ -440,7 +763,8 @@ mod tests {
         });
         small.save(&path).unwrap();
 
-        let reloaded = Catalog::load_or_seed(&path).unwrap();
+        // Read the bytes back raw: load_or_seed would top up the seeds.
+        let reloaded = Catalog::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(reloaded, small);
 
         let names: Vec<String> = std::fs::read_dir(dir.path())

@@ -245,7 +245,10 @@ mod tests {
     }
 
     fn catalog_with(models: Vec<CatalogModel>) -> Catalog {
-        Catalog { models }
+        Catalog {
+            models,
+            ..Default::default()
+        }
     }
 
     #[test]

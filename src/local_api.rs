@@ -1174,6 +1174,7 @@ mod tests {
                 synthetic_model_of("stt", TaskKind::AudioStt),
                 synthetic_model_of("vid", TaskKind::Video),
             ],
+            ..Default::default()
         }
     }
 
@@ -1302,6 +1303,7 @@ mod tests {
     fn seeded_catalog() -> Catalog {
         Catalog {
             models: vec![synthetic_model("synthetic-img")],
+            ..Default::default()
         }
     }
 
@@ -1471,6 +1473,7 @@ mod tests {
     fn llm_catalog() -> Catalog {
         Catalog {
             models: vec![synthetic_model_of("chat-llm", TaskKind::Llm)],
+            ..Default::default()
         }
     }
 
@@ -1556,6 +1559,7 @@ mod tests {
         stt.source.engine = crate::types::ModelEngine::Parakeet;
         Catalog {
             models: vec![stt, synthetic_model_of("chat-llm", TaskKind::Llm)],
+            ..Default::default()
         }
     }
 

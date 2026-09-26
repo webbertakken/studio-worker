@@ -696,7 +696,10 @@ mod tests {
         free_gib: f32,
         runtime: Arc<FakeRuntime>,
     ) -> Fixture {
-        let catalog = Arc::new(Mutex::new(Catalog { models }));
+        let catalog = Arc::new(Mutex::new(Catalog {
+            models,
+            ..Default::default()
+        }));
         let residency = Residency::load_for_serving(Some(residency_path.clone()));
         let host = ModelHost::new(catalog, runtime, Arc::new(FixedProbe(free_gib)), residency);
         Fixture {

@@ -359,6 +359,7 @@ mod tests {
     fn start(loaded: bool) -> Harness {
         let catalog = Arc::new(Mutex::new(Catalog {
             models: vec![stt("stt-a")],
+            ..Default::default()
         }));
         let host = ModelHost::new(
             catalog,
