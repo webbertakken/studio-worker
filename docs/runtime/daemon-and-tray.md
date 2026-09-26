@@ -29,6 +29,12 @@ Closing or crashing the UI never stops a job. Stopping the daemon stops the work
 - `run` takes the daemon lock before anything else. When another process holds it, `run`
   logs `op="daemon_lock"` "another daemon is already running for this config" and exits 0,
   so a service manager does not treat it as a crash.
+- Under a supervisor (PM2, systemd), run `studio-worker run --wait-for-lock`: if another
+  daemon holds the lock (for example one the tray UI started), it logs "waiting for the daemon
+  lock" once, with the holder's pid, and takes over the moment that daemon ends, instead of
+  exiting and being restarted in a loop.
+- The daemon's pid is in `<config dir>/daemon.pid`, beside the lock (Windows locks are
+  mandatory, so the locked file itself cannot be read).
 - The lock is released when the process exits, however it exits.
 - The lock is advisory and per config directory: two workers with different `--config`
   directories run side by side.
@@ -128,8 +134,9 @@ Once a second the poller:
 3. applies them to the replica.
 
 When the daemon cannot be reached, the link becomes `unreachable` and the replica is emptied,
-so no tab shows stale data. If the daemon lock is free, no daemon is running: the poller starts
-one (`studio-worker --config <path> run`, detached in its own process group, output
+so no tab shows stale data. If the daemon lock stays free for 20 s (`SPAWN_GRACE`, longer than
+a supervisor's restart gap, so a supervised daemon is never raced), no daemon is running: the
+poller starts one (`studio-worker --config <path> run`, detached in its own process group, output
 appended to `<config dir>/daemon.log`) at most once every 10 s and logs `op="daemon_spawn"`;
 a thread reaps it and logs its exit. If the lock is held, a daemon is starting or wedged,
 and the link reads `starting`.

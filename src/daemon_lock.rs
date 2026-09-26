@@ -128,6 +128,34 @@ fn write_pid(path: &Path) -> std::io::Result<()> {
     writeln!(file, "{}", std::process::id())
 }
 
+/// How often a waiting daemon retries the lock.  Safe range 0.5..=10 s.
+pub const WAIT_POLL: Duration = Duration::from_secs(2);
+
+/// Block until this process holds the daemon lock (`run --wait-for-lock`,
+/// for a supervised daemon).  Logs once when it starts waiting.
+pub fn wait_until_acquired(config_path: &Path, poll: Duration) -> std::io::Result<DaemonLock> {
+    let mut said = false;
+    loop {
+        match acquire_with(config_path, 1, poll)? {
+            Acquired::Mine(lock) => return Ok(lock),
+            Acquired::HeldElsewhere => {
+                if !said {
+                    let holder =
+                        std::fs::read_to_string(pid_path_for(config_path)).unwrap_or_default();
+                    tracing::info!(
+                        target: TRACE_TARGET,
+                        op = "daemon_lock",
+                        holder = holder.trim(),
+                        "waiting for the daemon lock; taking over when the other daemon ends"
+                    );
+                    said = true;
+                }
+                std::thread::sleep(poll);
+            }
+        }
+    }
+}
+
 /// Whether a daemon holds the lock for the config at `config_path`.
 pub fn is_held(config_path: &Path) -> std::io::Result<bool> {
     let file = open(&lock_path_for(config_path))?;
@@ -153,6 +181,33 @@ mod tests {
             lock_path_for(Path::new("/etc/sw/config.toml")),
             PathBuf::from("/etc/sw/daemon.lock")
         );
+    }
+
+    #[test]
+    fn a_waiting_daemon_takes_the_lock_once_it_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let Acquired::Mine(first) = acquire_with(&config, 1, FAST).unwrap() else {
+            panic!("first");
+        };
+        let waiter = {
+            let config = config.clone();
+            std::thread::spawn(move || {
+                crate::test_support::capture(move || {
+                    let lock = wait_until_acquired(&config, Duration::from_millis(10)).unwrap();
+                    assert!(lock.path().ends_with(LOCK_FILE_NAME));
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_millis(80));
+        drop(first);
+        let logs = waiter.join().unwrap();
+        assert_eq!(
+            logs.matches("waiting for the daemon lock").count(),
+            1,
+            "{logs}"
+        );
+        assert!(logs.contains("daemon lock taken"), "{logs}");
     }
 
     #[test]
