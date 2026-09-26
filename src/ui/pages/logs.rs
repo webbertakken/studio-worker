@@ -1,5 +1,5 @@
-//! Logs tab — windowed view over the bounded ring the runtime keeps
-//! in `WorkerObservers::recent_logs`.  Separate from the shipping
+//! Logs: a windowed view over the worker log ring the replica keeps in
+//! `WorkerObservers::recent_logs`.  Separate from the shipping
 //! queue (which is drained every WS tick); reading from the ring
 //! means the display doesn't blank out between ships.
 
@@ -10,6 +10,10 @@ use eframe::egui;
 use parking_lot::Mutex;
 
 use crate::types::LogEntry;
+
+use super::super::icons::Icon;
+use super::super::log_view::{self, LogLine};
+use super::super::widgets;
 
 pub const LOGS_WINDOW: usize = 500;
 
@@ -39,12 +43,19 @@ pub enum LevelFilter {
 }
 
 impl LevelFilter {
+    pub const ALL: [LevelFilter; 4] = [
+        LevelFilter::All,
+        LevelFilter::Info,
+        LevelFilter::Warn,
+        LevelFilter::Error,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
-            LevelFilter::All => "all",
-            LevelFilter::Info => "info",
-            LevelFilter::Warn => "warn",
-            LevelFilter::Error => "error",
+            LevelFilter::All => "All",
+            LevelFilter::Info => "Info",
+            LevelFilter::Warn => "Warn",
+            LevelFilter::Error => "Error",
         }
     }
 
@@ -69,6 +80,19 @@ pub struct LogsView {
 }
 
 impl LogsView {
+    /// One line saying what the page shows.
+    pub fn summary(&self) -> String {
+        if self.windowed {
+            format!(
+                "Showing the last {} matching entries of {} kept",
+                self.entries.len(),
+                self.total_buffer
+            )
+        } else {
+            format!("{} of {} entries", self.entries.len(), self.total_buffer)
+        }
+    }
+
     pub fn build(buffer: &[LogEntry], filter: &LogFilter, window: usize) -> Self {
         let needle = filter.search.trim().to_lowercase();
         let filtered: Vec<LogEntry> = buffer
@@ -100,104 +124,61 @@ impl LogsView {
     }
 }
 
+/// Draw the page: a toolbar, then the filtered log filling the page.
 pub fn render(ui: &mut egui::Ui, buffer: &Arc<Mutex<VecDeque<LogEntry>>>, filter: &mut LogFilter) {
-    ui.heading("Logs");
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label("Level:");
-        for level in [
-            LevelFilter::All,
-            LevelFilter::Info,
-            LevelFilter::Warn,
-            LevelFilter::Error,
-        ] {
-            ui.selectable_value(&mut filter.level, level, level.label());
-        }
-        ui.separator();
-        ui.label("Search:");
-        ui.add(
-            egui::TextEdit::singleline(&mut filter.search)
-                .desired_width(220.0)
-                .hint_text("category / message / job id"),
-        );
-        ui.separator();
-        ui.checkbox(&mut filter.auto_scroll, "auto-scroll");
-    });
-    ui.add_space(6.0);
-
+    widgets::page_title(
+        ui,
+        "Logs",
+        "Everything the daemon logs at info and up, newest at the bottom.",
+    );
     let view = {
         let buf = buffer.lock();
-        // VecDeque doesn't slice directly; copy the (bounded) snapshot.
+        // VecDeque does not slice; copy the (bounded) snapshot.
         let snapshot: Vec<LogEntry> = buf.iter().cloned().collect();
         LogsView::build(&snapshot, filter, LOGS_WINDOW)
     };
+    let lines: Vec<LogLine> = view
+        .entries
+        .iter()
+        .map(|e| LogLine::from_entry(e, &chrono::Local))
+        .collect();
+    let composed = log_view::compose(&lines);
 
-    if view.entries.is_empty() {
-        ui.label(
-            egui::RichText::new("No log entries match the current filter.")
-                .italics()
-                .color(egui::Color32::from_gray(150)),
+    ui.horizontal(|ui| {
+        for level in LevelFilter::ALL {
+            ui.selectable_value(&mut filter.level, level, level.label());
+        }
+        ui.add_space(12.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut filter.search)
+                .desired_width(260.0)
+                .hint_text("Search category, message or job id"),
         );
+        ui.add_space(12.0);
+        ui.checkbox(&mut filter.auto_scroll, "Follow")
+            .on_hover_text("keep the newest line in view");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            widgets::copy_button(ui, "logs", "Copy", &composed.text);
+        });
+    });
+    ui.add_space(4.0);
+    // Always one line, so the log below never moves.
+    ui.label(widgets::muted(ui, view.summary()).small());
+    ui.add_space(6.0);
+    let height = (ui.available_height() - 24.0).max(160.0);
+    if view.entries.is_empty() {
+        widgets::card(ui, |ui| {
+            ui.set_min_height(height - 2.0 * f32::from(widgets::CARD_PADDING));
+            widgets::empty_state(
+                ui,
+                Icon::Logs,
+                "No log entries match",
+                "Clear the search or pick another level.",
+            );
+        });
         return;
     }
-
-    if view.windowed {
-        ui.label(
-            egui::RichText::new(format!(
-                "showing last {} entries (buffer holds {} total)",
-                view.entries.len(),
-                view.total_buffer
-            ))
-            .italics()
-            .color(egui::Color32::from_gray(150)),
-        );
-    }
-    ui.add_space(4.0);
-
-    let scroll = egui::ScrollArea::vertical()
-        .max_height(f32::INFINITY)
-        .stick_to_bottom(filter.auto_scroll);
-    scroll.show_rows(ui, 18.0, view.entries.len(), |ui, range| {
-        for entry in &view.entries[range] {
-            render_entry(ui, entry);
-        }
-    });
-}
-
-fn render_entry(ui: &mut egui::Ui, e: &LogEntry) {
-    let colour = match e.level.as_str() {
-        "error" => egui::Color32::LIGHT_RED,
-        "warn" => egui::Color32::from_rgb(232, 168, 56),
-        _ => egui::Color32::from_gray(200),
-    };
-    ui.horizontal(|ui| {
-        ui.monospace(
-            egui::RichText::new(&e.ts)
-                .color(egui::Color32::from_gray(120))
-                .size(11.0),
-        );
-        ui.label(
-            egui::RichText::new(format!("[{}]", e.level))
-                .color(colour)
-                .strong()
-                .size(11.0),
-        );
-        ui.label(
-            egui::RichText::new(format!("{}:", e.category))
-                .color(egui::Color32::from_gray(170))
-                .size(11.0),
-        );
-        ui.label(egui::RichText::new(&e.message).size(11.0));
-        if let Some(j) = &e.job_id {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.monospace(
-                    egui::RichText::new(j)
-                        .color(egui::Color32::from_gray(120))
-                        .size(11.0),
-                );
-            });
-        }
-    });
+    log_view::show(ui, "worker-log", &composed, filter.auto_scroll, height);
 }
 
 #[cfg(test)]
@@ -267,6 +248,34 @@ mod tests {
         assert!(view.windowed);
         assert_eq!(view.entries.last().unwrap().message, "m999");
         assert_eq!(view.entries.first().unwrap().message, "m500");
+    }
+
+    #[test]
+    fn the_summary_says_how_much_is_shown() {
+        let buf: Vec<LogEntry> = (0..10)
+            .map(|i| entry("info", "x", &format!("m{i}"), None))
+            .collect();
+        let view = LogsView::build(&buf, &LogFilter::default(), 4);
+        assert_eq!(
+            view.summary(),
+            "Showing the last 4 matching entries of 10 kept"
+        );
+        let view = LogsView::build(&buf, &LogFilter::default(), LOGS_WINDOW);
+        assert_eq!(view.summary(), "10 of 10 entries");
+        let labels: Vec<_> = LevelFilter::ALL.iter().map(|l| l.label()).collect();
+        assert_eq!(labels, ["All", "Info", "Warn", "Error"]);
+    }
+
+    #[test]
+    fn the_page_draws_with_entries_and_without() {
+        let ring = Arc::new(Mutex::new(VecDeque::from(vec![
+            entry("warn", "heartbeat", "late", Some("j-1")),
+            entry("error", "claim", "boom", None),
+        ])));
+        let mut filter = LogFilter::default();
+        egui::__run_test_ui(|ui| render(ui, &ring, &mut filter));
+        filter.search = "nothing matches this".into();
+        egui::__run_test_ui(|ui| render(ui, &ring, &mut filter));
     }
 
     #[test]

@@ -114,6 +114,7 @@ runtime.rs::run       (the daemon; `ui::run` is the tray UI client)
 
 ui::run (tray UI)
    |
+   +--> single_instance::acquire     (one tray UI per config dir; a second hands over and exits 0)
    +--> autostart::ensure            (login entry, always)
    +--> daemon_link::Poller          (1 s poll into a Replica; starts the daemon when absent)
    +--> eframe window + tray         (restarts itself in place while no display is usable)
@@ -209,18 +210,27 @@ src/
 │                     log-flush, reconnect with exponential backoff.
 │
 └── ui/               (feature `ui`) The tray UI, a client of the daemon.
-    ├── mod.rs        ui::run: login entry, poller thread, eframe; display wait
-    │                 (restart in place).  Tray install (Linux ksni on tokio).
-    ├── app.rs        eframe App impl: status line, tab dispatch, hide-to-tray, quit.
+    ├── mod.rs        ui::run: UI lock, login entry, poller + raise threads, eframe;
+    │                 display wait (restart in place).  Tray install (Linux ksni on tokio).
+    ├── single_instance.rs  One tray UI per config dir (ui.lock); a second launch
+    │                 leaves ui.raise for the running one and exits.
+    ├── app.rs        eframe App impl: chrome + page dispatch, theme, hide-to-tray, quit.
+    ├── chrome.rs     Navigation rail, pulse header, status bar; Ctrl+1…5.
+    ├── pulse.rs      What the header says: activity, daemon, studio, GPU memory (pure).
+    ├── theme.rs      Dark + light palettes held to WCAG AA by tests; egui visuals; glow.
+    ├── prefs.rs      Window preferences (theme, reduce motion, notifications) in ui.toml.
+    ├── widgets.rs    Cards, pills, dots, buttons, fact rows, copy buttons, meters.
+    ├── icons.rs      Line icons painted from geometry (rail, job kinds).
+    ├── log_view.rs   Shared log view: monospace, levels coloured, wrapping, copyable.
+    ├── format.rs     Durations, ages, day labels, clock times.
     ├── actions.rs    Operator actions to the daemon off the UI thread + feedback.
-    ├── tab.rs        Tab enum + STUDIO_WORKER_UI_TAB env override for screenshots.
-    ├── tabs/
-    │   ├── status.rs Initialising / Pending / Rejected / Registered view models.
-    │   ├── jobs.rs   Running jobs, studio jobs, local queue; thumbnails, job log.
-    │   ├── models.rs Catalogue models: state, residency, Load / Unload.
-    │   ├── config.rs Operator-editable fields; Save goes to the daemon.
-    │   ├── logs.rs   Level filter + free-text search + auto-scroll, windowed.
-    │   └── about.rs  UI + daemon versions / config path / Check for updates.
+    ├── page.rs       Page enum + STUDIO_WORKER_UI_PAGE env override for screenshots.
+    ├── pages/
+    │   ├── jobs.rs   Running slot + history by day, filters; detail pane, larger image.
+    │   ├── models.rs GPU memory summary; models grouped by loader; Load / Unload / Retry.
+    │   ├── worker.rs State, registration, studio, hardware, local API, about, update check.
+    │   ├── logs.rs   Level filter + search + follow + copy, windowed.
+    │   └── config.rs Operator-editable fields (Save goes to the daemon) + window prefs.
     ├── tray.rs       3-variant icon (idle/busy/disconnected), menu factory.
     └── notifier.rs   Trait + DesktopNotifier + per-event NotificationPrefs gate.
 ```
@@ -498,8 +508,8 @@ swap.  Full design: [model lifecycle](../runtime/model-lifecycle.md); API:
 
 6. Worker:
      - Clears busy flag.
-     - Pushes CurrentJob → RecentJob in the observers ring (UI Status
-       + Jobs tabs surface this).
+     - Pushes CurrentJob → RecentJob in the observers ring (the UI's
+       pulse header and Jobs page surface this).
 
 Server-driven offer pipeline: the next Offer comes from the studio's
 `notifyJobCompleted` (defer'd from the multipart route's `waitUntil`),
@@ -545,7 +555,7 @@ The runtime tracks its observable state in
 - `thumbnails` — PNG thumbnails of recent image jobs
 - `last_heartbeat: Option<HeartbeatStatus>` — written after every
   WS heartbeat ack / failure
-- `recent_logs` — the worker log ring the Logs tab shows
+- `recent_logs` — the worker log ring the Logs page shows
 
 The daemon serves them to the tray UI as `GET /daemon/status`; the UI
 never reads them in-process.
@@ -562,7 +572,7 @@ never reads them in-process.
 - Linux / macOS: `~/.config/minis-studio-worker/config.toml`
 - Windows: `%APPDATA%\minis-studio-worker\config.toml`
 
-**Operator-facing fields** (exposed in the UI's Config tab):
+**Operator-facing fields** (exposed in the UI's Config page):
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -622,25 +632,34 @@ The tray UI is a **client of the daemon**: it never runs a job and never
 talks to the studio.  A poller ([`daemon_link.rs`](../../src/daemon_link.rs))
 reads `GET /daemon/status`, new worker log entries, the model list, the
 selected job's log and missing thumbnails once a second into a `Replica`
-the tabs render; actions go back over the local API.  When the daemon does
+the pages render; actions go back over the local API.  When the daemon does
 not answer, the replica is emptied (no stale data), a "daemon not
-reachable" view replaces the tabs, and when no daemon holds the daemon
-lock the UI starts one.  Full design:
+reachable" card replaces the pages, and when no daemon holds the daemon
+lock the UI starts one.  One tray UI runs per config directory
+(`ui.lock`); a second launch asks the running one to show its window and
+exits.  Full design:
 [daemon and tray UI](../runtime/daemon-and-tray.md).
 
-### Tab structure
+### Window structure
 
-| Tab | What it shows |
+A navigation rail on the left (`Ctrl+1` … `Ctrl+5`), a pulse header on top
+(activity with the running job and its elapsed time, daemon link, studio
+connection, GPU memory held by loaded models, **Pause / Resume**) and a
+status bar at the bottom (the daemon's version and URL, the result of the
+last action).  None of them change size with the state.  The window opens
+on Jobs.
+
+| Page | What it shows |
 |---|---|
-| **Status** | Worker id, API URL, VRAM total / threshold, IDLE / BUSY / PAUSED badge, connection, GPU runtime, last heartbeat, **Pause / Resume**.  When unregistered: Initialising / Pending (with request id + copy button) / Rejected (with reason + **Reset registration**). |
-| **Jobs** | Running jobs (every source), studio jobs, local queue; each card shows source, kind, model, prompt, outcome, duration, and a thumbnail for image jobs; selecting a card shows the job's log. |
-| **Models** | Each catalogue model's lifecycle state, residency, memory estimate, since, failure; Load / Unload per the lifecycle guards (Load only for engines with an in-process loader). |
-| **Config** | The operator-editable subset of `Config`: Connection / Worker / Auto-update / Models / Notifications / Window.  Save sends it to the daemon (`PUT /daemon/config`), which validates, saves and applies it. |
-| **Logs** | Everything the daemon logs at info and up (level filter, free-text search, auto-scroll), from the daemon's worker log ring. |
-| **About** | Tray UI and daemon versions, Sentry release name, config path, manual "Check for updates". |
+| **Jobs** | A running slot that is always reserved (one glowing card per running job, or an empty card), then every finished job (studio and local) grouped by day with All / Studio / Local filters.  Cards have a fixed height: a thumbnail or kind glyph, the prompt, kind and model, source, time and duration, an outcome pill.  The detail pane shows the selected job: image (click for a larger view), facts, whole prompt, failure reason, and its log (monospace, levels coloured, wrapping, selectable, Copy log).  `↑` / `↓` move the selection. |
+| **Models** | GPU memory held (one bar segment per loaded model), then models kept in memory (in-process loader) and models loaded per job, in catalogue order: state, name and id, kind, engine, estimate, resident pin, exclusive group, since, error; one action (Load / Unload / Retry). |
+| **Worker** | State with **Pause / Resume**; registration (worker id, or Initialising / Pending with request id + copy / Rejected with reason + **Reset registration**); studio connection, last heartbeat, API URL; GPU runtime, VRAM total / threshold, memory held; local API URL; tray UI and daemon versions, Sentry release, config path, manual "Check for updates". |
+| **Logs** | Everything the daemon logs at info and up (level filter, search, follow, copy), from the daemon's worker log ring. |
+| **Config** | The operator-editable subset of `Config` in cards (Connection / Worker / Auto-update / Models / Start-up); Save sends it to the daemon (`PUT /daemon/config`), which validates, saves and applies it.  This window: theme (dark by default, light, follow system), reduce motion, notifications, stored at once in `<config dir>/ui.toml`. |
 
-A status line under the tab bar always shows the link to the daemon and
-the result of the last action.  Screenshots in
+Both themes meet WCAG 2.2 AA contrast (tests in
+[`src/ui/theme.rs`](../../src/ui/theme.rs)); errors show where they
+happen, never as toasts.  Screenshots in
 [`docs/screenshots/`](../screenshots/).
 
 ### Tray icon
@@ -678,8 +697,8 @@ process.
 OS-native desktop notifications via `notify-rust`, gated behind a
 `Notifier` trait so tests inject a `CapturingNotifier` and assert
 what would have been shown.  Both completion and failure
-notifications are off by default, opt-in per-event from the Config
-tab.
+notifications are off by default, opt-in per event on the Config
+page (stored with the window's preferences in `ui.toml`).
 
 ---
 
@@ -737,7 +756,7 @@ trait — they're excluded from the 90% coverage gate
 - **Studio-side logs**: every tick of the worker pushes its log
   buffer over the WS LogBatch frame.  The studio drops them into the
   `workerLogs` D1 table; the dashboard's LogViewer renders them.
-- **Tray UI Logs tab**: the daemon's worker log ring (its own info-and-up
+- **Tray UI Logs page**: the daemon's worker log ring (its own info-and-up
   events plus the studio-session breadcrumbs), served by
   `GET /daemon/logs?after=<seq>`.
 - **Per-job logs**: every job runs in a `job` span; the events inside it

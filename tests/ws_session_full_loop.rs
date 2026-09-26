@@ -462,7 +462,7 @@ async fn ws_session_logs_a_breadcrumb_when_json_result_is_sent() {
 async fn ws_session_heartbeats_pick_up_live_config_changes() {
     // Regression: the capability snapshot used to be built once per
     // session, so an operator saving a new VRAM threshold from the UI
-    // Config tab (or `set-threshold` on a shared config) was never
+    // Config page (or `set-threshold` on a shared config) was never
     // advertised to the studio until the next reconnect — and the
     // studio's pickWorkerForJob kept filtering on the stale budget.
     let (ws_addr, mut thresholds, _server) = spawn_heartbeat_collecting_ws().await;
@@ -668,10 +668,10 @@ async fn ws_session_logs_advertised_capabilities_on_handshake() {
 
 #[tokio::test]
 async fn ws_session_ships_pause_and_resume_transitions_to_operator_logs() {
-    // A Pause / Resume from the Status tab or tray menu only emits a
+    // A Pause / Resume from the Worker page or tray menu only emits a
     // local `tracing` breadcrumb (stdout / Sentry); it never enters the
     // worker's shipped log stream.  So the studio's shipped-log view and
-    // the UI's Logs tab used to show `auto_enabled=false` heartbeats
+    // the UI's Logs page used to show `auto_enabled=false` heartbeats
     // with no record of *why* the worker stopped claiming.  The
     // heartbeat pump must observe the runtime pause flag and ship the
     // transition, so a toggle from any source is visible to operators.

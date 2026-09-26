@@ -53,11 +53,11 @@ top-level [`README.md`](../README.md).  For active plans, see
 
 ## Screenshots
 
-[Status](screenshots/status.png) ·
 [Jobs](screenshots/jobs.png) ·
+[Jobs (a failed job)](screenshots/jobs-failed.png) ·
 [Models](screenshots/models.png) ·
-[Config](screenshots/config.png) ·
+[Worker](screenshots/worker.png) ·
+[Worker (waiting for approval)](screenshots/worker-register.png) ·
 [Logs](screenshots/logs.png) ·
-[About](screenshots/about.png) ·
-[Status (unregistered / pre-approval)](screenshots/status-register.png) ·
+[Config](screenshots/config.png) ·
 [Daemon not reachable](screenshots/daemon-unreachable.png)

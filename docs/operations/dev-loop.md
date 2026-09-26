@@ -29,7 +29,7 @@ Wrapper script:
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-cd /home/webber/Repositories/studio-worker
+cd <your studio-worker checkout>
 export RUST_LOG="${RUST_LOG:-studio_worker=debug,info}"
 export RUST_BACKTRACE=1
 export DISPLAY="${DISPLAY:-:0}"
@@ -58,7 +58,7 @@ Wrapper script:
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-cd /home/webber/Repositories/studio-worker
+cd <your studio-worker checkout>
 export RUST_LOG="${RUST_LOG:-studio_worker=info,warn}"
 export RUST_BACKTRACE=1
 export DISPLAY="${DISPLAY:-:0}"
@@ -101,8 +101,8 @@ This is what you want when:
 ## Tailing logs
 
 ```bash
-tail -f /home/webber/.pm2/logs/studio-worker-ui-stable-out.log
-tail -f /home/webber/.pm2/logs/studio-worker-ui-stable-error.log
+tail -f ~/.pm2/logs/studio-worker-ui-stable-out.log
+tail -f ~/.pm2/logs/studio-worker-ui-stable-error.log
 ```
 
 PM2's own `pm2 logs --lines 50` works but if you want long greps

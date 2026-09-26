@@ -480,7 +480,7 @@ async fn run_one_session(
     // frame (rebuilding fires every engine's registration log every
     // 5s and floods the logs) but rebuilds the capability snapshot
     // from the live config each tick, so operator edits (e.g. a new
-    // VRAM threshold saved from the UI's Config tab) reach the studio
+    // VRAM threshold saved from the UI's Config page) reach the studio
     // without waiting for a reconnect.
     let engine_arc: Arc<dyn Engine> = engine.into();
     let heartbeat = spawn_heartbeat_pump(
@@ -707,7 +707,7 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     crate::runtime::sync_studio_model(&ctx.observers, &job.model, task_kind, &job.model_source);
     // The FULL prompt goes back to the studio (and to the engine).
     // The bounded preview (`truncate_prompt`) is only for the UI's
-    // Jobs tab so the in-memory observer ring stays small even when
+    // Jobs page so the in-memory observer ring stays small even when
     // LLM prompts are huge.  Mixing the two used to send the
     // truncated 200-char preview as the `prompt` form field on the
     // multipart `/complete`, which the studio then persisted onto the
@@ -1082,10 +1082,10 @@ fn spawn_heartbeat_pump(
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            // A Pause / Resume from any source (Status tab, tray menu)
+            // A Pause / Resume from any source (Worker page, tray menu)
             // only emits a local `tracing` breadcrumb; ship the actual
             // transition so the studio's shipped-log view and the UI's
-            // Logs tab record why the worker started / stopped claiming.
+            // Logs page record why the worker started / stopped claiming.
             let now_paused = paused.load(Ordering::SeqCst);
             if let Some(message) = pause_transition_breadcrumb(last_paused, now_paused) {
                 push_log_with_observers(&logs, Some(&observers), "info", "ws", message, None);
@@ -1215,7 +1215,7 @@ fn reconnect_breadcrumb(error: Option<&anyhow::Error>, attempt: u32, backoff: Du
 /// authenticated this worker) onto every `Welcome`, but it used to be
 /// deserialised and dropped — the line named only the worker id. With
 /// it surfaced, an operator can spot clock skew between the worker host
-/// and the studio straight from the UI's Logs tab and the
+/// and the studio straight from the UI's Logs page and the
 /// studio-shipped log view: skew distorts heartbeat-timeout reasoning,
 /// auth-token expiry windows, and log-timestamp correlation across the
 /// two sides. Pure so the wording is unit-tested without a live
@@ -1231,7 +1231,7 @@ fn welcome_breadcrumb(worker_id: &str, server_time: &str) -> String {
 /// model + vram estimate, so a worker fielding offers across many games
 /// gave no clue which game / asset each job served. Surfacing both
 /// (data already on the wire) lets operators triage "which game's jobs
-/// are failing on this box" straight from the UI's Logs tab and the
+/// are failing on this box" straight from the UI's Logs page and the
 /// studio-shipped log view. Pure so the wording is unit-tested without
 /// a live offer.
 fn offer_received_breadcrumb(
@@ -1277,7 +1277,7 @@ fn result_ack_breadcrumb(outcome: &str, job_id: &str) -> String {
 /// dropped reject leaves the offer reserved on a paused worker until it
 /// times out.  The transport layer already logs the failure locally on
 /// `studio_worker::ws::client`, but only a session-level breadcrumb
-/// reaches the UI's Logs tab and the studio-shipped log view with the
+/// reaches the UI's Logs page and the studio-shipped log view with the
 /// offending `job_id` attached.  Pure so the wording + level are
 /// unit-tested without a live WS sink.
 fn offer_response_breadcrumb(
@@ -1305,7 +1305,7 @@ fn offer_response_breadcrumb(
 /// the session's `currentJob` slot) until it times out, with no local
 /// record that the notification never landed.  The transport layer logs
 /// the drop locally on `studio_worker::ws::client`, but only a
-/// session-level breadcrumb reaches the UI's Logs tab and the
+/// session-level breadcrumb reaches the UI's Logs page and the
 /// studio-shipped log view with the offending `job_id` attached.  Pure
 /// so the wording + level are unit-tested without a live WS sink.
 fn fail_send_breadcrumb(job_id: &str, result: &WsResult<()>) -> Option<(&'static str, String)> {
@@ -1347,10 +1347,10 @@ fn record_fail_send(
 /// or `None` when the flag is unchanged since the previous heartbeat
 /// tick.
 ///
-/// A Pause / Resume from the Status tab or tray menu only emits a local
+/// A Pause / Resume from the Worker page or tray menu only emits a local
 /// `tracing` breadcrumb (stdout / Sentry) naming the source; it never
 /// enters the worker's shipped log stream.  So the studio's shipped-log
-/// view and the UI's Logs tab used to show `auto_enabled=false`
+/// view and the UI's Logs page used to show `auto_enabled=false`
 /// heartbeats with no record of *why* the worker stopped claiming.  The
 /// heartbeat pump calls this each tick and ships the transition through
 /// `push_log_with_observers`, so a toggle from *any* source reaches the
@@ -1578,7 +1578,7 @@ mod tests {
     fn pause_transition_breadcrumb_reports_pause_and_resume() {
         // A genuine operator toggle must ship an info-level breadcrumb
         // naming the new claiming state so the studio's shipped-log view
-        // and the UI's Logs tab record why the worker stopped / resumed.
+        // and the UI's Logs page record why the worker stopped / resumed.
         let paused = pause_transition_breadcrumb(false, true).expect("a pause must be reported");
         assert!(
             paused.contains("paused by operator"),

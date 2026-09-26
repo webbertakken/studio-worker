@@ -14,7 +14,7 @@
 //!
 //! * **Operator-facing**: `api_base_url`, `vram_threshold_gb`,
 //!   `start_minimised`, `auto_update_*`, `models_root`.
-//!   These are exposed in the tray UI's Config tab (through the daemon's
+//!   These are exposed in the tray UI's Config page (through the daemon's
 //!   `PUT /daemon/config`).
 //! * **Internal state, persisted but not user-editable**: `worker_id`,
 //!   `auth_token`, `install_id`, `registration_request_id`,

@@ -268,7 +268,7 @@ Three consumers of one bounded buffer
 
 1. **stderr** — every entry also lands as a `tracing` event
    (`RUST_LOG=studio_worker=debug`).
-2. **Tray UI Logs tab** — `WorkerObservers.recent_logs` ring (1000
+2. **Tray UI Logs page** — `WorkerObservers.recent_logs` ring (1000
    entries) so the tab doesn't blank when the shipper drains.  The
    daemon's own info-and-up events land in the same ring
    (`job_log::WorkerLogLayer`); the UI reads it with
@@ -321,7 +321,7 @@ NTFS locks a running binary against overwrite but allows the rename
 — with rollback on failure and cleanup of the parked file on the
 next start.  Any failure leaves the old version running and retries
 next interval.  Manual check via
-`check-update` CLI or the UI About tab.  No studio involvement —
+`check-update` CLI or the UI Worker page.  No studio involvement —
 the feed is GitHub.
 
 ## 12. Service install + autostart
@@ -344,6 +344,8 @@ never runs a job.  Design: [daemon and tray UI](../runtime/daemon-and-tray.md).
 
 ```
 ui::run
+  single_instance::acquire              <config dir>/ui.lock; held → write ui.raise,
+                                          log op="single_instance", exit 0
   autostart::ensure                     login entry, always
   Poller thread, every 1 s:
     read <config dir>/local-api.json    URL + token (fresh each time)
@@ -355,10 +357,14 @@ ui::run
     GET /jobs/<id>/thumbnail            thumbnails the replica lacks
     on failure: empty the Replica (no stale data);
       daemon lock held → link "starting"
-      lock free        → start `studio-worker --config <path> run`
+      lock free 20 s   → start `studio-worker --config <path> run`
                          (detached, output → <config dir>/daemon.log),
-                         at most every 10 s
-  eframe window + tray: tabs render the Replica
+                         at most every 10 s; the grace outlasts a
+                         supervisor's restart gap
+  raise watcher, every 250 ms:          ui.raise present → delete it, show +
+                                          focus the window (op="raise")
+  eframe window + tray: rail, pulse header, status bar; pages render the
+    Replica; theme + reduce motion + notifications from <config dir>/ui.toml
     no usable display → op="display_wait", wait 2 s…60 s, restart in place
   actions (helper threads) → POST /daemon/pause|resume,
     PUT /daemon/config, POST /models/:id/load|unload,
@@ -399,7 +405,7 @@ Local-only (the studio is not involved).
 4. `POST /models/:id/unload`: residency cleared, `unloading`; the lane's cancel flag is
    raised, the in-flight request drains (bounded), the weights are dropped, `unloaded`.
 5. Startup: `spawn_local_api` builds the host and calls `restore_residents`.
-6. The tray UI's Models tab shows each model's state and calls the same load / unload
+6. The tray UI's Models page shows each model's state and calls the same load / unload
    routes; `GET /models` also says whether the model's engine has an in-process loader
    (`loadable`).
 

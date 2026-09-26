@@ -1,5 +1,6 @@
 //! The eframe `App`: a client of the daemon.  It renders the [`Replica`]
-//! the poller keeps fresh and sends the operator's actions through the
+//! the poller keeps fresh inside the window's chrome (rail, pulse header,
+//! status bar) and sends the operator's actions through the
 //! [`ActionRunner`]; it never runs a job itself.
 
 use std::{
@@ -20,22 +21,32 @@ use crate::{
 
 use super::{
     actions::ActionRunner,
+    chrome,
     notifier::{decide, NotificationPrefs, Notifier, NotifyDecision},
-    tab::Tab,
-    tabs::{
-        about::{self as about_tab, AboutState, UpdateFeed},
-        config::{self as config_tab, ConfigDraft},
-        jobs::{self as jobs_tab, JobsContext, ThumbnailTextures},
-        logs::{self as logs_tab, LogFilter},
-        models::{self as models_tab, ModelAction, ModelRow},
-        status::{self as status_tab, StatusAction},
+    page::Page,
+    pages::{
+        config::{self as config_page, ConfigDraft},
+        jobs::{self as jobs_page, JobsContext, JobsState},
+        logs::{self as logs_page, LogFilter},
+        models::{self as models_page, ModelAction, ModelsView},
+        worker::{self as worker_page, AboutState, UpdateFeed, WorkerAction},
     },
+    prefs::{self, UiPrefs},
+    pulse::{Pulse, PulseInputs},
+    theme::{self, Palette, ThemeChoice},
     tray::{self, TrayVariant},
 };
 
 /// Tracing target for App-level lifecycle + tray events.  Stable so
 /// operators can filter with `RUST_LOG=studio_worker::ui::app=info`.
 const TRACE_TARGET: &str = "studio_worker::ui::app";
+
+/// How often the window repaints while running work glows (≈ 20 fps).
+pub const GLOW_FRAME: Duration = Duration::from_millis(50);
+/// How often it repaints otherwise, so durations tick.
+pub const IDLE_FRAME: Duration = Duration::from_millis(500);
+/// Widest the text-heavy pages grow, in points: lines stay readable.
+pub const READING_WIDTH: f32 = 1080.0;
 
 /// Emit a structured breadcrumb when the tray health indicator flips
 /// between idle / busy / disconnected.  Pulled out of
@@ -63,6 +74,31 @@ pub fn tray_variant_for(link: &LinkState, replica: &Replica) -> TrayVariant {
     tray::derive_variant(busy, hb.as_ref(), HEARTBEAT_INTERVAL)
 }
 
+/// The pulse the header shows, from the replica.
+pub fn pulse_of(link: &LinkState, replica: &Replica, now: chrono::DateTime<chrono::Utc>) -> Pulse {
+    let registration = replica.registration.lock().clone();
+    let session = replica.observers.session_state.lock().clone();
+    let active = replica.observers.active_jobs.lock().clone();
+    let models = replica.models.lock().clone();
+    let vram_total_gb = replica
+        .status
+        .lock()
+        .as_ref()
+        .map_or(0.0, |s| s.vram_total_gb);
+    Pulse::build(PulseInputs {
+        link,
+        registered: replica.registered(),
+        registration: &registration,
+        session: &session,
+        busy: replica.busy.load(Ordering::SeqCst),
+        paused: replica.paused.load(Ordering::SeqCst),
+        active: &active,
+        models: &models,
+        vram_total_gb,
+        now,
+    })
+}
+
 /// Everything `App` needs to render and act on the world.
 pub struct AppDeps {
     pub replica: Replica,
@@ -79,12 +115,12 @@ type PendingSave = Arc<Mutex<Option<Result<EditableConfig, String>>>>;
 
 pub struct App {
     deps: AppDeps,
-    tab: Tab,
+    page: Page,
     config_draft: ConfigDraft,
     pending_save: PendingSave,
     log_filter: LogFilter,
     about_state: AboutState,
-    textures: ThumbnailTextures,
+    jobs: JobsState,
     /// `STUDIO_WORKER_UI_JOB`: a job to select once it shows up.
     initial_job: Option<String>,
     /// Identity (`job_id` + `finished_at`) of the newest recent-job we
@@ -94,7 +130,11 @@ pub struct App {
     /// can't make new arrivals invisible.
     last_notified: Option<(String, chrono::DateTime<chrono::Utc>)>,
     notifier: Box<dyn Notifier + Send + Sync>,
-    notification_prefs: NotificationPrefs,
+    /// The window's own preferences, stored in `ui.toml`.
+    prefs: UiPrefs,
+    prefs_path: PathBuf,
+    /// The theme last handed to egui; `None` until the first frame.
+    applied_theme: Option<ThemeChoice>,
     tray_variant: TrayVariant,
     quit_requested: Arc<std::sync::atomic::AtomicBool>,
     /// Quit is under way: the daemon was told to stop, the window closes.
@@ -116,18 +156,22 @@ impl App {
     pub fn with_notifier(deps: AppDeps, notifier: Box<dyn Notifier + Send + Sync>) -> Self {
         let config_draft = ConfigDraft::from(&deps.replica.cfg.lock());
         let start_minimised_pending = deps.start_minimised;
+        let prefs_path = prefs::path_for(&deps.config_path);
+        let prefs = prefs::load(&prefs_path);
         Self {
             deps,
-            tab: Tab::initial(),
+            page: Page::initial(),
             config_draft,
             pending_save: Arc::default(),
             log_filter: LogFilter::default(),
             about_state: AboutState::default(),
-            textures: ThumbnailTextures::default(),
+            jobs: JobsState::default(),
             initial_job: std::env::var("STUDIO_WORKER_UI_JOB").ok(),
             last_notified: None,
             notifier,
-            notification_prefs: NotificationPrefs::default(),
+            prefs,
+            prefs_path,
+            applied_theme: None,
             tray_variant: TrayVariant::Disconnected,
             quit_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quitting: false,
@@ -150,11 +194,16 @@ impl App {
     }
 
     pub fn notification_prefs(&self) -> NotificationPrefs {
-        self.notification_prefs
+        self.prefs.notifications()
     }
 
     pub fn set_notification_prefs(&mut self, prefs: NotificationPrefs) {
-        self.notification_prefs = prefs;
+        self.prefs.notify_on_completion = prefs.on_completion;
+        self.prefs.notify_on_failure = prefs.on_failure;
+    }
+
+    pub fn prefs(&self) -> UiPrefs {
+        self.prefs
     }
 
     pub fn tray_variant(&self) -> TrayVariant {
@@ -191,8 +240,9 @@ impl App {
             self.last_notified = Some((newest.job_id.clone(), newest.finished_at));
         }
         // Notify oldest-first so the OS order matches completion order.
+        let prefs = self.notification_prefs();
         for entry in new_entries.into_iter().rev() {
-            if let NotifyDecision::Show { title, body } = decide(self.notification_prefs, &entry) {
+            if let NotifyDecision::Show { title, body } = decide(prefs, &entry) {
                 self.notifier.show(&title, &body);
             }
         }
@@ -213,79 +263,109 @@ impl App {
         v
     }
 
-    /// Shared by the real `ui` entry point and the headless tests.
-    pub fn render(&mut self, ui: &mut egui::Ui) {
-        let link = self.deps.replica.link.lock().clone();
-        egui::Panel::top("tab_bar").show_inside(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                for tab in Tab::ALL {
-                    let selected = self.tab == tab;
-                    if ui.selectable_label(selected, tab.label()).clicked() {
-                        self.tab = tab;
-                    }
-                }
-            });
-            ui.add_space(2.0);
-            self.render_status_line(ui, &link);
-            ui.add_space(4.0);
-        });
-
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if !link.is_connected() && self.tab != Tab::About {
-                    render_unreachable(ui, &link, &self.deps.config_path);
-                    return;
-                }
-                match self.tab {
-                    Tab::Status => self.render_status(ui),
-                    Tab::Jobs => self.render_jobs(ui),
-                    Tab::Models => self.render_models(ui),
-                    Tab::Config => self.render_config(ui),
-                    Tab::Logs => self.render_logs(ui),
-                    Tab::About => self.render_about(ui),
-                }
-            });
-        });
-
-        // The poller updates the replica asynchronously; keep repainting so
-        // durations tick and new state shows without a user event.
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
+    /// Hand the theme to egui when it changed.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        if self.applied_theme != Some(self.prefs.theme) {
+            theme::apply(ctx, self.prefs.theme);
+            self.applied_theme = Some(self.prefs.theme);
+        }
     }
 
-    /// One line, always present (so nothing shifts): the link, and the
-    /// result of the last action.
-    fn render_status_line(&self, ui: &mut egui::Ui, link: &LinkState) {
-        ui.horizontal(|ui| {
-            let colour = match link {
-                LinkState::Connected { .. } => egui::Color32::LIGHT_GREEN,
-                LinkState::Connecting | LinkState::Starting { .. } => {
-                    egui::Color32::from_rgb(232, 168, 56)
+    /// Shared by the real `ui` entry point and the headless tests.
+    pub fn render(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.apply_theme(&ctx);
+        if let Some(page) = chrome::page_shortcut(&ctx) {
+            self.page = page;
+        }
+        let link = self.deps.replica.link.lock().clone();
+        let pulse = pulse_of(&link, &self.deps.replica, chrono::Utc::now());
+        let glow = theme::breath(ui.input(|i| i.time), self.prefs.reduce_motion);
+        let p = *Palette::of_ui(ui);
+        let chrome_frame = egui::Frame::new().fill(p.chrome);
+
+        egui::Panel::left("rail")
+            .exact_size(chrome::RAIL_WIDTH)
+            .resizable(false)
+            .frame(chrome_frame)
+            .show_inside(ui, |ui| {
+                if let Some(page) = chrome::rail(ui, self.page, crate::AGENT_VERSION) {
+                    self.page = page;
                 }
-                LinkState::Unreachable { .. } => egui::Color32::LIGHT_RED,
+            });
+        egui::Panel::top("pulse")
+            .exact_size(chrome::HEADER_HEIGHT)
+            .resizable(false)
+            .frame(chrome_frame.inner_margin(egui::Margin::symmetric(20, 8)))
+            .show_inside(ui, |ui| {
+                if let Some(paused) = chrome::header(ui, &pulse, glow) {
+                    self.deps.actions.run(Action::SetPaused(paused));
+                }
+            });
+        egui::Panel::bottom("status")
+            .exact_size(chrome::STATUS_BAR_HEIGHT)
+            .resizable(false)
+            .frame(chrome_frame.inner_margin(egui::Margin::symmetric(16, 0)))
+            .show_inside(ui, |ui| {
+                let feedback = self.deps.actions.feedback.lock().clone();
+                chrome::status_bar(ui, &link.summary(), feedback.as_ref());
+            });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(p.page)
+                    .inner_margin(egui::Margin::same(20)),
+            )
+            .show_inside(ui, |ui| self.render_page(ui, &link, &pulse, glow));
+
+        // The poller updates the replica asynchronously; keep repainting so
+        // durations tick, and more often while running work glows.
+        let frame = if pulse.activity.glows() && !self.prefs.reduce_motion {
+            GLOW_FRAME
+        } else {
+            IDLE_FRAME
+        };
+        ctx.request_repaint_after(frame);
+    }
+
+    fn render_page(&mut self, ui: &mut egui::Ui, link: &LinkState, pulse: &Pulse, glow: f32) {
+        if !link.is_connected() {
+            let detail = match link {
+                LinkState::Starting { error } | LinkState::Unreachable { error, .. } => {
+                    error.as_str()
+                }
+                _ => "",
             };
-            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter().circle_filled(dot.center(), 4.0, colour);
-            ui.label(egui::RichText::new(link.summary()).small());
-            if let Some(feedback) = self.deps.actions.feedback.lock().clone() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let colour = if feedback.ok {
-                        egui::Color32::from_gray(190)
-                    } else {
-                        egui::Color32::LIGHT_RED
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} \u{00b7} {}",
-                            feedback.at.with_timezone(&chrono::Local).format("%H:%M:%S"),
-                            feedback.text
-                        ))
-                        .small()
-                        .color(colour),
-                    );
+            let log = crate::daemon_link::daemon_log_path(&self.deps.config_path);
+            let offline = worker_page::Offline {
+                summary: link.summary(),
+                detail: detail.to_string(),
+                daemon_log: log,
+            };
+            if self.page == Page::Worker {
+                reading_column(ui, "worker", |ui| {
+                    self.render_worker(ui, pulse, glow, Some(&offline))
+                });
+            } else {
+                reading_column(ui, "unreachable", |ui| {
+                    worker_page::unreachable_card(ui, &offline)
                 });
             }
-        });
+            return;
+        }
+        match self.page {
+            Page::Jobs => self.render_jobs(ui),
+            Page::Models => reading_column(ui, "models", |ui| self.render_models(ui)),
+            Page::Worker => {
+                reading_column(ui, "worker", |ui| self.render_worker(ui, pulse, glow, None))
+            }
+            Page::Logs => logs_page::render(
+                ui,
+                &self.deps.replica.observers.recent_logs,
+                &mut self.log_filter,
+            ),
+            Page::Config => self.render_config(ui),
+        }
     }
 
     /// Shared housekeeping invoked before every frame's render.
@@ -329,13 +409,13 @@ impl App {
         }
     }
 
-    /// Expose the current tab for tests + future tray-state derivation.
-    pub fn current_tab(&self) -> Tab {
-        self.tab
+    /// The page the window shows.
+    pub fn current_page(&self) -> Page {
+        self.page
     }
 
-    pub fn set_tab(&mut self, tab: Tab) {
-        self.tab = tab;
+    pub fn set_page(&mut self, page: Page) {
+        self.page = page;
     }
 
     pub fn deps(&self) -> &AppDeps {
@@ -344,23 +424,25 @@ impl App {
 
     fn render_jobs(&mut self, ui: &mut egui::Ui) {
         let replica = &self.deps.replica;
-        let view = jobs_tab::JobsView::build(&replica.observers, chrono::Utc::now());
+        let view = jobs_page::JobsView::build(&replica.observers);
         if let Some(spec) = &self.initial_job {
-            if let Some(id) = jobs_tab::resolve_initial_selection(spec, &view) {
+            if let Some(id) = jobs_page::resolve_initial_selection(spec, &view) {
                 *replica.selected_job.lock() = Some(id);
                 self.initial_job = None;
             }
         }
         let selected = replica.selected_job.lock().clone();
         let log = replica.selected_log.lock().clone();
-        let changed = jobs_tab::render(
+        let changed = jobs_page::render(
             ui,
             &view,
             JobsContext {
                 thumbnails: &replica.observers.thumbnails,
-                textures: &mut self.textures,
+                state: &mut self.jobs,
                 selected: selected.as_deref(),
                 log: log.as_ref(),
+                paused: replica.paused.load(Ordering::SeqCst),
+                reduce_motion: self.prefs.reduce_motion,
             },
         );
         if let Some(selection) = changed {
@@ -370,17 +452,81 @@ impl App {
     }
 
     fn render_models(&mut self, ui: &mut egui::Ui) {
-        let rows: Vec<ModelRow> = self
+        let vram_total_gb = self
             .deps
             .replica
-            .models
+            .status
             .lock()
-            .iter()
-            .map(ModelRow::from_entry)
-            .collect();
-        match models_tab::render(ui, &rows) {
+            .as_ref()
+            .map_or(0.0, |s| s.vram_total_gb);
+        let view = ModelsView::build(&self.deps.replica.models.lock(), vram_total_gb);
+        match models_page::render(ui, &view) {
             Some(ModelAction::Load(id)) => self.deps.actions.run(Action::Load(id)),
             Some(ModelAction::Unload(id)) => self.deps.actions.run(Action::Unload(id)),
+            None => {}
+        }
+    }
+
+    fn render_worker(
+        &mut self,
+        ui: &mut egui::Ui,
+        pulse: &Pulse,
+        glow: f32,
+        offline: Option<&worker_page::Offline>,
+    ) {
+        let replica = &self.deps.replica;
+        let status = replica.status.lock().clone();
+        let facts = offline.is_none().then(|| {
+            let cfg = replica.cfg.lock();
+            let registration = replica.registration.lock().clone();
+            let session = replica.observers.session_state.lock().clone();
+            let hb = replica.observers.last_heartbeat.lock().clone();
+            let gpu = replica.observers.gpu_runtime.lock().clone();
+            worker_page::WorkerFacts::build(worker_page::FactsInputs {
+                cfg: &cfg,
+                registered: replica.registered(),
+                registration: &registration,
+                session: &session,
+                heartbeat: hb.as_ref(),
+                gpu: gpu.as_ref(),
+                vram_total_gb: status.as_ref().map_or(0.0, |s| s.vram_total_gb),
+                held_gb: pulse.gpu.map_or(0.0, |g| g.held_gb),
+                local_api_url: replica.observers.local_api_url.lock().clone(),
+            })
+        });
+        let about = worker_page::AboutView::build(
+            &self.about_state,
+            &self.deps.config_path,
+            status.map(|s| s.version),
+        );
+        let feed = {
+            let cfg = replica.cfg.lock();
+            UpdateFeed {
+                url: cfg.auto_update_feed.clone(),
+                prerelease: cfg.auto_update_prerelease,
+            }
+        };
+        let action = worker_page::render(
+            ui,
+            worker_page::WorkerContext {
+                activity: &pulse.activity,
+                paused: pulse.paused,
+                facts: facts.as_ref(),
+                offline,
+                about: &about,
+                about_state: &self.about_state,
+                tokio: &self.deps.tokio,
+                feed: &feed,
+                glow,
+            },
+        );
+        match action {
+            Some(WorkerAction::SetPaused(paused)) => {
+                self.deps.actions.run(Action::SetPaused(paused))
+            }
+            Some(WorkerAction::ResetRegistration) => {
+                self.deps.actions.run(Action::ResetRegistration)
+            }
             None => {}
         }
     }
@@ -388,12 +534,17 @@ impl App {
     fn render_config(&mut self, ui: &mut egui::Ui) {
         let live = self.deps.replica.cfg.lock().clone();
         self.config_draft.follow(&live);
-        if let Some(edit) = config_tab::render(
+        let outcome = config_page::render(
             ui,
             &mut self.config_draft,
             &self.deps.config_path,
-            &mut self.notification_prefs,
-        ) {
+            &mut self.prefs,
+        );
+        if outcome.prefs_changed {
+            // A failed save is logged; the preference still applies now.
+            let _ = prefs::save(&self.prefs_path, &self.prefs);
+        }
+        if let Some(edit) = outcome.save {
             let slot = self.pending_save.clone();
             let path = self.deps.config_path.clone();
             let edit = EditableConfig::from_config(&edit);
@@ -417,99 +568,17 @@ impl App {
             Err(err) => self.config_draft.save_failed(err),
         }
     }
-
-    fn render_logs(&mut self, ui: &mut egui::Ui) {
-        logs_tab::render(
-            ui,
-            &self.deps.replica.observers.recent_logs,
-            &mut self.log_filter,
-        );
-    }
-
-    fn render_about(&mut self, ui: &mut egui::Ui) {
-        let daemon_version = self
-            .deps
-            .replica
-            .status
-            .lock()
-            .as_ref()
-            .map(|s| s.version.clone());
-        let view =
-            about_tab::AboutView::build(&self.about_state, &self.deps.config_path, daemon_version);
-        let feed = {
-            let cfg = self.deps.replica.cfg.lock();
-            UpdateFeed {
-                url: cfg.auto_update_feed.clone(),
-                prerelease: cfg.auto_update_prerelease,
-            }
-        };
-        about_tab::render(ui, &view, &self.about_state, &self.deps.tokio, &feed);
-    }
-
-    fn render_status(&mut self, ui: &mut egui::Ui) {
-        let replica = &self.deps.replica;
-        let view = {
-            let cfg = replica.cfg.lock();
-            let registration = replica.registration.lock().clone();
-            let hb = replica.observers.last_heartbeat.lock().clone();
-            let session_state = replica.observers.session_state.lock().clone();
-            let gpu = replica.observers.gpu_runtime.lock().clone();
-            let vram_total_gb = replica
-                .status
-                .lock()
-                .as_ref()
-                .map_or(0.0, |s| s.vram_total_gb);
-            status_tab::StatusView::build(
-                &cfg,
-                replica.registered(),
-                &registration,
-                replica.busy.load(Ordering::SeqCst),
-                replica.paused.load(Ordering::SeqCst),
-                hb.as_ref(),
-                vram_total_gb,
-                &session_state,
-                gpu.as_ref(),
-            )
-        };
-        match status_tab::render(ui, &view) {
-            Some(StatusAction::SetPaused(paused)) => {
-                self.deps.actions.run(Action::SetPaused(paused))
-            }
-            Some(StatusAction::ResetRegistration) => {
-                self.deps.actions.run(Action::ResetRegistration)
-            }
-            None => {}
-        }
-    }
 }
 
-/// What the window shows instead of the tabs while the daemon does not
-/// answer: never stale data.
-fn render_unreachable(ui: &mut egui::Ui, link: &LinkState, config_path: &std::path::Path) {
-    ui.heading("Worker daemon not reachable");
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.spinner();
-        ui.label(link.summary());
-    });
-    ui.add_space(8.0);
-    let detail = match link {
-        LinkState::Starting { error } | LinkState::Unreachable { error, .. } => error.as_str(),
-        _ => "",
-    };
-    if !detail.is_empty() {
-        ui.label(
-            egui::RichText::new(detail)
-                .monospace()
-                .color(egui::Color32::from_gray(180)),
-        );
-        ui.add_space(8.0);
-    }
-    ui.label(format!(
-        "The tray UI shows what the daemon (`studio-worker run`) does.  It starts one when \
-         none is running and keeps retrying.  A daemon it starts writes its output to {}.",
-        crate::daemon_link::daemon_log_path(config_path).display()
-    ));
+/// A vertically scrolling column no wider than [`READING_WIDTH`].
+fn reading_column(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_max_width(READING_WIDTH);
+            add(ui);
+        });
 }
 
 impl eframe::App for App {
@@ -620,24 +689,86 @@ mod tests {
     }
 
     #[test]
-    fn new_defaults_to_status_tab() {
+    fn the_window_opens_on_jobs() {
         let app = App::new(mock_deps());
-        assert_eq!(app.current_tab(), Tab::Status);
+        assert_eq!(app.current_page(), Page::Jobs);
     }
 
     #[test]
-    fn render_each_tab_connected_and_not_does_not_panic() {
-        for tab in Tab::ALL {
+    fn every_page_renders_connected_and_not_in_both_themes() {
+        for page in Page::ALL {
             for link_up in [false, true] {
-                let deps = mock_deps();
-                if link_up {
-                    connected(&deps);
+                for theme in [ThemeChoice::Dark, ThemeChoice::Light] {
+                    let deps = mock_deps();
+                    if link_up {
+                        connected(&deps);
+                        seed(&deps.replica);
+                    }
+                    let mut app = App::new(deps);
+                    app.prefs.theme = theme;
+                    app.set_page(page);
+                    egui::__run_test_ui(|ui| app.render(ui));
+                    assert_eq!(app.applied_theme, Some(theme));
                 }
-                let mut app = App::new(deps);
-                app.set_tab(tab);
-                egui::__run_test_ui(|ui| app.render(ui));
             }
         }
+    }
+
+    /// A replica with a running job, a finished one and a loaded model.
+    fn seed(replica: &Replica) {
+        let now = chrono::Utc::now();
+        replica
+            .observers
+            .active_jobs
+            .lock()
+            .push(crate::runtime::CurrentJob {
+                job_id: "run".into(),
+                kind: crate::types::TaskKind::Image,
+                model: "sd".into(),
+                prompt: "a fox".into(),
+                started_at: now,
+                source: crate::runtime::JobSource::Studio,
+            });
+        crate::runtime::record_recent_job(&replica.observers, completed_recent_job("done"));
+        *replica.selected_job.lock() = Some("done".into());
+    }
+
+    #[test]
+    fn the_pulse_reads_the_replica() {
+        let deps = mock_deps();
+        connected(&deps);
+        seed(&deps.replica);
+        let link = deps.replica.link.lock().clone();
+        let pulse = pulse_of(&link, &deps.replica, chrono::Utc::now());
+        assert!(pulse.activity.glows());
+        assert!(pulse.can_pause);
+    }
+
+    #[test]
+    fn window_preferences_load_from_and_save_next_to_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        prefs::save(
+            &prefs::path_for(&config_path),
+            &UiPrefs {
+                theme: ThemeChoice::Light,
+                reduce_motion: true,
+                ..UiPrefs::default()
+            },
+        )
+        .unwrap();
+        let deps = AppDeps {
+            config_path: config_path.clone(),
+            ..mock_deps()
+        };
+        let mut app = App::new(deps);
+        assert_eq!(app.prefs().theme, ThemeChoice::Light);
+        assert!(app.prefs().reduce_motion);
+        app.set_notification_prefs(NotificationPrefs {
+            on_completion: true,
+            on_failure: false,
+        });
+        assert!(app.notification_prefs().on_completion);
     }
 
     #[test]

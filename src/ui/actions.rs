@@ -1,5 +1,5 @@
 //! Carries the operator's clicks to the daemon off the UI thread, and keeps
-//! the one-line result the status line shows.
+//! the one-line result the status bar shows.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

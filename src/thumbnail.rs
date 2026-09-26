@@ -12,9 +12,10 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use parking_lot::Mutex;
 
-/// Longer side of a thumbnail, in pixels.  Crisp at the UI's 96 px card
-/// size on a 2x display.
-pub const THUMBNAIL_MAX_SIDE: u32 = 192;
+/// Longer side of a thumbnail, in pixels: crisp on the UI's 88 pt card tile
+/// on a 2x display, and large enough to recognise when shown larger.  About
+/// 0.1 to 0.4 MB of PNG each, so the 100 kept stay within tens of MB.
+pub const THUMBNAIL_MAX_SIDE: u32 = 384;
 
 /// Thumbnails of this many most recent image jobs are kept: the size of
 /// the studio and local job rings together.
@@ -118,6 +119,13 @@ mod tests {
             dimensions(&png),
             (THUMBNAIL_MAX_SIDE, THUMBNAIL_MAX_SIDE / 2)
         );
+    }
+
+    #[test]
+    fn a_thumbnail_is_large_enough_to_show_larger() {
+        // The UI shows it on a 88 pt card tile and larger on request.
+        let png = make_thumbnail(&encoded(1024, 1024, image::ImageFormat::WebP)).unwrap();
+        assert_eq!(dimensions(&png), (384, 384));
     }
 
     #[test]

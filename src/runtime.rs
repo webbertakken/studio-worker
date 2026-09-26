@@ -34,7 +34,7 @@ const TRACE_TARGET: &str = "studio_worker::runtime";
 pub const RECENT_JOBS_CAP: usize = 50;
 
 /// Maximum number of log entries kept in `WorkerObservers::recent_logs`
-/// for the UI's Logs tab.  The shipping queue (`logs: Arc<Mutex<Vec<…>>>`)
+/// for the UI's Logs page.  The shipping queue (`logs: Arc<Mutex<Vec<…>>>`)
 /// is drained on every WS tick — the display ring is what the UI reads.
 pub const RECENT_LOGS_CAP: usize = 1000;
 
@@ -122,7 +122,7 @@ pub enum HeartbeatOutcome {
 /// Where the WS session is in its lifecycle, surfaced to the UI so a
 /// worker that can't reach the studio shows *why* instead of sitting
 /// silently.  Terminal states (`AuthFailed`, `Fatal`) carry a
-/// call-to-action the Status tab renders.
+/// call-to-action the Worker page renders.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SessionState {
@@ -144,7 +144,7 @@ pub enum SessionState {
 }
 
 impl SessionState {
-    /// One-line operator-facing summary for the UI Status tab,
+    /// One-line operator-facing summary for the UI Worker page,
     /// including the recovery action for terminal states.
     pub fn summary(&self) -> String {
         match self {
@@ -206,7 +206,7 @@ pub struct WorkerObservers {
     /// unreadable file).
     pub catalog_path: Arc<Mutex<Option<std::path::PathBuf>>>,
     /// Bounded ring of every log entry the worker has emitted, kept
-    /// for the UI's Logs tab.  Separate from the WS ship queue
+    /// for the UI's Logs page.  Separate from the WS ship queue
     /// (which is drained every second) so the display doesn't blank
     /// out between ticks.
     pub recent_logs: Arc<Mutex<VecDeque<LogEntry>>>,
@@ -1467,9 +1467,9 @@ pub fn push_log(
 }
 
 /// Same as [`push_log`] but also appends to
-/// [`WorkerObservers::recent_logs`] so the UI's Logs tab keeps a
+/// [`WorkerObservers::recent_logs`] so the UI's Logs page keeps a
 /// rolling display window.  The WS session uses this variant so
-/// operators don't see the Logs tab blank out every second when the
+/// operators don't see the Logs page blank out every second when the
 /// shipping queue gets drained.
 pub fn push_log_with_observers(
     logs: &Arc<Mutex<Vec<LogEntry>>>,
@@ -1680,13 +1680,13 @@ mod tests {
 
     #[test]
     fn recent_logs_ring_is_bounded_at_recent_logs_cap() {
-        // The observer ring backing the UI Logs tab is never drained
+        // The observer ring backing the UI Logs page is never drained
         // (unlike the ship queue, which the WS shipper empties every
         // second), so this cap is its only bound.  A regression that
         // dropped the eviction loop would leak memory for the lifetime
         // of a long-running worker; one that flipped `pop_front` for
         // `pop_back` would silently retain the *oldest* entries and show
-        // a stale Logs tab.  Mirrors `recent_jobs_ring_caps_at_*`.
+        // a stale Logs page.  Mirrors `recent_jobs_ring_caps_at_*`.
         let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
         let observers = WorkerObservers::default();
         let overflow = 25;

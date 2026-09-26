@@ -37,7 +37,7 @@ use crate::{
 /// `RUST_LOG=studio_worker::auto_register=debug`.
 const TRACE_TARGET: &str = "studio_worker::auto_register";
 
-/// What `tick()` returns + what the UI Status tab reads.  Distinct
+/// What `tick()` returns + what the UI Worker page reads.  Distinct
 /// from the persisted config fields, which carry the raw building
 /// blocks (`install_id`, `registration_request_id`, …).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

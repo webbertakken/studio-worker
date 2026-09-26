@@ -186,7 +186,7 @@ impl Fields {
     }
 }
 
-/// The worker log ring the Logs tab shows: the entries and the sequence
+/// The worker log ring the Logs page shows: the entries and the sequence
 /// number of the newest (see `runtime::recent_logs_after`).
 #[derive(Clone, Default)]
 pub struct WorkerLogRing {
@@ -214,7 +214,7 @@ pub fn global_worker_log() -> &'static WorkerLogRing {
 }
 
 /// Copies the worker's own info / warn / error events into a
-/// [`WorkerLogRing`], so the Logs tab shows everything the daemon does,
+/// [`WorkerLogRing`], so the Logs page shows everything the daemon does,
 /// not only the studio session's breadcrumbs.  Events on the bare
 /// `studio_worker` target are skipped: `runtime::push_log` writes those
 /// into the ring itself.

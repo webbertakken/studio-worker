@@ -5,26 +5,40 @@ with code in this repository.
 
 ## Overview
 
-`studio-worker` is a pull-based image-generation agent for the minis.gg
+`studio-worker` is a pull-based generation worker for the minis.gg
 studio.  It registers with the studio API, heartbeats, claims jobs that
 fit its VRAM threshold, runs them locally (synthetic or a real
 backend), and posts the results back.
+
+One binary runs as two processes: the **daemon** (`studio-worker run`)
+hosts everything (studio session, local API, model host, streaming speech
+listener, auto-updater, every job); the **tray UI** (`studio-worker ui`) is
+a client of the daemon over the local API and starts one when none runs.
+Design: [`@docs/runtime/daemon-and-tray.md`](docs/runtime/daemon-and-tray.md).
 
 The repo is public and CI runs on free-tier GitHub Actions, so all tests
 must run without a GPU.
 
 ## Commands
 
-| Task            | Command                                |
-| --------------- | -------------------------------------- |
-| Run             | `cargo run -- run`                     |
-| Build (release) | `cargo build --release`                |
-| Compile check   | `cargo check`                          |
-| Lint            | `cargo clippy --tests -- -D warnings`  |
-| Format check    | `cargo fmt --check`                    |
-| Format          | `cargo fmt`                            |
-| Test            | `cargo test`                           |
-| Single test     | `cargo test <test_name>`               |
+| Task            | Command                                                                  |
+| --------------- | ------------------------------------------------------------------------ |
+| Run the daemon  | `cargo run -- run`                                                       |
+| Run the tray UI | `cargo run -- ui` (starts a daemon when none runs)                       |
+| Isolated run    | `cargo run -- --config <tmp>/config.toml ui` with `HOME=<tmp>`            |
+| Build (release) | `cargo build --release`                                                  |
+| Compile check   | `cargo check`                                                            |
+| Lint            | `cargo clippy --tests -- -D warnings`                                    |
+| Lint, headless  | `cargo clippy --tests --no-default-features -- -D warnings`              |
+| Lint, all       | `cargo clippy --tests --features all -- -D warnings`                     |
+| Format check    | `cargo fmt --check`                                                      |
+| Format          | `cargo fmt`                                                              |
+| Test            | `cargo test`                                                             |
+| Single test     | `cargo test <test_name>`                                                 |
+| Coverage gate   | `cargo +nightly llvm-cov --no-default-features --fail-under-lines 90` (plus the `--ignore-filename-regex` in `coverage.yml`) |
+
+`ui` rewrites the login entry under `$HOME` to the running exe: give test runs their own `HOME`.
+`STUDIO_WORKER_UI_PAGE=<page>` and `STUDIO_WORKER_UI_JOB=<id|latest>` pick the first page and job.
 
 `./.cargo/config.toml` caps `cargo build` at 2 parallel jobs by default so
 local builds don't saturate the dev box.  Override with `--jobs N` when on
@@ -47,10 +61,11 @@ CI.
 - **image** — encode synthetic WEBP/PNG output
 - **wiremock** — test-only mock HTTP server for integration tests
 - **tracing / tracing-subscriber** — structured logging
-- **egui / eframe** (`ui` feature, **on by default**) — native desktop
-  UI with tab shell, in-window register form, live job + heartbeat
-  view, full config editor, log tail, manual update check. glow/dlopen
-  GL so the build needs no pkg-config / GTK.
+- **egui / eframe** (`ui` feature, **on by default**) — the tray UI: a
+  navigation rail (Jobs, Models, Worker, Logs, Config), a pulse header
+  (running job, daemon, studio, GPU memory, Pause), a status bar; dark and
+  light palettes held to WCAG AA by tests; line icons painted from
+  geometry. glow/dlopen GL so the build needs no pkg-config / GTK.
 - **notify-rust** (`ui`) — OS-native desktop notifications (zbus on
   Linux, pure Rust; no libdbus).
 - **System tray** (`ui`): **ksni** (pure-Rust StatusNotifierItem) on
@@ -90,8 +105,40 @@ CI.
   workflow.
 - `src/http.rs` — `ApiClient` wrapping the surviving HTTP routes
   (`register` + multipart `complete`).
-- `src/runtime.rs` — CLI helpers + auto-updater loop.  The session
-  loop has moved to `src/ws/session.rs`.
+- `src/local_api.rs` — the daemon's loopback HTTP API (bearer token):
+  generation, catalogue, model lifecycle, `/daemon/*` control, job logs
+  and thumbnails.  The tray UI's only way into the daemon.
+- `src/control.rs` — `DaemonControl`: status snapshot, pause, config
+  update, registration reset, shutdown; `src/daemon_api.rs` — its wire
+  types, shared with the UI.
+- `src/daemon_lock.rs` — one daemon per config dir (`daemon.lock`).
+- `src/daemon_client.rs` + `src/daemon_link.rs` — the UI side: a blocking
+  client found via `local-api.json`, the 1 s `Poller` into a `Replica`,
+  the daemon starter, operator actions.
+- `src/host.rs` — the model host: loaded models, lanes, residency,
+  admission, swaps; with `src/lifecycle.rs` (per-model state machine),
+  `src/residency.rs` (`residency.json`), `src/admission.rs` (free device
+  memory), `src/loaders.rs` (in-process loaders per engine).
+- `src/catalog.rs` — the local model catalogue (`models.json`);
+  `src/local.rs` — local jobs without the studio (transient or on a lane).
+- `src/job_run.rs`, `src/job_log.rs`, `src/thumbnail.rs`, `src/job_gate.rs` —
+  one job's bookkeeping (running list, `job` span, rings), per-job logs and
+  the worker log ring, image thumbnails, the one-transient-job gate.
+- `src/stt_stream/` — the LAN streaming speech-to-text listener
+  (`server`, `session`, `vad`, `tokens`).
+- `src/net.rs` (download guards), `src/secrets.rs` (local token entropy).
+- `src/ui/` (feature `ui`) — the tray UI, a client of the daemon:
+  `mod.rs` (`ui::run`: UI lock, login entry, poller, eframe, display
+  wait), `single_instance.rs` (`ui.lock` + `ui.raise`), `app.rs`,
+  `chrome.rs` (rail, pulse header, status bar), `pulse.rs`, `theme.rs`,
+  `prefs.rs` (`ui.toml`), `widgets.rs`, `icons.rs`, `log_view.rs`,
+  `format.rs`, `page.rs`, `pages/{jobs,models,worker,logs,config}.rs`,
+  `tray.rs` + `tray_host.rs`, `notifier.rs`, `actions.rs`.  Pure view
+  models are unit-tested; rendering stays thin and is smoke-tested with
+  `egui::__run_test_ui`.
+- `src/runtime.rs` — the daemon (`run`: lock, local API, registration
+  gate, session + updater loops), CLI helpers, `WorkerObservers`.  The
+  session loop lives in `src/ws/session.rs`.
 - `src/ws/{client,session,types}.rs` — WebSocket client + session
   + wire-format types mirroring `apps/studio/src/shared/types/workerWs.ts`.
 - `src/service.rs` — systemd / launchd / scheduled-task installers.

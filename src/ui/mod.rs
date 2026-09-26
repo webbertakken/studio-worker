@@ -2,19 +2,29 @@
 //! daemon (`studio-worker run`).  See `docs/runtime/daemon-and-tray.md`.
 //!
 //! The UI never runs a job: a poller mirrors the daemon's state into a
-//! [`Replica`] the tabs render, and the operator's actions go back over the
-//! local API.  When no daemon runs, the poller starts one.
+//! [`Replica`] the pages render, and the operator's actions go back over the
+//! local API.  When no daemon runs, the poller starts one.  One tray UI runs
+//! per config directory (`single_instance`).
 //!
 //! Gated behind the `ui` cargo feature so headless installs and the
 //! service path don't pull in egui / eframe / the tray backends.
 
 pub mod actions;
 pub mod app;
+pub mod chrome;
+pub mod format;
+pub mod icons;
+pub mod log_view;
 pub mod notifier;
-pub mod tab;
-pub mod tabs;
+pub mod page;
+pub mod pages;
+pub mod prefs;
+pub mod pulse;
+pub mod single_instance;
+pub mod theme;
 pub mod tray;
 pub mod tray_host;
+pub mod widgets;
 
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
@@ -74,6 +84,10 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         display_attempt = attempt,
         "tray UI starting as a client of the daemon"
     );
+    let _ui_lock = match take_ui_lock(&path, attempt) {
+        UiLockOutcome::Held(lock) => lock,
+        UiLockOutcome::HandedOver => return Ok(()),
+    };
     ensure_autostart();
 
     // The poller runs whether or not the window can open: it starts the
@@ -102,6 +116,21 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         }
     });
 
+    std::thread::spawn({
+        let stop = stop.clone();
+        let repaint = repaint.clone();
+        let path = path.clone();
+        move || {
+            single_instance::watch(path, stop, || match repaint.lock().as_ref() {
+                Some(ctx) => {
+                    raise_window(ctx);
+                    true
+                }
+                None => false,
+            })
+        }
+    });
+
     let actions = actions::ActionRunner::new(path.clone(), replica.clone());
     let deps = app::AppDeps {
         replica: replica.clone(),
@@ -115,8 +144,8 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     // `ViewportCommand::Minimized` — egui 0.34's ViewportBuilder has
     // no `with_minimized`.
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([1000.0, 760.0])
-        .with_min_inner_size([640.0, 480.0])
+        .with_inner_size([1240.0, 820.0])
+        .with_min_inner_size([960.0, 600.0])
         .with_title("studio-worker");
     // In development, open on the left monitor instead of the
     // primary screen.  Override with STUDIO_WORKER_WINDOW_POS="x,y".
@@ -138,12 +167,14 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         Arc::new(move |paused| actions.run(Action::SetPaused(paused)))
     };
 
+    let app_theme = prefs::load(&prefs::path_for(&deps.config_path)).theme;
     let outcome = eframe::run_native(
         "studio-worker",
         native_options,
         Box::new(move |cc| {
-            // Dark mode by default (project design rule).
-            cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
+            // Dark by default (project design rule); the operator's choice
+            // from ui.toml otherwise.
+            theme::apply(&cc.egui_ctx, app_theme);
             *repaint.lock() = Some(cc.egui_ctx.clone());
             actions.attach(cc.egui_ctx.clone());
             let mut app = app::App::with_notifier(deps, app::App::default_notifier_box());
@@ -172,6 +203,55 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
             restart_for_display(attempt + 1)
         }
     }
+}
+
+/// What [`take_ui_lock`] decided.
+enum UiLockOutcome {
+    /// This process is the tray UI; `None` when the lock could not be
+    /// opened and the UI runs without the guard.
+    Held(Option<single_instance::UiLock>),
+    /// Another tray UI runs for this config and was asked to show itself.
+    HandedOver,
+}
+
+/// Take the UI lock, or hand over to the tray UI that holds it.  A UI
+/// restarting itself for the display waits for its predecessor's lock.
+fn take_ui_lock(path: &std::path::Path, display_attempt: u32) -> UiLockOutcome {
+    let (attempts, pause) = if display_attempt > 0 {
+        (
+            single_instance::RESTART_ATTEMPTS,
+            single_instance::RESTART_PAUSE,
+        )
+    } else {
+        (1, Duration::ZERO)
+    };
+    match single_instance::acquire(path, attempts, pause) {
+        Ok(single_instance::Instance::Primary(lock)) => UiLockOutcome::Held(Some(lock)),
+        Ok(single_instance::Instance::Secondary) => {
+            // Best-effort: the failure is logged, and exiting is right either
+            // way (the running UI already has a tray icon).
+            let _ = single_instance::hand_over(path);
+            UiLockOutcome::HandedOver
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "single_instance",
+                error = %e,
+                "could not open the ui lock; running without the single-instance guard"
+            );
+            UiLockOutcome::Held(None)
+        }
+    }
+}
+
+/// Show, un-minimise and focus the window (from any thread).
+pub fn raise_window(ctx: &eframe::egui::Context) {
+    use eframe::egui::ViewportCommand;
+    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(ViewportCommand::Focus);
+    ctx.request_repaint();
 }
 
 /// Start this UI again in place with the next display attempt.  The
@@ -278,6 +358,51 @@ mod tests {
         assert!(logs.contains("attempt=2"), "{logs}");
         assert!(logs.contains("retry_in_secs=4"), "{logs}");
         assert!(logs.contains("MIT-MAGIC-COOKIE"), "{logs}");
+    }
+
+    #[test]
+    fn a_second_ui_hands_over_to_the_first_and_leaves_a_raise_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let first = take_ui_lock(&config, 0);
+        assert!(matches!(first, UiLockOutcome::Held(Some(_))));
+        assert!(matches!(
+            take_ui_lock(&config, 0),
+            UiLockOutcome::HandedOver
+        ));
+        assert!(single_instance::take_raise_request(&config));
+    }
+
+    #[test]
+    fn a_ui_restarting_for_the_display_waits_for_its_predecessors_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let predecessor = take_ui_lock(&config, 0);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(predecessor);
+        });
+        assert!(matches!(
+            take_ui_lock(&config, 1),
+            UiLockOutcome::Held(Some(_))
+        ));
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn an_unopenable_ui_lock_runs_without_the_guard_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the config directory should be: the lock cannot open.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        let config = blocker.join("config.toml");
+        let logs = crate::test_support::capture(move || {
+            assert!(matches!(
+                take_ui_lock(&config, 0),
+                UiLockOutcome::Held(None)
+            ));
+        });
+        assert!(logs.contains("without the single-instance guard"), "{logs}");
     }
 
     #[test]

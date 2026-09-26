@@ -10,10 +10,10 @@ use parking_lot::Mutex;
 
 use crate::runtime::{JobOutcome, RecentJob};
 
-/// Per-event desktop-notification toggles.  Surfaced in the Config
-/// tab and held on the `App` for the current session only.  They are
-/// not part of the persisted `Config`, so they reset to off on each
-/// restart.
+/// Per-event desktop-notification toggles.  Surfaced on the Config
+/// page under This window and stored with the window's other
+/// preferences in `ui.toml` (see `ui::prefs`), not in the daemon's
+/// `Config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NotificationPrefs {
     pub on_completion: bool,

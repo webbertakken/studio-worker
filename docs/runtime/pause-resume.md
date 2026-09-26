@@ -46,7 +46,7 @@ operator can re-pause from the tray UI (or `POST /daemon/pause`).
 | Surface | Mechanism |
 |---|---|
 | **Local API** | `POST /daemon/pause` / `POST /daemon/resume` → `DaemonControl::set_paused` (logs `op="control"`).  See [`src/control.rs`](../../src/control.rs). |
-| **Tray UI Status tab** | Pause / Resume button; sends the route above.  See [`src/ui/tabs/status.rs`](../../src/ui/tabs/status.rs). |
+| **Tray UI** | Pause / Resume in the pulse header (every page) and on the Worker page; sends the route above.  See [`src/ui/chrome.rs`](../../src/ui/chrome.rs) and [`src/ui/pages/worker.rs`](../../src/ui/pages/worker.rs). |
 | **Tray menu** | The "Pause" / "Resume" item (label follows the daemon's state); sends the same route. |
 | **Programmatic** | Any holder of the daemon's `Arc<AtomicBool>` can flip it; the WS session reads via `paused.load(Ordering::SeqCst)`. |
 
@@ -64,7 +64,7 @@ operator can re-pause from the tray UI (or `POST /daemon/pause`).
 The persisted `auto_enabled` field had two problems:
 
 1. **Surface confusion** — it was both an operator-facing setting
-   (in the Config tab) AND a runtime decision (read by the
+   (in the Config page) AND a runtime decision (read by the
    dispatcher).  Editing it required a worker restart in practice.
 2. **Restart semantics** — a service-restart should always come
    back willing to take work.  A persisted `auto_enabled=false`
