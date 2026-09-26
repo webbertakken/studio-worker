@@ -1,10 +1,14 @@
-//! Native egui desktop UI.  See `plans/native-ui.md` for the full
-//! design (tabs, tray icon, notifications, autostart).
+//! The tray UI: an egui window + system tray that is a client of the
+//! daemon (`studio-worker run`).  See `docs/runtime/daemon-and-tray.md`.
 //!
-//! This module is gated behind the `ui` cargo feature so headless
-//! installs and the systemd / launchd service path don't pull in
-//! egui / eframe / tray-icon / notify-rust + their system libs.
+//! The UI never runs a job: a poller mirrors the daemon's state into a
+//! [`Replica`] the tabs render, and the operator's actions go back over the
+//! local API.  When no daemon runs, the poller starts one.
+//!
+//! Gated behind the `ui` cargo feature so headless installs and the
+//! service path don't pull in egui / eframe / the tray backends.
 
+pub mod actions;
 pub mod app;
 pub mod notifier;
 pub mod tab;
@@ -19,119 +23,98 @@ use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 
 use crate::{
-    auto_register::{self, RegistrationState},
     config,
-    runtime::{self, LoopSchedule, WorkerObservers},
-    types::LogEntry,
+    daemon_link::{Action, Poller, ProcessStarter, Replica},
 };
 
-/// Entry point for `studio-worker ui`.  Loads config, spawns the four
-/// background loops on the calling tokio runtime, then hands the main
-/// thread to eframe (which it owns for the lifetime of the window).
-pub fn run(config_path: Option<&str>) -> Result<()> {
-    let (cfg, path) = config::load(config_path)?;
-    runtime::log_startup_banner(&cfg, &path);
+const TRACE_TARGET: &str = "studio_worker::ui";
 
+/// Carries the display-retry attempt across the restart in place.
+pub const DISPLAY_ATTEMPT_ENV: &str = "STUDIO_WORKER_UI_DISPLAY_ATTEMPT";
+
+/// First wait before retrying the display, doubled per attempt.
+pub const DISPLAY_RETRY_BASE: Duration = Duration::from_secs(2);
+/// Longest wait between display attempts.
+pub const DISPLAY_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// How long to wait before display attempt `attempt + 1`.
+pub fn display_retry_delay(attempt: u32) -> Duration {
+    DISPLAY_RETRY_BASE
+        .saturating_mul(2u32.saturating_pow(attempt.min(16)))
+        .min(DISPLAY_RETRY_MAX)
+}
+
+/// The display attempt this process is, from [`DISPLAY_ATTEMPT_ENV`].
+pub fn display_attempt(env_value: Option<&str>) -> u32 {
+    env_value.and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// Log a failed display attempt and answer how long to wait.
+pub fn log_display_wait(attempt: u32, error: &str) -> Duration {
+    let delay = display_retry_delay(attempt);
+    tracing::warn!(
+        target: TRACE_TARGET,
+        op = "display_wait",
+        attempt = attempt + 1,
+        retry_in_secs = delay.as_secs(),
+        error = %error,
+        "no usable display yet; the tray UI will retry"
+    );
+    delay
+}
+
+/// Entry point for `studio-worker ui`.
+pub fn run(config_path: Option<&str>) -> Result<()> {
+    let path = config::resolve_path(config_path)?;
+    let attempt = display_attempt(std::env::var(DISPLAY_ATTEMPT_ENV).ok().as_deref());
+    tracing::info!(
+        target: TRACE_TARGET,
+        op = "startup",
+        config_path = %path.display(),
+        display_attempt = attempt,
+        "tray UI starting as a client of the daemon"
+    );
     ensure_autostart();
 
-    let cfg = config::shared(cfg);
+    // The poller runs whether or not the window can open: it starts the
+    // daemon when none runs, even while the UI waits for a display.
+    let replica = Replica::default();
     let stop = Arc::new(AtomicBool::new(false));
-    let busy = Arc::new(AtomicBool::new(false));
-    // Operator pause toggle.  Runtime-only: never persisted so the
-    // worker comes up unpaused on every launch.
-    let paused = Arc::new(AtomicBool::new(false));
-    let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    let observers = WorkerObservers::default();
-
-    let registration = auto_register::shared_initial();
-
-    // Spawn the loops on the tokio runtime that's already driving
-    // `run_cli` (multi-threaded — main.rs builds `Runtime::new()`).
-    // `eframe::run_native` blocks the main thread; the loops keep
-    // ticking on worker threads.
-    let handle = tokio::runtime::Handle::current();
-
-    // Auto-register loop: polls every 30s until Approved or Rejected.
-    // Then the WS session takes over.
-    let cfg_autoreg = cfg.clone();
-    let path_autoreg = path.clone();
-    let registration_autoreg = registration.clone();
-    let stop_autoreg = stop.clone();
-    handle.spawn(async move {
-        loop {
-            if stop_autoreg.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            let state =
-                auto_register::tick(&cfg_autoreg, &path_autoreg, &registration_autoreg).await;
-            if matches!(
-                state,
-                RegistrationState::Approved | RegistrationState::Rejected { .. }
-            ) {
-                return;
-            }
-            for _ in 0..30 {
-                if stop_autoreg.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
+    let repaint: Arc<Mutex<Option<eframe::egui::Context>>> = Arc::default();
+    let exe = std::env::current_exe()?;
+    let poller = Poller::new(
+        replica.clone(),
+        path.clone(),
+        Box::new(ProcessStarter {
+            exe,
+            config_path: path.clone(),
+        }),
+    );
+    std::thread::spawn({
+        let stop = stop.clone();
+        let repaint = repaint.clone();
+        move || {
+            poller.run(stop, || {
+                if let Some(ctx) = repaint.lock().as_ref() {
+                    ctx.request_repaint();
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+            })
         }
     });
 
-    // Always-on local image API (127.0.0.1), independent of studio registration.
-    // Shares the one-job gate with the WS session so local + studio jobs
-    // never run concurrently on the same GPU.
-    let gate = crate::job_gate::JobGate::from_shared(busy.clone());
-    let control = crate::control::DaemonControl {
-        cfg: cfg.clone(),
-        config_path: path.clone(),
-        paused: paused.clone(),
-        stop: stop.clone(),
-        registration: registration.clone(),
-        reset_requested: Arc::new(AtomicBool::new(false)),
-        vram_total_gb: 0.0,
-    };
-    let local_api = runtime::spawn_local_api(&control, observers.clone(), gate);
-
-    let cfg_loops = cfg.clone();
-    let stop_loops = stop.clone();
-    let logs_loops = logs.clone();
-    let busy_loops = busy.clone();
-    let paused_loops = paused.clone();
-    let observers_loops = observers.clone();
-    handle.spawn(async move {
-        if let Err(e) = runtime::run_loops(
-            cfg_loops,
-            stop_loops,
-            logs_loops,
-            busy_loops,
-            paused_loops,
-            observers_loops,
-            LoopSchedule::default(),
-        )
-        .await
-        {
-            tracing::error!(target: "studio_worker::ui", error = %e, "run_loops exited");
-        }
-    });
-
-    let app_state = app::AppDeps {
-        cfg: cfg.clone(),
-        logs: logs.clone(),
-        busy: busy.clone(),
-        paused: paused.clone(),
-        observers: observers.clone(),
-        stop: stop.clone(),
+    let actions = actions::ActionRunner::new(path.clone(), replica.clone());
+    let deps = app::AppDeps {
+        replica: replica.clone(),
+        actions: actions.clone(),
         config_path: path,
-        tokio: handle.clone(),
+        tokio: tokio::runtime::Handle::current(),
     };
 
     // Start-minimised is requested by the App on its first frame via
     // `ViewportCommand::Minimized` — egui 0.34's ViewportBuilder has
     // no `with_minimized`.
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([960.0, 720.0])
+        .with_inner_size([1000.0, 760.0])
         .with_min_inner_size([640.0, 480.0])
         .with_title("studio-worker");
     // In development, open on the left monitor instead of the
@@ -146,55 +129,73 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         ..Default::default()
     };
 
-    // The tray menu label flips between "Pause" / "Resume" based on
-    // the current paused state; start with the live value so the
-    // first render is correct.
-    let initial_paused = paused.load(std::sync::atomic::Ordering::SeqCst);
-    // The Linux (ksni) tray backend runs on the tokio runtime; hand it
-    // a runtime handle so it can spawn its zbus service.
-    let tokio_for_tray = handle.clone();
+    let initial_paused = replica.paused.load(std::sync::atomic::Ordering::SeqCst);
+    // The Linux (ksni) tray backend runs on the tokio runtime.
+    let tokio_for_tray = tokio::runtime::Handle::current();
+    let set_paused: tray_host::SetPaused = {
+        let actions = actions.clone();
+        Arc::new(move |paused| actions.run(Action::SetPaused(paused)))
+    };
 
-    eframe::run_native(
+    let outcome = eframe::run_native(
         "studio-worker",
         native_options,
         Box::new(move |cc| {
             // Dark mode by default (project design rule).
             cc.egui_ctx.set_visuals(eframe::egui::Visuals::dark());
-            let app = app::App::with_notifier_and_registration(
-                app_state,
-                app::App::default_notifier_box(),
-                registration,
-            );
-            let quit_handle = app.quit_requested_handle();
-
-            // Best-effort tray.  Linux uses ksni (pure Rust); macOS /
-            // Windows use tray-icon.  Either may be unavailable (no
-            // StatusNotifier host, no system tray) — the window UI keeps
-            // working without it rather than aborting startup.
-            let tray_handle = tray_host::install(
+            *repaint.lock() = Some(cc.egui_ctx.clone());
+            actions.attach(cc.egui_ctx.clone());
+            let mut app = app::App::with_notifier(deps, app::App::default_notifier_box());
+            // Best-effort tray: the window works without one.
+            if let Some(tray) = tray_host::install(
                 cc.egui_ctx.clone(),
-                paused.clone(),
-                quit_handle,
+                replica.paused.clone(),
+                set_paused,
+                app.quit_requested_handle(),
                 tokio_for_tray,
                 initial_paused,
-            );
-            // Stash the tray inside the App so it lives as long as the
-            // event loop (dropping it removes the icon).
-            let mut app = app;
-            if let Some(tray) = tray_handle {
+            ) {
                 app.attach_tray(tray);
             }
             Ok(Box::new(app))
         }),
-    )
-    .map_err(|e| anyhow!("eframe: {e}"))?;
-
-    // Signal loops to wind down once the window closes.
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    if let Some(handle) = local_api {
-        let _ = handle.join();
+    );
+    match outcome {
+        Ok(()) => {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        Err(err) => {
+            let delay = log_display_wait(attempt, &err.to_string());
+            std::thread::sleep(delay);
+            restart_for_display(attempt + 1)
+        }
     }
-    Ok(())
+}
+
+/// Start this UI again in place with the next display attempt.  The
+/// windowing library allows one event loop per process and caches a
+/// failed display connection, so a retry needs a fresh process.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn restart_for_display(attempt: u32) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1))
+        .env(DISPLAY_ATTEMPT_ENV, attempt.to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let err = cmd.exec();
+        Err(anyhow!(
+            "restarting the tray UI for the display failed: {err}"
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        cmd.spawn()
+            .map_err(|e| anyhow!("restarting the tray UI for the display failed: {e}"))?;
+        std::process::exit(0);
+    }
 }
 
 /// Keep the tray UI's login entry installed and pointing at this
@@ -248,7 +249,35 @@ fn dev_window_position(env: Option<&str>) -> Option<[f32; 2]> {
 
 #[cfg(test)]
 mod tests {
-    use super::dev_window_position;
+    use super::*;
+
+    #[test]
+    fn the_display_retry_doubles_up_to_a_minute() {
+        assert_eq!(display_retry_delay(0), Duration::from_secs(2));
+        assert_eq!(display_retry_delay(1), Duration::from_secs(4));
+        assert_eq!(display_retry_delay(4), Duration::from_secs(32));
+        assert_eq!(display_retry_delay(5), DISPLAY_RETRY_MAX);
+        assert_eq!(display_retry_delay(u32::MAX), DISPLAY_RETRY_MAX);
+    }
+
+    #[test]
+    fn the_display_attempt_comes_from_the_environment() {
+        assert_eq!(display_attempt(None), 0);
+        assert_eq!(display_attempt(Some("3")), 3);
+        assert_eq!(display_attempt(Some("junk")), 0);
+    }
+
+    #[test]
+    fn a_display_wait_is_logged_with_its_attempt() {
+        let logs = crate::test_support::capture(|| {
+            let delay = log_display_wait(1, "Invalid MIT-MAGIC-COOKIE-1 key");
+            assert_eq!(delay, Duration::from_secs(4));
+        });
+        assert!(logs.contains("op=\"display_wait\""), "{logs}");
+        assert!(logs.contains("attempt=2"), "{logs}");
+        assert!(logs.contains("retry_in_secs=4"), "{logs}");
+        assert!(logs.contains("MIT-MAGIC-COOKIE"), "{logs}");
+    }
 
     #[test]
     fn parses_explicit_position_override() {

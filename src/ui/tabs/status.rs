@@ -3,11 +3,6 @@
 //! hasn't registered yet, this tab shows the in-window Register form
 //! (fork #2 of plans/native-ui.md, default A).
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-
 use chrono::{DateTime, Utc};
 use eframe::egui;
 
@@ -89,6 +84,7 @@ impl StatusView {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         cfg: &Config,
+        registered: bool,
         registration: &RegistrationState,
         busy: bool,
         paused: bool,
@@ -97,7 +93,6 @@ impl StatusView {
         session_state: &SessionState,
         gpu_runtime: Option<&GpuRuntimeStatus>,
     ) -> Self {
-        let registered = cfg.worker_id.is_some() && cfg.auth_token.is_some();
         if registered {
             return Self::Registered {
                 worker_id: cfg.worker_id.clone().unwrap_or_default(),
@@ -154,7 +149,16 @@ pub fn format_age(now: DateTime<Utc>, when: DateTime<Utc>) -> String {
 // Rendering
 // ---------------------------------------------------------------------------
 
-pub fn render(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<AtomicBool>) {
+/// What the operator asked for on the Status tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusAction {
+    /// Pause (`true`) or resume claiming studio jobs.
+    SetPaused(bool),
+    /// Clear a rejected registration and ask the studio again.
+    ResetRegistration,
+}
+
+pub fn render(ui: &mut egui::Ui, view: &StatusView) -> Option<StatusAction> {
     match view {
         StatusView::Initialising { api_base_url } => render_initialising(ui, api_base_url),
         StatusView::Pending {
@@ -165,9 +169,10 @@ pub fn render(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<AtomicBool
         StatusView::Rejected {
             api_base_url,
             reason,
-        } => render_rejected(ui, api_base_url, reason),
-        StatusView::Registered { .. } => render_registered(ui, view, paused_flag),
+        } => return render_rejected(ui, api_base_url, reason),
+        StatusView::Registered { .. } => return render_registered(ui, view),
     }
+    None
 }
 
 fn render_initialising(ui: &mut egui::Ui, api_base_url: &str) {
@@ -226,7 +231,7 @@ fn render_pending(ui: &mut egui::Ui, api_base_url: &str, request_id: &str, since
     );
 }
 
-fn render_rejected(ui: &mut egui::Ui, api_base_url: &str, reason: &str) {
+fn render_rejected(ui: &mut egui::Ui, api_base_url: &str, reason: &str) -> Option<StatusAction> {
     ui.heading("Registration rejected");
     ui.add_space(4.0);
     ui.colored_label(
@@ -239,22 +244,24 @@ fn render_rejected(ui: &mut egui::Ui, api_base_url: &str, reason: &str) {
     );
     ui.add_space(12.0);
     ui.label(format!(
-        "To try again, contact the operator of {api_base_url} to understand why, then run:"
+        "Local models and the local API keep working.  To ask {api_base_url} again, \
+         check with its operator why, then reset the registration:"
     ));
     ui.add_space(4.0);
-    ui.monospace("studio-worker register --reset");
+    let clicked = ui
+        .button("Reset registration")
+        .on_hover_text("clear the local registration state and submit a fresh request")
+        .clicked();
     ui.add_space(4.0);
     ui.label(
-        egui::RichText::new(
-            "This clears the local request state and submits a fresh request on \
-             the next launch.",
-        )
-        .italics()
-        .color(egui::Color32::from_gray(160)),
+        egui::RichText::new("Same as `studio-worker register --reset`, without a restart.")
+            .italics()
+            .color(egui::Color32::from_gray(160)),
     );
+    clicked.then_some(StatusAction::ResetRegistration)
 }
 
-fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<AtomicBool>) {
+fn render_registered(ui: &mut egui::Ui, view: &StatusView) -> Option<StatusAction> {
     let StatusView::Registered {
         worker_id,
         api_base_url,
@@ -293,6 +300,7 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
     });
     ui.add_space(8.0);
 
+    let mut action = None;
     ui.horizontal(|ui| {
         let (label, hint) = if *paused {
             ("Resume", "start accepting new job offers again")
@@ -303,7 +311,7 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
             )
         };
         if ui.button(label).on_hover_text(hint).clicked() {
-            toggle_pause(paused_flag);
+            action = Some(StatusAction::SetPaused(!*paused));
         }
     });
     ui.add_space(8.0);
@@ -368,28 +376,7 @@ fn render_registered(ui: &mut egui::Ui, view: &StatusView, paused_flag: &Arc<Ato
             };
             ui.end_row();
         });
-}
-
-/// Flip the operator pause flag and emit a local `tracing` breadcrumb
-/// (stdout / Sentry) naming the Status tab as the source, matching the
-/// identical toggle from the tray menu (`ui::tray_host`).  The
-/// operator-facing record of the resulting claiming-state change — in
-/// the studio's shipped-log view and the UI's Logs tab — is shipped by
-/// the heartbeat pump, which observes this flag each tick (see
-/// `ws::session::pause_transition_breadcrumb`), so a toggle from any
-/// source is surfaced uniformly without plumbing the log channel into
-/// every UI control.  `fetch_xor` returns the previous value, so the
-/// new paused state is its negation.  Extracted from the button handler
-/// so the logging is unit-testable without an egui context.  Returns
-/// the new paused state.
-fn toggle_pause(paused_flag: &Arc<AtomicBool>) -> bool {
-    let now_paused = !paused_flag.fetch_xor(true, Ordering::SeqCst);
-    tracing::info!(
-        target: "studio_worker::ui::status",
-        paused = now_paused,
-        "pause toggled from status tab"
-    );
-    now_paused
+    action
 }
 
 #[cfg(test)]
@@ -398,6 +385,10 @@ mod tests {
     use crate::config::Config;
     use crate::runtime::HeartbeatStatus;
     use chrono::TimeZone;
+
+    fn registered_of(cfg: &Config) -> bool {
+        cfg.worker_id.is_some() && cfg.auth_token.is_some()
+    }
 
     fn registered_cfg() -> Config {
         Config {
@@ -414,6 +405,7 @@ mod tests {
         let cfg = Config::default();
         let view = StatusView::build(
             &cfg,
+            registered_of(&cfg),
             &RegistrationState::Pristine,
             false,
             false,
@@ -436,6 +428,7 @@ mod tests {
         let since = Utc::now();
         let view = StatusView::build(
             &cfg,
+            registered_of(&cfg),
             &RegistrationState::Pending {
                 request_id: "rr-42".into(),
                 since,
@@ -465,6 +458,7 @@ mod tests {
         let cfg = Config::default();
         let view = StatusView::build(
             &cfg,
+            registered_of(&cfg),
             &RegistrationState::Rejected {
                 reason: "unknown contributor".into(),
             },
@@ -488,6 +482,7 @@ mod tests {
         let cfg = registered_cfg();
         let view = StatusView::build(
             &cfg,
+            registered_of(&cfg),
             &RegistrationState::Pending {
                 request_id: "rr-stale".into(),
                 since: Utc::now(),
@@ -507,6 +502,7 @@ mod tests {
         let cfg = registered_cfg();
         let view = StatusView::build(
             &cfg,
+            registered_of(&cfg),
             &RegistrationState::Approved,
             false,
             false,
@@ -544,6 +540,7 @@ mod tests {
         let cfg = registered_cfg();
         let view = StatusView::build(
             &cfg,
+            registered_of(&cfg),
             &RegistrationState::Approved,
             false,
             true,
@@ -567,6 +564,7 @@ mod tests {
         };
         let view = StatusView::build(
             &cfg,
+            registered_of(&cfg),
             &RegistrationState::Approved,
             false,
             false,
@@ -598,6 +596,7 @@ mod tests {
         };
         let view = StatusView::build(
             &cfg,
+            registered_of(&cfg),
             &RegistrationState::Approved,
             true,
             false,
@@ -646,49 +645,5 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 5, 25, 12, 0, 0).unwrap();
         let then = Utc.with_ymd_and_hms(2026, 5, 25, 12, 0, 5).unwrap();
         assert_eq!(format_age(now, then), "just now");
-    }
-
-    #[test]
-    fn toggle_pause_flips_flag_and_logs_both_directions() {
-        // The Status-tab Pause/Resume button must leave the same
-        // breadcrumb the tray-menu toggle does (`ui::mod`), otherwise a
-        // pause from the window is invisible in the shipped logs while
-        // the identical action from the tray is not.
-        let flag = Arc::new(AtomicBool::new(false));
-
-        let out = crate::test_support::capture({
-            let flag = flag.clone();
-            move || assert!(toggle_pause(&flag), "first toggle must pause")
-        });
-        assert!(
-            flag.load(Ordering::SeqCst),
-            "flag is paused after first toggle"
-        );
-        assert!(out.contains("INFO"), "expected INFO level, got: {out}");
-        assert!(
-            out.contains("studio_worker::ui::status"),
-            "expected the status target, got: {out}"
-        );
-        assert!(
-            out.contains("pause toggled from status tab"),
-            "expected the toggle message, got: {out}"
-        );
-        assert!(
-            out.contains("paused=true"),
-            "expected paused=true, got: {out}"
-        );
-
-        let out = crate::test_support::capture({
-            let flag = flag.clone();
-            move || assert!(!toggle_pause(&flag), "second toggle must resume")
-        });
-        assert!(
-            !flag.load(Ordering::SeqCst),
-            "flag is resumed after second toggle"
-        );
-        assert!(
-            out.contains("paused=false"),
-            "expected paused=false, got: {out}"
-        );
     }
 }

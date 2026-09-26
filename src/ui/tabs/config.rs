@@ -1,7 +1,8 @@
-//! Config tab — user-editable subset of [`Config`] reachable as
-//! widgets.  Save writes through `crate::config::save`; the runtime
-//! loops pick up the new values on their next tick because every
-//! tick snapshots `Arc<Mutex<Config>>`.
+//! Config tab — the operator-editable subset of [`Config`] as widgets.
+//! The daemon owns the config: Save sends the edit to it
+//! (`PUT /daemon/config`), which validates, saves and applies it; the
+//! answer comes back through [`ConfigDraft::saved`] or
+//! [`ConfigDraft::save_failed`].
 //!
 //! Internal state (`worker_id`, `auth_token`, `install_id`,
 //! `registration_*`) is deliberately not surfaced here.  The
@@ -22,6 +23,8 @@ pub struct ConfigDraft {
     pub current: Config,
     pub original: Config,
     pub last_save_error: Option<String>,
+    /// A save is on its way to the daemon.
+    pub pending: bool,
 }
 
 impl ConfigDraft {
@@ -30,6 +33,7 @@ impl ConfigDraft {
             current: cfg.clone(),
             original: cfg.clone(),
             last_save_error: None,
+            pending: false,
         }
     }
 
@@ -37,36 +41,37 @@ impl ConfigDraft {
         !configs_equal(&self.current, &self.original)
     }
 
-    pub fn save(&mut self, path: &Path) -> Result<(), String> {
-        match config::save(&self.current, path) {
-            Ok(()) => {
-                // An operator deliberately applying settings through the
-                // window is a discrete, rare action that warrants an
-                // info-level breadcrumb — unlike `config::save`, which
-                // the auto-register poll loop calls every tick and so
-                // logs the routine persist at debug.  Emitting here (not
-                // in `config::save`) keeps that hot path quiet while
-                // surfacing operator-driven changes in default logs.
-                // Only non-secret, user-editable fields are named.
-                let changed = config::changed_fields(&self.original, &self.current).join(",");
-                tracing::info!(
-                    target: "studio_worker::ui::config",
-                    changed = ?changed,
-                    vram_threshold_gb = self.current.vram_threshold_gb,
-                    auto_update_enabled = self.current.auto_update_enabled,
-                    models_root = %self.current.models_root.display(),
-                    "operator applied config changes via UI"
-                );
-                self.original = self.current.clone();
-                self.last_save_error = None;
-                Ok(())
-            }
-            Err(e) => {
-                let msg = format!("{e}");
-                self.last_save_error = Some(msg.clone());
-                Err(msg)
-            }
+    /// Follow the daemon's config while the operator is not editing, so
+    /// the tab never shows values the daemon no longer has.
+    pub fn follow(&mut self, live: &Config) {
+        if !self.dirty() && !self.pending && !configs_equal(&self.original, live) {
+            *self = Self::from(live);
         }
+    }
+
+    /// The daemon saved `saved`: it is the new baseline.
+    pub fn saved(&mut self, saved: &Config) {
+        let changed = config::changed_fields(&self.original, saved).join(",");
+        tracing::info!(
+            target: "studio_worker::ui::config",
+            changed = ?changed,
+            "operator applied config changes via UI"
+        );
+        self.original = saved.clone();
+        self.current = saved.clone();
+        self.last_save_error = None;
+        self.pending = false;
+    }
+
+    /// The daemon refused the edit or could not be reached; keep it.
+    pub fn save_failed(&mut self, error: String) {
+        tracing::warn!(
+            target: "studio_worker::ui::config",
+            error = %error,
+            "config changes not applied"
+        );
+        self.last_save_error = Some(error);
+        self.pending = false;
     }
 
     pub fn reset(&mut self) {
@@ -81,13 +86,15 @@ fn configs_equal(a: &Config, b: &Config) -> bool {
     config::changed_fields(a, b).is_empty()
 }
 
+/// Draw the tab; answers the config to send to the daemon when the
+/// operator pressed Save.
 pub fn render(
     ui: &mut egui::Ui,
     draft: &mut ConfigDraft,
     config_path: &Path,
     notification_prefs: &mut NotificationPrefs,
-) -> bool {
-    let mut saved = false;
+) -> Option<Config> {
+    let mut save_requested = None;
     ui.heading("Configuration");
     ui.label(
         egui::RichText::new(format!("{}", config_path.display()))
@@ -161,14 +168,18 @@ pub fn render(
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         let dirty = draft.dirty();
-        let save = ui.add_enabled(dirty, egui::Button::new("Save"));
+        let save = ui.add_enabled(dirty && !draft.pending, egui::Button::new("Save"));
         if save.clicked() {
-            saved = draft.save(config_path).is_ok();
+            draft.pending = true;
+            save_requested = Some(draft.current.clone());
         }
         if ui.add_enabled(dirty, egui::Button::new("Reset")).clicked() {
             draft.reset();
         }
-        if let Some(err) = &draft.last_save_error {
+        if draft.pending {
+            ui.spinner();
+            ui.label("saving\u{2026}");
+        } else if let Some(err) = &draft.last_save_error {
             ui.colored_label(egui::Color32::LIGHT_RED, format!("save failed: {err}"));
         } else if !dirty && draft.last_save_error.is_none() {
             ui.label(
@@ -178,7 +189,7 @@ pub fn render(
             );
         }
     });
-    saved
+    save_requested
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +273,6 @@ fn labeled_folder(ui: &mut egui::Ui, label: &str, value: &mut PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn draft_starts_clean() {
@@ -288,17 +298,29 @@ mod tests {
     }
 
     #[test]
-    fn save_writes_through_and_clears_dirty() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let cfg = Config::default();
-        let mut draft = ConfigDraft::from(&cfg);
+    fn saved_makes_the_answer_the_new_baseline() {
+        let mut draft = ConfigDraft::from(&Config::default());
         draft.current.vram_threshold_gb = 24.0;
-        draft.save(&path).unwrap();
-        assert!(!draft.dirty());
-        // Reload from disk and confirm the value persisted.
-        let (loaded, _) = config::load(Some(&path.to_string_lossy())).unwrap();
-        assert!((loaded.vram_threshold_gb - 24.0).abs() < f32::EPSILON);
+        draft.pending = true;
+        let mut answer = draft.current.clone();
+        answer.vram_threshold_gb = 23.5;
+        draft.saved(&answer);
+        assert!(!draft.dirty() && !draft.pending);
+        assert_eq!(draft.current.vram_threshold_gb, 23.5);
+    }
+
+    #[test]
+    fn a_clean_draft_follows_the_daemon_but_an_edit_is_kept() {
+        let mut live = Config::default();
+        let mut draft = ConfigDraft::from(&live);
+        live.vram_threshold_gb = 5.0;
+        draft.follow(&live);
+        assert_eq!(draft.current.vram_threshold_gb, 5.0);
+
+        draft.current.vram_threshold_gb = 7.0;
+        live.vram_threshold_gb = 6.0;
+        draft.follow(&live);
+        assert_eq!(draft.current.vram_threshold_gb, 7.0, "edits survive a poll");
     }
 
     #[test]
@@ -312,39 +334,29 @@ mod tests {
     }
 
     #[test]
-    fn save_emits_operator_apply_breadcrumb() {
+    fn saved_emits_operator_apply_breadcrumb() {
         use crate::test_support::capture;
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("config.toml");
         let logs = capture(move || {
-            let cfg = Config::default();
-            let mut draft = ConfigDraft::from(&cfg);
+            let mut draft = ConfigDraft::from(&Config::default());
             draft.current.vram_threshold_gb = 24.0;
-            draft.save(&path).expect("save must succeed");
+            let answer = draft.current.clone();
+            draft.saved(&answer);
         });
-        assert!(logs.contains("INFO"), "expected INFO level, got: {logs}");
-        assert!(
-            logs.contains("studio_worker::ui::config"),
-            "expected ui::config target, got: {logs}"
-        );
-        assert!(
-            logs.contains("changed=\"vram_threshold_gb\""),
-            "expected the changed field list, got: {logs}"
-        );
+        assert!(logs.contains("studio_worker::ui::config"), "{logs}");
+        assert!(logs.contains("changed=\"vram_threshold_gb\""), "{logs}");
         assert!(
             logs.contains("operator applied config changes via UI"),
-            "expected the apply message, got: {logs}"
+            "{logs}"
         );
     }
 
     #[test]
-    fn save_failure_records_last_save_error() {
-        let cfg = Config::default();
-        let mut draft = ConfigDraft::from(&cfg);
-        // /proc is read-only on Linux — a write attempt fails.
-        let bad = Path::new("/proc/this-should-fail/config.toml");
-        let res = draft.save(bad);
-        assert!(res.is_err());
-        assert!(draft.last_save_error.is_some());
+    fn save_failed_keeps_the_edit_and_the_error() {
+        let mut draft = ConfigDraft::from(&Config::default());
+        draft.current.vram_threshold_gb = 3.0;
+        draft.pending = true;
+        draft.save_failed("invalid config".into());
+        assert!(draft.dirty() && !draft.pending);
+        assert_eq!(draft.last_save_error.as_deref(), Some("invalid config"));
     }
 }

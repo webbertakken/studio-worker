@@ -30,15 +30,19 @@ pub enum CheckLine {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AboutView {
     pub version: &'static str,
+    /// The daemon's version, when it answers.  Differs from `version`
+    /// after the daemon updated itself and the tray UI has not restarted.
+    pub daemon_version: Option<String>,
     pub release_name: &'static str,
     pub config_path: PathBuf,
     pub last_check: Option<CheckLine>,
 }
 
 impl AboutView {
-    pub fn build(state: &AboutState, config_path: &Path) -> Self {
+    pub fn build(state: &AboutState, config_path: &Path, daemon_version: Option<String>) -> Self {
         Self {
             version: AGENT_VERSION,
+            daemon_version,
             release_name: RELEASE_NAME,
             config_path: config_path.to_path_buf(),
             last_check: state.last_check.lock().clone(),
@@ -51,7 +55,7 @@ pub fn render(
     view: &AboutView,
     state: &AboutState,
     tokio: &Handle,
-    config_path: &Path,
+    feed: &UpdateFeed,
 ) {
     ui.heading("About studio-worker");
     ui.add_space(4.0);
@@ -60,8 +64,19 @@ pub fn render(
         .num_columns(2)
         .spacing([12.0, 6.0])
         .show(ui, |ui| {
-            ui.label("Version");
+            ui.label("Tray UI version");
             ui.monospace(view.version);
+            ui.end_row();
+
+            ui.label("Daemon version");
+            match &view.daemon_version {
+                Some(v) if v == view.version => ui.monospace(v),
+                Some(v) => ui.colored_label(
+                    egui::Color32::from_rgb(232, 168, 56),
+                    format!("{v} (restart the tray UI to match)"),
+                ),
+                None => ui.label("not reachable"),
+            };
             ui.end_row();
 
             ui.label("Sentry release");
@@ -80,11 +95,7 @@ pub fn render(
             .add_enabled(!busy, egui::Button::new("Check for updates"))
             .clicked()
         {
-            spawn_check(
-                tokio.clone(),
-                state.last_check.clone(),
-                config_path.to_path_buf(),
-            );
+            spawn_check(tokio.clone(), state.last_check.clone(), feed.clone());
         }
         match &view.last_check {
             None => {}
@@ -99,14 +110,20 @@ pub fn render(
     });
 }
 
-fn spawn_check(tokio: Handle, slot: Arc<Mutex<Option<CheckLine>>>, config_path: PathBuf) {
+/// The release feed the daemon is configured with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateFeed {
+    pub url: String,
+    pub prerelease: bool,
+}
+
+fn spawn_check(tokio: Handle, slot: Arc<Mutex<Option<CheckLine>>>, feed: UpdateFeed) {
     *slot.lock() = Some(CheckLine::InFlight);
-    let path_str = config_path.to_string_lossy().to_string();
     tokio.spawn(async move {
         // Build a fresh CheckOutcome string through the same formatter
         // `studio-worker check-update` uses on the CLI so messages are
         // identical between surfaces.
-        let outcome = run_check(Some(path_str.as_str())).await;
+        let outcome = run_check(feed).await;
         let line = record_check_outcome(outcome);
         *slot.lock() = Some(CheckLine::Result(line));
     });
@@ -150,15 +167,11 @@ fn record_check_outcome(outcome: anyhow::Result<update::CheckOutcome>) -> String
     }
 }
 
-async fn run_check(config_path: Option<&str>) -> anyhow::Result<update::CheckOutcome> {
-    use semver::Version;
-
-    let (cfg, _) = crate::config::load(config_path)?;
-    let current = Version::parse(AGENT_VERSION)?;
-    let outcome = tokio::task::spawn_blocking(move || {
-        update::check(&cfg.auto_update_feed, &current, cfg.auto_update_prerelease)
-    })
-    .await??;
+async fn run_check(feed: UpdateFeed) -> anyhow::Result<update::CheckOutcome> {
+    let current = semver::Version::parse(AGENT_VERSION)?;
+    let outcome =
+        tokio::task::spawn_blocking(move || update::check(&feed.url, &current, feed.prerelease))
+            .await??;
     Ok(outcome)
 }
 
@@ -169,7 +182,7 @@ mod tests {
     #[test]
     fn build_returns_static_version_strings() {
         let state = AboutState::default();
-        let view = AboutView::build(&state, Path::new("/tmp/c.toml"));
+        let view = AboutView::build(&state, Path::new("/tmp/c.toml"), None);
         assert_eq!(view.version, AGENT_VERSION);
         assert_eq!(view.release_name, RELEASE_NAME);
         assert_eq!(view.config_path, PathBuf::from("/tmp/c.toml"));
@@ -180,7 +193,7 @@ mod tests {
     fn build_surfaces_last_check_when_set() {
         let state = AboutState::default();
         *state.last_check.lock() = Some(CheckLine::Result("up to date".into()));
-        let view = AboutView::build(&state, Path::new("/tmp/c.toml"));
+        let view = AboutView::build(&state, Path::new("/tmp/c.toml"), None);
         assert_eq!(
             view.last_check,
             Some(CheckLine::Result("up to date".into()))

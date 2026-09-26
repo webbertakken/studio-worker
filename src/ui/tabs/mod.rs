@@ -6,4 +6,5 @@ pub mod about;
 pub mod config;
 pub mod jobs;
 pub mod logs;
+pub mod models;
 pub mod status;

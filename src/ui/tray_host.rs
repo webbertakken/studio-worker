@@ -22,6 +22,10 @@ use eframe::egui;
 
 use super::tray::{self, TrayVariant};
 
+/// Asks the daemon to pause (`true`) or resume.  The tray reads the
+/// replica's `paused` flag for its label and calls this on a click.
+pub type SetPaused = Arc<dyn Fn(bool) + Send + Sync>;
+
 /// Tracing target for tray lifecycle + click events.  Stable so
 /// operators can filter with `RUST_LOG=studio_worker::ui::tray=debug`.
 const TRACE_TARGET: &str = "studio_worker::ui::tray";
@@ -92,6 +96,7 @@ impl Inner {
 struct KsniTray {
     variant: TrayVariant,
     paused: Arc<AtomicBool>,
+    set_paused: SetPaused,
     quit: Arc<AtomicBool>,
     ctx: egui::Context,
 }
@@ -107,19 +112,20 @@ impl KsniTray {
     }
 
     fn toggle_pause(&self) {
-        let was_paused = self.paused.fetch_xor(true, Ordering::SeqCst);
+        let paused = !self.paused.load(Ordering::SeqCst);
         tracing::info!(
             target: TRACE_TARGET,
-            paused = !was_paused,
+            paused,
             "pause toggled from tray menu"
         );
+        (self.set_paused)(paused);
         self.ctx.request_repaint();
     }
 
     fn request_quit(&self) {
         tracing::info!(
             target: TRACE_TARGET,
-            "quit requested from tray menu; stopping worker"
+            "quit requested from tray menu; stopping the daemon"
         );
         self.quit.store(true, Ordering::SeqCst);
         self.ctx.request_repaint();
@@ -193,6 +199,7 @@ impl ksni::Tray for KsniTray {
 pub fn install(
     ctx: egui::Context,
     paused: Arc<AtomicBool>,
+    set_paused: SetPaused,
     quit: Arc<AtomicBool>,
     tokio: tokio::runtime::Handle,
     _initial_paused: bool,
@@ -203,6 +210,7 @@ pub fn install(
         let tray = KsniTray {
             variant: TrayVariant::Disconnected,
             paused,
+            set_paused,
             quit,
             ctx,
         };
@@ -280,6 +288,7 @@ impl Inner {
 pub fn install(
     ctx: egui::Context,
     paused: Arc<AtomicBool>,
+    set_paused: SetPaused,
     quit: Arc<AtomicBool>,
     _tokio: tokio::runtime::Handle,
     initial_paused: bool,
@@ -343,16 +352,17 @@ pub fn install(
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else if event.id == toggle_id {
-                let was_paused = paused.fetch_xor(true, Ordering::SeqCst);
+                let now_paused = !paused.load(Ordering::SeqCst);
                 tracing::info!(
                     target: TRACE_TARGET,
-                    paused = !was_paused,
+                    paused = now_paused,
                     "pause toggled from tray menu"
                 );
+                set_paused(now_paused);
             } else if event.id == quit_id {
                 tracing::info!(
                     target: TRACE_TARGET,
-                    "quit requested from tray menu; stopping worker"
+                    "quit requested from tray menu; stopping the daemon"
                 );
                 quit.store(true, Ordering::SeqCst);
             }
