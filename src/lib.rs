@@ -82,7 +82,9 @@ fn log_cli_startup(command: &cli::Command) {
 pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {
     log_cli_startup(&args.command);
     match args.command {
-        cli::Command::Run => runtime::run(args.config.as_deref()).await,
+        cli::Command::Run { wait_for_lock } => {
+            runtime::run(args.config.as_deref(), wait_for_lock).await
+        }
         cli::Command::Register {
             api_base_url,
             reset,
@@ -129,7 +131,11 @@ mod tests {
 
     #[test]
     fn startup_breadcrumb_names_version_and_command() {
-        let logs = capture(|| log_cli_startup(&cli::Command::Run));
+        let logs = capture(|| {
+            log_cli_startup(&cli::Command::Run {
+                wait_for_lock: false,
+            })
+        });
         assert!(logs.contains("INFO"), "expected INFO event, got: {logs}");
         assert!(
             logs.contains("studio_worker::cli"),

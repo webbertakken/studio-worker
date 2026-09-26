@@ -245,7 +245,9 @@ auto_update_prerelease = false
     let handle = tokio::spawn(async move {
         let _ = run_cli(cli::Cli {
             config: Some(path_str),
-            command: cli::Command::Run,
+            command: cli::Command::Run {
+                wait_for_lock: false,
+            },
         })
         .await;
     });
