@@ -137,7 +137,7 @@ Once a second the poller:
 3. applies them to the replica.
 
 When the daemon cannot be reached, the link becomes `unreachable` and the replica is emptied,
-so no tab shows stale data. If the daemon lock stays free for 20 s (`SPAWN_GRACE`, longer than
+so no page shows stale data. If the daemon lock stays free for 20 s (`SPAWN_GRACE`, longer than
 a supervisor's restart gap, so a supervised daemon is never raced), no daemon is running: the
 poller starts one (`studio-worker --config <path> run`, detached in its own process group, output
 appended to `<config dir>/daemon.log`) at most once every 10 s and logs `op="daemon_spawn"`;

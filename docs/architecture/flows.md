@@ -357,9 +357,10 @@ ui::run
     GET /jobs/<id>/thumbnail            thumbnails the replica lacks
     on failure: empty the Replica (no stale data);
       daemon lock held → link "starting"
-      lock free        → start `studio-worker --config <path> run`
+      lock free 20 s   → start `studio-worker --config <path> run`
                          (detached, output → <config dir>/daemon.log),
-                         at most every 10 s
+                         at most every 10 s; the grace outlasts a
+                         supervisor's restart gap
   raise watcher, every 250 ms:          ui.raise present → delete it, show +
                                           focus the window (op="raise")
   eframe window + tray: rail, pulse header, status bar; pages render the
