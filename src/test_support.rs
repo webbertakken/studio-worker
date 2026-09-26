@@ -185,18 +185,34 @@ impl crate::host::ChatModel for TestLoaded {
         &self,
         params: crate::types::LlmParams,
         _cancelled: &dyn Fn() -> bool,
+        on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<serde_json::Value> {
         let last = params
             .messages
             .last()
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        // Streams `resident:` then the last message, word by word.
+        on_piece("resident:");
+        for (i, word) in last.split(' ').enumerate() {
+            on_piece(&if i == 0 {
+                word.to_string()
+            } else {
+                format!(" {word}")
+            });
+        }
         Ok(serde_json::json!({
             "object": "chat.completion",
             "model": self.id,
             "choices": [{ "index": 0, "message": { "role": "assistant", "content": format!("resident:{last}") }, "finish_reason": "stop" }],
             "kwargs": params.chat_template_kwargs,
+            "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 },
         }))
+    }
+
+    /// One token per character.
+    fn tokenize(&self, text: &str, _add_special: bool) -> anyhow::Result<Vec<i32>> {
+        Ok(text.chars().map(|c| c as i32).collect())
     }
 }
 
