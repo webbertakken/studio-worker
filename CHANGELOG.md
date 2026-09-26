@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.10](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.9...studio-worker-v0.4.10) (2026-09-26)
+
+
+### Features
+
+* redesign the tray UI ([#138](https://github.com/webbertakken/studio-worker/issues/138)) ([7b6e725](https://github.com/webbertakken/studio-worker/commit/7b6e725369465ceb3f9ade1543992a9f9d7a0f97))
+* streamed chat, tokenize and model reuse ([#135](https://github.com/webbertakken/studio-worker/issues/135)) ([de44738](https://github.com/webbertakken/studio-worker/commit/de44738e9f322162a85aa0296819b6cd5e6dcb11))
+
+
+### Bug Fixes
+
+* never race a supervised daemon ([#137](https://github.com/webbertakken/studio-worker/issues/137)) ([72b9433](https://github.com/webbertakken/studio-worker/commit/72b943327c4a1da62024eda40dd1a2cccdb531ba))
+
 ## [0.4.9](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.8...studio-worker-v0.4.9) (2026-09-26)
 
 
