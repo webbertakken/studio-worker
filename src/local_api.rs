@@ -42,7 +42,7 @@ use crate::engine::Engine;
 use crate::host::{HostError, ModelHost, ModelStatus};
 use crate::job_gate::JobGate;
 use crate::lifecycle::ModelState;
-use crate::local::{run_image, run_kind, LocalError, LocalImageRequest};
+use crate::local::{chat_on_lane, run_image, run_kind, LocalError, LocalImageRequest};
 use crate::runtime::{JobOutcome, WorkerObservers};
 use crate::types::{
     AudioSttParams, AudioTtsParams, ChatMessage, LlmParams, Task, TaskKind, TaskResult, VideoParams,
@@ -189,6 +189,9 @@ struct ChatBody {
     top_p: Option<f32>,
     #[serde(default)]
     stop: Option<Vec<String>>,
+    /// llama-server compatible template switches (e.g. `enable_thinking`).
+    #[serde(default)]
+    chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -525,13 +528,25 @@ impl LocalApi {
             temperature: parsed.temperature.unwrap_or(0.7),
             top_p: parsed.top_p,
             stop: parsed.stop,
+            chat_template_kwargs: parsed.chat_template_kwargs,
             ..Default::default()
         };
+        let catalog = self.catalog.lock().clone();
+        // A loaded model answers on its own lane, outside the job gate.
+        if let Some(result) = chat_on_lane(
+            &self.host,
+            &catalog,
+            &self.observers,
+            parsed.model.as_deref(),
+            &prompt_preview,
+            params.clone(),
+        ) {
+            return respond_llm(request, result);
+        }
         let Some(_reservation) = self.gate.try_reserve() else {
             return respond_busy(request);
         };
-        let catalog = self.catalog.lock().clone();
-        match run_kind(
+        let outcome = run_kind(
             self.engine.as_ref(),
             &catalog,
             &self.observers,
@@ -539,14 +554,8 @@ impl LocalApi {
             parsed.model.as_deref(),
             &prompt_preview,
             Task::Llm(params),
-        ) {
-            Ok(TaskResult::Llm { json }) => match serde_json::to_vec(&json) {
-                Ok(bytes) => respond(request, 200, "application/json", &bytes),
-                Err(e) => respond(request, 500, "text/plain", e.to_string().as_bytes()),
-            },
-            Ok(_) => respond(request, 500, "text/plain", b"unexpected non-llm result"),
-            Err(err) => respond_local_err(request, err),
-        }
+        );
+        respond_llm(request, outcome)
     }
 
     fn handle_tts(&self, mut request: Request) -> std::io::Result<()> {
@@ -972,6 +981,17 @@ fn respond_local_err(request: Request, err: LocalError) -> std::io::Result<()> {
     respond(request, status, "text/plain", err.to_string().as_bytes())
 }
 
+fn respond_llm(request: Request, outcome: Result<TaskResult, LocalError>) -> std::io::Result<()> {
+    match outcome {
+        Ok(TaskResult::Llm { json }) => match serde_json::to_vec(&json) {
+            Ok(bytes) => respond(request, 200, "application/json", &bytes),
+            Err(e) => respond(request, 500, "text/plain", e.to_string().as_bytes()),
+        },
+        Ok(_) => respond(request, 500, "text/plain", b"unexpected non-llm result"),
+        Err(err) => respond_local_err(request, err),
+    }
+}
+
 /// `/models/<id><suffix>` -> `Some(id)` for a non-empty id without slashes.
 fn lifecycle_route<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
     let id = path.strip_prefix("/models/")?.strip_suffix(suffix)?;
@@ -1338,6 +1358,89 @@ mod tests {
         );
         assert!(unloaded.is_some(), "weights freed after delete");
         assert_eq!(h.host.loaded_gib(), 0.0);
+    }
+
+    fn llm_catalog() -> Catalog {
+        Catalog {
+            models: vec![synthetic_model_of("chat-llm", TaskKind::Llm)],
+        }
+    }
+
+    fn chat(h: &Harness, body: serde_json::Value) -> (u16, serde_json::Value) {
+        json(h.post("/v1/chat/completions").json(&body).send().unwrap())
+    }
+
+    #[test]
+    fn chat_is_served_on_the_lane_of_a_loaded_model() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let (status, body) = chat(
+            &h,
+            serde_json::json!({ "model": "chat-llm", "messages": [{ "role": "user", "content": "hi" }] }),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "resident:hi");
+    }
+
+    #[test]
+    fn chat_uses_the_default_llm_when_it_is_loaded() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let (_, body) = chat(
+            &h,
+            serde_json::json!({ "messages": [{ "role": "user", "content": "yo" }] }),
+        );
+        assert_eq!(body["choices"][0]["message"]["content"], "resident:yo");
+    }
+
+    #[test]
+    fn chat_template_kwargs_reach_the_model() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let (_, body) = chat(
+            &h,
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "chat_template_kwargs": { "enable_thinking": false },
+            }),
+        );
+        assert_eq!(
+            body["kwargs"],
+            serde_json::json!({ "enable_thinking": false })
+        );
+    }
+
+    #[test]
+    fn chat_on_an_unloaded_model_runs_as_a_transient_job() {
+        let h = Harness::start(llm_catalog());
+        let (status, body) = chat(
+            &h,
+            serde_json::json!({ "model": "chat-llm", "messages": [{ "role": "user", "content": "hi" }] }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(!content.starts_with("resident:"), "{content}");
+    }
+
+    #[test]
+    fn a_resident_chat_is_recorded_as_a_local_job_and_skips_the_job_gate() {
+        let gate = JobGate::new();
+        let h = Harness::start_with_gate(llm_catalog(), gate.clone());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let _held = gate.try_reserve().expect("a transient job holds the gate");
+        let (status, _) = chat(
+            &h,
+            serde_json::json!({ "model": "chat-llm", "messages": [{ "role": "user", "content": "lane" }] }),
+        );
+        assert_eq!(status, 200, "a loaded model serves on its own lane");
+        let jobs = h.observers.local_jobs.lock().clone();
+        let last = jobs.front().expect("recorded");
+        assert_eq!(last.model, "chat-llm");
+        assert_eq!(last.prompt, "lane");
     }
 
     #[test]

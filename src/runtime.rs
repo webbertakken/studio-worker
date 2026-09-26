@@ -833,7 +833,7 @@ pub fn spawn_local_api(
     let models_root = Some(cfg.lock().models_root.clone());
     let host = crate::host::ModelHost::new(
         catalog.clone(),
-        Arc::new(crate::loaders::Loaders),
+        Arc::new(crate::loaders::Loaders::new(cfg.lock().models_root.clone())),
         Arc::new(crate::admission::SystemProbe),
         crate::residency::Residency::load_for_serving(crate::config::residency_path_for(
             config_path,

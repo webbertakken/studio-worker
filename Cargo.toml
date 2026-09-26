@@ -20,9 +20,10 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Render each model's own Jinja chat template (GGUF `tokenizer.chat_template`);
+# Render each model's own Jinja chat template (GGUF `tokenizer.chat_template`).
+# Real templates use macros, namespace() and loop controls: keep the defaults.
 # pycompat covers the Python string methods real templates call.
-minijinja = { version = "2", default-features = false, features = ["builtins", "json", "serde", "unicode"] }
+minijinja = { version = "2", features = ["json", "loop_controls", "serde", "unicode"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 toml = "0.8"
 # Tiny synchronous HTTP server for the always-on local image API
@@ -171,7 +172,7 @@ winreg = "0.52"
 # the other modalities still work); Linux + macOS keep it.  The `llama`
 # feature's `dep:` edges below are simply inactive on Windows.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-llama-cpp-2 = { version = "0.1.124", optional = true, default-features = false }
+llama-cpp-2 = { version = "0.1.157", optional = true, default-features = false }
 encoding_rs = { version = "0.8", optional = true }
 
 [features]
@@ -184,6 +185,10 @@ encoding_rs = { version = "0.8", optional = true }
 # (whisper, image-candle) stay opt-in.
 default = ["ui", "llama", "video", "tts", "image-onnx"]
 llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# In-process LLM on NVIDIA GPUs (all layers offloaded).  Needs the CUDA
+# toolkit (nvcc) at build time, so it is opt-in: CI and release builds
+# stay CPU-only.
+cuda = ["llama", "llama-cpp-2/cuda"]
 whisper = ["dep:whisper-rs"]
 image-candle = [
     "dep:candle-core",

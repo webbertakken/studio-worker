@@ -2,11 +2,17 @@
 //!
 //! Compiled in via `--features llama`.  Reads every `*.gguf` it can
 //! find under `<models_root>/llm/` and exposes the filename stem as a
-//! model id.  When a job's `model` matches, the engine loads it on
-//! demand (with an LRU of size 1 — keep the most recently used model
-//! resident in VRAM/RAM), runs the generation, and returns
-//! `chat.completion`-shaped JSON.
+//! model id.  A job loads its model, runs the generation and frees it
+//! again (transient); models kept warm are the model host's resident
+//! models (`LoadedLlm`, see `docs/runtime/model-lifecycle.md`).  Both
+//! paths share `complete`, returning `chat.completion`-shaped JSON.
+use crate::catalog::CatalogModel;
+use crate::engine::chat_template::{merge_kwargs, render_chat, TemplateVars};
+use crate::engine::llm_core::{
+    chat_messages, completion_json, effective_context, finish_for, plan_budget, should_add_bos,
+};
 use crate::engine::{Engine, EngineCapabilities};
+use crate::host::{ChatModel, LoadedModel};
 use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -30,7 +36,6 @@ const TRACE_TARGET: &str = "studio_worker::engine::llama";
 pub struct LlamaEngine {
     backend: Arc<LlamaBackend>,
     models_root: PathBuf,
-    cached: Mutex<Option<CachedModel>>,
 }
 
 // `LlamaBackend::init()` can only run once per process; subsequent calls
@@ -70,18 +75,12 @@ fn global_backend() -> Result<Arc<LlamaBackend>> {
     Ok(arc)
 }
 
-struct CachedModel {
-    id: String,
-    model: Arc<LlamaModel>,
-}
-
 impl LlamaEngine {
     pub fn new(models_root: PathBuf) -> Result<Self> {
         let backend = global_backend().context("initialising llama backend")?;
         Ok(Self {
             backend,
             models_root,
-            cached: Mutex::new(None),
         })
     }
 
@@ -113,75 +112,38 @@ impl LlamaEngine {
             .map(|(_, p)| p)
     }
 
-    fn load_or_get(&self, model: &str, path: &Path) -> Result<Arc<LlamaModel>> {
-        let mut guard = self.cached.lock();
-        if let Some(c) = &*guard {
-            if c.id == model {
-                debug!(
-                    target: TRACE_TARGET,
-                    op = "load",
-                    model,
-                    cache = "hit",
-                    "reusing cached model"
-                );
-                return Ok(c.model.clone());
-            }
-        }
+    /// Load `path` for one transient job.  Dropped when the job ends, so a
+    /// transient job never leaves memory behind that the model host (and
+    /// its admission) cannot see; keeping a model warm is what residency is for.
+    fn load_transient(&self, model: &str, path: &Path) -> Result<LlamaModel> {
         info!(
             target: TRACE_TARGET,
             op = "load",
             model,
             path = %path.display(),
-            "loading model"
+            "loading model for one job"
         );
         let started = Instant::now();
-        let params = LlamaModelParams::default();
-        let loaded = LlamaModel::load_from_file(&self.backend, path, &params)
-            .with_context(|| format!("loading model {} from {}", model, path.display()))
-            .inspect_err(|e| {
-                warn!(
-                    target: TRACE_TARGET,
-                    op = "load",
-                    model,
-                    path = %path.display(),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    error = %e,
-                    "failed to load model"
-                );
-            })?;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let arc = Arc::new(loaded);
-        *guard = Some(CachedModel {
-            id: model.to_string(),
-            model: arc.clone(),
-        });
+        let loaded = load_model(&self.backend, model, path).inspect_err(|e| {
+            warn!(
+                target: TRACE_TARGET,
+                op = "load",
+                model,
+                path = %path.display(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "failed to load model"
+            );
+        })?;
         info!(
             target: TRACE_TARGET,
             op = "load",
             model,
-            elapsed_ms,
+            elapsed_ms = started.elapsed().as_millis() as u64,
             "model loaded"
         );
-        Ok(arc)
+        Ok(loaded)
     }
-}
-
-fn render_prompt(messages: &[ChatMessage]) -> String {
-    // Minimal chat template: <role>: <content>\n…\nassistant:
-    let mut out = String::new();
-    for m in messages {
-        out.push_str(&format!("<|{}|>\n{}\n", m.role, m.content));
-    }
-    out.push_str("<|assistant|>\n");
-    out
-}
-
-/// Whether a prompt of `prompt_tokens` plus a `max_tokens` generation
-/// budget overflows the context window `n_ctx` (the KV-cache size).
-/// Pure so the over-budget guard is unit-tested without a loaded model.
-/// Saturating arithmetic keeps a pathological `max_tokens` from wrapping.
-fn exceeds_context_window(prompt_tokens: usize, max_tokens: u32, n_ctx: u32) -> bool {
-    prompt_tokens.saturating_add(max_tokens as usize) > n_ctx as usize
 }
 
 /// Append a sampled token's decoded text to the running completion.
@@ -215,91 +177,267 @@ fn append_piece<E: std::fmt::Display>(
     }
 }
 
-fn run_generation(
+/// All layers on the GPU when built with CUDA; CPU otherwise.
+fn gpu_layers() -> u32 {
+    if cfg!(feature = "cuda") {
+        999
+    } else {
+        0
+    }
+}
+
+/// Prompt tokens decoded per batch.  Matches llama-server's default
+/// `n_batch`; the context's `n_batch` must be at least this.
+const PROMPT_BATCH: usize = 2048;
+
+fn load_model(backend: &LlamaBackend, id: &str, path: &Path) -> Result<LlamaModel> {
+    let params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers());
+    LlamaModel::load_from_file(backend, path, &params)
+        .with_context(|| format!("loading model {id} from {}", path.display()))
+}
+
+/// Special-token text a template may reference.
+fn template_vars(model: &LlamaModel) -> TemplateVars {
+    let text = |token| {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        model
+            .token_to_piece(token, &mut decoder, true, None)
+            .unwrap_or_default()
+    };
+    TemplateVars {
+        bos_token: text(model.token_bos()),
+        eos_token: text(model.token_eos()),
+    }
+}
+
+/// Render the request with the model's own template and switches.
+fn render_request(
+    model: &LlamaModel,
+    defaults: &ModelCliDefaults,
+    params: &LlmParams,
+) -> Result<String> {
+    let template = model
+        .meta_val_str("tokenizer.chat_template")
+        .map_err(|_| anyhow!("model has no chat template (tokenizer.chat_template)"))?;
+    let kwargs = merge_kwargs(
+        defaults.chat_template_kwargs.as_ref(),
+        params.chat_template_kwargs.as_ref(),
+    );
+    Ok(render_chat(
+        &template,
+        &chat_messages(params),
+        &kwargs,
+        &template_vars(model),
+    )?)
+}
+
+fn model_adds_bos(model: &LlamaModel) -> bool {
+    model
+        .meta_val_str("tokenizer.ggml.add_bos_token")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Run one chat completion on a loaded model.  Shared by the resident
+/// lane and the transient (per-job) path, so both behave the same.
+pub fn complete(
     model: &LlamaModel,
     backend: &LlamaBackend,
-    prompt: &str,
-    max_tokens: u32,
-    temperature: f32,
-) -> Result<(String, u32)> {
-    let ctx_size = NonZeroU32::new(2048).expect("non-zero");
+    id: &str,
+    defaults: &ModelCliDefaults,
+    params: LlmParams,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<serde_json::Value> {
+    let started = Instant::now();
+    let prompt = render_request(model, defaults, &params)?;
+    let bos = template_vars(model).bos_token;
+    let add_bos = if should_add_bos(model_adds_bos(model), &prompt, &bos) {
+        AddBos::Always
+    } else {
+        AddBos::Never
+    };
+    let tokens = model
+        .str_to_token(&prompt, add_bos)
+        .map_err(|e| anyhow!("tokenize prompt: {e:?}"))?;
+    let n_ctx = effective_context(defaults.context_size, model.n_ctx_train());
+    let budget = plan_budget(tokens.len(), params.max_tokens, n_ctx)?;
+    debug!(
+        target: TRACE_TARGET,
+        op = "generate",
+        model = id,
+        prompt_tokens = tokens.len(),
+        budget,
+        n_ctx,
+        "starting generation"
+    );
     let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(Some(ctx_size))
-        .with_n_batch(512);
+        .with_n_ctx(NonZeroU32::new(n_ctx))
+        .with_n_batch(PROMPT_BATCH as u32);
     let mut ctx = model
         .new_context(backend, ctx_params)
         .context("creating llama context")?;
 
-    let tokens = model
-        .str_to_token(prompt, AddBos::Always)
-        .map_err(|e| anyhow!("tokenize prompt: {e:?}"))?;
-    if tokens.is_empty() {
-        bail!("prompt tokenised to zero tokens");
+    let mut batch = LlamaBatch::new(PROMPT_BATCH, 1);
+    let mut pos: i32 = 0;
+    let last = tokens.len() - 1;
+    for chunk in tokens.chunks(PROMPT_BATCH) {
+        if cancelled() {
+            bail!("cancelled: model is unloading");
+        }
+        batch.clear();
+        for token in chunk {
+            batch
+                .add(*token, pos, &[0], pos as usize == last)
+                .map_err(|e| anyhow!("batch add: {e:?}"))?;
+            pos += 1;
+        }
+        ctx.decode(&mut batch).context("decoding prompt")?;
     }
 
-    // A prompt plus its generation budget larger than the context
-    // window overflows the KV cache: later decode steps run past what
-    // this context was sized for and the output silently truncates.
-    // We deliberately don't trim the prompt here (that would mangle the
-    // operator's input) — instead we surface the condition so "why was
-    // my long chat cut off" is answerable from the logs.  Raise n_ctx
-    // for longer chats.
-    if exceeds_context_window(tokens.len(), max_tokens, ctx_size.get()) {
-        warn!(
-            target: TRACE_TARGET,
-            op = "generate",
-            prompt_tokens = tokens.len(),
-            max_tokens,
-            n_ctx = ctx_size.get(),
-            "prompt + max_tokens exceeds the context window; output may be \
-             truncated — raise n_ctx for longer chats"
-        );
-    }
-
-    let mut batch = LlamaBatch::new(2048, 1);
-    let last_index = tokens.len() as i32 - 1;
-    for (i, token) in (0_i32..).zip(tokens.iter().copied()) {
-        let is_last = i == last_index;
-        batch
-            .add(token, i, &[0], is_last)
-            .map_err(|e| anyhow!("batch add: {e:?}"))?;
-    }
-    ctx.decode(&mut batch).context("decoding prompt")?;
-
-    let mut sampler = LlamaSampler::chain_simple(if temperature <= 0.0 {
-        vec![LlamaSampler::greedy()]
+    let mut sampler = if params.temperature <= 0.0 {
+        LlamaSampler::greedy()
     } else {
-        vec![
-            LlamaSampler::temp(temperature),
-            LlamaSampler::dist(/* seed */ 1234),
-        ]
-    });
-
+        let mut chain = Vec::new();
+        if let Some(p) = params.top_p {
+            chain.push(LlamaSampler::top_p(p, 1));
+        }
+        chain.push(LlamaSampler::temp(params.temperature));
+        chain.push(LlamaSampler::dist(1234));
+        LlamaSampler::chain_simple(chain)
+    };
+    let stops = params.stop.clone().unwrap_or_default();
+    // One decoder for the whole completion: a character split across two
+    // tokens decodes once both halves arrive.
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut out = String::new();
-    let mut decode_failures: u32 = 0;
-    let mut cursor = batch.n_tokens();
-    #[allow(clippy::explicit_counter_loop)]
-    for step in 0..max_tokens {
-        let new_token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(new_token);
-        if model.is_eog_token(new_token) {
+    let (mut generated, mut hit_end, mut decode_failures) = (0u32, false, 0u32);
+    while generated < budget {
+        if cancelled() {
+            bail!("cancelled: model is unloading");
+        }
+        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        sampler.accept(token);
+        if model.is_eog_token(token) {
+            hit_end = true;
             break;
         }
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
         append_piece(
             &mut out,
-            step as usize,
-            model.token_to_piece(new_token, &mut decoder, false, None),
+            generated as usize,
+            model.token_to_piece(token, &mut decoder, false, None),
             &mut decode_failures,
         );
+        generated += 1;
+        if let Some(cut) = stops
+            .iter()
+            .find_map(|s| out.rfind(s.as_str()).filter(|_| !s.is_empty()))
+        {
+            out.truncate(cut);
+            hit_end = true;
+            break;
+        }
         batch.clear();
         batch
-            .add(new_token, cursor, &[0], true)
+            .add(token, pos, &[0], true)
             .map_err(|e| anyhow!("batch add (token): {e:?}"))?;
-        cursor += 1;
+        pos += 1;
         ctx.decode(&mut batch).context("decoding token")?;
     }
-    Ok((out, decode_failures))
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let finish = finish_for(generated, budget, hit_end);
+    info!(
+        target: TRACE_TARGET,
+        op = "generate",
+        model = id,
+        prompt_tokens = tokens.len(),
+        completion_tokens = generated,
+        finish = finish.as_str(),
+        decode_failures,
+        elapsed_ms,
+        "generation complete"
+    );
+    Ok(completion_json(
+        id,
+        &out,
+        tokens.len(),
+        generated,
+        finish,
+        elapsed_ms,
+    ))
+}
+
+/// A GGUF held in memory by the model host (a resident model).
+pub struct LoadedLlm {
+    id: String,
+    model: LlamaModel,
+    backend: Arc<LlamaBackend>,
+    defaults: ModelCliDefaults,
+}
+
+impl LoadedModel for LoadedLlm {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_chat(&self) -> Option<&dyn ChatModel> {
+        Some(self)
+    }
+}
+
+impl ChatModel for LoadedLlm {
+    fn chat(&self, params: LlmParams, cancelled: &dyn Fn() -> bool) -> Result<serde_json::Value> {
+        complete(
+            &self.model,
+            &self.backend,
+            &self.id,
+            &self.defaults,
+            params,
+            cancelled,
+        )
+    }
+}
+
+/// Download (if needed) and load `model` for the host to keep resident.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn load_resident(models_root: &Path, model: &CatalogModel) -> Result<LoadedLlm> {
+    let backend = global_backend().context("initialising llama backend")?;
+    let files = ensure_llm_files(models_root, &model.source)?;
+    let path = pick_gguf(&files).ok_or_else(|| {
+        anyhow!(
+            "llama modelSource for `{}` contained no .gguf file",
+            model.id
+        )
+    })?;
+    let started = Instant::now();
+    let loaded = load_model(&backend, &model.id, &path)?;
+    info!(
+        target: TRACE_TARGET,
+        op = "load",
+        model = %model.id,
+        gpu_layers = gpu_layers(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "resident model loaded"
+    );
+    Ok(LoadedLlm {
+        id: model.id.clone(),
+        model: loaded,
+        backend,
+        defaults: model.source.cli_defaults.clone(),
+    })
+}
+
+/// Download every file of `source` into `<root>/llm/`.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn ensure_llm_files(
+    models_root: &Path,
+    source: &ModelSource,
+) -> Result<Vec<(ModelFileRole, PathBuf)>> {
+    let dir = models_root.join("llm");
+    source
+        .files
+        .iter()
+        .map(|file| Ok((file.role, crate::engine::download::ensure_file(&dir, file)?)))
+        .collect()
 }
 
 /// Sentinel the studio's claim filter recognises as "any llama-cpp
@@ -347,88 +485,28 @@ fn as_llm(task: Task, model: &str) -> Result<LlmParams> {
 }
 
 impl LlamaEngine {
-    /// Download every file the studio listed on the offer into
-    /// `<root>/llm/`, returning the resolved (role, path) pairs.  Cached
-    /// files are reused; a truncated download is rejected by the shared
-    /// downloader rather than cached as a corrupt model.
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    fn ensure_model_files(&self, source: &ModelSource) -> Result<Vec<(ModelFileRole, PathBuf)>> {
-        let dir = self.llm_dir();
-        let mut out = Vec::with_capacity(source.files.len());
-        for file in &source.files {
-            let local = crate::engine::download::ensure_file(&dir, file)?;
-            out.push((file.role, local));
-        }
-        Ok(out)
-    }
-
-    /// Load `path` (caching it) and run one chat completion, returning
-    /// `chat.completion`-shaped JSON.  Shared by the plain `dispatch`
-    /// (local model) and `dispatch_with_source` (downloaded model) paths.
-    fn run_llm(&self, model: &str, path: &Path, llm: LlmParams) -> Result<TaskResult> {
-        let loaded = self.load_or_get(model, path)?;
-        let prompt = render_prompt(&llm.messages);
-        debug!(
-            target: TRACE_TARGET,
-            op = "dispatch",
-            kind = "llm",
-            model,
-            max_tokens = llm.max_tokens,
-            temperature = llm.temperature,
-            messages = llm.messages.len(),
-            "starting generation"
-        );
-        let started = Instant::now();
-        let (content, decode_failures) = run_generation(
-            &loaded,
-            &self.backend,
-            &prompt,
-            llm.max_tokens.max(1),
-            llm.temperature.max(0.0),
-        )
-        .inspect_err(|e| {
-            warn!(
-                target: TRACE_TARGET,
-                op = "dispatch",
-                kind = "llm",
-                model,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                error = %e,
-                "generation failed"
-            );
-        })?;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        info!(
-            target: TRACE_TARGET,
-            op = "dispatch",
-            kind = "llm",
-            model,
-            elapsed_ms,
-            completion_chars = content.len(),
-            decode_failures,
-            "generation complete"
-        );
-
-        let prompt_tokens = prompt.split_whitespace().count();
-        let completion_tokens = content.split_whitespace().count();
-        let json = serde_json::json!({
-            "object": "chat.completion",
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content.trim(),
-                },
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
-            "elapsed_ms": elapsed_ms,
-        });
+    /// Load `path` (caching it) and run one chat completion with the
+    /// model's catalogue `defaults`.  Shared by `dispatch` (local model)
+    /// and `dispatch_with_source` (downloaded model).
+    fn run_llm(
+        &self,
+        model: &str,
+        path: &Path,
+        defaults: &ModelCliDefaults,
+        llm: LlmParams,
+    ) -> Result<TaskResult> {
+        let loaded = self.load_transient(model, path)?;
+        let json =
+            complete(&loaded, &self.backend, model, defaults, llm, &|| false).inspect_err(|e| {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    kind = "llm",
+                    model,
+                    error = %e,
+                    "generation failed"
+                );
+            })?;
         Ok(TaskResult::Llm { json })
     }
 }
@@ -468,7 +546,7 @@ impl Engine for LlamaEngine {
                 self.llm_dir().display()
             )
         })?;
-        self.run_llm(model, &path, llm)
+        self.run_llm(model, &path, &ModelCliDefaults::default(), llm)
     }
 
     fn dispatch_with_source(
@@ -489,61 +567,17 @@ impl Engine for LlamaEngine {
                 )
             })?
         } else {
-            let resolved = self.ensure_model_files(source)?;
+            let resolved = ensure_llm_files(&self.models_root, source)?;
             pick_gguf(&resolved)
                 .ok_or_else(|| anyhow!("llama modelSource for `{model}` contained no .gguf file"))?
         };
-        self.run_llm(model, &path, llm)
+        self.run_llm(model, &path, &source.cli_defaults, llm)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn exceeds_context_window_false_when_within_window() {
-        // 100 prompt + 50 budget = 150 <= 2048.
-        assert!(!exceeds_context_window(100, 50, 2048));
-    }
-
-    #[test]
-    fn exceeds_context_window_true_when_over_window() {
-        // 2000 prompt + 100 budget = 2100 > 2048.
-        assert!(exceeds_context_window(2000, 100, 2048));
-    }
-
-    #[test]
-    fn exceeds_context_window_false_at_exact_window() {
-        // Filling the window exactly is not yet an overflow.
-        assert!(!exceeds_context_window(1998, 50, 2048));
-    }
-
-    #[test]
-    fn exceeds_context_window_saturates_on_huge_budget() {
-        // A pathological max_tokens must not wrap to a small sum.
-        assert!(exceeds_context_window(1, u32::MAX, 2048));
-    }
-
-    #[test]
-    fn render_prompt_concatenates_messages_with_assistant_marker() {
-        let messages = vec![
-            ChatMessage {
-                role: "system".into(),
-                content: "be helpful".into(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            },
-        ];
-        let rendered = render_prompt(&messages);
-        assert!(rendered.contains("<|system|>"));
-        assert!(rendered.contains("be helpful"));
-        assert!(rendered.contains("<|user|>"));
-        assert!(rendered.contains("hi"));
-        assert!(rendered.ends_with("<|assistant|>\n"));
-    }
 
     // -----------------------------------------------------------------
     // append_piece — accumulates a sampled token's decoded text into the

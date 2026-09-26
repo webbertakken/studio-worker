@@ -3,20 +3,37 @@
 
 use crate::catalog::CatalogModel;
 use crate::host::{LoadedModel, ModelRuntime};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Dispatches a load to the loader for the model's engine.  An engine
 /// with no in-process loader is refused by name, never faked.
-#[derive(Default)]
-pub struct Loaders;
+pub struct Loaders {
+    models_root: PathBuf,
+}
+
+impl Loaders {
+    /// `models_root`: where model files are downloaded to.
+    pub fn new(models_root: PathBuf) -> Self {
+        Self { models_root }
+    }
+}
 
 impl ModelRuntime for Loaders {
     fn load(&self, model: &CatalogModel) -> anyhow::Result<Arc<dyn LoadedModel>> {
-        anyhow::bail!(
-            "no in-process loader for engine {:?} (model {})",
-            model.source.engine,
-            model.id
-        )
+        match &model.source.engine {
+            #[cfg(all(feature = "llama", not(target_os = "windows")))]
+            crate::types::ModelEngine::LlamaCpp => Ok(Arc::new(
+                crate::engine::llama::load_resident(&self.models_root, model)?,
+            )),
+            engine => {
+                let _ = &self.models_root;
+                anyhow::bail!(
+                    "no in-process loader for engine {engine:?} (model {})",
+                    model.id
+                )
+            }
+        }
     }
 }
 
@@ -42,7 +59,10 @@ mod tests {
             origin: "local".into(),
             exclusive_group: None,
         };
-        let err = Loaders.load(&model).err().expect("refused");
+        let err = Loaders::new(PathBuf::from("/nonexistent"))
+            .load(&model)
+            .err()
+            .expect("refused");
         assert!(
             err.to_string()
                 .contains("no in-process loader for engine SdCpp"),

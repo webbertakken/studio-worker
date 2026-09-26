@@ -126,6 +126,32 @@ impl crate::host::LoadedModel for TestLoaded {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn as_chat(&self) -> Option<&dyn crate::host::ChatModel> {
+        Some(self)
+    }
+}
+
+/// Echoes the last message as `resident:<text>`, plus the kwargs it got,
+/// so tests can tell a resident answer from a transient one.
+impl crate::host::ChatModel for TestLoaded {
+    fn chat(
+        &self,
+        params: crate::types::LlmParams,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        let last = params
+            .messages
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        Ok(serde_json::json!({
+            "object": "chat.completion",
+            "model": self.id,
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": format!("resident:{last}") }, "finish_reason": "stop" }],
+            "kwargs": params.chat_template_kwargs,
+        }))
+    }
 }
 
 /// A model runtime whose loads succeed at once.

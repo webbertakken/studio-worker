@@ -173,6 +173,42 @@ mod tests {
         assert!(err.to_string().starts_with("chat template"), "{err}");
     }
 
+    /// Qwen3.5's real template (Apache-2.0, from the model's GGUF
+    /// `tokenizer.chat_template`): macros, `namespace()`, loop state.
+    const QWEN35: &str = include_str!("../../tests/fixtures/qwen3.5-chat-template.jinja");
+
+    #[test]
+    fn renders_the_real_qwen35_template_with_thinking_off() {
+        let out = render_chat(
+            QWEN35,
+            &msgs(),
+            &kwargs(serde_json::json!({ "enable_thinking": false })),
+            &vars(),
+        )
+        .unwrap();
+        assert!(
+            out.starts_with("<|im_start|>system\nAnswer in JSON.<|im_end|>\n"),
+            "{out}"
+        );
+        assert!(out.contains("<|im_start|>user\nhi<|im_end|>\n"), "{out}");
+        assert!(
+            out.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn renders_the_real_qwen35_template_with_thinking_on() {
+        let out = render_chat(
+            QWEN35,
+            &msgs(),
+            &kwargs(serde_json::json!({ "enable_thinking": true })),
+            &vars(),
+        )
+        .unwrap();
+        assert!(out.ends_with("<|im_start|>assistant\n<think>\n"), "{out}");
+    }
+
     #[test]
     fn request_kwargs_override_model_defaults() {
         let merged = merge_kwargs(

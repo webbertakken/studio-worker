@@ -124,6 +124,57 @@ pub fn run_kind(
     dispatch_and_record(engine, model, observers, prompt_preview, task)
 }
 
+/// Serve a chat on the lane of a loaded model, recording it like any
+/// local job.  `None` when the resolved model is not loaded (or is not
+/// a chat model): the caller runs it as a transient job instead.
+pub fn chat_on_lane(
+    host: &crate::host::ModelHost,
+    catalog: &Catalog,
+    observers: &WorkerObservers,
+    model_id: Option<&str>,
+    prompt_preview: &str,
+    params: crate::types::LlmParams,
+) -> Option<Result<TaskResult, LocalError>> {
+    let model = match model_id {
+        Some(id) => catalog.get(id)?,
+        None => catalog.default_model_for(TaskKind::Llm)?,
+    };
+    if model.kind != TaskKind::Llm {
+        return None;
+    }
+    let job_id = next_job_id();
+    let started_at = Utc::now();
+    let served = host.with_lane(&model.id, |loaded, lane| {
+        loaded
+            .as_chat()
+            .map(|chat| chat.chat(params, &|| lane.cancelled()))
+    });
+    let result = match served {
+        Ok(Some(result)) => result.map(|json| TaskResult::Llm { json }),
+        // Not loaded, or loaded but not a chat model: the transient path decides.
+        Ok(None) | Err(_) => return None,
+    };
+    let outcome = match &result {
+        Ok(_) => JobOutcome::Completed,
+        Err(err) => JobOutcome::Failed {
+            reason: err.to_string(),
+        },
+    };
+    record_local_job(
+        observers,
+        RecentJob {
+            job_id,
+            kind: TaskKind::Llm,
+            model: model.id.clone(),
+            prompt: truncate_prompt(prompt_preview),
+            outcome,
+            started_at,
+            finished_at: Utc::now(),
+        },
+    );
+    Some(result.map_err(|err| LocalError::Engine(err.to_string())))
+}
+
 /// Dispatch `task` on `model` and record the finished job in the
 /// local-queue ring.  Shared by [`run_image`] and [`run_kind`] so the
 /// dispatch + bookkeeping lives in one place.
