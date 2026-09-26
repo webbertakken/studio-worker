@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.11](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.10...studio-worker-v0.4.11) (2026-09-26)
+
+
+### Features
+
+* **sdcpp:** serve Qwen-Image-2.1 removal ([#134](https://github.com/webbertakken/studio-worker/issues/134)) ([facb993](https://github.com/webbertakken/studio-worker/commit/facb993cd48bba57a98779c276d2f3106799c8e5))
+
 ## [0.4.10](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.9...studio-worker-v0.4.10) (2026-09-26)
 
 
