@@ -23,6 +23,7 @@ pub mod host;
 pub mod http;
 pub mod job_gate;
 pub mod lifecycle;
+pub mod loaders;
 pub mod local;
 pub mod local_api;
 pub mod net;

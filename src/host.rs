@@ -540,24 +540,14 @@ fn credit(free: FreeMemory, freed_gib: f32) -> FreeMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admission::MemoryProbe;
     use crate::catalog::{Catalog, CatalogModel};
     use crate::lifecycle::ModelState;
+    use crate::test_support::FixedProbe;
     use crate::types::{ModelEngine, ModelSource, TaskKind};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     const WAIT: Duration = Duration::from_secs(5);
-
-    struct FixedProbe(f32);
-    impl MemoryProbe for FixedProbe {
-        fn free_gib(&self) -> Option<f32> {
-            Some(self.0)
-        }
-        fn total_gib(&self) -> Option<f32> {
-            Some(24.0)
-        }
-    }
 
     struct FakeLoaded {
         id: String,

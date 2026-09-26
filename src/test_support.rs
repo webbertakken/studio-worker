@@ -105,6 +105,43 @@ pub fn capture<F: FnOnce() + Send + 'static>(f: F) -> String {
     .expect("capture thread panicked")
 }
 
+/// A device-memory probe that always reports `free` GiB (of 24 total).
+pub struct FixedProbe(pub f32);
+
+impl crate::admission::MemoryProbe for FixedProbe {
+    fn free_gib(&self) -> Option<f32> {
+        Some(self.0)
+    }
+    fn total_gib(&self) -> Option<f32> {
+        Some(24.0)
+    }
+}
+
+/// A loaded model that only knows its id.
+pub struct TestLoaded {
+    pub id: String,
+}
+
+impl crate::host::LoadedModel for TestLoaded {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A model runtime whose loads succeed at once.
+pub struct InstantRuntime;
+
+impl crate::host::ModelRuntime for InstantRuntime {
+    fn load(
+        &self,
+        model: &crate::catalog::CatalogModel,
+    ) -> anyhow::Result<std::sync::Arc<dyn crate::host::LoadedModel>> {
+        Ok(std::sync::Arc::new(TestLoaded {
+            id: model.id.clone(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

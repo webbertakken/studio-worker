@@ -212,6 +212,12 @@ pub fn catalog_path_for(config_path: &Path) -> Option<PathBuf> {
     config_path.parent().map(|dir| dir.join("models.json"))
 }
 
+/// Path to the model residency file (`residency.json`), next to the
+/// active config file, for the same isolation reason as [`catalog_path_for`].
+pub fn residency_path_for(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent().map(|dir| dir.join("residency.json"))
+}
+
 /// Path to the local API discovery file (`local-api.json`), next to
 /// the active config file.  Written on every successful bind so local
 /// clients can find the URL + bearer token without parsing logs;
@@ -582,6 +588,10 @@ mod tests {
         assert_eq!(
             local_api_discovery_path_for(cfg),
             Some(PathBuf::from("/tmp/custom-dir/local-api.json"))
+        );
+        assert_eq!(
+            residency_path_for(cfg),
+            Some(PathBuf::from("/tmp/custom-dir/residency.json"))
         );
         // A parentless path yields None rather than a panic.
         assert_eq!(catalog_path_for(Path::new("/")), None);

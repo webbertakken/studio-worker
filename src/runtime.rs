@@ -831,6 +831,14 @@ pub fn spawn_local_api(
     );
 
     let models_root = Some(cfg.lock().models_root.clone());
+    let host = crate::host::ModelHost::new(
+        catalog.clone(),
+        Arc::new(crate::loaders::Loaders),
+        Arc::new(crate::admission::SystemProbe),
+        crate::residency::Residency::load_for_serving(crate::config::residency_path_for(
+            config_path,
+        )),
+    );
     let api = crate::local_api::LocalApi::bind(
         &format!("127.0.0.1:{port}"),
         engine.clone(),
@@ -840,6 +848,7 @@ pub fn spawn_local_api(
         token.clone(),
         gate.clone(),
         models_root.clone(),
+        host.clone(),
     )
     .or_else(|_| {
         crate::local_api::LocalApi::bind(
@@ -851,6 +860,7 @@ pub fn spawn_local_api(
             token.clone(),
             gate.clone(),
             models_root,
+            host.clone(),
         )
     });
 
@@ -869,6 +879,9 @@ pub fn spawn_local_api(
         &observers,
         crate::engine::sd_provision::vulkan_runtime_status(),
     );
+
+    // Bring back the models the operator left loaded.
+    host.restore_residents();
 
     let url = api.url();
     *observers.local_api_url.lock() = Some(url.clone());

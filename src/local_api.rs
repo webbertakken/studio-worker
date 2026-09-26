@@ -39,7 +39,9 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::catalog::{Catalog, CatalogModel};
 use crate::engine::Engine;
+use crate::host::{HostError, ModelHost, ModelStatus};
 use crate::job_gate::JobGate;
+use crate::lifecycle::ModelState;
 use crate::local::{run_image, run_kind, LocalError, LocalImageRequest};
 use crate::runtime::{JobOutcome, WorkerObservers};
 use crate::types::{
@@ -149,6 +151,8 @@ pub struct LocalApi {
     /// Root the engine downloads models into.  Reported (with its free
     /// space) on `/healthz` so a stuck first-use download is visible.
     models_root: Option<PathBuf>,
+    /// Loads, unloads and serves resident models (the model lifecycle).
+    host: ModelHost,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +256,7 @@ impl LocalApi {
         token: String,
         gate: JobGate,
         models_root: Option<PathBuf>,
+        host: ModelHost,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !token.is_empty(),
@@ -273,6 +278,7 @@ impl LocalApi {
             token,
             gate,
             models_root,
+            host,
         })
     }
 
@@ -380,6 +386,20 @@ impl LocalApi {
             (Method::Get, "/models") => self.handle_list_models(request),
             (Method::Post, "/models") => self.handle_add_model(request),
             (Method::Get, "/jobs") => self.handle_jobs(request),
+            (Method::Get, p) if lifecycle_route(p, "/state").is_some() => {
+                let id = lifecycle_route(p, "/state").unwrap_or_default().to_string();
+                self.respond_lifecycle(request, self.host.status(&id), 200)
+            }
+            (Method::Post, p) if lifecycle_route(p, "/load").is_some() => {
+                let id = lifecycle_route(p, "/load").unwrap_or_default().to_string();
+                self.respond_lifecycle(request, self.host.load(&id), 202)
+            }
+            (Method::Post, p) if lifecycle_route(p, "/unload").is_some() => {
+                let id = lifecycle_route(p, "/unload")
+                    .unwrap_or_default()
+                    .to_string();
+                self.respond_lifecycle(request, self.host.unload(&id), 202)
+            }
             (Method::Delete, p) if p.starts_with("/models/") => {
                 let id = p.trim_start_matches("/models/").to_string();
                 self.handle_delete_model(request, &id)
@@ -671,8 +691,23 @@ impl LocalApi {
     }
 
     fn handle_list_models(&self, request: Request) -> std::io::Result<()> {
-        let catalog = self.catalog.lock();
-        match serde_json::to_vec(&catalog.models) {
+        let models = self.catalog.lock().models.clone();
+        let statuses = self.host.statuses();
+        let listed: Vec<serde_json::Value> = models
+            .iter()
+            .map(|model| {
+                let mut value = serde_json::to_value(model).unwrap_or_default();
+                if let (Some(obj), Some(status)) = (
+                    value.as_object_mut(),
+                    statuses.iter().find(|s| s.id == model.id),
+                ) {
+                    obj.insert("state".into(), status.state.name().into());
+                    obj.insert("resident".into(), status.resident.into());
+                }
+                value
+            })
+            .collect();
+        match serde_json::to_vec(&listed) {
             Ok(body) => respond(request, 200, "application/json", &body),
             Err(err) => respond(request, 500, "text/plain", err.to_string().as_bytes()),
         }
@@ -706,6 +741,16 @@ impl LocalApi {
     }
 
     fn handle_delete_model(&self, request: Request, id: &str) -> std::io::Result<()> {
+        // Free the weights and drop the residency before the entry goes.
+        if let Err(err) = self.host.unload(id) {
+            if !matches!(err, HostError::UnknownModel(_)) {
+                return respond_json(
+                    request,
+                    500,
+                    &serde_json::json!({ "error": "unload_failed", "message": err.to_string() }),
+                );
+            }
+        }
         let (existed, saved) = {
             let mut catalog = self.catalog.lock();
             let existed = catalog.remove(id);
@@ -717,6 +762,61 @@ impl LocalApi {
         match saved {
             Ok(()) => respond(request, 200, "application/json", b"{\"ok\":true}"),
             Err(err) => respond(request, 500, "text/plain", err.to_string().as_bytes()),
+        }
+    }
+
+    /// Answer a lifecycle call: the model's status, or a named error.
+    /// `pending_status` is used while the model is still transitioning.
+    fn respond_lifecycle(
+        &self,
+        request: Request,
+        outcome: Result<ModelStatus, HostError>,
+        pending_status: u16,
+    ) -> std::io::Result<()> {
+        match outcome {
+            Ok(status) => {
+                let code = match status.state {
+                    ModelState::Loading | ModelState::Unloading => pending_status,
+                    _ => 200,
+                };
+                respond_json(request, code, &status_json(&status))
+            }
+            Err(err) => {
+                let (code, body) = match &err {
+                    HostError::UnknownModel(_) => {
+                        (404, serde_json::json!({ "error": "unknown_model" }))
+                    }
+                    HostError::Disabled(_) => {
+                        (400, serde_json::json!({ "error": "model_disabled" }))
+                    }
+                    HostError::Refused(r) => (
+                        409,
+                        serde_json::json!({
+                            "error": "insufficient_memory",
+                            "neededGib": r.needed_gib,
+                            "freeGib": r.free_gib,
+                            "marginGib": r.margin_gib,
+                        }),
+                    ),
+                    HostError::NotLoaded { state, .. } => (
+                        409,
+                        serde_json::json!({ "error": "model_not_loaded", "state": state }),
+                    ),
+                    HostError::Persist(_) => {
+                        (500, serde_json::json!({ "error": "residency_not_saved" }))
+                    }
+                };
+                let mut body = body;
+                body["message"] = err.to_string().into();
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    op = "lifecycle",
+                    status = code,
+                    error = %err,
+                    "lifecycle request refused"
+                );
+                respond_json(request, code, &body)
+            }
         }
     }
 
@@ -872,6 +972,31 @@ fn respond_local_err(request: Request, err: LocalError) -> std::io::Result<()> {
     respond(request, status, "text/plain", err.to_string().as_bytes())
 }
 
+/// `/models/<id><suffix>` -> `Some(id)` for a non-empty id without slashes.
+fn lifecycle_route<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let id = path.strip_prefix("/models/")?.strip_suffix(suffix)?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// The wire shape of a model's status.
+fn status_json(status: &ModelStatus) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "id": status.id,
+        "state": status.state.name(),
+        "resident": status.resident,
+        "since": status.since.to_rfc3339(),
+    });
+    if let ModelState::Failed { reason } = &status.state {
+        body["error"] = reason.clone().into();
+    }
+    body
+}
+
+fn respond_json(request: Request, status: u16, body: &serde_json::Value) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    respond(request, status, "application/json", &bytes)
+}
+
 fn respond(request: Request, status: u16, content_type: &str, body: &[u8]) -> std::io::Result<()> {
     let header = Header::from_bytes(b"Content-Type".as_slice(), content_type.as_bytes())
         .expect("static content-type header is valid");
@@ -959,6 +1084,7 @@ mod tests {
     struct Harness {
         url: String,
         observers: WorkerObservers,
+        host: crate::host::ModelHost,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
@@ -969,17 +1095,34 @@ mod tests {
         }
 
         fn start_with_gate(catalog: Catalog, gate: JobGate) -> Self {
+            Self::start_full(catalog, gate, 20.0)
+        }
+
+        /// Start with a device reporting `free_gib` of free memory.
+        fn start_with_free(catalog: Catalog, free_gib: f32) -> Self {
+            Self::start_full(catalog, JobGate::new(), free_gib)
+        }
+
+        fn start_full(catalog: Catalog, gate: JobGate, free_gib: f32) -> Self {
             let engine: Arc<dyn Engine> = Arc::new(SyntheticEngine::new());
             let observers = WorkerObservers::default();
+            let catalog = Arc::new(Mutex::new(catalog));
+            let host = crate::host::ModelHost::new(
+                catalog.clone(),
+                Arc::new(crate::test_support::InstantRuntime),
+                Arc::new(crate::test_support::FixedProbe(free_gib)),
+                crate::residency::Residency::load_for_serving(None),
+            );
             let api = LocalApi::bind(
                 "127.0.0.1:0",
                 engine,
-                Arc::new(Mutex::new(catalog)),
+                catalog,
                 None,
                 observers.clone(),
                 TEST_TOKEN.to_string(),
                 gate.clone(),
                 None,
+                host.clone(),
             )
             .unwrap();
             let url = api.url();
@@ -989,6 +1132,7 @@ mod tests {
             Harness {
                 url,
                 observers,
+                host,
                 stop,
                 handle: Some(handle),
             }
@@ -1016,6 +1160,15 @@ mod tests {
                 let _ = handle.join();
             }
         }
+    }
+
+    fn test_host(catalog: &Arc<Mutex<Catalog>>) -> crate::host::ModelHost {
+        crate::host::ModelHost::new(
+            catalog.clone(),
+            Arc::new(crate::test_support::InstantRuntime),
+            Arc::new(crate::test_support::FixedProbe(20.0)),
+            crate::residency::Residency::load_for_serving(None),
+        )
     }
 
     fn seeded_catalog() -> Catalog {
@@ -1058,6 +1211,133 @@ mod tests {
         let h = Harness::start(seeded_catalog());
         let body = h.get("/models").send().unwrap().text().unwrap();
         assert!(body.contains("synthetic-img"));
+    }
+
+    fn json(res: reqwest::blocking::Response) -> (u16, serde_json::Value) {
+        let status = res.status().as_u16();
+        (status, res.json().unwrap())
+    }
+
+    fn wait_state(h: &Harness, id: &str, want: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (status, body) = json(h.get(&format!("/models/{id}/state")).send().unwrap());
+            assert_eq!(status, 200, "{body}");
+            if body["state"] == want {
+                return body;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never reached {want}: {body}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn get_models_carries_state_and_residency() {
+        let h = Harness::start(seeded_catalog());
+        let (status, body) = json(h.get("/models").send().unwrap());
+        assert_eq!(status, 200);
+        let first = &body.as_array().unwrap()[0];
+        assert_eq!(first["state"], "unloaded");
+        assert_eq!(first["resident"], false);
+        assert!(first["id"].is_string(), "catalogue fields stay: {first}");
+    }
+
+    #[test]
+    fn load_reaches_loaded_and_marks_resident() {
+        let h = Harness::start(seeded_catalog());
+        let (status, body) = json(h.post("/models/synthetic-img/load").send().unwrap());
+        assert!(status == 202 || status == 200, "{status} {body}");
+        assert_eq!(body["id"], "synthetic-img");
+        assert_eq!(body["resident"], true);
+        let body = wait_state(&h, "synthetic-img", "loaded");
+        assert!(body["since"].is_string());
+        let (status, _) = json(h.post("/models/synthetic-img/load").send().unwrap());
+        assert_eq!(status, 200, "loading a loaded model is a no-op");
+    }
+
+    #[test]
+    fn unload_frees_and_clears_residency() {
+        let h = Harness::start(seeded_catalog());
+        h.post("/models/synthetic-img/load").send().unwrap();
+        wait_state(&h, "synthetic-img", "loaded");
+        let (status, body) = json(h.post("/models/synthetic-img/unload").send().unwrap());
+        assert!(status == 202 || status == 200, "{status} {body}");
+        assert_eq!(body["resident"], false);
+        wait_state(&h, "synthetic-img", "unloaded");
+        let (status, _) = json(h.post("/models/synthetic-img/unload").send().unwrap());
+        assert_eq!(status, 200, "unloading an unloaded model is a no-op");
+    }
+
+    #[test]
+    fn a_load_that_does_not_fit_is_a_409_with_the_numbers() {
+        let mut catalog = seeded_catalog();
+        catalog.models[0].vram_gb_estimate = 8.0;
+        let h = Harness::start_with_free(catalog, 4.0);
+        let (status, body) = json(h.post("/models/synthetic-img/load").send().unwrap());
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"], "insufficient_memory");
+        assert_eq!(body["neededGib"], 8.0);
+        assert_eq!(body["freeGib"], 4.0);
+        assert!(body["marginGib"].is_number());
+        wait_state(&h, "synthetic-img", "unloaded");
+    }
+
+    #[test]
+    fn unknown_models_are_404_on_every_lifecycle_route() {
+        let h = Harness::start(seeded_catalog());
+        for res in [
+            h.get("/models/nope/state").send().unwrap(),
+            h.post("/models/nope/load").send().unwrap(),
+            h.post("/models/nope/unload").send().unwrap(),
+        ] {
+            let (status, body) = json(res);
+            assert_eq!(status, 404);
+            assert_eq!(body["error"], "unknown_model");
+        }
+    }
+
+    #[test]
+    fn a_disabled_model_cannot_be_loaded() {
+        let mut catalog = seeded_catalog();
+        catalog.models[0].enabled = false;
+        let h = Harness::start(catalog);
+        let (status, body) = json(h.post("/models/synthetic-img/load").send().unwrap());
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "model_disabled");
+    }
+
+    #[test]
+    fn lifecycle_routes_need_the_token() {
+        let h = Harness::start(seeded_catalog());
+        let res = reqwest::blocking::Client::new()
+            .post(format!("{}/models/synthetic-img/load", h.url))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 401);
+        wait_state(&h, "synthetic-img", "unloaded");
+    }
+
+    #[test]
+    fn deleting_a_loaded_model_unloads_it_first() {
+        let h = Harness::start(seeded_catalog());
+        h.post("/models/synthetic-img/load").send().unwrap();
+        wait_state(&h, "synthetic-img", "loaded");
+        let res = reqwest::blocking::Client::new()
+            .delete(format!("{}/models/synthetic-img", h.url))
+            .bearer_auth(TEST_TOKEN)
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let unloaded = h.host.wait_for(
+            "synthetic-img",
+            |s| *s == crate::lifecycle::ModelState::Unloaded,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(unloaded.is_some(), "weights freed after delete");
+        assert_eq!(h.host.loaded_gib(), 0.0);
     }
 
     #[test]
@@ -1324,15 +1604,17 @@ mod tests {
             delay: std::time::Duration::from_millis(400),
         });
         let observers = WorkerObservers::default();
+        let catalog = Arc::new(Mutex::new(seeded_catalog()));
         let api = LocalApi::bind(
             "127.0.0.1:0",
             engine,
-            Arc::new(Mutex::new(seeded_catalog())),
+            catalog.clone(),
             None,
             observers,
             TEST_TOKEN.to_string(),
             JobGate::new(),
             None,
+            test_host(&catalog),
         )
         .unwrap();
         let url = api.url();
@@ -1438,15 +1720,17 @@ mod tests {
     #[test]
     fn bind_refuses_an_empty_token() {
         let engine: Arc<dyn Engine> = Arc::new(SyntheticEngine::new());
+        let catalog = Arc::new(Mutex::new(seeded_catalog()));
         let err = LocalApi::bind(
             "127.0.0.1:0",
             engine,
-            Arc::new(Mutex::new(seeded_catalog())),
+            catalog.clone(),
             None,
             WorkerObservers::default(),
             String::new(),
             JobGate::new(),
             None,
+            test_host(&catalog),
         )
         .err()
         .expect("empty token must be refused")

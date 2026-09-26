@@ -32,11 +32,34 @@ it works even when the worker is not registered with any studio.
 | POST   | `/tts`          | yes  | `{text, model?, voice?, speed?, language?, ext?}` | audio bytes (`audio/wav` etc.) |
 | POST   | `/stt`          | yes  | `{inputUrl, model?, language?}`            | transcript JSON |
 | POST   | `/video`        | yes  | `{prompt, model?, negativePrompt?, seconds?, width?, height?, ext?}` | video bytes (`video/mp4` etc.) |
-| GET    | `/models`       | yes  | —                                          | catalog as JSON array |
+| GET    | `/models`       | yes  | —                                          | catalog as JSON array, each entry with `state` + `resident` |
+| GET    | `/models/:id/state` | yes | —                                        | `{id, state, resident, since, error?}` |
+| POST   | `/models/:id/load`  | yes | —                                        | `202` loading / `200` loaded; marks it resident |
+| POST   | `/models/:id/unload`| yes | —                                        | `202` unloading / `200` unloaded; clears residency |
 | POST   | `/models`       | yes  | a catalog model (same `ModelSource` shape) | `{"ok":true}` |
-| DELETE | `/models/:id`   | yes  | —                                          | `{"ok":true}` / 404 |
+| DELETE | `/models/:id`   | yes  | —                                          | `{"ok":true}` / 404; unloads it first |
 | GET    | `/jobs`         | yes  | —                                          | recent local jobs as JSON |
 | GET    | `/healthz`      | no   | —                                          | runtime snapshot (below) |
+
+### Model lifecycle
+
+Models can be kept loaded (resident) for warm answers and unloaded to free device memory; see
+[model lifecycle](runtime/model-lifecycle.md) for states, residency and admission.
+
+Lifecycle routes answer JSON. Errors carry a stable `error` code plus a `message`:
+
+| Status | `error` | When |
+| --- | --- | --- |
+| 404 | `unknown_model` | no catalogue model with that id |
+| 400 | `model_disabled` | the model is disabled in the catalogue |
+| 409 | `insufficient_memory` | admission refused the load; carries `neededGib`, `freeGib`, `marginGib` |
+| 500 | `residency_not_saved` | the residency file could not be written; nothing changed |
+
+```bash
+curl -s -X POST "$(jq -r .url $DISCOVERY)/models/qwen3.5-0.8b/load" \
+  -H "authorization: Bearer $(jq -r .token $DISCOVERY)"
+# {"id":"qwen3.5-0.8b","state":"loading","resident":true,"since":"..."}
+```
 
 ### Health snapshot
 
