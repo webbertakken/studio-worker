@@ -189,6 +189,7 @@ mod tests {
             },
             enabled: true,
             origin: "local".into(),
+            exclusive_group: None,
         }
     }
 

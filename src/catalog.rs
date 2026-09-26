@@ -31,7 +31,8 @@ pub struct CatalogModel {
     pub display_name: String,
     /// Task kind this model serves.
     pub kind: TaskKind,
-    /// Rough VRAM requirement in GB (informational).
+    /// Device memory the model needs in GiB; admission checks it before a
+    /// load or transient job (see `docs/runtime/model-lifecycle.md`).
     #[serde(default)]
     pub vram_gb_estimate: f32,
     /// Optional human description.
@@ -48,6 +49,10 @@ pub struct CatalogModel {
     /// of the same id is never clobbered by the sync.
     #[serde(default = "default_origin")]
     pub origin: String,
+    /// Models sharing a group are loaded one at a time: loading one
+    /// unloads the other first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_group: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -295,6 +300,7 @@ fn zimage_turbo() -> CatalogModel {
         },
         enabled: true,
         origin: "local".into(),
+        exclusive_group: None,
     }
 }
 

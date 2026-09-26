@@ -67,8 +67,11 @@ Every catalogue model has exactly one state. Only the worker changes it.
 - Residency is stored per model in `<config dir>/residency.json`, separate from the catalogue, so
   a studio catalogue sync never changes it.
 - When the daemon starts it loads every resident model, in catalogue order. A resident model that
-  fails to load stays resident and shows `failed`; the failure is logged, and the next start
-  tries again.
+  fails to load stays resident and shows `failed`; one that admission refuses stays resident and
+  `unloaded`. Either is logged, and the next start tries again. A resident id missing from the
+  catalogue is logged and skipped.
+- Swapping within an exclusive group clears the outgoing model's residency; the incoming load
+  waits for it to unload (bounded) and is admitted against the memory the swap frees.
 - Deleting a catalogue model unloads it and drops its residency.
 
 ## Concurrency

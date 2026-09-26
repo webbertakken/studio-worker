@@ -212,6 +212,7 @@ pub fn sync_studio_model(
         source: source.clone(),
         enabled: true,
         origin: "studio".into(),
+        exclusive_group: None,
     };
     let changed = observers.catalog.lock().sync_studio_model(incoming);
     if !changed {

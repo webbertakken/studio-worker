@@ -19,6 +19,7 @@ pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod engine;
+pub mod host;
 pub mod http;
 pub mod job_gate;
 pub mod lifecycle;
