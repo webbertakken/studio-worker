@@ -158,7 +158,7 @@ pub fn chat_on_lane(
         );
         let result = run
             .span()
-            .in_scope(|| chat.chat(params, &|| lane.cancelled()));
+            .in_scope(|| chat.chat(params, &|| lane.cancelled(), &mut |_| {}));
         Some((run, result))
     });
     let (run, result) = match served {
@@ -169,6 +169,118 @@ pub fn chat_on_lane(
     let result = result.map(|json| TaskResult::Llm { json });
     run.finish(outcome_of(&result));
     Some(result.map_err(|err| LocalError::Engine(err.to_string())))
+}
+
+/// The chat model a request names, or the default one: it must exist and
+/// be an LLM.
+pub fn resolve_llm<'a>(
+    catalog: &'a Catalog,
+    model_id: Option<&str>,
+) -> Result<&'a crate::catalog::CatalogModel, LocalError> {
+    let model = match model_id {
+        Some(id) => catalog
+            .get(id)
+            .ok_or_else(|| LocalError::UnknownModel(id.to_string()))?,
+        None => catalog
+            .default_model_for(TaskKind::Llm)
+            .ok_or(LocalError::NoModelForKind(TaskKind::Llm))?,
+    };
+    if model.kind != TaskKind::Llm {
+        return Err(LocalError::WrongKind {
+            id: model.id.clone(),
+            want: TaskKind::Llm,
+            got: model.kind,
+        });
+    }
+    Ok(model)
+}
+
+/// Stream a chat on `model_id`'s lane as server-sent events through
+/// `send` (which answers `false` once the client has gone, ending the
+/// generation).  Recorded like any local job.  The caller has checked the
+/// model is loaded; if it unloads first, the stream carries the error.
+pub fn stream_on_lane(
+    host: &crate::host::ModelHost,
+    observers: &WorkerObservers,
+    model_id: &str,
+    prompt_preview: &str,
+    params: crate::types::LlmParams,
+    send: &mut dyn FnMut(Vec<u8>) -> bool,
+) {
+    use crate::engine::llm_core::{
+        chunk_frame, final_frame, sse_event, Finish, ThinkSplitter, SSE_DONE,
+    };
+    let gone = std::cell::Cell::new(false);
+    let mut emit = |bytes: Vec<u8>| {
+        if !gone.get() && !send(bytes) {
+            gone.set(true);
+        }
+    };
+    let served = host.with_lane(model_id, |loaded, lane| {
+        let Some(chat) = loaded.as_chat() else {
+            return Err(anyhow::anyhow!("model {model_id} is not a chat model"));
+        };
+        let run = JobRun::begin(
+            observers,
+            CurrentJob {
+                job_id: next_job_id(),
+                kind: TaskKind::Llm,
+                model: model_id.to_string(),
+                prompt: truncate_prompt(prompt_preview),
+                started_at: Utc::now(),
+                source: JobSource::Lane,
+            },
+        );
+        let mut splitter = ThinkSplitter::default();
+        let result = run.span().in_scope(|| {
+            chat.chat(params, &|| lane.cancelled() || gone.get(), &mut |piece| {
+                for delta in splitter.push(piece) {
+                    emit(sse_event(&chunk_frame(model_id, &delta)));
+                }
+            })
+        });
+        for delta in splitter.finish() {
+            emit(sse_event(&chunk_frame(model_id, &delta)));
+        }
+        let recorded: Result<TaskResult, anyhow::Error> = match &result {
+            Ok(json) => Ok(TaskResult::Llm { json: json.clone() }),
+            Err(e) => Err(anyhow::anyhow!("{e:#}")),
+        };
+        run.finish(outcome_of(&recorded));
+        result
+    });
+    let last = match served {
+        Ok(Ok(json)) => {
+            let finish = match json["choices"][0]["finish_reason"].as_str() {
+                Some("length") => Finish::Length,
+                _ => Finish::Stop,
+            };
+            let usage = &json["usage"];
+            final_frame(
+                model_id,
+                finish,
+                usage["prompt_tokens"].as_u64().unwrap_or(0) as usize,
+                usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            )
+        }
+        Ok(Err(e)) => serde_json::json!({ "error": { "message": format!("{e:#}") } }),
+        Err(e) => serde_json::json!({ "error": { "message": e.to_string() } }),
+    };
+    emit(sse_event(&last));
+    emit(SSE_DONE.to_vec());
+}
+
+/// Token ids for `text` from a loaded chat model, on its lane.
+pub fn tokenize_on_lane(
+    host: &crate::host::ModelHost,
+    model_id: &str,
+    text: &str,
+    add_special: bool,
+) -> Result<anyhow::Result<Vec<i32>>, crate::host::HostError> {
+    host.with_lane(model_id, |loaded, _lane| match loaded.as_chat() {
+        Some(chat) => chat.tokenize(text, add_special),
+        None => Err(anyhow::anyhow!("model {model_id} is not a chat model")),
+    })
 }
 
 /// The outcome a finished job is recorded with.

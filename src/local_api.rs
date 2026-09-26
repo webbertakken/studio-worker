@@ -229,6 +229,49 @@ struct ChatBody {
     /// llama-server compatible template switches (e.g. `enable_thinking`).
     #[serde(default)]
     chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Stream the answer as server-sent events (a loaded model only).
+    #[serde(default)]
+    stream: bool,
+}
+
+/// llama-server compatible `/tokenize` request.
+#[derive(Deserialize)]
+struct TokenizeBody {
+    content: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    add_special: bool,
+}
+
+/// Chunks the streaming thread sends ahead of a slow client.  Bounded so a
+/// stalled client applies back-pressure to generation.
+const STREAM_BUFFER_CHUNKS: usize = 256;
+
+/// A response body fed by a channel: each message is written as it comes;
+/// the body ends when the sender is dropped.
+struct ChannelBody {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl std::io::Read for ChannelBody {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos == self.buf.len() {
+            match self.rx.recv() {
+                Ok(next) => {
+                    self.buf = next;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 #[derive(Deserialize)]
@@ -429,6 +472,7 @@ impl LocalApi {
             (Method::Get, "/healthz") => self.handle_healthz(request),
             (Method::Post, "/image") => self.handle_image(request),
             (Method::Post, "/v1/chat/completions") => self.handle_chat(request),
+            (Method::Post, "/tokenize") => self.handle_tokenize(request),
             (Method::Post, "/tts") => self.handle_tts(request),
             (Method::Post, "/stt") => self.handle_stt(request),
             (Method::Post, "/video") => self.handle_video(request),
@@ -588,6 +632,15 @@ impl LocalApi {
             ..Default::default()
         };
         let catalog = self.catalog.lock().clone();
+        if parsed.stream {
+            return self.stream_chat(
+                request,
+                &catalog,
+                parsed.model.as_deref(),
+                &prompt_preview,
+                params,
+            );
+        }
         // A loaded model answers on its own lane, outside the job gate.
         if let Some(result) = chat_on_lane(
             &self.services.host,
@@ -612,6 +665,124 @@ impl LocalApi {
             Task::Llm(params),
         );
         respond_llm(request, outcome)
+    }
+
+    /// Stream a chat from a loaded model as OpenAI `chat.completion.chunk`
+    /// server-sent events, ending with `data: [DONE]`.
+    fn stream_chat(
+        &self,
+        request: Request,
+        catalog: &Catalog,
+        model_id: Option<&str>,
+        prompt_preview: &str,
+        params: LlmParams,
+    ) -> std::io::Result<()> {
+        let model = match crate::local::resolve_llm(catalog, model_id) {
+            Ok(model) => model.id.clone(),
+            Err(err) => return respond_local_err(request, err),
+        };
+        if let Err(refusal) = self.require_loaded(&model) {
+            return respond_json(request, 409, &refusal);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(STREAM_BUFFER_CHUNKS);
+        let host = self.services.host.clone();
+        let observers = self.observers.clone();
+        let preview = prompt_preview.to_string();
+        std::thread::spawn(move || {
+            crate::local::stream_on_lane(
+                &host,
+                &observers,
+                &model,
+                &preview,
+                params,
+                &mut |bytes| tx.send(bytes).is_ok(),
+            );
+        });
+        let body = ChannelBody {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        };
+        let headers = vec![
+            Header::from_bytes("content-type", "text/event-stream").expect("static header"),
+            Header::from_bytes("cache-control", "no-cache").expect("static header"),
+        ];
+        request.respond(Response::new(200.into(), headers, body, None, None))
+    }
+
+    /// `Ok` when `model` is loaded; else the `model_not_loaded` refusal body.
+    fn require_loaded(&self, model: &str) -> Result<(), serde_json::Value> {
+        match self.services.host.status(model) {
+            Ok(status) if status.state.serves() => Ok(()),
+            Ok(status) => Err(serde_json::json!({
+                "error": "model_not_loaded",
+                "state": status.state.name(),
+                "message": format!("model {model} is not loaded; POST /models/{model}/load first"),
+            })),
+            Err(err) => {
+                Err(serde_json::json!({ "error": "model_not_loaded", "message": err.to_string() }))
+            }
+        }
+    }
+
+    /// llama-server compatible token count: `{content, model?, add_special?}`
+    /// -> `{tokens: [...]}` from a loaded chat model.
+    fn handle_tokenize(&self, mut request: Request) -> std::io::Result<()> {
+        let body = match read_body(&mut request)? {
+            BodyOutcome::Ok(body) => body,
+            BodyOutcome::TooLarge => return respond_too_large(request),
+        };
+        let parsed: TokenizeBody = match serde_json::from_str(&body) {
+            Ok(p) => p,
+            Err(err) => {
+                return respond_json(
+                    request,
+                    400,
+                    &serde_json::json!({ "error": "bad_request", "message": err.to_string() }),
+                )
+            }
+        };
+        let model = {
+            let catalog = self.catalog.lock();
+            match crate::local::resolve_llm(&catalog, parsed.model.as_deref()) {
+                Ok(model) => model.id.clone(),
+                Err(err @ LocalError::UnknownModel(_)) => {
+                    return respond_json(
+                        request,
+                        404,
+                        &serde_json::json!({ "error": "unknown_model", "message": err.to_string() }),
+                    )
+                }
+                Err(err) => {
+                    return respond_json(
+                        request,
+                        400,
+                        &serde_json::json!({ "error": "bad_request", "message": err.to_string() }),
+                    )
+                }
+            }
+        };
+        if let Err(refusal) = self.require_loaded(&model) {
+            return respond_json(request, 409, &refusal);
+        }
+        match crate::local::tokenize_on_lane(
+            &self.services.host,
+            &model,
+            &parsed.content,
+            parsed.add_special,
+        ) {
+            Ok(Ok(tokens)) => respond_json(request, 200, &serde_json::json!({ "tokens": tokens })),
+            Ok(Err(err)) => respond_json(
+                request,
+                500,
+                &serde_json::json!({ "error": "tokenize_failed", "message": format!("{err:#}") }),
+            ),
+            Err(err) => respond_json(
+                request,
+                409,
+                &serde_json::json!({ "error": "model_not_loaded", "message": err.to_string() }),
+            ),
+        }
     }
 
     fn handle_tts(&self, mut request: Request) -> std::io::Result<()> {
@@ -1651,6 +1822,117 @@ mod tests {
             serde_json::json!({ "messages": [{ "role": "user", "content": "yo" }] }),
         );
         assert_eq!(body["choices"][0]["message"]["content"], "resident:yo");
+    }
+
+    /// The JSON payloads of an SSE body, and whether it ended with [DONE].
+    fn sse(body: &str) -> (Vec<serde_json::Value>, bool) {
+        let data: Vec<&str> = body
+            .split("\n\n")
+            .filter_map(|e| e.strip_prefix("data: "))
+            .collect();
+        let done = data.last() == Some(&"[DONE]");
+        let frames = data
+            .iter()
+            .filter(|d| **d != "[DONE]")
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect();
+        (frames, done)
+    }
+
+    #[test]
+    fn a_loaded_model_streams_its_answer_as_server_sent_events() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let res = h
+            .post("/v1/chat/completions")
+            .json(&serde_json::json!({
+                "model": "chat-llm",
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hi there" }],
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        let (frames, done) = sse(&res.text().unwrap());
+        assert!(done, "ends with [DONE]");
+        let text: String = frames
+            .iter()
+            .filter_map(|f| f["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(text, "resident:hi there");
+        let last = frames.last().unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+        assert_eq!(last["usage"]["total_tokens"], 5);
+        assert!(frames.len() > 3, "more than one content chunk: {frames:?}");
+        let jobs = h.observers.local_jobs.lock().clone();
+        assert_eq!(jobs.front().unwrap().model, "chat-llm");
+    }
+
+    #[test]
+    fn streaming_needs_the_model_loaded() {
+        let h = Harness::start(llm_catalog());
+        let (status, body) = chat(
+            &h,
+            serde_json::json!({ "stream": true, "messages": [{ "role": "user", "content": "x" }] }),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"], "model_not_loaded");
+    }
+
+    #[test]
+    fn streaming_an_unknown_model_is_a_400() {
+        let h = Harness::start(llm_catalog());
+        let res = h
+            .post("/v1/chat/completions")
+            .json(&serde_json::json!({ "model": "nope", "stream": true, "messages": [] }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 400);
+    }
+
+    #[test]
+    fn tokenize_counts_with_the_loaded_model() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let (status, body) = json(
+            h.post("/tokenize")
+                .json(&serde_json::json!({ "content": "hello" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["tokens"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn tokenize_refuses_what_it_cannot_do() {
+        let h = Harness::start(llm_catalog());
+        let (status, body) = json(
+            h.post("/tokenize")
+                .json(&serde_json::json!({ "content": "x" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"], "model_not_loaded");
+        let (status, body) = json(
+            h.post("/tokenize")
+                .json(&serde_json::json!({ "content": "x", "model": "nope" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 404, "{body}");
+        let res = h.post("/tokenize").body("no").send().unwrap();
+        assert_eq!(res.status(), 400);
+        let res = reqwest::blocking::Client::new()
+            .post(format!("{}/tokenize", h.url))
+            .json(&serde_json::json!({ "content": "x" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 401);
     }
 
     #[test]
