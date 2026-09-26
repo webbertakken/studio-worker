@@ -135,6 +135,10 @@ On the first image job the engine resolves `sd-cli` in this order:
 3. `~/.local/bin/sd-cli` (matches the playbook above)
 4. `sd-cli` on `$PATH`
 
+Steps 3 and 4 only count when `sd-cli --version` reports the pinned commit
+(`DEFAULT_RELEASE_TAG`'s sha): build your own CUDA binary at that commit to keep using
+it. An install at another commit is passed over and the pinned build is provisioned.
+
 If none resolve, the engine **auto-provisions** into
 `<models_root>/bin/` (download + extract the platform Vulkan build),
 then runs it.  Provisioning can be steered with:

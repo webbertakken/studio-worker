@@ -45,10 +45,14 @@ side is kind-based, not model-based.
 worker's lifetime) via `ensure_sd_cli`:
 
 1. A path cached from a previous job (if still a file).
-2. `$STUDIO_WORKER_SD_CLI` - the operator's explicit override.
+2. `$STUDIO_WORKER_SD_CLI` - the operator's explicit override (a warning is logged when its
+   `--version` commit is not the pinned one).
 3. `<models_root>/bin/sd-cli` - the provisioner's own slot, re-provisioned
    first when its release marker no longer matches the pinned release.
-4. `~/.local/bin/sd-cli` -> `$PATH` - an implicit operator install.
+4. `~/.local/bin/sd-cli` -> `$PATH` - an implicit operator install, used only when its
+   `sd-cli --version` reports the pinned commit (so a CUDA build at the pin is kept); an
+   older one is passed over for the pinned build (and still used, with a warning, if
+   provisioning fails offline).
 5. **Auto-provision**: if nothing resolves, download the platform's
    prebuilt stable-diffusion.cpp Vulkan build and extract it into
    `<models_root>/bin/` (see [auto-provisioning](#auto-provisioning)).
