@@ -14,7 +14,6 @@ use eframe::egui;
 use crate::config::{self, default_models_root, Config};
 
 use super::super::notifier::NotificationPrefs;
-use crate::autostart;
 
 /// Buffer the user is editing.  `dirty` is true when any field
 /// differs from `original`; Save / Reset clear it.
@@ -23,11 +22,6 @@ pub struct ConfigDraft {
     pub current: Config,
     pub original: Config,
     pub last_save_error: Option<String>,
-    /// Last autostart-toggle failure, surfaced next to the toggle so
-    /// the operator sees why it did not stick (the checkbox otherwise
-    /// silently reverts on the next frame because `is_enabled()`
-    /// re-reads disk).
-    pub autostart_error: Option<String>,
 }
 
 impl ConfigDraft {
@@ -36,7 +30,6 @@ impl ConfigDraft {
             current: cfg.clone(),
             original: cfg.clone(),
             last_save_error: None,
-            autostart_error: None,
         }
     }
 
@@ -55,12 +48,11 @@ impl ConfigDraft {
                 // in `config::save`) keeps that hot path quiet while
                 // surfacing operator-driven changes in default logs.
                 // Only non-secret, user-editable fields are named.
-                let changed = changed_fields(&self.original, &self.current).join(",");
+                let changed = config::changed_fields(&self.original, &self.current).join(",");
                 tracing::info!(
                     target: "studio_worker::ui::config",
                     changed = ?changed,
                     vram_threshold_gb = self.current.vram_threshold_gb,
-                    auto_start = self.current.auto_start,
                     auto_update_enabled = self.current.auto_update_enabled,
                     models_root = %self.current.models_root.display(),
                     "operator applied config changes via UI"
@@ -80,55 +72,13 @@ impl ConfigDraft {
     pub fn reset(&mut self) {
         self.current = self.original.clone();
         self.last_save_error = None;
-        self.autostart_error = None;
     }
 }
 
-/// Equality over the persisted, user-editable fields.  Internal state
-/// (registration ids, auth token, worker id, install id) is excluded
-/// because the UI never mutates it; the auto-register flow owns it.
-///
-/// Delegates to [`changed_fields`] so the dirty-check and the save
-/// breadcrumb can never drift: any field that dirties the form is, by
-/// construction, also named when the operator applies it.
+/// Equality over the operator-editable fields (see
+/// [`config::changed_fields`]).
 fn configs_equal(a: &Config, b: &Config) -> bool {
-    changed_fields(a, b).is_empty()
-}
-
-/// Names of the user-editable fields that differ between `a` and `b`,
-/// in declaration order.  Backs both the dirty-check ([`configs_equal`])
-/// and the operator-apply breadcrumb in [`ConfigDraft::save`], so the
-/// two share a single source of truth for "what the UI can change".
-fn changed_fields(a: &Config, b: &Config) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    if a.api_base_url != b.api_base_url {
-        fields.push("api_base_url");
-    }
-    if (a.vram_threshold_gb - b.vram_threshold_gb).abs() >= f32::EPSILON {
-        fields.push("vram_threshold_gb");
-    }
-    if a.auto_start != b.auto_start {
-        fields.push("auto_start");
-    }
-    if a.start_minimised != b.start_minimised {
-        fields.push("start_minimised");
-    }
-    if a.auto_update_enabled != b.auto_update_enabled {
-        fields.push("auto_update_enabled");
-    }
-    if a.auto_update_interval_secs != b.auto_update_interval_secs {
-        fields.push("auto_update_interval_secs");
-    }
-    if a.auto_update_feed != b.auto_update_feed {
-        fields.push("auto_update_feed");
-    }
-    if a.auto_update_prerelease != b.auto_update_prerelease {
-        fields.push("auto_update_prerelease");
-    }
-    if a.models_root != b.models_root {
-        fields.push("models_root");
-    }
-    fields
+    config::changed_fields(a, b).is_empty()
 }
 
 pub fn render(
@@ -158,7 +108,6 @@ pub fn render(
             0.0,
             96.0,
         );
-        labeled_bool(ui, "Auto-start on boot", &mut draft.current.auto_start);
     });
 
     section(ui, "Auto-update", |ui| {
@@ -203,34 +152,11 @@ pub fn render(
         ui.end_row();
     });
 
-    let mut autostart_enabled = autostart::is_enabled();
-    let prev_autostart = autostart_enabled;
-    section(ui, "Background mode", |ui| {
-        ui.label("Run in tray on login");
-        ui.checkbox(&mut autostart_enabled, "");
-        ui.end_row();
+    section(ui, "Window", |ui| {
         ui.label("Start minimised");
         ui.checkbox(&mut draft.current.start_minimised, "");
         ui.end_row();
     });
-    if autostart_enabled != prev_autostart {
-        let outcome = match std::env::current_exe() {
-            Ok(exe) if autostart_enabled => autostart::enable(&exe),
-            Ok(_) => autostart::disable(),
-            Err(e) => Err(anyhow::anyhow!("cannot resolve current executable: {e}")),
-        };
-        // `autostart::enable`/`disable` already emit a structured
-        // tracing event; surface any failure in the UI too so the
-        // operator sees why the toggle did not stick instead of it
-        // silently reverting on the next frame.
-        draft.autostart_error = outcome.err().map(|e| format!("{e}"));
-    }
-    if let Some(err) = &draft.autostart_error {
-        ui.colored_label(
-            egui::Color32::LIGHT_RED,
-            format!("could not change autostart: {err}"),
-        );
-    }
 
     ui.add_space(12.0);
     ui.horizontal(|ui| {
@@ -383,31 +309,6 @@ mod tests {
         draft.reset();
         assert!((draft.current.vram_threshold_gb - cfg.vram_threshold_gb).abs() < f32::EPSILON);
         assert!(!draft.dirty());
-    }
-
-    #[test]
-    fn reset_clears_autostart_error() {
-        let cfg = Config::default();
-        let mut draft = ConfigDraft::from(&cfg);
-        draft.autostart_error = Some("boom".into());
-        draft.reset();
-        assert!(draft.autostart_error.is_none());
-    }
-
-    #[test]
-    fn changed_fields_names_only_differing_user_editable_fields() {
-        let base = Config::default();
-        let mut edited = base.clone();
-        edited.vram_threshold_gb = base.vram_threshold_gb + 8.0;
-        edited.models_root = PathBuf::from("/tmp/other-models");
-        let changed = changed_fields(&base, &edited);
-        assert_eq!(changed, vec!["vram_threshold_gb", "models_root"]);
-    }
-
-    #[test]
-    fn changed_fields_is_empty_for_identical_configs() {
-        let cfg = Config::default();
-        assert!(changed_fields(&cfg, &cfg).is_empty());
     }
 
     #[test]

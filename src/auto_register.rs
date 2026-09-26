@@ -40,7 +40,12 @@ const TRACE_TARGET: &str = "studio_worker::auto_register";
 /// What `tick()` returns + what the UI Status tab reads.  Distinct
 /// from the persisted config fields, which carry the raw building
 /// blocks (`install_id`, `registration_request_id`, …).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum RegistrationState {
     /// First-launch default; no request in flight, no worker_id.
     Pristine,

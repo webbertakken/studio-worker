@@ -154,6 +154,9 @@ pub struct LocalApi {
     models_root: Option<PathBuf>,
     /// The model host and streaming tokens.
     services: ModelServices,
+    /// The daemon's runtime handles, for the `/daemon/*` routes.  `None`
+    /// answers them `503 daemon_control_unavailable`.
+    control: Option<crate::control::DaemonControl>,
 }
 
 /// What the local API offers besides one-off jobs: the model host, and the
@@ -316,7 +319,14 @@ impl LocalApi {
             gate,
             models_root,
             services,
+            control: None,
         })
+    }
+
+    /// Serve the `/daemon/*` routes with `control`.
+    pub fn with_control(mut self, control: crate::control::DaemonControl) -> Self {
+        self.control = Some(control);
+        self
     }
 
     /// The bound socket address.
@@ -340,7 +350,9 @@ impl LocalApi {
     /// `std::thread::scope` lets the workers borrow `&self` + `stop`
     /// without an `Arc`, so the public signature is unchanged.
     pub fn serve(&self, stop: &AtomicBool) {
-        const WORKERS: usize = 4;
+        // Long generations each hold a thread while the tray UI polls once a
+        // second; eight keeps the cheap routes answering alongside them.
+        const WORKERS: usize = 8;
         std::thread::scope(|scope| {
             for _ in 0..WORKERS {
                 scope.spawn(|| {
@@ -424,6 +436,15 @@ impl LocalApi {
             (Method::Post, "/models") => self.handle_add_model(request),
             (Method::Get, "/jobs") => self.handle_jobs(request),
             (Method::Post, "/stream-tokens") => self.handle_stream_token(request),
+            (_, p) if p.starts_with("/daemon/") => self.handle_daemon(request, &method, &url),
+            (Method::Get, p) if job_route(p, "/log").is_some() => {
+                let id = job_route(p, "/log").unwrap_or_default().to_string();
+                self.handle_job_log(request, &id)
+            }
+            (Method::Get, p) if job_route(p, "/thumbnail").is_some() => {
+                let id = job_route(p, "/thumbnail").unwrap_or_default().to_string();
+                self.handle_job_thumbnail(request, &id)
+            }
             (Method::Get, p) if lifecycle_route(p, "/state").is_some() => {
                 let id = lifecycle_route(p, "/state").unwrap_or_default().to_string();
                 self.respond_lifecycle(request, self.services.host.status(&id), 200)
@@ -747,6 +768,10 @@ impl LocalApi {
                 ) {
                     obj.insert("state".into(), status.state.name().into());
                     obj.insert("resident".into(), status.resident.into());
+                    obj.insert("since".into(), status.since.to_rfc3339().into());
+                    if let ModelState::Failed { reason } = &status.state {
+                        obj.insert("error".into(), reason.clone().into());
+                    }
                 }
                 value
             })
@@ -960,6 +985,91 @@ impl LocalApi {
         }
     }
 
+    /// `/daemon/*`: what the tray UI sees and does.
+    fn handle_daemon(
+        &self,
+        mut request: Request,
+        method: &Method,
+        url: &str,
+    ) -> std::io::Result<()> {
+        let Some(control) = &self.control else {
+            return respond_json(
+                request,
+                503,
+                &serde_json::json!({ "error": "daemon_control_unavailable" }),
+            );
+        };
+        let path = url.split('?').next().unwrap_or("/");
+        match (method, path) {
+            (Method::Get, "/daemon/status") => {
+                let status = control.status(&self.observers, self.gate.is_busy());
+                respond_serialised(request, 200, &status)
+            }
+            (Method::Get, "/daemon/logs") => {
+                let after = query_param(url, "after")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let (entries, seq) = crate::runtime::recent_logs_after(&self.observers, after);
+                respond_serialised(request, 200, &crate::daemon_api::LogsPage { entries, seq })
+            }
+            (Method::Post, "/daemon/pause") => {
+                let paused = control.set_paused(true);
+                respond_json(request, 200, &serde_json::json!({ "paused": paused }))
+            }
+            (Method::Post, "/daemon/resume") => {
+                let paused = control.set_paused(false);
+                respond_json(request, 200, &serde_json::json!({ "paused": paused }))
+            }
+            (Method::Get, "/daemon/config") => {
+                respond_serialised(request, 200, &control.editable_config())
+            }
+            (Method::Put, "/daemon/config") => {
+                let body = match read_body(&mut request)? {
+                    BodyOutcome::Ok(body) => body,
+                    BodyOutcome::TooLarge => return respond_too_large(request),
+                };
+                let edit: crate::daemon_api::EditableConfig = match serde_json::from_str(&body) {
+                    Ok(edit) => edit,
+                    Err(err) => {
+                        return respond_error(request, 400, "bad_request", &err.to_string())
+                    }
+                };
+                match control.update_config(edit) {
+                    Ok(saved) => respond_serialised(request, 200, &saved),
+                    Err(err @ crate::control::ControlError::Invalid(_)) => {
+                        respond_error(request, 400, "invalid_config", &err.to_string())
+                    }
+                    Err(err) => respond_error(request, 500, "config_not_saved", &err.to_string()),
+                }
+            }
+            (Method::Post, "/daemon/registration/reset") => {
+                match control.request_registration_reset() {
+                    Ok(()) => respond_json(request, 202, &serde_json::json!({ "ok": true })),
+                    Err(err) => respond_error(request, 409, "not_rejected", &err.to_string()),
+                }
+            }
+            (Method::Post, "/daemon/shutdown") => {
+                control.shutdown();
+                respond_json(request, 202, &serde_json::json!({ "ok": true }))
+            }
+            _ => respond_error(request, 404, "not_found", "no such daemon route"),
+        }
+    }
+
+    fn handle_job_log(&self, request: Request, id: &str) -> std::io::Result<()> {
+        match crate::job_log::global().get(id) {
+            Some(log) => respond_serialised(request, 200, &log),
+            None => respond_error(request, 404, "unknown_job", "no log captured for that job"),
+        }
+    }
+
+    fn handle_job_thumbnail(&self, request: Request, id: &str) -> std::io::Result<()> {
+        match self.observers.thumbnails.get(id) {
+            Some(png) => respond(request, 200, "image/png", &png),
+            None => respond_error(request, 404, "no_thumbnail", "no thumbnail for that job"),
+        }
+    }
+
     fn persist(&self, catalog: &Catalog) -> std::io::Result<()> {
         match &self.catalog_path {
             Some(path) => catalog.save(path),
@@ -1100,6 +1210,20 @@ fn lifecycle_route<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
+/// `/jobs/<id><suffix>` -> `Some(id)` for a non-empty id without slashes.
+fn job_route<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let id = path.strip_prefix("/jobs/")?.strip_suffix(suffix)?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// The value of query parameter `name` in `url`, if present.
+fn query_param<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+    url.split_once('?')?
+        .1
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+}
+
 /// The wire shape of a model's status.
 fn status_json(status: &ModelStatus) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -1112,6 +1236,28 @@ fn status_json(status: &ModelStatus) -> serde_json::Value {
         body["error"] = reason.clone().into();
     }
     body
+}
+
+fn respond_serialised<T: serde::Serialize>(
+    request: Request,
+    status: u16,
+    body: &T,
+) -> std::io::Result<()> {
+    match serde_json::to_vec(body) {
+        Ok(bytes) => respond(request, status, "application/json", &bytes),
+        Err(err) => respond(request, 500, "text/plain", err.to_string().as_bytes()),
+    }
+}
+
+fn respond_error(request: Request, status: u16, code: &str, message: &str) -> std::io::Result<()> {
+    respond_serialised(
+        request,
+        status,
+        &crate::daemon_api::ErrorBody {
+            error: code.to_string(),
+            message: Some(message.to_string()),
+        },
+    )
 }
 
 fn respond_json(request: Request, status: u16, body: &serde_json::Value) -> std::io::Result<()> {
@@ -1879,6 +2025,67 @@ mod tests {
             .send()
             .unwrap();
         assert_eq!(res.status(), 401);
+    }
+
+    #[test]
+    fn daemon_routes_need_daemon_control() {
+        let h = Harness::start(multi_kind_catalog());
+        let resp = h.get("/daemon/status").send().unwrap();
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["error"], "daemon_control_unavailable");
+    }
+
+    #[test]
+    fn daemon_routes_need_the_token() {
+        let h = Harness::start(multi_kind_catalog());
+        let resp = reqwest::blocking::Client::new()
+            .get(format!("{}/daemon/status", h.url))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[test]
+    fn an_unknown_daemon_route_is_not_found() {
+        let daemon = crate::test_support::DaemonHarness::start();
+        let resp = reqwest::blocking::Client::new()
+            .get(format!("{}/daemon/nope", daemon.url))
+            .bearer_auth(crate::test_support::HARNESS_TOKEN)
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[test]
+    fn a_malformed_config_body_is_a_bad_request() {
+        let daemon = crate::test_support::DaemonHarness::start();
+        let resp = reqwest::blocking::Client::new()
+            .put(format!("{}/daemon/config", daemon.url))
+            .bearer_auth(crate::test_support::HARNESS_TOKEN)
+            .body("{")
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[test]
+    fn the_models_listing_carries_since_and_the_failure() {
+        let daemon = crate::test_support::DaemonHarness::start();
+        let models = daemon.client().models().unwrap();
+        assert!(models.iter().all(|m| m.since.is_some()));
+        assert!(models.iter().all(|m| m.error.is_none()));
+    }
+
+    #[test]
+    fn job_routes_and_query_params_parse() {
+        assert_eq!(job_route("/jobs/local-1/log", "/log"), Some("local-1"));
+        assert_eq!(job_route("/jobs//log", "/log"), None);
+        assert_eq!(job_route("/jobs/a/b/log", "/log"), None);
+        assert_eq!(query_param("/daemon/logs?after=12", "after"), Some("12"));
+        assert_eq!(query_param("/daemon/logs?x=1&after=3", "after"), Some("3"));
+        assert_eq!(query_param("/daemon/logs?afterx=3", "after"), None);
+        assert_eq!(query_param("/daemon/logs", "after"), None);
     }
 
     #[test]

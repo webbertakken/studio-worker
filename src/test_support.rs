@@ -214,6 +214,161 @@ impl crate::host::ModelRuntime for InstantRuntime {
     }
 }
 
+/// A daemon's local API on an ephemeral loopback port, with daemon control
+/// attached and a discovery file in a temporary config directory.  Its
+/// catalogue holds a synthetic image model (`img`) and a chat model
+/// (`chat`) that loads instantly.
+pub struct DaemonHarness {
+    pub url: String,
+    pub config_path: std::path::PathBuf,
+    pub control: crate::control::DaemonControl,
+    pub observers: crate::runtime::WorkerObservers,
+    pub host: crate::host::ModelHost,
+    pub catalog: std::sync::Arc<parking_lot::Mutex<crate::catalog::Catalog>>,
+    engine: std::sync::Arc<dyn crate::engine::Engine>,
+    _dir: tempfile::TempDir,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Token the [`DaemonHarness`] serves with.
+pub const HARNESS_TOKEN: &str = "harness-token-0123456789abcdef";
+
+fn harness_model(id: &str, kind: crate::types::TaskKind) -> crate::catalog::CatalogModel {
+    use crate::types::{ModelCliDefaults, ModelEngine, ModelSource, TaskKind};
+    crate::catalog::CatalogModel {
+        id: id.into(),
+        display_name: id.into(),
+        kind,
+        vram_gb_estimate: 1.0,
+        description: None,
+        source: ModelSource {
+            engine: if kind == TaskKind::Llm {
+                ModelEngine::LlamaCpp
+            } else {
+                ModelEngine::Synthetic
+            },
+            files: vec![],
+            cli_defaults: ModelCliDefaults {
+                cfg_scale: 1.0,
+                steps: 4,
+                width: 64,
+                height: 64,
+                ..Default::default()
+            },
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: None,
+    }
+}
+
+impl DaemonHarness {
+    pub fn start() -> Self {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let control = crate::control::DaemonControl::new(
+            crate::config::shared(crate::config::Config::default()),
+            config_path.clone(),
+            24.0,
+        );
+        let catalog = Arc::new(parking_lot::Mutex::new(crate::catalog::Catalog {
+            models: vec![
+                harness_model("chat", crate::types::TaskKind::Llm),
+                harness_model("img", crate::types::TaskKind::Image),
+            ],
+            ..Default::default()
+        }));
+        let host = crate::host::ModelHost::new(
+            catalog.clone(),
+            Arc::new(InstantRuntime),
+            Arc::new(FixedProbe(20.0)),
+            crate::residency::Residency::load_for_serving(None),
+        );
+        let observers = crate::runtime::WorkerObservers::default();
+        let engine: Arc<dyn crate::engine::Engine> =
+            Arc::new(crate::engine::SyntheticEngine::new());
+        let api = crate::local_api::LocalApi::bind(
+            "127.0.0.1:0",
+            engine.clone(),
+            catalog.clone(),
+            None,
+            observers.clone(),
+            HARNESS_TOKEN.to_string(),
+            crate::job_gate::JobGate::new(),
+            None,
+            crate::local_api::ModelServices::new(host.clone()),
+        )
+        .expect("bind")
+        .with_control(control.clone());
+        let url = api.url();
+        *observers.local_api_url.lock() = Some(url.clone());
+        let discovery = crate::config::local_api_discovery_path_for(&config_path).expect("path");
+        crate::local_api::write_discovery_file(&discovery, &url, HARNESS_TOKEN).expect("discovery");
+        let stop = control.stop.clone();
+        let handle = std::thread::spawn(move || api.serve(&stop));
+        Self {
+            url,
+            config_path,
+            control,
+            observers,
+            host,
+            catalog,
+            engine,
+            _dir: dir,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn client(&self) -> crate::daemon_client::DaemonClient {
+        crate::daemon_client::DaemonClient::new(&self.url, HARNESS_TOKEN).expect("client")
+    }
+
+    /// Block until model `id` reports `state` (by name).
+    pub fn wait_state(&self, id: &str, state: &str) {
+        self.host
+            .wait_for(id, |s| s.name() == state, std::time::Duration::from_secs(5))
+            .unwrap_or_else(|| panic!("{id} never reached {state}"));
+    }
+
+    /// Run one local image job; answers its id.
+    pub fn run_image_job(&self) -> String {
+        let catalog = self.catalog.lock().clone();
+        let req = crate::local::LocalImageRequest {
+            prompt: "a harness fox".into(),
+            model: Some("img".into()),
+            ..Default::default()
+        };
+        crate::local::run_image(self.engine.as_ref(), &catalog, &self.observers, &req)
+            .expect("image job");
+        self.observers.local_jobs.lock()[0].job_id.clone()
+    }
+
+    /// Push one worker log entry.
+    pub fn push_log(&self, message: &str) {
+        let queue = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        crate::runtime::push_log_with_observers(
+            &queue,
+            Some(&self.observers),
+            "info",
+            "test",
+            message,
+            None,
+        );
+    }
+}
+
+impl Drop for DaemonHarness {
+    fn drop(&mut self) {
+        self.control
+            .stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

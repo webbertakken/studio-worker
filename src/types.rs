@@ -489,8 +489,7 @@ pub struct FailRequest {
     pub retryable: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ui", derive(PartialEq, Eq))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     pub ts: String,
     pub level: String,

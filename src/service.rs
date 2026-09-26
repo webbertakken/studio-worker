@@ -222,7 +222,7 @@ pub fn install(config_path: Option<&str>) -> Result<()> {
     install_with(&RealOps, config_path)
 }
 
-/// One-shot turnkey finish line: persist `auto_start`, install +
+/// One-shot turnkey finish line: install +
 /// activate the OS service (so the worker runs now and at every login),
 /// then print exactly what the operator needs — the machine name the
 /// studio admin will approve, the studio URL, and the local API
@@ -252,11 +252,7 @@ pub fn setup_summary(machine_name: &str, api_base_url: &str, discovery_path: &st
 }
 
 pub fn setup_with<O: ServiceOps>(ops: &O, config_path: Option<&str>) -> Result<()> {
-    // Persist auto_start so the desktop UI (which reconciles its
-    // login-autostart entry from this flag) also comes back on login.
-    let (mut cfg, path) = crate::config::load(config_path)?;
-    cfg.auto_start = true;
-    crate::config::save(&cfg, &path)?;
+    let (cfg, path) = crate::config::load(config_path)?;
 
     // Install + activate the OS service (idempotent — overwrites the
     // unit and re-enables it).
@@ -781,16 +777,10 @@ mod tests {
     }
 
     #[test]
-    fn setup_with_persists_auto_start_installs_and_prints_guidance() {
+    fn setup_with_installs_the_service_and_prints_guidance() {
         let cfgdir = tempdir().unwrap();
         let cfg_path = cfgdir.path().join("config.toml");
-        // Start from a config with auto_start disabled to prove setup
-        // flips it on.
-        let cfg = crate::config::Config {
-            auto_start: false,
-            ..crate::config::Config::default()
-        };
-        crate::config::save(&cfg, &cfg_path).unwrap();
+        crate::config::save(&crate::config::Config::default(), &cfg_path).unwrap();
 
         let unitdir = tempdir().unwrap();
         let ops = fake_ops(unitdir.path().to_path_buf(), true);
@@ -808,8 +798,5 @@ mod tests {
         );
         // The unit file landed.
         assert!(unitdir.path().join(SERVICE_FILENAME).exists());
-        // auto_start persisted true.
-        let (reloaded, _) = crate::config::load(Some(&cfg_arg)).unwrap();
-        assert!(reloaded.auto_start, "setup must persist auto_start=true");
     }
 }

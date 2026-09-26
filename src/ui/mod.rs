@@ -32,10 +32,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     let (cfg, path) = config::load(config_path)?;
     runtime::log_startup_banner(&cfg, &path);
 
-    // Honour `auto_start`: make the tray UI come back on login without
-    // the operator having to toggle anything.  Best-effort and
-    // idempotent — a failure is logged, never fatal.
-    sync_autostart_on_launch(cfg.auto_start);
+    ensure_autostart();
 
     let cfg = config::shared(cfg);
     let stop = Arc::new(AtomicBool::new(false));
@@ -86,8 +83,16 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     // Shares the one-job gate with the WS session so local + studio jobs
     // never run concurrently on the same GPU.
     let gate = crate::job_gate::JobGate::from_shared(busy.clone());
-    let local_api =
-        runtime::spawn_local_api(cfg.clone(), &path, observers.clone(), gate, stop.clone());
+    let control = crate::control::DaemonControl {
+        cfg: cfg.clone(),
+        config_path: path.clone(),
+        paused: paused.clone(),
+        stop: stop.clone(),
+        registration: registration.clone(),
+        reset_requested: Arc::new(AtomicBool::new(false)),
+        vram_total_gb: 0.0,
+    };
+    let local_api = runtime::spawn_local_api(&control, observers.clone(), gate);
 
     let cfg_loops = cfg.clone();
     let stop_loops = stop.clone();
@@ -192,39 +197,26 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Reconcile the on-login autostart entry with the configured
-/// `auto_start` at UI launch.  The decision is the pure
-/// [`autostart::launch_sync_action`]; this only performs the chosen
-/// side effect and logs the outcome.
-fn sync_autostart_on_launch(auto_start: bool) {
-    use crate::autostart::{self, AutostartSync};
-    match autostart::launch_sync_action(auto_start, autostart::is_enabled()) {
-        AutostartSync::Enable => match std::env::current_exe() {
-            Ok(exe) => {
-                if let Err(e) = autostart::enable(&exe) {
-                    tracing::warn!(
-                        target: "studio_worker::ui",
-                        error = %e,
-                        "could not enable autostart-on-login"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(
-                target: "studio_worker::ui",
-                error = %e,
-                "could not resolve current exe to enable autostart-on-login"
-            ),
-        },
-        AutostartSync::Disable => {
-            if let Err(e) = autostart::disable() {
+/// Keep the tray UI's login entry installed and pointing at this
+/// executable.  Best-effort: a failure is logged, never fatal.
+fn ensure_autostart() {
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Err(e) = crate::autostart::ensure(&exe) {
                 tracing::warn!(
                     target: "studio_worker::ui",
+                    op = "autostart",
                     error = %e,
-                    "could not disable stale autostart-on-login"
+                    "could not install the login entry for the tray UI"
                 );
             }
         }
-        AutostartSync::Noop => {}
+        Err(e) => tracing::warn!(
+            target: "studio_worker::ui",
+            op = "autostart",
+            error = %e,
+            "could not resolve the current executable for the login entry"
+        ),
     }
 }
 
