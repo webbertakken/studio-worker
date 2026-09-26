@@ -31,6 +31,7 @@ pub mod residency;
 pub mod runtime;
 pub mod secrets;
 pub mod service;
+pub mod stt_stream;
 pub mod sys;
 pub mod telemetry;
 #[doc(hidden)]
