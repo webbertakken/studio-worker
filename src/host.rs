@@ -40,6 +40,19 @@ pub trait LoadedModel: Send + Sync {
     fn as_chat(&self) -> Option<&dyn ChatModel> {
         None
     }
+
+    /// The streaming interface, for loaded speech models.
+    fn as_stream(&self) -> Option<&dyn StreamingModel> {
+        None
+    }
+}
+
+/// A loaded streaming speech model.  Each `open` is an independent
+/// utterance state over the shared weights.
+pub trait StreamingModel {
+    fn open(
+        &self,
+    ) -> anyhow::Result<Box<dyn crate::stt_stream::session::StreamingTranscriber + '_>>;
 }
 
 /// A loaded model that answers chat completions.

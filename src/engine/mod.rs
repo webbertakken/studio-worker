@@ -111,8 +111,10 @@ pub mod llama_subprocess;
 pub mod multi;
 #[cfg(feature = "image-onnx")]
 pub mod onnx;
-#[cfg(feature = "image-onnx")]
+#[cfg(any(feature = "image-onnx", feature = "stt-stream"))]
 pub mod onnx_provision;
+#[cfg(feature = "stt-stream")]
+pub mod parakeet;
 pub mod sd_provision;
 pub mod sdcpp;
 #[cfg(feature = "tts")]

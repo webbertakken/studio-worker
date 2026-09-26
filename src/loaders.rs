@@ -26,6 +26,10 @@ impl ModelRuntime for Loaders {
             crate::types::ModelEngine::LlamaCpp => Ok(Arc::new(
                 crate::engine::llama::load_resident(&self.models_root, model)?,
             )),
+            #[cfg(feature = "stt-stream")]
+            crate::types::ModelEngine::Parakeet => Ok(Arc::new(
+                crate::engine::parakeet::load_resident(&self.models_root, model)?,
+            )),
             engine => {
                 let _ = &self.models_root;
                 anyhow::bail!(

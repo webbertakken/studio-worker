@@ -402,6 +402,9 @@ pub enum ModelEngine {
     /// ONNX Runtime image engine (pykeio/ort).  Serves the LaMa
     /// object-removal model used by Find-the-Differences removals.
     Onnx,
+    /// Streaming speech-to-text (parakeet-rs).  Local-only: served by a
+    /// loaded model over the LAN streaming listener, never by a job.
+    Parakeet,
     Synthetic,
 }
 
