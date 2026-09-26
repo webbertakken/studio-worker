@@ -24,6 +24,7 @@ Verified against both codebases on 2026-06-11.
 12. [Service install + autostart](#12-service-install--autostart)
 13. [Desktop UI observation](#13-desktop-ui-observation)
 14. [Telemetry](#14-telemetry)
+15. [Model lifecycle](#15-model-lifecycle)
 
 ---
 
@@ -354,3 +355,24 @@ Completion / failure notifications go through the `Notifier` trait
 tracing (regression-tested in
 [`tests/config_tracing.rs`](../../tests/config_tracing.rs)).
 Independent of the studio-bound log shipping (flow 8).
+
+---
+
+## 15. Model lifecycle
+
+Local-only (the studio is not involved).
+
+1. `POST /models/:id/load` -> `ModelHost::load`: unknown / disabled ids are refused;
+   exclusive-group members are marked for swap; admission probes free device memory
+   (`nvidia-smi`, AMD sysfs, else accounting) and refuses with `insufficient_memory`.
+2. Residency is saved (`residency.json`), the lifecycle moves to `loading` and a load
+   thread waits for any swap-out, then calls the engine's loader (`loaders.rs`), which
+   downloads and loads the weights.
+3. `loaded`: requests for the model run on its lane (`ModelHost::with_lane`), e.g.
+   `/v1/chat/completions` via `local::chat_on_lane`; they are recorded in the local queue.
+4. `POST /models/:id/unload`: residency cleared, `unloading`; the lane's cancel flag is
+   raised, the in-flight request drains (bounded), the weights are dropped, `unloaded`.
+5. Startup: `spawn_local_api` builds the host and calls `restore_residents`.
+
+Every transition logs `model state changed` (target `studio_worker::lifecycle`) with
+`op`, `model`, `from`, `to`; refusals log `load refused`.

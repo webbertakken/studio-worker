@@ -26,7 +26,7 @@ Design: [`docs/runtime/model-lifecycle.md`](../docs/runtime/model-lifecycle.md).
 - [x] 1.5 Local API routes: state in `GET /models`, `GET /models/:id/state`, load, unload.
 - [x] 1.6 LLM engine on the host: CUDA, the model's own chat template, configurable context,
       real token counts; transient path unchanged for studio offers.
-- [ ] 1.7 Docs: overview, flows, local API; screenshots where the UI changes.
+- [x] 1.7 Docs: overview, flows, local API; screenshots where the UI changes.
 
 ## Phase 2 - streaming speech-to-text
 

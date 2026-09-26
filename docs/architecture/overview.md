@@ -137,17 +137,35 @@ src/
 ├── types.rs          Wire types shared with the studio: WorkerCapabilities, Task*,
 │                     TaskResult, JobClaim, LogEntry, AutoRegisterRequest, RegisterStatus.
 ├── sys.rs            hostname/username/VRAM probe.
+├── net.rs            Transport-level guards for every download.
+├── secrets.rs        Entropy for locally-minted credentials (local API token).
+├── catalog.rs        Local model catalogue (models.json); studio models mirror into it.
+├── local.rs          Local jobs without the studio: transient dispatch + chat on a lane.
+├── local_api.rs      Loopback HTTP API (bearer token): generation, catalogue, lifecycle.
+├── job_gate.rs       One-transient-job-at-a-time reservation gate.
+├── lifecycle.rs      Per-model state machine: unloaded/loading/loaded/unloading/failed.
+├── host.rs           Model host: loaded models, lanes, residency, admission, swaps.
+├── residency.rs      Persisted resident set (residency.json).
+├── admission.rs      Free-device-memory probe + admission with a safety margin.
+├── loaders.rs        In-process loaders per engine, behind the host's ModelRuntime.
 ├── service.rs        Per-OS service file writers (systemd --user / launchd / schtasks XML).
 ├── autostart.rs      Cross-OS "run in tray on login" toggle (logged; desktop UI calls it).
 ├── update.rs         GitHub release feed poll + installer script download + re-exec on success.
 ├── telemetry.rs      Sentry init (opt-in via SENTRY_DSN env var) + tracing-subscriber layer.
-├── test_support.rs   #[doc(hidden)] tracing capture helper for integration tests.
+├── test_support.rs   #[doc(hidden)] tracing capture + host doubles for tests.
 │
 ├── engine/           Pluggable inference backends.
 │   ├── mod.rs        Engine trait + dispatch / dispatch_with_source.  Always-on SyntheticEngine.
 │   ├── multi.rs      MultiEngine; routes strictly by ModelSource.engine (no fallback).
 │   ├── sdcpp.rs      Real image inference via stable-diffusion.cpp subprocess.
-│   ├── llama.rs      (feature `llama`) llama-cpp-2 wrapper for LLM tasks.
+│   ├── llama.rs      (feature `llama`, `cuda` for GPU) llama-cpp-2: transient jobs +
+│   │                 resident LoadedLlm, both through one `complete`.
+│   ├── llama_subprocess.rs  Windows LLM via a llama-cli subprocess.
+│   ├── llm_core.rs   Engine-free LLM rules: context budget, BOS, reasoning split, response.
+│   ├── chat_template.rs  The model's own Jinja chat template (minijinja + pycompat).
+│   ├── download.rs   Shared model-file provisioning (cache, size + sha256 checks).
+│   ├── sd_provision.rs  Auto-provisioned sd-cli binary + Vulkan preflight.
+│   ├── onnx.rs / onnx_provision.rs  (feature `image-onnx`) ONNX Runtime image engine.
 │   ├── whisper.rs    (feature `whisper`) whisper-rs wrapper for STT.
 │   ├── candle_image.rs (feature `image-candle`) candle-transformers SD pipeline.
 │   ├── video.rs      (feature `video`) animated-GIF video stand-in (no ffmpeg).
@@ -396,6 +414,19 @@ an external service if they need it).  Feature-gated heavyweights
 (`llama`, `whisper`, `image-candle`, `video`, `tts`) still drop in
 via the same trait when their cargo features are enabled — see
 [`plans/real-engines.md`](../../plans/real-engines.md).
+
+---
+
+## Model host
+
+Besides one-off jobs, the worker keeps chosen models **loaded** for local
+clients and unloads them on request.  [`src/host.rs`](../../src/host.rs) owns
+that: each catalogue model has a lifecycle state, loaded models serve on their
+own lane (one request at a time, next to the transient-job gate), residency is
+persisted so loaded models come back after a restart, and admission refuses a
+load that would not fit in free device memory.  Models in an exclusive group
+swap.  Full design: [model lifecycle](../runtime/model-lifecycle.md); API:
+[local API](../local-api.md#model-lifecycle).
 
 ---
 
