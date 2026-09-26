@@ -30,7 +30,9 @@ use tracing::{debug, info, warn};
 const TRACE_TARGET: &str = "studio_worker::engine::sd_provision";
 
 /// Pinned, known-good upstream release.  Bump deliberately after
-/// verifying a newer build still serves our model set.  Overridable
+/// verifying a newer build still serves our model set and that every
+/// `asset_plan` name exists in its release assets (upstream renames them,
+/// e.g. the macOS build moved from `macOS-15.7.7` to `macOS-26.6.2`).  Overridable
 /// per box via `STUDIO_WORKER_SDCPP_RELEASE`.  When bumping, also update
 /// the pinned URL in `docs/operations/sd-cli-install.md` and the
 /// `sdcpp-prebuilt.yml` workflow default so the manual playbook, the
@@ -269,7 +271,7 @@ fn asset_plan(os: &str, arch: &str) -> Result<(AssetSource, &'static str)> {
         ("linux", "x86_64") => Ok((Upstream, "Linux-Ubuntu-24.04-x86_64-vulkan")),
         // The upstream Darwin build is a universal2 binary (x86_64 +
         // arm64), so Intel Macs use the very same asset.
-        ("macos", "aarch64") | ("macos", "x86_64") => Ok((Upstream, "Darwin-macOS-15.7.7-arm64")),
+        ("macos", "aarch64") | ("macos", "x86_64") => Ok((Upstream, "Darwin-macOS-26.6.2-arm64")),
         // Upstream has no aarch64 Linux build; we publish our own.
         ("linux", "aarch64") => Ok((SelfHosted, "Linux-aarch64-vulkan")),
         _ => bail!(
@@ -672,7 +674,7 @@ mod tests {
         );
         assert_eq!(
             asset_plan("macos", "aarch64").unwrap(),
-            (Upstream, "Darwin-macOS-15.7.7-arm64")
+            (Upstream, "Darwin-macOS-26.6.2-arm64")
         );
     }
 
@@ -682,7 +684,7 @@ mod tests {
         // Intel Macs ride the upstream universal2 Darwin binary.
         assert_eq!(
             asset_plan("macos", "x86_64").unwrap(),
-            (Upstream, "Darwin-macOS-15.7.7-arm64")
+            (Upstream, "Darwin-macOS-26.6.2-arm64")
         );
         // aarch64 Linux has no upstream build, so we self-host one.
         assert_eq!(
@@ -740,7 +742,7 @@ mod tests {
         let arm = download_url("master-669-2d40a8b", "macos", "aarch64").unwrap();
         let intel = download_url("master-669-2d40a8b", "macos", "x86_64").unwrap();
         assert_eq!(arm, intel, "Intel Macs use the same universal2 asset");
-        assert!(intel.contains("Darwin-macOS-15.7.7-arm64"), "got: {intel}");
+        assert!(intel.contains("Darwin-macOS-26.6.2-arm64"), "got: {intel}");
     }
 
     #[test]

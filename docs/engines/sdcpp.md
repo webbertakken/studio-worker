@@ -90,7 +90,7 @@ Every release target can auto-provision out of the box:
 |---|---|---|
 | Windows x64 | Vulkan | upstream `win-vulkan-x64` |
 | Linux x64 | Vulkan | upstream `Linux-Ubuntu-24.04-x86_64-vulkan` |
-| macOS arm64 | Metal | upstream `Darwin-macOS-15.7.7-arm64` |
+| macOS arm64 | Metal | upstream `Darwin-macOS-26.6.2-arm64` |
 | macOS x64 (Intel) | Metal | upstream `Darwin-…-arm64` — it's a **universal2** binary |
 | Linux arm64 | Vulkan | **our** `sdcpp-prebuilt-<ref>` release (see below) |
 

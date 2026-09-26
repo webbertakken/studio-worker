@@ -44,7 +44,7 @@ from source against CUDA, but Vulkan is the unattended default.
 | Linux x86_64 + NVIDIA / AMD / Intel | `sd-master-<sha>-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip` |
 | Linux x86_64 + AMD ROCm 7.x | `sd-master-<sha>-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.13.0.zip` |
 | Linux x86_64 + CPU only | `sd-master-<sha>-bin-Linux-Ubuntu-24.04-x86_64.zip` |
-| macOS arm64 | `sd-master-<sha>-bin-Darwin-macOS-15.7.7-arm64.zip` |
+| macOS arm64 | `sd-master-<sha>-bin-Darwin-macOS-26.6.2-arm64.zip` |
 | Windows x64 + CUDA | `sd-master-<sha>-bin-win-cuda12-x64.zip` |
 
 The zip ships three files:

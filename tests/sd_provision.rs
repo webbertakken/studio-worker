@@ -93,7 +93,6 @@ async fn provision_downloads_extracts_and_caches_sd_cli() {
     std::env::set_var(URL_ENV, &url);
     let root = models_root.clone();
     let first = detached(move || sd_provision::provision(&root).unwrap());
-    std::env::remove_var(URL_ENV);
 
     let expected = models_root.join("bin").join(sd_provision::binary_name());
     assert_eq!(first, expected);
@@ -117,9 +116,11 @@ async fn provision_downloads_extracts_and_caches_sd_cli() {
         .collect();
     assert!(leftovers.is_empty(), "scratch litter left: {leftovers:?}");
 
-    // Second call: binary already present -> no network (expect(1)).
+    // Second call, same release: the marker matches -> no network (expect(1)). The override stays
+    // set: without it the pinned release differs from the marker and would be re-provisioned.
     let root = models_root.clone();
     let second = detached(move || sd_provision::provision(&root).unwrap());
+    std::env::remove_var(URL_ENV);
     assert_eq!(second, expected);
     // `server` drops here; wiremock asserts the single download.
 }
