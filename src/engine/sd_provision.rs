@@ -30,13 +30,83 @@ use tracing::{debug, info, warn};
 const TRACE_TARGET: &str = "studio_worker::engine::sd_provision";
 
 /// Pinned, known-good upstream release.  Bump deliberately after
-/// verifying a newer build still serves our model set.  Overridable
+/// verifying a newer build still serves our model set and that every
+/// `asset_plan` name exists in its release assets (upstream renames them,
+/// e.g. the macOS build moved from `macOS-15.7.7` to `macOS-26.6.2`).  Overridable
 /// per box via `STUDIO_WORKER_SDCPP_RELEASE`.  When bumping, also update
 /// the pinned URL in `docs/operations/sd-cli-install.md` and the
 /// `sdcpp-prebuilt.yml` workflow default so the manual playbook, the
 /// self-hosted arm64 build, and the auto-provisioner all share one
 /// known-good sd.cpp commit.
-const DEFAULT_RELEASE_TAG: &str = "master-669-2d40a8b";
+const DEFAULT_RELEASE_TAG: &str = "master-920-2f88688";
+
+/// File next to a provisioned binary recording the release URL it came from.  A binary whose
+/// marker names a different release (a pin bump, an override) or has no marker (provisioned
+/// before markers existed) is re-provisioned, so bumping the pin reaches existing workers.
+pub const RELEASE_MARKER: &str = ".sd-cli-release";
+
+/// Whether the binary in the provisioner's slot must be (re)fetched to serve `wanted_url`.
+/// Pure over what is on disk so every branch is unit-testable.
+fn needs_provision(binary_present: bool, marker: Option<&str>, wanted_url: &str) -> bool {
+    !binary_present || marker.map(str::trim) != Some(wanted_url)
+}
+
+/// Shortest sha prefix treated as identifying a commit.
+const MIN_SHA_LEN: usize = 7;
+
+/// The commit an `sd-cli --version` output reports
+/// (`stable-diffusion.cpp version <v>, commit <sha>`), if any.
+pub fn reported_commit(version_output: &str) -> Option<&str> {
+    let (_, rest) = version_output.rsplit_once("commit ")?;
+    let sha = rest.split_whitespace().next()?;
+    (!sha.is_empty() && sha.chars().all(|c| c.is_ascii_hexdigit())).then_some(sha)
+}
+
+/// Whether a found binary's `reported` commit serves the `pinned` one.
+/// Short shas match by prefix either way.  An unknown pin (a full URL
+/// override) trusts whatever is installed; a binary that reports no
+/// commit never matches a known pin.
+pub fn matches_pin(reported: Option<&str>, pinned: Option<&str>) -> bool {
+    let Some(pinned) = pinned else { return true };
+    let Some(reported) = reported else {
+        return false;
+    };
+    let shared = reported.len().min(pinned.len());
+    shared >= MIN_SHA_LEN && reported[..shared].eq_ignore_ascii_case(&pinned[..shared])
+}
+
+/// The commit the pin names, or `None` when a full URL override makes
+/// it unknown.  Pure over the tag and override.
+pub fn pinned_commit_for(tag: &str, url_override: Option<&str>) -> Option<String> {
+    if url_override.is_some_and(|url| !url.trim().is_empty()) {
+        return None;
+    }
+    sha_from_tag(tag).ok().map(str::to_string)
+}
+
+/// The commit of the release this worker would provision (env-aware).
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn pinned_commit() -> Option<String> {
+    pinned_commit_for(&release_tag(), std::env::var(URL_ENV).ok().as_deref())
+}
+
+/// Run `<sd_cli> --version` and return the commit it reports.  Excluded
+/// from coverage: spawns a host binary.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn probe_commit(sd_cli: &Path) -> Option<String> {
+    let mut command = std::process::Command::new(sd_cli);
+    command.arg("--version");
+    if let Some((var, dir)) = library_path_env(sd_cli) {
+        command.env(var, dir);
+    }
+    let output = command.output().ok()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    reported_commit(&text).map(str::to_string)
+}
 
 /// Env override for the release tag.
 const RELEASE_ENV: &str = "STUDIO_WORKER_SDCPP_RELEASE";
@@ -201,7 +271,7 @@ fn asset_plan(os: &str, arch: &str) -> Result<(AssetSource, &'static str)> {
         ("linux", "x86_64") => Ok((Upstream, "Linux-Ubuntu-24.04-x86_64-vulkan")),
         // The upstream Darwin build is a universal2 binary (x86_64 +
         // arm64), so Intel Macs use the very same asset.
-        ("macos", "aarch64") | ("macos", "x86_64") => Ok((Upstream, "Darwin-macOS-15.7.7-arm64")),
+        ("macos", "aarch64") | ("macos", "x86_64") => Ok((Upstream, "Darwin-macOS-26.6.2-arm64")),
         // Upstream has no aarch64 Linux build; we publish our own.
         ("linux", "aarch64") => Ok((SelfHosted, "Linux-aarch64-vulkan")),
         _ => bail!(
@@ -452,17 +522,19 @@ fn clean_scratch(zip_path: &Path, staging: &Path) {
 pub fn provision(models_root: &Path) -> Result<PathBuf> {
     let target_dir = models_root.join("bin");
     let binary = target_dir.join(binary_name());
-    if binary.is_file() {
+    let marker_path = target_dir.join(RELEASE_MARKER);
+    let url = resolve_url()?;
+    let marker = std::fs::read_to_string(&marker_path).ok();
+    if !needs_provision(binary.is_file(), marker.as_deref(), &url) {
         return Ok(binary);
     }
-
-    let url = resolve_url()?;
     info!(
         target: TRACE_TARGET,
         op = "provision",
         url = %url,
         dest = %target_dir.display(),
-        "sd-cli not found; provisioning stable-diffusion.cpp"
+        previous = marker.as_deref().map(str::trim).unwrap_or(if binary.is_file() { "unmarked" } else { "none" }),
+        "provisioning stable-diffusion.cpp"
     );
 
     std::fs::create_dir_all(models_root)
@@ -487,6 +559,8 @@ pub fn provision(models_root: &Path) -> Result<PathBuf> {
         if !binary.is_file() {
             bail!("sd-cli install left no binary at {}", binary.display());
         }
+        std::fs::write(&marker_path, format!("{url}\n"))
+            .with_context(|| format!("writing {}", marker_path.display()))?;
         Ok(binary.clone())
     })();
 
@@ -521,6 +595,57 @@ fn now_nanos() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_commit_reads_the_commit_from_version_output() {
+        assert_eq!(
+            reported_commit("stable-diffusion.cpp version master-920-2f88688, commit 2f88688\n"),
+            Some("2f88688")
+        );
+        assert_eq!(
+            reported_commit("stable-diffusion.cpp version unknown, commit 29ab511"),
+            Some("29ab511")
+        );
+        assert_eq!(reported_commit("usage: sd-cli [options]"), None);
+        assert_eq!(reported_commit("commit "), None);
+    }
+
+    #[test]
+    fn matches_pin_compares_short_shas_and_trusts_an_unknown_pin() {
+        assert!(matches_pin(Some("2f88688"), Some("2f88688")));
+        assert!(matches_pin(Some("2f886881a2b3"), Some("2f88688")));
+        assert!(matches_pin(Some("2f88688"), Some("2f886881a2b3")));
+        assert!(!matches_pin(Some("29ab511"), Some("2f88688")));
+        // A binary that does not report a commit cannot be trusted to serve the pin.
+        assert!(!matches_pin(None, Some("2f88688")));
+        // A full URL override leaves the pinned commit unknown: accept what is installed.
+        assert!(matches_pin(Some("29ab511"), None));
+        assert!(matches_pin(None, None));
+        // Too-short fragments never match by accident.
+        assert!(!matches_pin(Some("2f"), Some("2f88688")));
+    }
+
+    #[test]
+    fn pinned_commit_follows_the_release_tag() {
+        assert_eq!(
+            pinned_commit_for("master-920-2f88688", None),
+            Some("2f88688".to_string())
+        );
+        assert_eq!(
+            pinned_commit_for("master-920-2f88688", Some("https://mirror/sd.zip")),
+            None
+        );
+        assert_eq!(pinned_commit_for("master", None), None);
+    }
+
+    #[test]
+    fn needs_provision_when_missing_unmarked_or_from_another_release() {
+        assert!(needs_provision(false, None, "u"));
+        assert!(needs_provision(false, Some("u"), "u"));
+        assert!(needs_provision(true, None, "u"));
+        assert!(needs_provision(true, Some("old"), "u"));
+        assert!(!needs_provision(true, Some("u\n"), "u"));
+    }
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -549,7 +674,7 @@ mod tests {
         );
         assert_eq!(
             asset_plan("macos", "aarch64").unwrap(),
-            (Upstream, "Darwin-macOS-15.7.7-arm64")
+            (Upstream, "Darwin-macOS-26.6.2-arm64")
         );
     }
 
@@ -559,7 +684,7 @@ mod tests {
         // Intel Macs ride the upstream universal2 Darwin binary.
         assert_eq!(
             asset_plan("macos", "x86_64").unwrap(),
-            (Upstream, "Darwin-macOS-15.7.7-arm64")
+            (Upstream, "Darwin-macOS-26.6.2-arm64")
         );
         // aarch64 Linux has no upstream build, so we self-host one.
         assert_eq!(
@@ -617,7 +742,7 @@ mod tests {
         let arm = download_url("master-669-2d40a8b", "macos", "aarch64").unwrap();
         let intel = download_url("master-669-2d40a8b", "macos", "x86_64").unwrap();
         assert_eq!(arm, intel, "Intel Macs use the same universal2 asset");
-        assert!(intel.contains("Darwin-macOS-15.7.7-arm64"), "got: {intel}");
+        assert!(intel.contains("Darwin-macOS-26.6.2-arm64"), "got: {intel}");
     }
 
     #[test]

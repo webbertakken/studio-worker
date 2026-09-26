@@ -44,7 +44,7 @@ from source against CUDA, but Vulkan is the unattended default.
 | Linux x86_64 + NVIDIA / AMD / Intel | `sd-master-<sha>-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip` |
 | Linux x86_64 + AMD ROCm 7.x | `sd-master-<sha>-bin-Linux-Ubuntu-24.04-x86_64-rocm-7.13.0.zip` |
 | Linux x86_64 + CPU only | `sd-master-<sha>-bin-Linux-Ubuntu-24.04-x86_64.zip` |
-| macOS arm64 | `sd-master-<sha>-bin-Darwin-macOS-15.7.7-arm64.zip` |
+| macOS arm64 | `sd-master-<sha>-bin-Darwin-macOS-26.6.2-arm64.zip` |
 | Windows x64 + CUDA | `sd-master-<sha>-bin-win-cuda12-x64.zip` |
 
 The zip ships three files:
@@ -78,7 +78,7 @@ the .so.
 #!/usr/bin/env bash
 set -euo pipefail
 
-URL='https://github.com/leejet/stable-diffusion.cpp/releases/download/master-669-2d40a8b/sd-master-2d40a8b-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip'
+URL='https://github.com/leejet/stable-diffusion.cpp/releases/download/master-920-2f88688/sd-master-2f88688-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip'
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -104,7 +104,7 @@ sd-cli -h | head -1
 The URL is pinned to the same `master-N-<sha>` build the worker
 auto-provisions - the `DEFAULT_RELEASE_TAG` const in
 [`src/engine/sd_provision.rs`](../../src/engine/sd_provision.rs)
-(`master-669-2d40a8b`) and the `sdcpp-prebuilt.yml` workflow default.
+(`master-920-2f88688`) and the `sdcpp-prebuilt.yml` workflow default.
 Keeping them identical means a manual install and the auto-provisioned
 binary share one known-good sd.cpp commit, so there's no flag drift
 between them.  When you bump `DEFAULT_RELEASE_TAG`, update this URL in
@@ -126,12 +126,18 @@ needed.
 
 On the first image job the engine resolves `sd-cli` in this order:
 
-1. `$STUDIO_WORKER_SD_CLI` env var (absolute path; operator override)
-2. `<models_root>/bin/sd-cli` - where the auto-provisioner installs,
-   and where you can drop your own binary (default `~/models/bin/`)
-   for a PATH-free override
+1. `$STUDIO_WORKER_SD_CLI` env var (absolute path; the operator override,
+   including a PATH-free one)
+2. `<models_root>/bin/sd-cli` - the auto-provisioner's slot (default
+   `~/models/bin/`); it records the release it installed in
+   `.sd-cli-release` and re-provisions when the pin changes, so do not
+   drop your own binary here
 3. `~/.local/bin/sd-cli` (matches the playbook above)
 4. `sd-cli` on `$PATH`
+
+Steps 3 and 4 only count when `sd-cli --version` reports the pinned commit
+(`DEFAULT_RELEASE_TAG`'s sha): build your own CUDA binary at that commit to keep using
+it. An install at another commit is passed over and the pinned build is provisioned.
 
 If none resolve, the engine **auto-provisions** into
 `<models_root>/bin/` (download + extract the platform Vulkan build),

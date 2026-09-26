@@ -93,11 +93,13 @@ impl SdCppEngine {
     }
 
     /// Resolve the `sd-cli` binary, provisioning it on first use.
-    /// Resolution order (operator installs win): a cached path from a
-    /// previous job, then env / `<models_root>/bin` / `~/.local/bin` /
-    /// `$PATH`, then an auto-provisioned download into
-    /// `<models_root>/bin/`.  The result is cached for the worker's
-    /// lifetime.
+    /// Resolution order: a cached path from a previous job, then the env
+    /// override (warned about when off-pin), then the provisioner's own
+    /// `<models_root>/bin` slot (re-provisioned when its release marker
+    /// no longer matches the pin), then `~/.local/bin` / `$PATH` when its
+    /// `--version` reports the pinned commit (else the pinned build is
+    /// provisioned), then a fresh download into `<models_root>/bin/`.
+    /// The result is cached for the worker's lifetime.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn ensure_sd_cli(&self) -> Result<PathBuf> {
         let mut guard = self.sd_cli.lock();
@@ -106,18 +108,80 @@ impl SdCppEngine {
                 return Ok(p.clone());
             }
         }
-        let resolved = match resolve_sd_cli(&self.models_root) {
+        let slot = self
+            .models_root
+            .join("bin")
+            .join(sd_provision::binary_name());
+        let pinned = sd_provision::pinned_commit();
+        let resolved = match env_sd_cli() {
             Some(p) => {
-                info!(
-                    target: TRACE_TARGET,
-                    op = "resolve",
-                    sd_cli = %p.display(),
-                    "using existing sd-cli"
-                );
+                // The explicit override is honoured even off-pin, but never silently.
+                let found = sd_provision::probe_commit(&p);
+                if !sd_provision::matches_pin(found.as_deref(), pinned.as_deref()) {
+                    warn!(
+                        target: TRACE_TARGET,
+                        op = "resolve",
+                        sd_cli = %p.display(),
+                        found = found.as_deref().unwrap_or("unknown"),
+                        pinned = pinned.as_deref().unwrap_or("unknown"),
+                        "STUDIO_WORKER_SD_CLI is not the pinned stable-diffusion.cpp commit; newer models may fail"
+                    );
+                }
+                info!(target: TRACE_TARGET, op = "resolve", sd_cli = %p.display(), source = "env", "using existing sd-cli");
                 p
             }
-            None => sd_provision::provision(&self.models_root)
-                .context("auto-provisioning sd-cli (stable-diffusion.cpp)")?,
+            None if slot.is_file() => match sd_provision::provision(&self.models_root) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        target: TRACE_TARGET,
+                        op = "resolve",
+                        sd_cli = %slot.display(),
+                        error = %e,
+                        "could not refresh the provisioned sd-cli; keeping the installed one"
+                    );
+                    slot
+                }
+            },
+            None => match implicit_sd_cli() {
+                Some(p) => {
+                    let found = sd_provision::probe_commit(&p);
+                    if sd_provision::matches_pin(found.as_deref(), pinned.as_deref()) {
+                        info!(
+                            target: TRACE_TARGET,
+                            op = "resolve",
+                            sd_cli = %p.display(),
+                            commit = found.as_deref().unwrap_or("unknown"),
+                            "using existing sd-cli (pinned commit)"
+                        );
+                        p
+                    } else {
+                        warn!(
+                            target: TRACE_TARGET,
+                            op = "resolve",
+                            sd_cli = %p.display(),
+                            found = found.as_deref().unwrap_or("unknown"),
+                            pinned = pinned.as_deref().unwrap_or("unknown"),
+                            "installed sd-cli is not the pinned commit; provisioning the pinned build"
+                        );
+                        match sd_provision::provision(&self.models_root) {
+                            Ok(provisioned) => provisioned,
+                            Err(e) => {
+                                warn!(
+                                    target: TRACE_TARGET,
+                                    op = "resolve",
+                                    sd_cli = %p.display(),
+                                    error = %e,
+                                    "could not provision the pinned sd-cli; falling back to the installed one"
+                                );
+                                p
+                            }
+                        }
+                    }
+                }
+                None => sd_provision::provision(&self.models_root)
+                    .context("auto-provisioning sd-cli (stable-diffusion.cpp)")?,
+            },
         };
         *guard = Some(resolved.clone());
         Ok(resolved)
@@ -581,10 +645,18 @@ fn build_sdcli_args(
         args.push(shift.to_string().into());
     }
     if source.cli_defaults.zero_cond_t == Some(true) {
-        args.push("--qwen-image-zero-cond-t".into());
+        args.push("--model-args".into());
+        args.push("qwen_image_zero_cond_t=true".into());
     }
     if source.cli_defaults.offload_to_cpu == Some(true) {
         args.push("--offload-to-cpu".into());
+    }
+    if source.cli_defaults.mmap == Some(true) {
+        args.push("--mmap".into());
+    }
+    if let Some(budget) = source.cli_defaults.max_vram_gib {
+        args.push("--max-vram".into());
+        args.push(budget.to_string().into());
     }
     // VRAM-saving flags that are safe on every box.
     args.push("--diffusion-fa".into());
@@ -616,25 +688,19 @@ fn apply_library_path(cmd: &mut Command, sd_cli: &Path) {
     cmd.env(var, value);
 }
 
-/// Look up `sd-cli` in env override -> `<models_root>/bin` ->
-/// `~/.local/bin` -> `$PATH`.  The `<models_root>/bin` slot is where a
-/// self-provisioned binary lands, so the auto-provisioner can drop it
-/// next to the cached models and have the worker pick it up with no
-/// PATH fiddling.  Excluded from coverage: touches several host paths
-/// only one of which matches per host, and CI doesn't ship `sd-cli`.
+/// The operator's explicit `STUDIO_WORKER_SD_CLI` override, when it names a file.
+/// Excluded from coverage: reads the process environment.
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn resolve_sd_cli(models_root: &Path) -> Option<PathBuf> {
+fn env_sd_cli() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var("STUDIO_WORKER_SD_CLI").ok()?);
+    path.is_file().then_some(path)
+}
+
+/// An implicitly installed `sd-cli`: `~/.local/bin`, then `$PATH`.  Excluded
+/// from coverage: touches host paths, and CI doesn't ship `sd-cli`.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn implicit_sd_cli() -> Option<PathBuf> {
     let bin = sd_provision::binary_name();
-    if let Ok(p) = std::env::var("STUDIO_WORKER_SD_CLI") {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let in_models = models_root.join("bin").join(bin);
-    if in_models.is_file() {
-        return Some(in_models);
-    }
     if let Some(home) = std::env::var_os("HOME") {
         let candidate = PathBuf::from(home).join(".local/bin").join(bin);
         if candidate.is_file() {
@@ -645,7 +711,7 @@ fn resolve_sd_cli(models_root: &Path) -> Option<PathBuf> {
 }
 
 /// `$PATH` lookup for a bare binary name.  Excluded from coverage
-/// for the same reason as `resolve_sd_cli`.
+/// for the same reason as `implicit_sd_cli`.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -1102,8 +1168,7 @@ mod tests {
                 flow_shift: Some(3.0),
                 zero_cond_t: Some(true),
                 offload_to_cpu: Some(true),
-                context_size: None,
-                chat_template_kwargs: None,
+                ..Default::default()
             },
         }
     }
@@ -1139,8 +1204,42 @@ mod tests {
         // Vision encoder + Qwen flow flags emitted.
         assert_eq!(s[idx_after(&s, "--llm_vision").unwrap()], "/mmproj.gguf");
         assert_eq!(s[idx_after(&s, "--flow-shift").unwrap()], "3");
-        assert!(s.contains(&"--qwen-image-zero-cond-t".to_string()));
+        // sd.cpp master-9xx dropped --qwen-image-zero-cond-t for a model arg.
+        assert!(!s.contains(&"--qwen-image-zero-cond-t".to_string()));
+        assert_eq!(
+            s[idx_after(&s, "--model-args").unwrap()],
+            "qwen_image_zero_cond_t=true"
+        );
         assert!(s.contains(&"--offload-to-cpu".to_string()));
+    }
+
+    #[test]
+    fn build_sdcli_args_emits_memory_budget_flags_from_the_registry() {
+        let params = ImageParams {
+            prompt: "Remove the red rowing boat".into(),
+            ..Default::default()
+        };
+        let mut source = qwen_edit_source();
+        source.cli_defaults.mmap = Some(true);
+        source.cli_defaults.max_vram_gib = Some(12.0);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/qwen21.gguf"),
+            Some(Path::new("/vae.safetensors")),
+            Some(Path::new("/llm.gguf")),
+            Some(Path::new("/mmproj.gguf")),
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            Some(Path::new("/tmp/ref.webp")),
+            false,
+        );
+        let s = args_to_strings(&args);
+        assert!(s.contains(&"--mmap".to_string()));
+        assert_eq!(s[idx_after(&s, "--max-vram").unwrap()], "12");
+        // Mask-free reference edit: no --mask without a mask path.
+        assert!(!s.contains(&"--mask".to_string()));
     }
 
     #[test]
@@ -1168,6 +1267,9 @@ mod tests {
         assert!(!s.contains(&"--flow-shift".to_string()));
         assert!(!s.contains(&"--qwen-image-zero-cond-t".to_string()));
         assert!(!s.contains(&"--offload-to-cpu".to_string()));
+        assert!(!s.contains(&"--model-args".to_string()));
+        assert!(!s.contains(&"--mmap".to_string()));
+        assert!(!s.contains(&"--max-vram".to_string()));
         assert!(!s.contains(&"--llm_vision".to_string()));
         assert!(!s.contains(&"-r".to_string()));
     }

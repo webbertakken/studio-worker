@@ -45,9 +45,15 @@ side is kind-based, not model-based.
 worker's lifetime) via `ensure_sd_cli`:
 
 1. A path cached from a previous job (if still a file).
-2. `$STUDIO_WORKER_SD_CLI` -> `<models_root>/bin/sd-cli` ->
-   `~/.local/bin/sd-cli` -> `$PATH` - any operator install wins.
-3. **Auto-provision**: if nothing resolves, download the platform's
+2. `$STUDIO_WORKER_SD_CLI` - the operator's explicit override (a warning is logged when its
+   `--version` commit is not the pinned one).
+3. `<models_root>/bin/sd-cli` - the provisioner's own slot, re-provisioned
+   first when its release marker no longer matches the pinned release.
+4. `~/.local/bin/sd-cli` -> `$PATH` - an implicit operator install, used only when its
+   `sd-cli --version` reports the pinned commit (so a CUDA build at the pin is kept); an
+   older one is passed over for the pinned build (and still used, with a warning, if
+   provisioning fails offline).
+5. **Auto-provision**: if nothing resolves, download the platform's
    prebuilt stable-diffusion.cpp Vulkan build and extract it into
    `<models_root>/bin/` (see [auto-provisioning](#auto-provisioning)).
 
@@ -66,7 +72,13 @@ On the first image job with no resolvable `sd-cli`, the engine:
    (`stable-diffusion.dll` / `libstable-diffusion.so` / `.dylib`)
    flat into `<models_root>/bin/` (the path-free slot the resolver
    prefers).  Flattening to bare file names also defuses zip-slip.
-3. On Linux / macOS the per-job `Command` gets `LD_LIBRARY_PATH` /
+3. Writes `<models_root>/bin/.sd-cli-release` with the release URL it
+   installed.  A later job whose pinned (or overridden) release differs
+   from the marker - or finds a binary with no marker - re-provisions,
+   so bumping `DEFAULT_RELEASE_TAG` reaches workers that provisioned an
+   older build.  If the refresh fails (offline) the installed binary
+   keeps serving and the failure is logged.
+4. On Linux / macOS the per-job `Command` gets `LD_LIBRARY_PATH` /
    `DYLD_LIBRARY_PATH` pointed at that dir so the loader finds the
    sibling library; Windows resolves sibling DLLs automatically.
 
@@ -78,7 +90,7 @@ Every release target can auto-provision out of the box:
 |---|---|---|
 | Windows x64 | Vulkan | upstream `win-vulkan-x64` |
 | Linux x64 | Vulkan | upstream `Linux-Ubuntu-24.04-x86_64-vulkan` |
-| macOS arm64 | Metal | upstream `Darwin-macOS-15.7.7-arm64` |
+| macOS arm64 | Metal | upstream `Darwin-macOS-26.6.2-arm64` |
 | macOS x64 (Intel) | Metal | upstream `Darwin-…-arm64` — it's a **universal2** binary |
 | Linux arm64 | Vulkan | **our** `sdcpp-prebuilt-<ref>` release (see below) |
 
@@ -142,16 +154,30 @@ The legacy `with_builtin(models_root)` returned a hardcoded
      --diffusion-model <local diffusion file>
      --vae             <local vae file>          # if present
      --llm             <local text encoder>      # if present
+     --llm_vision      <local vision tower>      # text-encoder-vision role, if present
      -p                <prompt from the task>
+     -r                <reference image>         # instruction edits (refImageUrl)
+     --mask            <mask>                    # if the task carries one
      --cfg-scale       <cli_defaults.cfgScale>
      --steps           <cli_defaults.steps or task.steps if explicit>
      -W                <cli_defaults.width or task.width>
      -H                <cli_defaults.height or task.height>
      -o                /tmp/studio-worker-sdcpp/out-<pid>-<nanos>.webp
      --sampling-method <cli_defaults.samplingMethod>  # if present
+     --flow-shift      <cli_defaults.flowShift>        # if present
+     --model-args      qwen_image_zero_cond_t=true     # if cli_defaults.zeroCondT
+     --offload-to-cpu                                 # if cli_defaults.offloadToCpu
+     --mmap                                           # if cli_defaults.mmap
+     --max-vram        <cli_defaults.maxVramGib>      # if present
      --diffusion-fa                                   # always
      --seed            <task.seed>                    # if explicit
    ```
+
+   `offloadToCpu` + `mmap` + `maxVramGib` together let a large model
+   (Qwen-Image-2.1 at ~23 GB unmanaged) share a card with other
+   tenants: weights stay memory-mapped in RAM and stream into a fixed
+   device budget. sd.cpp master-9xx replaced `--qwen-image-zero-cond-t`
+   with the `qwen_image_zero_cond_t` model argument.
 
    The CLI defaults from the studio's source win over the task's
    when the task is at its parameter-default value (e.g. `steps=20`

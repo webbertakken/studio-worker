@@ -486,6 +486,8 @@ fn zimage_turbo() -> CatalogModel {
                 offload_to_cpu: None,
                 context_size: None,
                 chat_template_kwargs: None,
+                mmap: None,
+                max_vram_gib: None,
             },
         },
         enabled: true,
