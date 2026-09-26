@@ -2,4 +2,5 @@
 //! activity detection and the LAN listener that serves loaded models.
 
 pub mod session;
+pub mod tokens;
 pub mod vad;
