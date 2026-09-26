@@ -19,7 +19,8 @@ itself a client of this API (see [daemon control](#daemon-control)).
 - Port: `4787` by default. Override with `STUDIO_WORKER_LOCAL_API_PORT`
   (or `local_api_port` in `config.toml`; the env var wins); if the
   preferred port is taken the worker falls back to an ephemeral port and logs
-  the chosen URL (also published in the tray UI's Jobs tab and the discovery file).
+  the chosen URL (also shown on the tray UI's Worker page and under the Jobs page's
+  Local filter, and published in the discovery file).
 - Request bodies are capped at 1 MiB (`413` beyond that).
 - Synchronous: `POST /image` blocks until the engine finishes and returns the
   image bytes. Each job is recorded in the in-app **Local queue**.
@@ -296,8 +297,9 @@ curl -s http://127.0.0.1:4787/models \
 ## Local queue in the app
 
 Local jobs are kept in their own ring (`WorkerObservers::local_jobs`), separate
-from studio-claimed jobs, and shown under **Local queue** in the tray UI's
-Jobs tab alongside the API URL, each with its log and, for images, a thumbnail.
+from studio-claimed jobs, and shown in the tray UI's Jobs page history (the
+**Local** filter shows them alone, with the API URL), each with its log and, for
+images, a thumbnail that opens larger.
 Chats served on a loaded model's lane (`source: lane`) and streaming speech
 sessions (`source: stream`) are local jobs too.
 

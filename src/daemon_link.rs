@@ -63,7 +63,7 @@ impl LinkState {
         matches!(self, LinkState::Connected { .. })
     }
 
-    /// One line for the UI's status line.
+    /// One line for the UI's status bar.
     pub fn summary(&self) -> String {
         match self {
             LinkState::Connecting => "connecting to the worker daemon…".into(),
@@ -86,7 +86,7 @@ impl LinkState {
 /// The UI's copy of the daemon's state.  Cheap to clone.
 #[derive(Clone)]
 pub struct Replica {
-    /// The daemon's observers, as the tabs read them.
+    /// The daemon's observers, as the pages read them.
     pub observers: WorkerObservers,
     /// The daemon's operator-editable config and worker id (no secrets).
     pub cfg: SharedConfig,
@@ -548,7 +548,7 @@ pub fn perform(config_path: &Path, action: &Action) -> Result<String, String> {
     outcome.map_err(|e| e.to_string())
 }
 
-/// Send the Config tab's edit to the daemon; answers what it saved.
+/// Send the Config page's edit to the daemon; answers what it saved.
 pub fn save_config(config_path: &Path, edit: &EditableConfig) -> Result<EditableConfig, String> {
     let outcome = DaemonClient::discover(config_path).and_then(|client| client.put_config(edit));
     if let Err(err) = &outcome {

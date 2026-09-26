@@ -94,7 +94,7 @@ Every job, whatever its source, is visible while it runs and after it ends.
 
 ### Worker log
 
-- The Logs tab shows the daemon's worker log ring (1 000 entries): the studio session's
+- The Logs page shows the daemon's worker log ring (1 000 entries): the studio session's
   breadcrumbs (`runtime::push_log`) plus every other `studio_worker` event at info and
   up, copied in by a second tracing layer.  Each entry carries the job id when it was
   emitted inside a job.
@@ -176,7 +176,8 @@ their size whatever the state, so nothing moves when a job starts or ends.
   - the studio: `Studio connected`, `Reconnecting (<n>)`, `Awaiting approval`,
     `Registration rejected`, `Studio auth failed`, …;
   - GPU memory: a bar and `≈ <loaded> / <total> GB`, the sum of the catalogue estimates of the
-    models loaded (or loading) against the device total;
+    models loaded (or loading, or unloading) against the device total; `unknown` while the
+    daemon does not answer;
   - **Pause / Resume**, enabled while the daemon answers.
 - **Status bar**: the daemon version and URL (or what the UI does about a missing daemon) on the
   left, the result of the last action on the right (red when it failed). Errors are shown
@@ -212,13 +213,14 @@ their size whatever the state, so nothing moves when a job starts or ends.
 
 - A memory summary on top: the device total, a bar with one segment per loaded model, and the
   sum of their estimates.
-- Two groups that never reorder: **Kept in memory** (models with an in-process loader) and
-  **Loaded per job** (engines that load for each job, e.g. `sd-cli`).
+- Two groups that never reorder, each in catalogue order: **Kept in memory** (models with an
+  in-process loader) and **Loaded per job** (engines that load for each job, e.g. `sd-cli`).
 - Each model is one row: its state (a coloured dot and word: `loaded`, `loading`,
   `unloading`, `unloaded`, `failed`), its name and id, `<kind> · <engine> · ≈ <GB>`, a
   `resident` pin, its exclusive group, since when it is in its state, and one action of fixed
-  width: **Load**, **Unload**, **Retry** after a failure, or a disabled `Loading…` /
-  `Unloading…`. A failed model shows its error in the row.
+  width: **Load**, **Unload** (also while loading: the load completes first), **Retry** after a
+  failure, or a disabled `Unloading…`, `Per job` (no in-process loader) or `Disabled`. A failed
+  model shows its error in the row.
 
 #### Worker
 
@@ -243,11 +245,11 @@ The worker's identity and health on one page (formerly Status and About):
 
 #### Config
 
-- One card per section: Connection, Worker, Auto-update, Models, sent to the daemon with
-  **Save** (it validates, saves and applies them); and This window (appearance, reduce motion,
+- One card per section: Connection, Worker, Auto-update, Models, Start-up, sent to the daemon
+  with **Save** (it validates, saves and applies them); and This window (appearance, reduce motion,
   notifications), applied and stored at once.
-- A footer that never changes height: Save, Reset, and the save state (`Unsaved changes`,
-  `Saving…`, `Saved`, or the daemon's refusal).
+- A footer that never changes height: Save, Reset, and the save state (`Up to date`,
+  `Unsaved changes`, `Saving…`, or `Not saved: <the daemon's refusal>`).
 
 #### Headless inspection
 

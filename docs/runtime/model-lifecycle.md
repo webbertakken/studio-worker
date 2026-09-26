@@ -104,7 +104,7 @@ All routes require the bearer token (see [local API](../local-api.md)).
 
 ## Tray UI
 
-The tray UI's Models tab lists every catalogue model with its state, residency and since,
+The tray UI's Models page lists every catalogue model with its state, residency and since,
 and offers Load / Unload per the guards above; Load only for `loadable` models (engines
 with an in-process loader).  See [daemon and tray UI](daemon-and-tray.md).
 

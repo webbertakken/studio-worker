@@ -91,20 +91,24 @@ sentry use rustls).  Headless rigs can still opt out:
 cargo install studio-worker --no-default-features   # service / `run` only
 ```
 
-| Tab     | What it shows                                                     |
+The window is a navigation rail, a header that always shows the worker's
+pulse (what runs, the daemon, the studio, GPU memory held, Pause / Resume)
+and a status bar with the result of your last action.  It opens on Jobs.
+
+| Page    | What it shows                                                     |
 | ------- | ----------------------------------------------------------------- |
-| Status  | Registration, studio connection, heartbeat, GPU runtime, busy / idle / paused badge, Pause / Resume; Reset registration after a rejection. |
-| Jobs    | Every running job (studio offers, local API jobs, chats on a loaded model, streaming speech sessions), the studio jobs and the local queue.  Image jobs show a thumbnail; selecting a job shows its log. |
-| Models  | Each catalogue model's lifecycle state, residency and memory estimate, with Load / Unload. |
-| Config  | The operator-editable settings; Save sends them to the daemon, which validates, saves and applies them. |
-| Logs    | Everything the daemon logs: level filter, free-text search, auto-scroll. |
-| About   | Tray UI and daemon versions, config path, "Check for updates". |
+| Jobs    | What runs now (studio offers, local API jobs, chats on a loaded model, streaming speech sessions) and every finished job, grouped by day and filterable by studio / local.  Selecting a job shows its image (click it to view larger), its facts, its failure reason and its log (coloured, wrapping, copyable). |
+| Models  | GPU memory held by loaded models, then each catalogue model's state, residency and memory estimate, with Load / Unload / Retry. |
+| Worker  | State and Pause / Resume, registration (request id while waiting for approval; Reset after a rejection), studio connection and heartbeat, GPU runtime and VRAM, local API URL, versions, config path, "Check for updates". |
+| Logs    | Everything the daemon logs: level filter, search, follow, copy. |
+| Config  | The operator-editable settings (Save sends them to the daemon, which validates, saves and applies them), and this window's theme (dark, light or follow system), reduce motion and notifications. |
 
-![Jobs tab](docs/screenshots/jobs.png)
+![Jobs page](docs/screenshots/jobs.png)
 
-A status line at the top always says whether the daemon answers.  While it
-does not, the tabs are replaced by a "daemon not reachable" view rather
-than stale data.
+While the daemon does not answer, the pages show a "daemon not reachable"
+card rather than stale data.  One tray UI runs per config: launching it
+again brings the running window forward instead of adding a second tray
+icon.
 
 The tray icon reflects state (idle = green, busy = amber,
 disconnected = red) and exposes:
@@ -186,7 +190,7 @@ the worker's next 30s poll picks up its `worker_id` + `auth_token`
 and starts heartbeating.  Two ways to launch:
 
 ```bash
-# Tray UI (recommended) — starts the daemon for you; the Status tab shows
+# Tray UI (recommended) — starts the daemon for you; the Worker page shows
 # 'Waiting for approval' until the operator approves.
 studio-worker ui
 

@@ -15,7 +15,7 @@ use crate::runtime::{
 };
 use crate::types::{LogEntry, ModelEngine, TaskKind};
 
-/// The operator-editable part of the config: what the Config tab shows and
+/// The operator-editable part of the config: what the Config page shows and
 /// `PUT /daemon/config` accepts.  Credentials and registration state are
 /// never part of it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
