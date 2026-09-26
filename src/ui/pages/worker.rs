@@ -284,12 +284,25 @@ pub enum WorkerAction {
     ResetRegistration,
 }
 
+/// Why the daemon's side of the pages is missing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Offline {
+    /// What the UI is doing about it.
+    pub summary: String,
+    /// The last error, if any.
+    pub detail: String,
+    /// Where a daemon the UI starts writes its output.
+    pub daemon_log: PathBuf,
+}
+
 /// What the page needs besides its view.
 pub struct WorkerContext<'a> {
     pub activity: &'a Activity,
     pub paused: bool,
     /// `None` while the daemon does not answer.
     pub facts: Option<&'a WorkerFacts>,
+    /// Set while the daemon does not answer.
+    pub offline: Option<&'a Offline>,
     pub about: &'a AboutView,
     pub about_state: &'a AboutState,
     pub tokio: &'a Handle,
@@ -309,6 +322,10 @@ pub fn render(ui: &mut egui::Ui, cx: WorkerContext<'_>) -> Option<WorkerAction> 
         "This machine's worker: its state, its place in the studio, its hardware and version.",
     );
     let mut action = None;
+    if let Some(offline) = cx.offline {
+        unreachable_card(ui, offline);
+        ui.add_space(12.0);
+    }
     if let Some(facts) = cx.facts {
         action = hero(ui, cx.activity, cx.paused, cx.glow);
         ui.add_space(12.0);
@@ -591,7 +608,8 @@ fn about_card(
 
 /// The card that stands in for the daemon's side of the pages while it
 /// does not answer.
-pub fn unreachable_card(ui: &mut egui::Ui, summary: &str, detail: &str, daemon_log: &Path) {
+pub fn unreachable_card(ui: &mut egui::Ui, offline: &Offline) {
+    let (summary, detail, daemon_log) = (&offline.summary, &offline.detail, &offline.daemon_log);
     let p = Palette::of_ui(ui);
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
@@ -605,13 +623,13 @@ pub fn unreachable_card(ui: &mut egui::Ui, summary: &str, detail: &str, daemon_l
                 );
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new(summary).color(p.muted));
+                    ui.label(RichText::new(summary.as_str()).color(p.muted));
                 });
             });
         });
         if !detail.is_empty() {
             ui.add_space(8.0);
-            widgets::tinted_box(ui, Tone::Neutral, detail);
+            widgets::tinted_box(ui, Tone::Neutral, detail.as_str());
         }
         ui.add_space(8.0);
         ui.label(
@@ -875,6 +893,11 @@ mod tests {
         ] {
             *state.last_check.lock() = check;
             let about = AboutView::build(&state, Path::new("/tmp/c.toml"), Some("0.0.1".into()));
+            let offline = Offline {
+                summary: "retrying".into(),
+                detail: "no discovery file".into(),
+                daemon_log: PathBuf::from("/tmp/daemon.log"),
+            };
             for f in all.iter().map(Some).chain([None]) {
                 for (activity, paused) in [
                     (Activity::Idle, false),
@@ -888,6 +911,7 @@ mod tests {
                                 activity: &activity,
                                 paused,
                                 facts: f,
+                                offline: f.is_none().then_some(&offline),
                                 about: &about,
                                 about_state: &state,
                                 tokio: &tokio,
@@ -896,12 +920,6 @@ mod tests {
                             },
                         );
                         assert_eq!(action, None);
-                        unreachable_card(
-                            ui,
-                            "retrying",
-                            "no discovery file",
-                            Path::new("/tmp/daemon.log"),
-                        );
                     });
                 }
             }

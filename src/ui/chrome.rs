@@ -247,12 +247,20 @@ fn gpu_gauge(ui: &mut egui::Ui, pulse: &Pulse) {
             ui.add_space(3.0);
             ui.label(RichText::new("GPU memory").small().color(p.muted));
             ui.add_space(1.0);
-            let colour = match pulse.gpu.tone() {
-                Tone::Busy => p.accent,
-                _ => p.info,
-            };
-            widgets::meter(ui, GPU_WIDTH, 6.0, &[(pulse.gpu.fraction(), colour)]);
-            ui.label(RichText::new(pulse.gpu.label()).small().color(p.text));
+            match &pulse.gpu {
+                Some(gpu) => {
+                    let colour = match gpu.tone() {
+                        Tone::Busy => p.accent,
+                        _ => p.info,
+                    };
+                    widgets::meter(ui, GPU_WIDTH, 6.0, &[(gpu.fraction(), colour)]);
+                    ui.label(RichText::new(gpu.label()).small().color(p.text));
+                }
+                None => {
+                    widgets::meter(ui, GPU_WIDTH, 6.0, &[]);
+                    ui.label(RichText::new("unknown").small().color(p.muted));
+                }
+            }
         },
     )
     .response

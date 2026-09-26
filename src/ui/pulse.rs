@@ -17,7 +17,8 @@ pub struct Pulse {
     pub activity: Activity,
     pub daemon: Signal,
     pub studio: Signal,
-    pub gpu: GpuMemory,
+    /// `None` while the daemon does not answer: nothing is known.
+    pub gpu: Option<GpuMemory>,
     /// The daemon answers, so Pause / Resume can reach it.
     pub can_pause: bool,
     pub paused: bool,
@@ -196,7 +197,7 @@ impl Pulse {
             activity: activity(&i, connected),
             daemon: daemon_signal(i.link),
             studio: studio_signal(connected, i.registered, i.registration, i.session),
-            gpu: GpuMemory::from_models(i.models, i.vram_total_gb),
+            gpu: connected.then(|| GpuMemory::from_models(i.models, i.vram_total_gb)),
             can_pause: connected,
             paused: connected && i.paused,
         }
@@ -433,6 +434,7 @@ mod tests {
         assert_eq!(p.activity.tone(), Tone::Bad);
         assert_eq!(p.daemon.label, "Daemon unreachable");
         assert_eq!(p.studio.label, "Studio unknown");
+        assert_eq!(p.gpu, None, "no stale memory figure");
         assert!(!p.can_pause && !p.paused, "no stale pause state");
     }
 
@@ -528,7 +530,7 @@ mod tests {
             ],
             ..Given::default()
         };
-        let gpu = pulse(&g).gpu;
+        let gpu = pulse(&g).gpu.expect("known while connected");
         assert_eq!(gpu.held_gb, 7.5);
         assert_eq!(gpu.label(), "\u{2248} 7.5 / 24 GB");
         assert!((gpu.fraction() - 7.5 / 24.0).abs() < 1e-6);

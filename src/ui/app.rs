@@ -337,20 +337,27 @@ impl App {
                 _ => "",
             };
             let log = crate::daemon_link::daemon_log_path(&self.deps.config_path);
-            reading_column(ui, "unreachable", |ui| {
-                worker_page::unreachable_card(ui, &link.summary(), detail, &log);
-                if self.page == Page::Worker {
-                    ui.add_space(16.0);
-                    self.render_worker(ui, pulse, glow, false);
-                }
-            });
+            let offline = worker_page::Offline {
+                summary: link.summary(),
+                detail: detail.to_string(),
+                daemon_log: log,
+            };
+            if self.page == Page::Worker {
+                reading_column(ui, "worker", |ui| {
+                    self.render_worker(ui, pulse, glow, Some(&offline))
+                });
+            } else {
+                reading_column(ui, "unreachable", |ui| {
+                    worker_page::unreachable_card(ui, &offline)
+                });
+            }
             return;
         }
         match self.page {
             Page::Jobs => self.render_jobs(ui),
             Page::Models => reading_column(ui, "models", |ui| self.render_models(ui)),
             Page::Worker => {
-                reading_column(ui, "worker", |ui| self.render_worker(ui, pulse, glow, true))
+                reading_column(ui, "worker", |ui| self.render_worker(ui, pulse, glow, None))
             }
             Page::Logs => logs_page::render(
                 ui,
@@ -460,10 +467,16 @@ impl App {
         }
     }
 
-    fn render_worker(&mut self, ui: &mut egui::Ui, pulse: &Pulse, glow: f32, connected: bool) {
+    fn render_worker(
+        &mut self,
+        ui: &mut egui::Ui,
+        pulse: &Pulse,
+        glow: f32,
+        offline: Option<&worker_page::Offline>,
+    ) {
         let replica = &self.deps.replica;
         let status = replica.status.lock().clone();
-        let facts = connected.then(|| {
+        let facts = offline.is_none().then(|| {
             let cfg = replica.cfg.lock();
             let registration = replica.registration.lock().clone();
             let session = replica.observers.session_state.lock().clone();
@@ -477,7 +490,7 @@ impl App {
                 heartbeat: hb.as_ref(),
                 gpu: gpu.as_ref(),
                 vram_total_gb: status.as_ref().map_or(0.0, |s| s.vram_total_gb),
-                held_gb: pulse.gpu.held_gb,
+                held_gb: pulse.gpu.map_or(0.0, |g| g.held_gb),
                 local_api_url: replica.observers.local_api_url.lock().clone(),
             })
         });
@@ -499,6 +512,7 @@ impl App {
                 activity: &pulse.activity,
                 paused: pulse.paused,
                 facts: facts.as_ref(),
+                offline,
                 about: &about,
                 about_state: &self.about_state,
                 tokio: &self.deps.tokio,
