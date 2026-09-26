@@ -50,7 +50,7 @@ pub enum LocalError {
     Engine(String),
 }
 
-fn next_job_id() -> String {
+pub(crate) fn next_job_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("local-{}-{n}", Utc::now().timestamp_millis())

@@ -130,6 +130,38 @@ impl crate::host::LoadedModel for TestLoaded {
     fn as_chat(&self) -> Option<&dyn crate::host::ChatModel> {
         Some(self)
     }
+
+    fn as_stream(&self) -> Option<&dyn crate::host::StreamingModel> {
+        Some(self)
+    }
+}
+
+/// Streams one word (`w1`, `w2`, ...) per 100 ms chunk.
+impl crate::host::StreamingModel for TestLoaded {
+    fn open(
+        &self,
+    ) -> anyhow::Result<Box<dyn crate::stt_stream::session::StreamingTranscriber + '_>> {
+        Ok(Box::new(WordPerChunk(0)))
+    }
+}
+
+/// A streaming transcriber that says `wN` for every chunk it hears.
+pub struct WordPerChunk(pub usize);
+
+impl crate::stt_stream::session::StreamingTranscriber for WordPerChunk {
+    fn chunk_samples(&self) -> usize {
+        1600
+    }
+    fn step(&mut self, chunk: &[f32]) -> anyhow::Result<String> {
+        if chunk.iter().all(|s| *s == 0.0) {
+            return Ok(String::new());
+        }
+        self.0 += 1;
+        Ok(format!("\u{2581}w{}", self.0))
+    }
+    fn reset(&mut self) {
+        self.0 = 0;
+    }
 }
 
 /// Echoes the last message as `resident:<text>`, plus the kwargs it got,

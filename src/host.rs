@@ -90,6 +90,8 @@ pub enum HostError {
     Refused(#[from] Refused),
     #[error("model {id} is not loaded ({state})")]
     NotLoaded { id: String, state: &'static str },
+    #[error("model {0} is busy serving another request")]
+    LaneBusy(String),
     #[error("could not persist residency: {0}")]
     Persist(#[from] std::io::Error),
 }
@@ -327,27 +329,50 @@ impl ModelHost {
         id: &str,
         f: impl FnOnce(&dyn LoadedModel, &Lane) -> R,
     ) -> Result<R, HostError> {
-        let (model, lane) = {
-            let mut entries = self.inner.entries.lock();
-            let e = entry(&mut entries, id);
-            match (&e.loaded, e.lifecycle.state().serves()) {
-                (Some((m, l)), true) => (m.clone(), l.clone()),
-                _ => {
-                    return Err(HostError::NotLoaded {
-                        id: id.to_string(),
-                        state: e.lifecycle.state().name(),
-                    })
-                }
-            }
-        };
+        let (model, lane) = self.lane_of(id)?;
         let _busy = lane.busy.lock();
+        Self::serve(id, model.as_ref(), &lane, f)
+    }
+
+    /// Like [`Self::with_lane`] but refuses (`LaneBusy`) instead of waiting,
+    /// for long requests such as a stream that would otherwise queue.
+    pub fn try_with_lane<R>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&dyn LoadedModel, &Lane) -> R,
+    ) -> Result<R, HostError> {
+        let (model, lane) = self.lane_of(id)?;
+        let Some(_busy) = lane.busy.try_lock() else {
+            return Err(HostError::LaneBusy(id.to_string()));
+        };
+        Self::serve(id, model.as_ref(), &lane, f)
+    }
+
+    fn serve<R>(
+        id: &str,
+        model: &dyn LoadedModel,
+        lane: &Lane,
+        f: impl FnOnce(&dyn LoadedModel, &Lane) -> R,
+    ) -> Result<R, HostError> {
         if lane.cancelled() {
             return Err(HostError::NotLoaded {
                 id: id.to_string(),
                 state: ModelState::Unloading.name(),
             });
         }
-        Ok(f(model.as_ref(), &lane))
+        Ok(f(model, lane))
+    }
+
+    fn lane_of(&self, id: &str) -> Result<(Arc<dyn LoadedModel>, Arc<Lane>), HostError> {
+        let mut entries = self.inner.entries.lock();
+        let e = entry(&mut entries, id);
+        match (&e.loaded, e.lifecycle.state().serves()) {
+            (Some((m, l)), true) => Ok((m.clone(), l.clone())),
+            _ => Err(HostError::NotLoaded {
+                id: id.to_string(),
+                state: e.lifecycle.state().name(),
+            }),
+        }
     }
 
     /// Block until `id`'s state satisfies `pred`, or `timeout` passes.
@@ -829,6 +854,42 @@ mod tests {
             matches!(&err, HostError::NotLoaded { id, state } if id == "a" && *state == "unloaded"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn try_with_lane_refuses_a_busy_lane_instead_of_waiting() {
+        let f = fixture(vec![model("a", 1.0, None)], 20.0, FakeRuntime::open());
+        f.host.load("a").unwrap();
+        f.host.wait_for("a", ModelState::serves, WAIT).unwrap();
+        let host = f.host.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            host.with_lane("a", |_m, _l| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap()
+        });
+        held_rx.recv_timeout(WAIT).unwrap();
+        let err = f.host.try_with_lane("a", |_m, _l| ()).unwrap_err();
+        assert!(
+            matches!(&err, HostError::LaneBusy(id) if id == "a"),
+            "{err}"
+        );
+        assert_eq!(err.to_string(), "model a is busy serving another request");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(f.host.try_with_lane("a", |_m, _l| ()).is_ok());
+    }
+
+    #[test]
+    fn try_with_lane_needs_a_loaded_model() {
+        let f = fixture(vec![model("a", 1.0, None)], 20.0, FakeRuntime::open());
+        assert!(matches!(
+            f.host.try_with_lane("a", |_m, _l| ()),
+            Err(HostError::NotLoaded { .. })
+        ));
     }
 
     #[test]

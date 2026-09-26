@@ -87,6 +87,10 @@ pub struct Config {
     /// `STUDIO_WORKER_LOCAL_API_PORT` env var overrides both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_api_port: Option<u16>,
+    /// Port of the LAN streaming speech listener (`0.0.0.0`).  `None` uses
+    /// the built-in default; `STUDIO_WORKER_STREAM_PORT` overrides both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_port: Option<u16>,
     /// Bearer token local API clients must present.  Generated once
     /// on first launch and persisted.  Internal — never surfaced in
     /// the UI and redacted from log events; local clients discover it
@@ -189,6 +193,7 @@ impl Default for Config {
             models_root: default_models_root(),
             ws_reconnect_attempts: None,
             local_api_port: None,
+            stream_port: None,
             local_api_token: None,
             install_id: None,
             registration_request_id: None,

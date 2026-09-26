@@ -44,6 +44,7 @@ use crate::job_gate::JobGate;
 use crate::lifecycle::ModelState;
 use crate::local::{chat_on_lane, run_image, run_kind, LocalError, LocalImageRequest};
 use crate::runtime::{JobOutcome, WorkerObservers};
+use crate::stt_stream::tokens::StreamTokens;
 use crate::types::{
     AudioSttParams, AudioTtsParams, ChatMessage, LlmParams, Task, TaskKind, TaskResult, VideoParams,
 };
@@ -151,9 +152,42 @@ pub struct LocalApi {
     /// Root the engine downloads models into.  Reported (with its free
     /// space) on `/healthz` so a stuck first-use download is visible.
     models_root: Option<PathBuf>,
-    /// Loads, unloads and serves resident models (the model lifecycle).
-    host: ModelHost,
+    /// The model host and streaming tokens.
+    services: ModelServices,
 }
+
+/// What the local API offers besides one-off jobs: the model host, and the
+/// tokens that open streaming sessions on the LAN listener.
+#[derive(Clone)]
+pub struct ModelServices {
+    pub host: ModelHost,
+    pub tokens: Arc<StreamTokens>,
+    /// Port of the running LAN stream listener; 0 while it is not listening.
+    pub stream_port: Arc<std::sync::atomic::AtomicU16>,
+}
+
+impl ModelServices {
+    pub fn new(host: ModelHost) -> Self {
+        Self {
+            host,
+            tokens: Arc::new(StreamTokens::default()),
+            stream_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamTokenBody {
+    model: String,
+    #[serde(default)]
+    ttl_secs: Option<i64>,
+}
+
+/// A stream token lives this long unless the request says otherwise.
+/// The holder (Runa) refreshes well before expiry.  Safe range: within
+/// the token store's clamp (30 s..=1 h).
+const DEFAULT_STREAM_TOKEN_TTL_SECS: i64 = 600;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -259,7 +293,7 @@ impl LocalApi {
         token: String,
         gate: JobGate,
         models_root: Option<PathBuf>,
-        host: ModelHost,
+        services: ModelServices,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !token.is_empty(),
@@ -281,7 +315,7 @@ impl LocalApi {
             token,
             gate,
             models_root,
-            host,
+            services,
         })
     }
 
@@ -389,19 +423,20 @@ impl LocalApi {
             (Method::Get, "/models") => self.handle_list_models(request),
             (Method::Post, "/models") => self.handle_add_model(request),
             (Method::Get, "/jobs") => self.handle_jobs(request),
+            (Method::Post, "/stream-tokens") => self.handle_stream_token(request),
             (Method::Get, p) if lifecycle_route(p, "/state").is_some() => {
                 let id = lifecycle_route(p, "/state").unwrap_or_default().to_string();
-                self.respond_lifecycle(request, self.host.status(&id), 200)
+                self.respond_lifecycle(request, self.services.host.status(&id), 200)
             }
             (Method::Post, p) if lifecycle_route(p, "/load").is_some() => {
                 let id = lifecycle_route(p, "/load").unwrap_or_default().to_string();
-                self.respond_lifecycle(request, self.host.load(&id), 202)
+                self.respond_lifecycle(request, self.services.host.load(&id), 202)
             }
             (Method::Post, p) if lifecycle_route(p, "/unload").is_some() => {
                 let id = lifecycle_route(p, "/unload")
                     .unwrap_or_default()
                     .to_string();
-                self.respond_lifecycle(request, self.host.unload(&id), 202)
+                self.respond_lifecycle(request, self.services.host.unload(&id), 202)
             }
             (Method::Delete, p) if p.starts_with("/models/") => {
                 let id = p.trim_start_matches("/models/").to_string();
@@ -534,7 +569,7 @@ impl LocalApi {
         let catalog = self.catalog.lock().clone();
         // A loaded model answers on its own lane, outside the job gate.
         if let Some(result) = chat_on_lane(
-            &self.host,
+            &self.services.host,
             &catalog,
             &self.observers,
             parsed.model.as_deref(),
@@ -701,7 +736,7 @@ impl LocalApi {
 
     fn handle_list_models(&self, request: Request) -> std::io::Result<()> {
         let models = self.catalog.lock().models.clone();
-        let statuses = self.host.statuses();
+        let statuses = self.services.host.statuses();
         let listed: Vec<serde_json::Value> = models
             .iter()
             .map(|model| {
@@ -751,7 +786,7 @@ impl LocalApi {
 
     fn handle_delete_model(&self, request: Request, id: &str) -> std::io::Result<()> {
         // Free the weights and drop the residency before the entry goes.
-        if let Err(err) = self.host.unload(id) {
+        if let Err(err) = self.services.host.unload(id) {
             if !matches!(err, HostError::UnknownModel(_)) {
                 return respond_json(
                     request,
@@ -814,6 +849,7 @@ impl LocalApi {
                     HostError::Persist(_) => {
                         (500, serde_json::json!({ "error": "residency_not_saved" }))
                     }
+                    HostError::LaneBusy(_) => (409, serde_json::json!({ "error": "model_busy" })),
                 };
                 let mut body = body;
                 body["message"] = err.to_string().into();
@@ -827,6 +863,72 @@ impl LocalApi {
                 respond_json(request, code, &body)
             }
         }
+    }
+
+    /// Mint a short-lived token that opens one streaming model on the LAN
+    /// listener (\`ws://<host>:<port>/transcribe?token=...\`).
+    fn handle_stream_token(&self, mut request: Request) -> std::io::Result<()> {
+        let body = match read_body(&mut request)? {
+            BodyOutcome::Ok(body) => body,
+            BodyOutcome::TooLarge => return respond_too_large(request),
+        };
+        let parsed: StreamTokenBody = match serde_json::from_str(&body) {
+            Ok(p) => p,
+            Err(err) => {
+                return respond_json(
+                    request,
+                    400,
+                    &serde_json::json!({ "error": "bad_request", "message": err.to_string() }),
+                )
+            }
+        };
+        let model = self.catalog.lock().get(&parsed.model).cloned();
+        let Some(model) = model else {
+            return respond_json(
+                request,
+                404,
+                &serde_json::json!({ "error": "unknown_model" }),
+            );
+        };
+        if model.source.engine != crate::types::ModelEngine::Parakeet {
+            return respond_json(
+                request,
+                400,
+                &serde_json::json!({ "error": "not_a_stream_model" }),
+            );
+        }
+        let port = self.services.stream_port.load(Ordering::SeqCst);
+        if port == 0 {
+            return respond_json(
+                request,
+                503,
+                &serde_json::json!({ "error": "stream_listener_down" }),
+            );
+        }
+        let ttl =
+            chrono::Duration::seconds(parsed.ttl_secs.unwrap_or(DEFAULT_STREAM_TOKEN_TTL_SECS));
+        let grant = self
+            .services
+            .tokens
+            .mint(&model.id, ttl, chrono::Utc::now());
+        tracing::info!(
+            target: TRACE_TARGET,
+            op = "stream_token",
+            model = %model.id,
+            expires_at = %grant.expires_at,
+            "stream token minted"
+        );
+        respond_json(
+            request,
+            200,
+            &serde_json::json!({
+                "token": grant.token,
+                "model": grant.model,
+                "expiresAt": grant.expires_at.to_rfc3339(),
+                "port": port,
+                "path": crate::stt_stream::server::STREAM_PATH,
+            }),
+        )
     }
 
     fn handle_jobs(&self, request: Request) -> std::io::Result<()> {
@@ -1105,6 +1207,7 @@ mod tests {
         url: String,
         observers: WorkerObservers,
         host: crate::host::ModelHost,
+        services: ModelServices,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
@@ -1133,6 +1236,10 @@ mod tests {
                 Arc::new(crate::test_support::FixedProbe(free_gib)),
                 crate::residency::Residency::load_for_serving(None),
             );
+            let services = ModelServices::new(host.clone());
+            services
+                .stream_port
+                .store(4798, std::sync::atomic::Ordering::SeqCst);
             let api = LocalApi::bind(
                 "127.0.0.1:0",
                 engine,
@@ -1142,7 +1249,7 @@ mod tests {
                 TEST_TOKEN.to_string(),
                 gate.clone(),
                 None,
-                host.clone(),
+                services.clone(),
             )
             .unwrap();
             let url = api.url();
@@ -1153,6 +1260,7 @@ mod tests {
                 url,
                 observers,
                 host,
+                services,
                 stop,
                 handle: Some(handle),
             }
@@ -1443,6 +1551,86 @@ mod tests {
         assert_eq!(last.prompt, "lane");
     }
 
+    fn stream_catalog() -> Catalog {
+        let mut stt = synthetic_model_of("stt-a", TaskKind::AudioStt);
+        stt.source.engine = crate::types::ModelEngine::Parakeet;
+        Catalog {
+            models: vec![stt, synthetic_model_of("chat-llm", TaskKind::Llm)],
+        }
+    }
+
+    #[test]
+    fn stream_tokens_are_minted_for_streaming_models() {
+        let h = Harness::start(stream_catalog());
+        let (status, body) = json(
+            h.post("/stream-tokens")
+                .json(&serde_json::json!({ "model": "stt-a", "ttlSecs": 600 }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 200, "{body}");
+        let token = body["token"].as_str().unwrap();
+        assert_eq!(token.len(), 64);
+        assert_eq!(body["model"], "stt-a");
+        assert_eq!(body["port"], 4798);
+        assert_eq!(body["path"], "/transcribe");
+        assert!(body["expiresAt"].is_string());
+        assert_eq!(
+            h.services.tokens.check(token, chrono::Utc::now()),
+            Ok("stt-a".to_string()),
+            "the listener accepts it"
+        );
+    }
+
+    #[test]
+    fn stream_tokens_are_refused_for_other_models() {
+        let h = Harness::start(stream_catalog());
+        let (status, body) = json(
+            h.post("/stream-tokens")
+                .json(&serde_json::json!({ "model": "chat-llm" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "not_a_stream_model");
+        let (status, body) = json(
+            h.post("/stream-tokens")
+                .json(&serde_json::json!({ "model": "nope" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 404);
+        assert_eq!(body["error"], "unknown_model");
+    }
+
+    #[test]
+    fn stream_tokens_need_a_running_listener() {
+        let mut h = Harness::start(stream_catalog());
+        h.services
+            .stream_port
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = json(
+            h.post("/stream-tokens")
+                .json(&serde_json::json!({ "model": "stt-a" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 503);
+        assert_eq!(body["error"], "stream_listener_down");
+        let _ = &mut h;
+    }
+
+    #[test]
+    fn stream_tokens_need_the_install_token() {
+        let h = Harness::start(stream_catalog());
+        let res = reqwest::blocking::Client::new()
+            .post(format!("{}/stream-tokens", h.url))
+            .json(&serde_json::json!({ "model": "stt-a" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 401);
+    }
+
     #[test]
     fn post_models_adds_a_model_then_lists_it() {
         let h = Harness::start(seeded_catalog());
@@ -1717,7 +1905,7 @@ mod tests {
             TEST_TOKEN.to_string(),
             JobGate::new(),
             None,
-            test_host(&catalog),
+            ModelServices::new(test_host(&catalog)),
         )
         .unwrap();
         let url = api.url();
@@ -1833,7 +2021,7 @@ mod tests {
             String::new(),
             JobGate::new(),
             None,
-            test_host(&catalog),
+            ModelServices::new(test_host(&catalog)),
         )
         .err()
         .expect("empty token must be refused")

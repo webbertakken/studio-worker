@@ -749,7 +749,33 @@ pub const DEFAULT_LOCAL_API_PORT: u16 = 4787;
 /// file can't quietly move the API.  Pure so every branch is
 /// unit-testable.
 pub fn resolve_local_api_port(env_value: Option<&str>, cfg_port: Option<u16>) -> u16 {
-    let fallback = cfg_port.unwrap_or(DEFAULT_LOCAL_API_PORT);
+    resolve_port(
+        "STUDIO_WORKER_LOCAL_API_PORT",
+        env_value,
+        cfg_port,
+        DEFAULT_LOCAL_API_PORT,
+    )
+}
+
+/// The LAN stream listener's port: `STUDIO_WORKER_STREAM_PORT`, else the
+/// config's `stream_port`, else [`crate::stt_stream::server::DEFAULT_STREAM_PORT`].
+pub fn resolve_stream_port(env_value: Option<&str>, cfg_port: Option<u16>) -> u16 {
+    resolve_port(
+        "STUDIO_WORKER_STREAM_PORT",
+        env_value,
+        cfg_port,
+        crate::stt_stream::server::DEFAULT_STREAM_PORT,
+    )
+}
+
+/// Env beats config beats default; an invalid env value falls back, logged.
+fn resolve_port(
+    env_name: &str,
+    env_value: Option<&str>,
+    cfg_port: Option<u16>,
+    default: u16,
+) -> u16 {
+    let fallback = cfg_port.unwrap_or(default);
     match env_value {
         Some(raw) => match raw.parse::<u16>() {
             Ok(port) => port,
@@ -759,7 +785,7 @@ pub fn resolve_local_api_port(env_value: Option<&str>, cfg_port: Option<u16>) ->
                     op = "resolve_port",
                     invalid = raw,
                     fallback,
-                    "STUDIO_WORKER_LOCAL_API_PORT is not a valid port; falling back"
+                    "{env_name} is not a valid port; falling back"
                 );
                 fallback
             }
@@ -791,6 +817,42 @@ pub fn ensure_local_api_token(cfg: &SharedConfig, config_path: &std::path::Path)
         );
     }
     token
+}
+
+/// Bind the LAN streaming speech listener and serve it on its own thread.
+/// A failed bind is logged and leaves the port at 0, so stream-token
+/// requests answer `stream_listener_down` instead of pointing nowhere.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn spawn_stream_listener(
+    cfg: &SharedConfig,
+    services: &crate::local_api::ModelServices,
+    observers: &WorkerObservers,
+    stop: Arc<AtomicBool>,
+) {
+    let port = resolve_stream_port(
+        std::env::var("STUDIO_WORKER_STREAM_PORT").ok().as_deref(),
+        cfg.lock().stream_port,
+    );
+    let addr = format!("0.0.0.0:{port}");
+    match crate::stt_stream::server::StreamServer::bind(
+        &addr,
+        services.host.clone(),
+        services.tokens.clone(),
+        observers.clone(),
+    ) {
+        Ok(server) => {
+            let bound = server.local_addr().port();
+            services.stream_port.store(bound, Ordering::SeqCst);
+            tracing::info!(target: "studio_worker::stt_stream", addr = %server.local_addr(), "stream listener listening");
+            std::thread::spawn(move || server.serve(&stop));
+        }
+        Err(err) => tracing::warn!(
+            target: "studio_worker::stt_stream",
+            %addr,
+            error = %err,
+            "stream listener could not bind; streaming speech is unavailable"
+        ),
+    }
 }
 
 /// Build the engine + catalog and start the local image API server on a
@@ -839,6 +901,8 @@ pub fn spawn_local_api(
             config_path,
         )),
     );
+    let services = crate::local_api::ModelServices::new(host.clone());
+    spawn_stream_listener(&cfg, &services, &observers, stop.clone());
     let api = crate::local_api::LocalApi::bind(
         &format!("127.0.0.1:{port}"),
         engine.clone(),
@@ -848,7 +912,7 @@ pub fn spawn_local_api(
         token.clone(),
         gate.clone(),
         models_root.clone(),
-        host.clone(),
+        services.clone(),
     )
     .or_else(|_| {
         crate::local_api::LocalApi::bind(
@@ -860,7 +924,7 @@ pub fn spawn_local_api(
             token.clone(),
             gate.clone(),
             models_root,
-            host.clone(),
+            services.clone(),
         )
     });
 
