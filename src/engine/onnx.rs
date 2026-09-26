@@ -122,22 +122,19 @@ impl OnnxImageEngine {
         Ok(data.to_vec())
     }
 
-    /// Provision (download on first use) the ONNX Runtime shared library for this
-    /// platform and point `ort` (load-dynamic) at it via `ORT_DYLIB_PATH`, before
-    /// the first session is created. Idempotent.
+    /// Make sure the process-wide ONNX Runtime (shared with every ONNX
+    /// engine) is provisioned and `ort` points at it, before the first
+    /// session is created. Idempotent.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn ensure_ort_runtime(&self) -> Result<()> {
-        if std::env::var_os("ORT_DYLIB_PATH").is_some() {
-            return Ok(());
-        }
-        let lib = onnx_provision::provision(&self.models_root)?;
-        std::env::set_var("ORT_DYLIB_PATH", &lib);
+        let runtime = onnx_provision::ensure_runtime(&self.models_root)?;
         info!(
             target: TRACE_TARGET,
             op = "runtime",
-            dylib = %lib.display(),
+            dylib = %runtime.lib.display(),
+            flavour = runtime.flavour.name(),
             version = onnx_provision::ORT_VERSION,
-            "onnx runtime provisioned"
+            "onnx runtime ready"
         );
         Ok(())
     }
