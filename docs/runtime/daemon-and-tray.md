@@ -57,7 +57,8 @@ bearer token). Details and shapes: [local API](../local-api.md#daemon-control).
 | `GET` | `/jobs/:id/log` | the job's log lines |
 | `GET` | `/jobs/:id/thumbnail` | the job's thumbnail (`image/png`) |
 
-`GET /models` additionally carries each model's `since` and, when failed, `error`.
+`GET /models` additionally carries each model's `since`, `loadable` (its engine has an
+in-process loader, so it can be kept loaded) and, when failed, `error`.
 
 The UI polls rather than holding a stream open: the local API serves on a small fixed pool of
 threads, and a long-lived stream per UI would pin one of them for good.
@@ -84,6 +85,14 @@ Every job, whatever its source, is visible while it runs and after it ends.
 - Every job logs `op="job"` "job started" and "job finished" (with its outcome and duration),
   so even a silent engine leaves a trace.
 
+### Worker log
+
+- The Logs tab shows the daemon's worker log ring (1 000 entries): the studio session's
+  breadcrumbs (`runtime::push_log`) plus every other `studio_worker` event at info and
+  up, copied in by a second tracing layer.  Each entry carries the job id when it was
+  emitted inside a job.
+- The UI reads it incrementally: `GET /daemon/logs?after=<seq>`.
+
 ### Thumbnails
 
 - When a job returns an image, the daemon decodes it and keeps a PNG of at most 192 px on the
@@ -96,7 +105,8 @@ Every job, whatever its source, is visible while it runs and after it ends.
 
 ### Start-up
 
-1. Resolve the config path (the daemon owns the config; the UI never writes it).
+1. Resolve the config path (the daemon owns the config; the UI never writes it; it only
+   reads `start_minimised` from it before the daemon answers).
 2. Install the login autostart entry for the tray UI; it is always installed.
 3. Start the poller (below).
 4. Open the window. When there is no usable display (e.g. started at login before the
@@ -119,9 +129,13 @@ Once a second the poller:
 
 When the daemon cannot be reached, the link becomes `unreachable` and the replica is emptied,
 so no tab shows stale data. If the daemon lock is free, no daemon is running: the poller starts
-one (`studio-worker --config <path> run`, detached, output appended to
-`<config dir>/daemon.log`) at most once every 10 s and logs `op="daemon_spawn"`. If the lock is
-held, a daemon is starting or wedged, and the link reads `starting`.
+one (`studio-worker --config <path> run`, detached in its own process group, output
+appended to `<config dir>/daemon.log`) at most once every 10 s and logs `op="daemon_spawn"`;
+a thread reaps it and logs its exit. If the lock is held, a daemon is starting or wedged,
+and the link reads `starting`.
+
+A daemon the UI started outlives the UI.  (A process supervisor that kills whole process
+trees, such as PM2, also stops it when it stops the UI.)
 
 ### Window
 
@@ -135,11 +149,15 @@ held, a daemon is starting or wedged, and the link reads `starting`.
   kind, model, prompt, outcome and duration, and its thumbnail when it has one. Selecting a
   card shows its log.
 - **Models**: each catalogue model with kind, engine, memory estimate, state, residency and
-  since; Load and Unload buttons per the lifecycle guards; a failed model shows its error.
+  since; Load and Unload buttons per the lifecycle guards (Load only when `loadable`); a
+  failed model shows its error.
 - **Config**: the operator-editable fields; Save sends them to the daemon, which validates,
   saves and applies them.
 - **Logs**: the worker log, filtered and searchable.
-- **About**: UI and daemon versions, config path, update check.
+- **About**: UI and daemon versions (they differ after the daemon updated itself until the
+  UI restarts), config path, update check.
+- `STUDIO_WORKER_UI_TAB=<tab>` picks the first tab and `STUDIO_WORKER_UI_JOB=<id|latest>`
+  selects a job once it shows up, for screenshots and headless inspection.
 
 ### Tray
 
@@ -165,7 +183,8 @@ held, a daemon is starting or wedged, and the link reads `starting`.
 | `control` | `studio_worker::local_api` | pause, resume, config save, reset, shutdown via the API |
 | `job` | `studio_worker::job` | job started / finished |
 | `thumbnail` | `studio_worker::job` | thumbnail could not be made |
-| `link` | `studio_worker::ui::link` | the UI's link to the daemon changed state |
-| `daemon_spawn` | `studio_worker::ui::link` | the UI started a daemon, or failed to |
+| `link` | `studio_worker::daemon_link` | the UI's link to the daemon changed state |
+| `daemon_spawn` | `studio_worker::daemon_link` | the UI started a daemon, failed to, or it exited |
+| `action` | `studio_worker::daemon_link` | an operator action reached the daemon, or did not |
 | `display_wait` | `studio_worker::ui` | no usable display yet; retrying |
-| `autostart` | `studio_worker::autostart` | login entry written / already current / failed |
+| `enable` / `ensure` | `studio_worker::autostart` | login entry written / already current / failed |

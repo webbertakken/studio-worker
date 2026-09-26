@@ -3,10 +3,13 @@
 `studio-worker` is a single self-contained Rust binary that pulls
 **image**, **LLM**, **audio (STT/TTS)**, and **video** generation
 jobs from the [minis.gg studio](https://studio.minis.gg), runs them
-locally, and posts the results back.  It's deliberately one process:
-no helper daemons, no shared secrets, no out-of-band setup.  An
-operator clicks Approve in the studio dashboard once per machine,
-and the worker takes over from there.
+locally, and posts the results back.  One binary runs as two
+processes: a headless **daemon** (`studio-worker run`) that hosts every
+model and job, and a **tray UI** (`studio-worker ui`) that is a client of
+the daemon over the local API (see [daemon and tray UI](../runtime/daemon-and-tray.md)).
+No shared secrets, no out-of-band setup: an operator clicks Approve in
+the studio dashboard once per machine, and the worker takes over from
+there.
 
 This page is the canonical "how does the whole thing work" reference.
 For install / register / day-one instructions see the top-level
@@ -23,7 +26,7 @@ For install / register / day-one instructions see the top-level
 6. [Engine abstraction](#engine-abstraction)
 7. [Job lifecycle (one claim end-to-end)](#job-lifecycle-one-claim-end-to-end)
 8. [Config + persisted state](#config--persisted-state)
-9. [Optional desktop UI](#optional-desktop-ui)
+9. [Tray UI](#tray-ui)
 10. [Auto-update](#auto-update)
 11. [Observability](#observability)
 12. [Service / autostart](#service--autostart)
@@ -95,22 +98,33 @@ tokio runtime + tracing/sentry init  (telemetry.rs)
 cli.rs::Cli::parse   ->   lib.rs::run_cli  ->  match on Command
    |
    v
-runtime.rs::run       (or ui::run, or one-shot helpers)
+runtime.rs::run       (the daemon; `ui::run` is the tray UI client)
    |
    +--> 1. config::load              (config.rs)
-   +--> 2. ensure_registered         (calls auto_register::tick in a loop until Approved)
-   +--> 3. run_loops                 (spawns the WS session + auto-updater)
+   +--> 2. daemon_lock::acquire      (one daemon per config dir; a second exits 0)
+   +--> 3. spawn_local_api           (local API + model host + stream listener, with DaemonControl)
+   +--> 4. serve_studio
               |
-              +--> ws::session::spawn_ws_session  (heartbeats, claim, complete, fail, logs)
-              +--> runtime::spawn_auto_updater    (release-feed poll + re-exec)
+              +--> ensure_registered  (auto_register::tick in a loop until Approved;
+              |                        a rejection waits for a reset, local serving continues)
+              +--> run_loops          (spawns the WS session + auto-updater)
+                     |
+                     +--> ws::session::spawn_ws_session  (heartbeats, claim, complete, fail, logs)
+                     +--> runtime::spawn_auto_updater    (release-feed poll + re-exec)
+
+ui::run (tray UI)
+   |
+   +--> autostart::ensure            (login entry, always)
+   +--> daemon_link::Poller          (1 s poll into a Replica; starts the daemon when absent)
+   +--> eframe window + tray         (restarts itself in place while no display is usable)
 ```
 
 The CLI surface from [`src/cli.rs`](../../src/cli.rs):
 
 | Subcommand | What it does |
 |---|---|
-| `run` | Start the runtime: ensure registered, then the WS session + auto-updater |
-| `ui` (feature `ui`) | Same as `run` but with the egui window + tray + notifications |
+| `run` | The daemon: local API + model host, ensure registered, then the WS session + auto-updater |
+| `ui` (feature `ui`) | The tray UI: egui window + tray + notifications, a client of the daemon (starts one when absent) |
 | `register` | Persist api-base-url / clear state (`--reset`).  **No HTTP** — the next `run`/`ui` actually auto-registers |
 | `status` | Print config path, registration state, threshold, auto-update toggle |
 | `set-threshold <gb>` | Update `vram_threshold_gb` |
@@ -141,7 +155,16 @@ src/
 ├── secrets.rs        Entropy for locally-minted credentials (local API token).
 ├── catalog.rs        Local model catalogue (models.json); studio models mirror into it.
 ├── local.rs          Local jobs without the studio: transient dispatch + chat on a lane.
-├── local_api.rs      Loopback HTTP API (bearer token): generation, catalogue, lifecycle.
+├── local_api.rs      Loopback HTTP API (bearer token): generation, catalogue, lifecycle,
+│                     daemon control (`/daemon/*`), job logs and thumbnails.
+├── control.rs        DaemonControl: status snapshot, pause, config update, reset, shutdown.
+├── daemon_api.rs     Wire types of the daemon-control routes (daemon + tray UI).
+├── daemon_client.rs  Blocking client of the local API, found via the discovery file.
+├── daemon_link.rs    The tray UI's poller, replica, daemon starter and actions.
+├── daemon_lock.rs    One daemon per config directory (`daemon.lock`).
+├── job_run.rs        One job's bookkeeping: running list, span, thumbnail, ring.
+├── job_log.rs        Per-job log capture + the worker log ring (tracing layers).
+├── thumbnail.rs      PNG thumbnails of image jobs, bounded ring.
 ├── job_gate.rs       One-transient-job-at-a-time reservation gate.
 ├── lifecycle.rs      Per-model state machine: unloaded/loading/loaded/unloading/failed.
 ├── host.rs           Model host: loaded models, lanes, residency, admission, swaps.
@@ -154,7 +177,7 @@ src/
 │   ├── tokens.rs     Short-lived stream tokens (stored hashed).
 │   └── server.rs     LAN WebSocket listener; one session per loaded model's lane.
 ├── service.rs        Per-OS service file writers (systemd --user / launchd / schtasks XML).
-├── autostart.rs      Cross-OS "run in tray on login" toggle (logged; desktop UI calls it).
+├── autostart.rs      Cross-OS tray-UI login entry, always installed by `ui::run` (logged).
 ├── update.rs         GitHub release feed poll + installer script download + re-exec on success.
 ├── telemetry.rs      Sentry init (opt-in via SENTRY_DSN env var) + tracing-subscriber layer.
 ├── test_support.rs   #[doc(hidden)] tracing capture + host doubles for tests.
@@ -185,17 +208,19 @@ src/
 │   └── session.rs    spawn_ws_session: connect, hello, heartbeat, offer-handler,
 │                     log-flush, reconnect with exponential backoff.
 │
-└── ui/               (feature `ui`) Native egui desktop window.
-    ├── mod.rs        ui::run: load config, spawn auto-register + run_loops on tokio,
-    │                 hand main thread to eframe.  Tray install (Linux ksni on tokio).
-    ├── app.rs        eframe App impl: tab dispatch, shared state, hide-to-tray, quit.
+└── ui/               (feature `ui`) The tray UI, a client of the daemon.
+    ├── mod.rs        ui::run: login entry, poller thread, eframe; display wait
+    │                 (restart in place).  Tray install (Linux ksni on tokio).
+    ├── app.rs        eframe App impl: status line, tab dispatch, hide-to-tray, quit.
+    ├── actions.rs    Operator actions to the daemon off the UI thread + feedback.
     ├── tab.rs        Tab enum + STUDIO_WORKER_UI_TAB env override for screenshots.
     ├── tabs/
     │   ├── status.rs Initialising / Pending / Rejected / Registered view models.
-    │   ├── jobs.rs   Current card + bounded recent-jobs ring.
-    │   ├── config.rs Every Config field as a widget; Save writes through.
+    │   ├── jobs.rs   Running jobs, studio jobs, local queue; thumbnails, job log.
+    │   ├── models.rs Catalogue models: state, residency, Load / Unload.
+    │   ├── config.rs Operator-editable fields; Save goes to the daemon.
     │   ├── logs.rs   Level filter + free-text search + auto-scroll, windowed.
-    │   └── about.rs  Version / sentry release / config path / Check for updates.
+    │   └── about.rs  UI + daemon versions / config path / Check for updates.
     ├── tray.rs       3-variant icon (idle/busy/disconnected), menu factory.
     └── notifier.rs   Trait + DesktopNotifier + per-event NotificationPrefs gate.
 ```
@@ -452,7 +477,8 @@ swap.  Full design: [model lifecycle](../runtime/model-lifecycle.md); API:
 
 3. Worker receives Offer:
      - Sends Accept frame; sets busy flag; populates
-       `observers.current_job` for the Jobs tab.
+       `observers.current_job` (the heartbeat reports it) and starts a
+       `JobRun` (running list, job log span, thumbnail).
      - Hands the task to `engine.dispatch_with_source(model, task,
        source)` on a blocking thread.
      - The MultiEngine routes by `source.engine`; the sdcpp engine
@@ -510,15 +536,19 @@ Rules worth pinning explicitly:
   `worker_id` + `auth_token` are populated, rather than
   fatal-bailing on first attempt.
 
-The runtime tracks all three observable slots in
+The runtime tracks its observable state in
 [`runtime::WorkerObservers`](../../src/runtime.rs):
 
-- `current_job: Option<CurrentJob>` — set during dispatch
-- `recent_jobs: VecDeque<RecentJob>` (cap 50, newest-first)
+- `current_job: Option<CurrentJob>` — the studio job in flight (heartbeat)
+- `active_jobs: Vec<CurrentJob>` — every running job, whatever its source
+- `recent_jobs` / `local_jobs: VecDeque<RecentJob>` (cap 50 each, newest-first)
+- `thumbnails` — PNG thumbnails of recent image jobs
 - `last_heartbeat: Option<HeartbeatStatus>` — written after every
   WS heartbeat ack / failure
+- `recent_logs` — the worker log ring the Logs tab shows
 
-These are `Arc<Mutex<…>>` and read directly by the UI for live state.
+The daemon serves them to the tray UI as `GET /daemon/status`; the UI
+never reads them in-process.
 
 ---
 
@@ -538,7 +568,7 @@ These are `Arc<Mutex<…>>` and read directly by the UI for live state.
 |---|---|---|
 | `api_base_url` | `https://studio.minis.gg/` | Studio API root |
 | `vram_threshold_gb` | `12.0` | Max VRAM per claim |
-| `auto_start` | `true` | OS service auto-start at boot |
+| `start_minimised` | `true` | Tray UI window starts minimised |
 | `auto_update_enabled` | `true` | Check the GitHub release feed |
 | `auto_update_interval_secs` | `1800` | How often (default 30 min) |
 | `auto_update_feed` | release URL | GitHub feed to poll |
@@ -581,50 +611,67 @@ Coverage regression contract in
 
 ---
 
-## Optional desktop UI
+## Tray UI
 
-Built behind the `ui` cargo feature; brings in `egui` + `eframe` +
-`notify-rust`, plus the platform tray backend: `tray-icon` on
+Built behind the `ui` cargo feature (on by default); brings in `egui` +
+`eframe` + `notify-rust`, plus the platform tray backend: `tray-icon` on
 macOS / Windows, `ksni` (pure-Rust StatusNotifierItem) on Linux, so the
-build needs no GTK.  Off by default so the headless server install
-stays lean.
+build needs no GTK.
+
+The tray UI is a **client of the daemon**: it never runs a job and never
+talks to the studio.  A poller ([`daemon_link.rs`](../../src/daemon_link.rs))
+reads `GET /daemon/status`, new worker log entries, the model list, the
+selected job's log and missing thumbnails once a second into a `Replica`
+the tabs render; actions go back over the local API.  When the daemon does
+not answer, the replica is emptied (no stale data), a "daemon not
+reachable" view replaces the tabs, and when no daemon holds the daemon
+lock the UI starts one.  Full design:
+[daemon and tray UI](../runtime/daemon-and-tray.md).
 
 ### Tab structure
 
 | Tab | What it shows |
 |---|---|
-| **Status** | Worker id, API URL, VRAM total / threshold, IDLE / BUSY / PAUSED badge, last heartbeat freshness, **Pause / Resume button** (flips the runtime `paused` flag).  When unregistered: Initialising / Pending (with request id + copy button) / Rejected (with reason + `--reset` hint) state. |
-| **Jobs** | Current job card (kind, model, prompt preview, elapsed) + last 50 finished jobs with outcome / duration. |
-| **Config** | The operator-facing subset of `Config` as widgets, grouped into Connection (API base URL) / Worker (VRAM threshold + Auto-start) / Auto-update / Models (folder picker for `models_root`) / Notifications / Background mode.  Save writes through; Reset reverts.  Internal state (`worker_id`, `auth_token`, `install_id`, registration ids) is deliberately not shown — the auto-register flow owns it. |
-| **Logs** | Level filter (all/info/warn/error), free-text search across category/message/job id, auto-scroll toggle.  Reads from `WorkerObservers.recent_logs` (bounded 1000-entry ring) so it doesn't blank out when the WS log-shipper drains every second. |
-| **About** | Version, Sentry release name, config path, manual "Check for updates" button. |
+| **Status** | Worker id, API URL, VRAM total / threshold, IDLE / BUSY / PAUSED badge, connection, GPU runtime, last heartbeat, **Pause / Resume**.  When unregistered: Initialising / Pending (with request id + copy button) / Rejected (with reason + **Reset registration**). |
+| **Jobs** | Running jobs (every source), studio jobs, local queue; each card shows source, kind, model, prompt, outcome, duration, and a thumbnail for image jobs; selecting a card shows the job's log. |
+| **Models** | Each catalogue model's lifecycle state, residency, memory estimate, since, failure; Load / Unload per the lifecycle guards (Load only for engines with an in-process loader). |
+| **Config** | The operator-editable subset of `Config`: Connection / Worker / Auto-update / Models / Notifications / Window.  Save sends it to the daemon (`PUT /daemon/config`), which validates, saves and applies it. |
+| **Logs** | Everything the daemon logs at info and up (level filter, free-text search, auto-scroll), from the daemon's worker log ring. |
+| **About** | Tray UI and daemon versions, Sentry release name, config path, manual "Check for updates". |
 
-Screenshots in [`docs/screenshots/`](../screenshots/).
+A status line under the tab bar always shows the link to the daemon and
+the result of the last action.  Screenshots in
+[`docs/screenshots/`](../screenshots/).
 
 ### Tray icon
 
-Three coloured variants derived from `(busy, last_heartbeat)`:
+Three coloured variants:
 
-- **Idle** — green; not busy + heartbeat fresh + ok
-- **Busy** — amber; busy flag set
-- **Disconnected** — red; heartbeat stale (> 3 × interval), missing,
-  or returned an error
+- **Idle** — green; daemon reachable, nothing running, heartbeat fresh + ok
+- **Busy** — amber; a job runs (any source)
+- **Disconnected** — red; daemon not reachable, or heartbeat stale
+  (> 3 × interval), missing, or failed
 
-Menu: **Open Window** / **Pause / Resume** / **Quit**.  The label
-flips between Pause and Resume based on the runtime `paused` flag.
-
-Closing the window hides to the tray; loops keep running.  Quit comes
-from the tray menu (signals `stop`, awaits in-flight job up to ~5s,
-then exits).
+Menu: **Open Window** / **Pause / Resume** / **Quit**.  Pause / Resume goes
+to the daemon; Quit stops the daemon (`POST /daemon/shutdown`) and closes
+the UI.  Closing the window hides it to the tray; the daemon keeps running.
 
 **Per-OS backends** ([`src/ui/tray_host.rs`](../../src/ui/tray_host.rs)):
 Linux uses **ksni** (pure-Rust StatusNotifierItem over zbus) so the
-build needs no GTK; the tray runs on the tokio runtime and the menu
-`activate` callbacks drive the shared `paused` / `quit` flags + an
-egui repaint.  macOS / Windows use **tray-icon** (native APIs), built
-on the eframe main thread, with menu events arriving through muda's
-global `MenuEvent::receiver()` channel.  Either backend is
-best-effort — the window UI works without a tray.
+build needs no GTK; the tray runs on the tokio runtime.  macOS / Windows
+use **tray-icon** (native APIs), built on the eframe main thread, with
+menu events arriving through muda's global `MenuEvent::receiver()`
+channel.  Either backend is best-effort — the window UI works without a
+tray.
+
+### Display wait
+
+When the window cannot open (no usable display yet, e.g. started at login
+before the X session accepts clients), the UI logs `op="display_wait"`
+with the attempt and the error, waits (2 s doubling to 60 s) and restarts
+itself in place.  The windowing library allows one event loop per process
+and caches a failed display connection, so the retry needs a fresh
+process.
 
 ### Notifications
 
@@ -690,8 +737,12 @@ trait — they're excluded from the 90% coverage gate
 - **Studio-side logs**: every tick of the worker pushes its log
   buffer over the WS LogBatch frame.  The studio drops them into the
   `workerLogs` D1 table; the dashboard's LogViewer renders them.
-- **In-UI logs tab**: same buffer, virtualised view, level filter +
-  search.
+- **Tray UI Logs tab**: the daemon's worker log ring (its own info-and-up
+  events plus the studio-session breadcrumbs), served by
+  `GET /daemon/logs?after=<seq>`.
+- **Per-job logs**: every job runs in a `job` span; the events inside it
+  (engine downloads, loads, generation) are kept per job and served by
+  `GET /jobs/:id/log`.
 - **Sentry (opt-in)**: set `SENTRY_DSN` (and optionally
   `SENTRY_ENVIRONMENT`) before launch.  Captures panics, forwards
   `tracing::error!` events, attaches preceding `warn!` events as
@@ -721,13 +772,12 @@ file:
 [`tests/runtime_helpers.rs`](../../tests/runtime_helpers.rs)
 under an `XDG_CONFIG_HOME` override.
 
-### "Run in tray on login" (UI mode)
+### Tray UI login entry (always)
 
-[`src/autostart.rs`](../../src/autostart.rs) (always compiled, like
-`service.rs`; the desktop UI's Config tab is the only caller).  Toggle
-in the Config tab's "Background mode" group.  Each enable/disable emits
-a structured `tracing` event on target `studio_worker::autostart`.
-Writes:
+[`src/autostart.rs`](../../src/autostart.rs).  Every `ui::run` makes sure
+the tray UI starts at login from the current executable (rewriting a stale
+entry); there is no setting to turn it off.  Each write or no-op emits a
+structured `tracing` event on target `studio_worker::autostart`.  Writes:
 
 - Linux: `~/.config/autostart/studio-worker-ui.desktop`
 - macOS: `~/Library/LaunchAgents/gg.minis.studio-worker-ui.plist`
@@ -736,9 +786,9 @@ Writes:
   The standard per-user autostart mechanism: no console flash, no admin
   rights, no COM.
 
-The two mechanisms coexist; they install different artefacts.  Use
-the service for headless rigs, the autostart toggle for desktop
-contributors.
+The two mechanisms coexist: the service runs the daemon before anyone
+logs in; the tray UI starts at login and starts the daemon itself when
+none runs.  The daemon lock keeps it to one daemon per config directory.
 
 ---
 
@@ -766,7 +816,11 @@ contributors.
 | `sd-cli` binary missing | sdcpp `ensure_sd_cli` (first image job) | The engine always registers and advertises `image`; on the first image job it resolves `sd-cli` or auto-provisions the prebuilt into `cfg.models_root/bin`.  If no prebuilt exists for the target or the download fails, the job `Fail`s with the install remedy |
 | Vulkan loader (`libvulkan.so.1` / `vulkan-1.dll`) missing | sdcpp dispatch preflight | `Fail { retryable: true }` with the exact remedy (install `libvulkan1` + a GPU driver) instead of a cryptic `sd-cli` crash.  macOS uses Metal, so no Vulkan loader is involved |
 | rustls 0.23+ CryptoProvider missing | first WSS handshake | Process panics on `crypto/mod.rs:249`.  Fix is `rustls::crypto::ring::default_provider().install_default()` once at startup; see [`src/main.rs`](../../src/main.rs) |
-| `worker_id` / `auth_token` missing at WS connect | `has_credentials` check | Session loop waits (polling cfg every 1s) instead of fatal-bailing.  Lets the UI's parallel auto-register + WS flow work. |
+| `worker_id` / `auth_token` missing at WS connect | `has_credentials` check | Session loop waits (polling cfg every 1s) instead of fatal-bailing. |
+| Operator rejected the registration | `serve_studio` | The daemon keeps serving locally and waits; Reset registration (tray UI, `POST /daemon/registration/reset`) clears the state and asks again |
+| A second daemon for the same config | `daemon_lock::acquire` | Logs `op="daemon_lock"` and exits 0 |
+| Daemon not reachable from the tray UI | `daemon_link::Poller` | Replica emptied, "not reachable" view; starts a daemon when the lock is free (at most every 10 s) |
+| No usable display for the tray UI | `ui::run` | `op="display_wait"`, backoff 2 s → 60 s, restart in place |
 | Hello-without-Welcome race | `wait_for_welcome` gate | Block heartbeat + log-shipper spawn until the studio's Welcome reply arrives, so `tokio::interval()`'s t=0 first tick doesn't ship a heartbeat into an unauthenticated session |
 
 All worker-side failures emit a structured `tracing::warn!` or

@@ -97,10 +97,16 @@ All routes require the bearer token (see [local API](../local-api.md)).
 
 | Method | Path | Answers |
 | --- | --- | --- |
-| `GET` | `/models` | the catalogue, each entry with `state` and `resident` |
+| `GET` | `/models` | the catalogue, each entry with `state`, `resident`, `since`, `loadable` and, when failed, `error` |
 | `GET` | `/models/:id/state` | `{ id, state, resident, error?, since }` |
 | `POST` | `/models/:id/load` | `202` loading / `200` already loaded / `409 insufficient_memory` / `404` unknown / `400` disabled |
 | `POST` | `/models/:id/unload` | `202` unloading / `200` already unloaded / `404` unknown |
+
+## Tray UI
+
+The tray UI's Models tab lists every catalogue model with its state, residency and since,
+and offers Load / Unload per the guards above; Load only for `loadable` models (engines
+with an in-process loader).  See [daemon and tray UI](daemon-and-tray.md).
 
 ## Observability
 

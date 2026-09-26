@@ -1,9 +1,10 @@
 # Local image API
 
 The worker exposes an always-on local HTTP API so you can generate images
-(e.g. Z-Image) **without the studio**. It starts automatically whenever the
-worker runs (`run` or the desktop UI), before the studio-registration gate, so
-it works even when the worker is not registered with any studio.
+(e.g. Z-Image) **without the studio**. The daemon (`studio-worker run`, which the tray UI
+starts when none runs) serves it, before the studio-registration gate, so it
+works even when the worker is not registered with any studio.  The tray UI is
+itself a client of this API (see [daemon control](#daemon-control)).
 
 - Bind: `127.0.0.1` only.
 - Auth: every route except `GET /healthz` requires
@@ -18,7 +19,7 @@ it works even when the worker is not registered with any studio.
 - Port: `4787` by default. Override with `STUDIO_WORKER_LOCAL_API_PORT`
   (or `local_api_port` in `config.toml`; the env var wins); if the
   preferred port is taken the worker falls back to an ephemeral port and logs
-  the chosen URL (also published in the UI's Jobs tab and the discovery file).
+  the chosen URL (also published in the tray UI's Jobs tab and the discovery file).
 - Request bodies are capped at 1 MiB (`413` beyond that).
 - Synchronous: `POST /image` blocks until the engine finishes and returns the
   image bytes. Each job is recorded in the in-app **Local queue**.
@@ -32,13 +33,21 @@ it works even when the worker is not registered with any studio.
 | POST   | `/tts`          | yes  | `{text, model?, voice?, speed?, language?, ext?}` | audio bytes (`audio/wav` etc.) |
 | POST   | `/stt`          | yes  | `{inputUrl, model?, language?}`            | transcript JSON |
 | POST   | `/video`        | yes  | `{prompt, model?, negativePrompt?, seconds?, width?, height?, ext?}` | video bytes (`video/mp4` etc.) |
-| GET    | `/models`       | yes  | —                                          | catalog as JSON array, each entry with `state` + `resident` |
+| GET    | `/models`       | yes  | —                                          | catalog as JSON array, each entry with `state`, `resident`, `since`, `loadable` (+ `error` when failed) |
 | GET    | `/models/:id/state` | yes | —                                        | `{id, state, resident, since, error?}` |
 | POST   | `/models/:id/load`  | yes | —                                        | `202` loading / `200` loaded; marks it resident |
 | POST   | `/models/:id/unload`| yes | —                                        | `202` unloading / `200` unloaded; clears residency |
 | POST   | `/models`       | yes  | a catalog model (same `ModelSource` shape) | `{"ok":true}` |
 | DELETE | `/models/:id`   | yes  | —                                          | `{"ok":true}` / 404; unloads it first |
 | GET    | `/jobs`         | yes  | —                                          | recent local jobs as JSON |
+| GET    | `/jobs/:id/log` | yes  | —                                          | the job's captured log (`404 unknown_job`) |
+| GET    | `/jobs/:id/thumbnail` | yes | —                                     | `image/png` thumbnail of an image job (`404 no_thumbnail`) |
+| GET    | `/daemon/status` | yes | —                                          | the tray UI's snapshot (below) |
+| GET    | `/daemon/logs`  | yes  | `?after=<seq>`                             | `{entries, seq}`: worker log entries newer than `seq` |
+| POST   | `/daemon/pause`, `/daemon/resume` | yes | —                      | `{paused}` |
+| GET / PUT | `/daemon/config` | yes | PUT: the editable config              | the editable config (`400 invalid_config`, `500 config_not_saved`) |
+| POST   | `/daemon/registration/reset` | yes | —                             | `202` / `409 not_rejected` |
+| POST   | `/daemon/shutdown` | yes | —                                        | `202`; the daemon stops gracefully |
 | POST   | `/stream-tokens` | yes | `{model, ttlSecs?}`                     | `{token, model, expiresAt, port, path}` for the LAN stream listener |
 | GET    | `/healthz`      | no   | —                                          | runtime snapshot (below) |
 
@@ -61,6 +70,60 @@ curl -s -X POST "$(jq -r .url $DISCOVERY)/models/qwen3.5-0.8b/load" \
   -H "authorization: Bearer $(jq -r .token $DISCOVERY)"
 # {"id":"qwen3.5-0.8b","state":"loading","resident":true,"since":"..."}
 ```
+
+`loadable` is `false` for engines without an in-process loader (sd-cpp, ONNX,
+synthetic): those models run per job and cannot be kept loaded.
+
+### Daemon control
+
+The tray UI (`studio-worker ui`) is a client of the daemon over these routes;
+design in [daemon and tray UI](runtime/daemon-and-tray.md).  They carry the same
+Host / Origin / token guards as every other route.  Errors answer
+`{"error": <code>, "message": <text>}`.
+
+`GET /daemon/status` answers everything the UI shows except the logs; it never
+carries a credential:
+
+```jsonc
+{
+  "version": "0.4.8", "pid": 4242, "configPath": "/home/you/.config/minis-studio-worker/config.toml",
+  "paused": false,
+  "busy": false,                       // the one-job gate is taken
+  "registered": true, "workerId": "w-…",
+  "registration": { "state": "approved" },   // pristine | pending{requestId,since} | approved | rejected{reason}
+  "config": { "apiBaseUrl": "…", "vramThresholdGb": 12.0, "startMinimised": true,
+              "autoUpdateEnabled": true, "autoUpdateIntervalSecs": 1800,
+              "autoUpdateFeed": "…", "autoUpdatePrerelease": false, "modelsRoot": "…" },
+  "session": { "state": "connected" },       // waiting_for_approval | connecting | connected | reconnecting{attempt} | auth_failed{reason} | fatal{reason} | stopped
+  "heartbeat": { "outcome": "ok", "lastAttemptAt": "…" },
+  "gpuRuntime": { "ok": true, "detail": "GPU runtime available" },
+  "vramTotalGb": 24.0,
+  "localApiUrl": "http://127.0.0.1:4787",
+  "currentJobId": null,                      // the studio job the heartbeat reports
+  "activeJobs": [ /* running jobs */ ],
+  "recentJobs": [ /* finished studio jobs, newest first, up to 50 */ ],
+  "localJobs":  [ /* finished local jobs, newest first, up to 50 */ ],
+  "logsSeq": 1234                            // newest worker log entry
+}
+```
+
+A job: `{jobId, kind, model, prompt, source: studio|local|lane|stream,
+status: running|completed|failed, reason?, startedAt, finishedAt?, hasThumbnail}`.
+
+`GET /daemon/logs?after=<seq>` answers the worker log entries (`{ts, level,
+category, message, jobId?}`) newer than `seq` and the newest `seq`; pass it back
+next time.  An `after` beyond the newest (the daemon restarted) answers the
+whole ring (1 000 entries).
+
+`GET /jobs/:id/log` answers `{lines: [{ts, level, target, message}], dropped}`:
+the events emitted while the job ran (400 lines per job, the 128 most recent
+jobs).  `GET /jobs/:id/thumbnail` answers a PNG of at most 192 px (the 100 most
+recent image jobs).
+
+`PUT /daemon/config` takes the `config` object above; the daemon validates it
+(http(s) URLs, a threshold of 0 or more, an interval of at least 60 s, a
+non-empty models root), saves it, then applies it.  A changed `modelsRoot`
+applies to engines built after a restart.
 
 ### Streaming speech-to-text
 
@@ -216,8 +279,10 @@ curl -s http://127.0.0.1:4787/models \
 ## Local queue in the app
 
 Local jobs are kept in their own ring (`WorkerObservers::local_jobs`), separate
-from studio-claimed jobs, and shown under **Local queue** in the desktop UI's
-Jobs tab alongside the API URL.
+from studio-claimed jobs, and shown under **Local queue** in the tray UI's
+Jobs tab alongside the API URL, each with its log and, for images, a thumbnail.
+Chats served on a loaded model's lane (`source: lane`) and streaming speech
+sessions (`source: stream`) are local jobs too.
 
 ## Notes
 

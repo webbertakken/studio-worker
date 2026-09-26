@@ -22,7 +22,7 @@ Verified against both codebases on 2026-06-11.
 10. [Process startup + shutdown](#10-process-startup--shutdown)
 11. [Auto-update](#11-auto-update)
 12. [Service install + autostart](#12-service-install--autostart)
-13. [Desktop UI observation](#13-desktop-ui-observation)
+13. [Tray UI observation](#13-tray-ui-observation)
 14. [Telemetry](#14-telemetry)
 15. [Model lifecycle](#15-model-lifecycle)
 
@@ -34,8 +34,8 @@ Operator-gated, no shared secret.  Worker side:
 [`src/auto_register.rs`](../../src/auto_register.rs) (state machine,
 one HTTP round-trip per `tick()`), [`src/http.rs`](../../src/http.rs)
 (`register_request` + `poll_register_status`), orchestrated by
-`runtime::ensure_registered` (headless) or the `ui::run` spawn loop
-(both poll every 30s).  Studio side:
+`runtime::ensure_registered` inside the daemon's `serve_studio` (polls
+every 30s).  Studio side:
 `apps/studio/src/worker/modules/graphics/routes/workers.ts`
 (`workerAgentRoutes` + `workerAdminRoutes`) and `workerAuth.ts`.
 
@@ -73,8 +73,10 @@ The operator decides in the dashboard (`PendingWorkersPanel.tsx` →
 `studioWorkers` row with the capabilities snapshot and records
 `decidedBy`.  Worker-side terminal states: `Approved` falls through
 to the WS session; `Rejected` stops the loop until
-`studio-worker register --reset`; a `404` on poll drops the stale
-request and recreates next tick.
+a reset (`studio-worker register --reset`, or Reset registration in the
+tray UI via `POST /daemon/registration/reset`, which needs no restart);
+the daemon keeps serving locally meanwhile.  A `404` on poll drops the
+stale request and recreates next tick.
 
 ## 2. WebSocket session lifecycle
 
@@ -89,9 +91,7 @@ Durable Object (`WorkerConnections.ts` + `orchestrator.ts` +
 
 ```
 spawn_ws_session loop:
-  wait until config has worker_id + auth_token   (poll 1s — lets the
-                                                  UI's parallel
-                                                  auto-register work)
+  wait until config has worker_id + auth_token   (poll 1s)
   connect GET /workers/:id/connect (upgrade)  → DO accepts socket,
                                                 unauthenticated session;
                                                 an older socket for the
@@ -252,9 +252,9 @@ manual D1 playbook: [recovery.md](../operations/recovery.md).
 
 ## 7. Pause / resume
 
-Runtime-only `Arc<AtomicBool>` — full description in
-[pause-resume.md](../runtime/pause-resume.md).  Flow: UI Status tab
-or tray menu flips the flag → next heartbeat advertises
+Runtime-only `Arc<AtomicBool>` in the daemon — full description in
+[pause-resume.md](../runtime/pause-resume.md).  Flow: the tray UI's Status
+tab or tray menu sends `POST /daemon/pause` / `resume`, which flips the flag → next heartbeat advertises
 `autoEnabled: false` → studio's `pickWorkerForJob` skips the worker
 → any offer racing the flag flip is rejected with `"worker paused by
 operator"`, which the studio treats as transient (no attempt
@@ -268,8 +268,11 @@ Three consumers of one bounded buffer
 
 1. **stderr** — every entry also lands as a `tracing` event
    (`RUST_LOG=studio_worker=debug`).
-2. **UI Logs tab** — `WorkerObservers.recent_logs` ring (1000
-   entries) so the tab doesn't blank when the shipper drains.
+2. **Tray UI Logs tab** — `WorkerObservers.recent_logs` ring (1000
+   entries) so the tab doesn't blank when the shipper drains.  The
+   daemon's own info-and-up events land in the same ring
+   (`job_log::WorkerLogLayer`); the UI reads it with
+   `GET /daemon/logs?after=<seq>`.
 3. **Studio** — the WS log-shipper pump drains the buffer every 1s
    into `LogBatch` frames; the DO's `onLogBatch` →
    `repo.ingestLogs` → `workerLogs` D1 table → dashboard LogViewer.
@@ -292,14 +295,14 @@ the first TLS handshake) → Sentry guard → tokio runtime →
 `run_cli` ([`src/lib.rs`](../../src/lib.rs)) dispatches the clap
 command ([`src/cli.rs`](../../src/cli.rs)).
 
-`runtime::run` (headless): `config::load` → startup banner →
-`ensure_registered` (flow 1, blocking until Approved) → `run_loops`
-spawns the WS session (flow 2) + auto-updater (flow 11).  `ui::run`
-(desktop): same loops, but auto-register runs in parallel with the
-WS session — the session's wait-for-credentials poll makes that
-safe — and the main thread is handed to eframe.
+`runtime::run` (the daemon): `config::load` → daemon lock (a second
+daemon for the same config exits 0) → startup banner → local API + model
+host + stream listener → `serve_studio`: `ensure_registered` (flow 1) →
+`run_loops` spawns the WS session (flow 2) + auto-updater (flow 11).
+`ui::run` (the tray UI) runs no loops of its own: see flow 13.
 
-Shutdown: SIGTERM / SIGINT / tray-Quit sets the shared `stop` flag;
+Shutdown: SIGTERM / SIGINT / `POST /daemon/shutdown` (tray Quit) sets the
+shared `stop` flag;
 every pump re-polls it on a 250ms tick (`wait_with_stop`), the
 session closes cleanly, an in-flight job gets ~5s to finish.  The
 service manager (flow 12) restarts the binary when the session loop
@@ -328,21 +331,44 @@ Two coexisting worker-side mechanisms, no studio involvement:
 - **`install-service`** ([`src/service.rs`](../../src/service.rs)):
   systemd `--user` unit / launchd plist / Windows scheduled-task XML
   for headless rigs.
-- **Autostart-on-login** ([`src/autostart.rs`](../../src/autostart.rs)):
-  `.desktop` entry / LaunchAgent / HKCU `…\Run` registry value,
-  reconciled with the `auto_start` config flag on every `ui::run`
-  launch.
+- **Tray UI at login** ([`src/autostart.rs`](../../src/autostart.rs)):
+  `.desktop` entry / LaunchAgent / HKCU `…\Run` registry value, always
+  installed (and kept pointing at the current executable) by every
+  `ui::run`.  The tray UI starts the daemon when none runs; the daemon
+  lock keeps it to one per config directory.
 
-## 13. Desktop UI observation
+## 13. Tray UI observation
 
-The UI never talks to the studio directly; it reads the shared
-[`WorkerObservers`](../../src/runtime.rs) slots the runtime writes:
-`current_job` (set on Accept, cleared after completion),
-`recent_jobs` (ring of 50), `last_heartbeat` (written on every ack /
-failure — drives the tray icon's idle / busy / disconnected
-variants), `recent_logs`, plus the shared registration state for the
-pre-approval Status views.  Writes flow the other way through the
-`paused` flag (flow 7) and `config::save` from the Config tab.
+The tray UI is a client of the daemon; it never talks to the studio and
+never runs a job.  Design: [daemon and tray UI](../runtime/daemon-and-tray.md).
+
+```
+ui::run
+  autostart::ensure                     login entry, always
+  Poller thread, every 1 s:
+    read <config dir>/local-api.json    URL + token (fresh each time)
+    GET /daemon/status                  snapshot → Replica (observers, config,
+                                          registration, busy, paused)
+    GET /daemon/logs?after=<seq>        new worker log entries
+    GET /models                         catalogue with state, residency, since
+    GET /jobs/<selected>/log            the selected job's log
+    GET /jobs/<id>/thumbnail            thumbnails the replica lacks
+    on failure: empty the Replica (no stale data);
+      daemon lock held → link "starting"
+      lock free        → start `studio-worker --config <path> run`
+                         (detached, output → <config dir>/daemon.log),
+                         at most every 10 s
+  eframe window + tray: tabs render the Replica
+    no usable display → op="display_wait", wait 2 s…60 s, restart in place
+  actions (helper threads) → POST /daemon/pause|resume,
+    PUT /daemon/config, POST /models/:id/load|unload,
+    POST /daemon/registration/reset, POST /daemon/shutdown (Quit)
+```
+
+Every job the daemon runs (flow 3 offers, local API requests, chats on a
+loaded model's lane, streaming speech sessions) goes through a `JobRun`:
+listed as running, run inside a `job` tracing span whose events form the
+job's log, thumbnailed when it returns an image, recorded in its ring.
 Completion / failure notifications go through the `Notifier` trait
 ([`src/ui/notifier.rs`](../../src/ui/notifier.rs)), opt-in per event.
 
@@ -373,6 +399,9 @@ Local-only (the studio is not involved).
 4. `POST /models/:id/unload`: residency cleared, `unloading`; the lane's cancel flag is
    raised, the in-flight request drains (bounded), the weights are dropped, `unloaded`.
 5. Startup: `spawn_local_api` builds the host and calls `restore_residents`.
+6. The tray UI's Models tab shows each model's state and calls the same load / unload
+   routes; `GET /models` also says whether the model's engine has an in-process loader
+   (`loadable`).
 
 Every transition logs `model state changed` (target `studio_worker::lifecycle`) with
 `op`, `model`, `from`, `to`; refusals log `load refused`.
