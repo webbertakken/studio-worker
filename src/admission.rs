@@ -7,7 +7,7 @@
 const TRACE_TARGET: &str = "studio_worker::lifecycle";
 
 /// Device memory kept free for runtime overheads the catalogue estimates
-/// do not cover (CUDA context, KV growth, allocator slack).  Measured:
+/// do not cover (CUDA context, KV growth, allocator slack).
 /// Measured: Nemotron streaming ran at 3.5 GiB on CUDA against ~2.6 GiB of weights.
 /// Safe range 0.5..=2.0.
 pub const ADMISSION_MARGIN_GIB: f32 = 1.0;
