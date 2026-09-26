@@ -118,7 +118,7 @@ whole ring (1 000 entries).
 
 `GET /jobs/:id/log` answers `{lines: [{ts, level, target, message}], dropped}`:
 the events emitted while the job ran (400 lines per job, the 128 most recent
-jobs).  `GET /jobs/:id/thumbnail` answers a PNG of at most 192 px (the 100 most
+jobs).  `GET /jobs/:id/thumbnail` answers a PNG of at most 384 px (the 100 most
 recent image jobs).
 
 `PUT /daemon/config` takes the `config` object above; the daemon validates it

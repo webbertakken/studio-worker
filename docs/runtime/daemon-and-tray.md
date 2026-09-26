@@ -16,6 +16,7 @@ Closing or crashing the UI never stops a job. Stopping the daemon stops the work
 | --- | --- |
 | daemon | the `run` process; one per config directory |
 | daemon lock | `<config dir>/daemon.lock`, held exclusively by the running daemon |
+| UI lock | `<config dir>/ui.lock`, held exclusively by the running tray UI |
 | tray UI | the `ui` process: egui window + system tray, client of the daemon |
 | link | the UI's view of the daemon: `connected`, `starting` or `unreachable` |
 | snapshot | one `GET /daemon/status` answer: everything the UI shows except logs |
@@ -101,8 +102,8 @@ Every job, whatever its source, is visible while it runs and after it ends.
 
 ### Thumbnails
 
-- When a job returns an image, the daemon decodes it and keeps a PNG of at most 192 px on the
-  longer side.
+- When a job returns an image, the daemon decodes it and keeps a PNG of at most 384 px on the
+  longer side: sharp on a card, and large enough to recognise when the UI shows it larger.
 - Bounds: the thumbnails of the 100 most recent image jobs (the size of both job rings).
 - A thumbnail that cannot be made is logged (`op="thumbnail"`) in the job's log and the job
   itself is unaffected.
@@ -113,9 +114,11 @@ Every job, whatever its source, is visible while it runs and after it ends.
 
 1. Resolve the config path (the daemon owns the config; the UI never writes it; it only
    reads `start_minimised` from it before the daemon answers).
-2. Install the login autostart entry for the tray UI; it is always installed.
-3. Start the poller (below).
-4. Open the window. When there is no usable display (e.g. started at login before the
+2. Take the UI lock (see [one tray UI per config directory](#one-tray-ui-per-config-directory)),
+   or hand over to the tray UI that holds it and exit.
+3. Install the login autostart entry for the tray UI; it is always installed.
+4. Start the poller (below).
+5. Open the window. When there is no usable display (e.g. started at login before the
    graphical session accepts clients), the UI logs `op="display_wait"` with the attempt and
    the error, waits (2 s doubling to 60 s) and starts itself again in place. It never exits
    for want of a display.
@@ -144,27 +147,112 @@ and the link reads `starting`.
 A daemon the UI started outlives the UI.  (A process supervisor that kills whole process
 trees, such as PM2, also stops it when it stops the UI.)
 
+### One tray UI per config directory
+
+- `ui` takes `<config dir>/ui.lock` exclusively before anything else, so one config never gets
+  two tray icons.
+- When another tray UI holds it, the new one writes `<config dir>/ui.raise`, logs
+  `op="single_instance"` "another tray UI is running for this config" and exits 0.
+- The running tray UI checks for `ui.raise` every 250 ms; when it appears, it deletes it, logs
+  `op="raise"` and shows, un-minimises and focuses its window.
+- A tray UI that restarts itself for the display (below) waits up to 5 s for the lock its
+  predecessor still holds.
+- When the lock file cannot be opened, the UI logs a warning and runs without the guard.
+
 ### Window
 
-- A status line at the top is always present: the link state, the daemon version and URL, and
-  the result of the last action. It never changes height.
-- While the link is not `connected`, the tabs are replaced by a "daemon not reachable" view
-  that says what the UI is doing about it.
-- **Status**: registration, session, heartbeat, GPU runtime, Pause/Resume, and, when rejected,
-  Reset registration.
-- **Jobs**: running jobs, recent studio jobs, the local queue. Each card shows its source,
-  kind, model, prompt, outcome and duration, and its thumbnail when it has one. Selecting a
-  card shows its log.
-- **Models**: each catalogue model with kind, engine, memory estimate, state, residency and
-  since; Load and Unload buttons per the lifecycle guards (Load only when `loadable`); a
-  failed model shows its error.
-- **Config**: the operator-editable fields; Save sends them to the daemon, which validates,
-  saves and applies them.
-- **Logs**: the worker log, filtered and searchable.
-- **About**: UI and daemon versions (they differ after the daemon updated itself until the
-  UI restarts), config path, update check.
-- `STUDIO_WORKER_UI_TAB=<tab>` picks the first tab and `STUDIO_WORKER_UI_JOB=<id|latest>`
-  selects a job once it shows up, for screenshots and headless inspection.
+The window is a calm instrument panel: a navigation rail on the left, a pulse header on top, a
+status bar at the bottom, and the page in between. The header, the status bar and the rail keep
+their size whatever the state, so nothing moves when a job starts or ends.
+
+- **Rail**: Jobs, Models, Worker, Logs, Config, each an icon with its name, in that order;
+  `Ctrl+1` to `Ctrl+5` pick them, and each is reachable with `Tab` and activated with `Enter`
+  or `Space`. The tray UI version sits at the foot of the rail.
+- **Jobs is the page on open.**
+- **Pulse header**, always present:
+  - activity: `Idle`, `Paused`, or `Running <kind> · <model> · <elapsed>` (with `+N more`
+    when several jobs run); the running dot breathes softly;
+  - the daemon link: `Daemon connected`, `Daemon starting`, `Daemon unreachable`;
+  - the studio: `Studio connected`, `Reconnecting (<n>)`, `Awaiting approval`,
+    `Registration rejected`, `Studio auth failed`, …;
+  - GPU memory: a bar and `≈ <loaded> / <total> GB`, the sum of the catalogue estimates of the
+    models loaded (or loading) against the device total;
+  - **Pause / Resume**, enabled while the daemon answers.
+- **Status bar**: the daemon version and URL (or what the UI does about a missing daemon) on the
+  left, the result of the last action on the right (red when it failed). Errors are shown
+  where they happen, never as toasts.
+- **Appearance**: dark by default; Light and Follow system in Config. **Reduce motion** holds
+  the breathing glow steady. Both, and the notification toggles, are UI preferences stored in
+  `<config dir>/ui.toml` and applied at once (the daemon never reads them).
+- Text and state colours meet WCAG 2.2 AA contrast (4.5:1 for text, 3:1 for indicators and the
+  focus ring) in both themes; tests hold the palettes to it.
+- While the link is not `connected`, every page except Worker shows a "daemon not reachable"
+  card that says what the UI does about it; Worker shows it above the About card.
+
+#### Jobs
+
+- Two panes. The left pane lists the jobs; the right pane shows the selected job.
+- **Now running** is always reserved at the top of the list: one card per running job, its
+  border glowing softly, or an empty card of the same height when nothing runs.
+- **History** below: studio and local jobs together, newest first, grouped by day (`Today`,
+  `Yesterday`, then the date), with `All`, `Studio` and `Local` filters showing their counts;
+  the local API URL shows under the `Local` filter.
+- A card shows a tile (the image thumbnail, or the job kind's glyph), the prompt as its title
+  (two lines at most; `No prompt` when empty), `<kind> · <model>`, `<source> · <time> ·
+  <duration>` and an outcome pill (`Running`, `Done`, `Failed`).
+- The detail pane shows, for the selected job: the thumbnail (click it, or press `Enter` on
+  it, to see it larger), the facts (id, source, kind, model, started, finished, duration,
+  outcome), the whole prompt, the failure reason, and the job's log: monospace, levels
+  coloured, wrapping, selectable, with a **Copy log** button. With nothing selected it says
+  how to pick a job.
+- Clicking a card selects it; clicking it again clears the selection. `↑` / `↓` move the
+  selection, `Esc` closes the larger image or clears the selection.
+
+#### Models
+
+- A memory summary on top: the device total, a bar with one segment per loaded model, and the
+  sum of their estimates.
+- Two groups that never reorder: **Kept in memory** (models with an in-process loader) and
+  **Loaded per job** (engines that load for each job, e.g. `sd-cli`).
+- Each model is one row: its state (a coloured dot and word: `loaded`, `loading`,
+  `unloading`, `unloaded`, `failed`), its name and id, `<kind> · <engine> · ≈ <GB>`, a
+  `resident` pin, its exclusive group, since when it is in its state, and one action of fixed
+  width: **Load**, **Unload**, **Retry** after a failure, or a disabled `Loading…` /
+  `Unloading…`. A failed model shows its error in the row.
+
+#### Worker
+
+The worker's identity and health on one page (formerly Status and About):
+
+- a hero card with the state (`Idle`, `Running`, `Paused`) and **Pause / Resume**;
+- registration: `Initialising`, `Waiting for approval` (with the request id and a copy
+  button), `Registration rejected` (with the reason and **Reset registration**), or
+  registered (the worker id, copyable);
+- Studio: connection, last heartbeat, API base URL;
+- Hardware: GPU runtime, VRAM total, VRAM threshold per claim, memory held by loaded models;
+- Local API: its URL;
+- About: tray UI and daemon versions (they differ after the daemon updated itself until the
+  UI restarts), Sentry release, config path (copyable), **Check for updates**.
+
+#### Logs
+
+- A toolbar: level (`All`, `Info`, `Warn`, `Error`), search (category, message, job id),
+  **Follow** (stick to the newest line) and **Copy**.
+- The log as selectable monospace text: local time, level (coloured), category, message
+  (wrapping) and job id.
+
+#### Config
+
+- One card per section: Connection, Worker, Auto-update, Models, sent to the daemon with
+  **Save** (it validates, saves and applies them); and This window (appearance, reduce motion,
+  notifications), applied and stored at once.
+- A footer that never changes height: Save, Reset, and the save state (`Unsaved changes`,
+  `Saving…`, `Saved`, or the daemon's refusal).
+
+#### Headless inspection
+
+`STUDIO_WORKER_UI_PAGE=<page>` picks the first page and `STUDIO_WORKER_UI_JOB=<id|latest>`
+selects a job once it shows up, for screenshots and headless inspection.
 
 ### Tray
 
@@ -194,4 +282,7 @@ trees, such as PM2, also stops it when it stops the UI.)
 | `daemon_spawn` | `studio_worker::daemon_link` | the UI started a daemon, failed to, or it exited |
 | `action` | `studio_worker::daemon_link` | an operator action reached the daemon, or did not |
 | `display_wait` | `studio_worker::ui` | no usable display yet; retrying |
+| `single_instance` | `studio_worker::ui` | another tray UI holds the UI lock; this one hands over and exits |
+| `raise` | `studio_worker::ui` | a second launch asked this tray UI to show its window |
+| `prefs` | `studio_worker::ui` | UI preferences could not be read or saved |
 | `enable` / `ensure` | `studio_worker::autostart` | login entry written / already current / failed |
