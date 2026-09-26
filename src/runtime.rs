@@ -51,15 +51,43 @@ pub const PROMPT_PREVIEW_CHARS: usize = 200;
 /// loss.
 pub const LOG_SHIP_QUEUE_CAP: usize = 5_000;
 
-/// Job in flight right now.  Populated by the WS session before
-/// dispatch, cleared once the job finishes (success or failure).
-#[derive(Debug, Clone)]
+/// Where a job came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobSource {
+    /// An offer from the studio.
+    #[default]
+    Studio,
+    /// A local API request run as a transient job.
+    Local,
+    /// A local API request served on a loaded model's lane.
+    Lane,
+    /// A streaming speech session on the LAN listener.
+    Stream,
+}
+
+impl JobSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobSource::Studio => "studio",
+            JobSource::Local => "local",
+            JobSource::Lane => "lane",
+            JobSource::Stream => "stream",
+        }
+    }
+}
+
+/// A job in flight.  The studio's job also sits in
+/// `WorkerObservers::current_job` (the heartbeat reports it); every running
+/// job, whatever its source, sits in `WorkerObservers::active_jobs`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CurrentJob {
     pub job_id: String,
     pub kind: TaskKind,
     pub model: String,
     pub prompt: String,
     pub started_at: DateTime<Utc>,
+    pub source: JobSource,
 }
 
 /// Outcome a finished job ended with.  Failures carry the human
@@ -71,7 +99,7 @@ pub enum JobOutcome {
 }
 
 /// One finished job, retained in the recent-jobs ring for the UI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecentJob {
     pub job_id: String,
     pub kind: TaskKind,
@@ -80,10 +108,12 @@ pub struct RecentJob {
     pub outcome: JobOutcome,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    pub source: JobSource,
 }
 
 /// Result of the most recent heartbeat the WS session sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum HeartbeatOutcome {
     Ok,
     Err { reason: String },
@@ -93,7 +123,8 @@ pub enum HeartbeatOutcome {
 /// worker that can't reach the studio shows *why* instead of sitting
 /// silently.  Terminal states (`AuthFailed`, `Fatal`) carry a
 /// call-to-action the Status tab renders.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum SessionState {
     /// No credentials yet — waiting for the studio operator to approve.
     #[default]
@@ -135,10 +166,12 @@ impl SessionState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HeartbeatStatus {
-    pub last_attempt_at: DateTime<Utc>,
+    #[serde(flatten)]
     pub outcome: HeartbeatOutcome,
+    pub last_attempt_at: DateTime<Utc>,
 }
 
 /// Bundle of in-process observation slots the WS session writes to and
@@ -148,6 +181,10 @@ pub struct HeartbeatStatus {
 #[derive(Clone, Default)]
 pub struct WorkerObservers {
     pub current_job: Arc<Mutex<Option<CurrentJob>>>,
+    /// Every running job, whatever its source (see [`crate::job_run::JobRun`]).
+    pub active_jobs: Arc<Mutex<Vec<CurrentJob>>>,
+    /// Thumbnails of recent image jobs.
+    pub thumbnails: crate::thumbnail::Thumbnails,
     pub recent_jobs: Arc<Mutex<VecDeque<RecentJob>>>,
     /// Finished jobs submitted to the local API (the in-app "local queue"),
     /// kept separate from studio-claimed jobs.
@@ -173,6 +210,43 @@ pub struct WorkerObservers {
     /// (which is drained every second) so the display doesn't blank
     /// out between ticks.
     pub recent_logs: Arc<Mutex<VecDeque<LogEntry>>>,
+    /// Entries ever pushed into `recent_logs`; the newest entry's sequence
+    /// number.  Written under the `recent_logs` lock.
+    pub recent_logs_seq: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Entries of `recent_logs` newer than sequence number `after`, and the
+/// newest sequence number.  A client passes the returned number back as
+/// `after` next time to receive only what is new; an `after` beyond the
+/// newest number (the daemon restarted) answers the whole ring.
+pub fn recent_logs_after(observers: &WorkerObservers, after: u64) -> (Vec<LogEntry>, u64) {
+    let ring = observers.recent_logs.lock();
+    let newest = observers.recent_logs_seq.load(Ordering::SeqCst);
+    let oldest = newest - ring.len() as u64;
+    let after = if after > newest { 0 } else { after.max(oldest) };
+    let skip = (after - oldest) as usize;
+    (ring.iter().skip(skip).cloned().collect(), newest)
+}
+
+impl WorkerObservers {
+    /// Observers whose worker log is the process-wide ring the installed
+    /// [`crate::job_log::WorkerLogLayer`] fills: the daemon's.
+    pub fn with_global_worker_log() -> Self {
+        let ring = crate::job_log::global_worker_log();
+        Self {
+            recent_logs: ring.entries.clone(),
+            recent_logs_seq: ring.seq.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// The worker log ring, as a handle.
+    pub fn worker_log(&self) -> crate::job_log::WorkerLogRing {
+        crate::job_log::WorkerLogRing {
+            entries: self.recent_logs.clone(),
+            seq: self.recent_logs_seq.clone(),
+        }
+    }
 }
 
 /// Record the WS lifecycle state for the UI to read.
@@ -183,7 +257,7 @@ pub fn set_session_state(observers: &WorkerObservers, state: SessionState) {
 /// GPU-runtime readiness, probed once at startup so a missing Vulkan
 /// loader surfaces as an actionable status (UI + `/healthz`) *before*
 /// the first image job fails, not after.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GpuRuntimeStatus {
     /// True when the runtime sd-cli needs is present (always true on
     /// macOS/Metal).
@@ -212,6 +286,7 @@ pub fn sync_studio_model(
         source: source.clone(),
         enabled: true,
         origin: "studio".into(),
+        exclusive_group: None,
     };
     let changed = observers.catalog.lock().sync_studio_model(incoming);
     if !changed {
@@ -308,6 +383,7 @@ pub fn push_recent_job_for_tests(observers: &WorkerObservers, job_id: &str) {
             outcome: JobOutcome::Completed,
             started_at: now,
             finished_at: now,
+            source: JobSource::Studio,
         },
     );
 }
@@ -375,11 +451,7 @@ pub async fn register(config_path: Option<&str>, args: RegisterArgs) -> Result<(
     let (mut cfg, path) = config::load(config_path)?;
 
     if args.reset {
-        cfg.worker_id = None;
-        cfg.auth_token = None;
-        cfg.registration_request_id = None;
-        cfg.registration_secret = None;
-        cfg.install_id = None;
+        clear_registration(&mut cfg);
     }
     if let Some(url) = args.api_base_url {
         cfg.api_base_url = url;
@@ -428,7 +500,6 @@ pub fn format_status(cfg: &Config, path: &std::path::Path) -> String {
     };
     let _ = writeln!(out, "registration:       {registration_line}");
     let _ = writeln!(out, "vram_threshold_gb:  {}", cfg.vram_threshold_gb);
-    let _ = writeln!(out, "auto_start:         {}", cfg.auto_start);
     let _ = writeln!(out, "models_root:        {}", cfg.models_root.display());
     let _ = writeln!(out, "auto_update:        {}", cfg.auto_update_enabled);
     let _ = writeln!(
@@ -469,7 +540,6 @@ pub fn log_startup_banner(cfg: &Config, path: &std::path::Path) {
         config_path = path.display().to_string(),
         api_base_url = cfg.api_base_url.as_str(),
         vram_threshold_gb = cfg.vram_threshold_gb,
-        auto_start = cfg.auto_start,
         auto_update_enabled = cfg.auto_update_enabled,
         auto_update_interval_secs = cfg.auto_update_interval_secs,
         models_root = cfg.models_root.display().to_string(),
@@ -512,66 +582,143 @@ pub fn format_check_outcome(outcome: &update::CheckOutcome) -> String {
 
 pub async fn run(config_path: Option<&str>) -> Result<()> {
     let (cfg, path) = config::load(config_path)?;
+    // One daemon per config directory: a second one would fight the first
+    // over the local API port and the studio session.
+    let _lock = match crate::daemon_lock::acquire(&path)? {
+        crate::daemon_lock::Acquired::Mine(lock) => lock,
+        crate::daemon_lock::Acquired::HeldElsewhere => return Ok(()),
+    };
     log_startup_banner(&cfg, &path);
 
-    let cfg = config::shared(cfg);
-    let stop = Arc::new(AtomicBool::new(false));
+    let control = crate::control::DaemonControl::new(
+        config::shared(cfg),
+        path,
+        sys::detect_vram_gb().unwrap_or(0.0),
+    );
     let busy = Arc::new(AtomicBool::new(false));
-    // Operator pause toggle.  Runtime-only — never persisted, so the
-    // worker comes up unpaused after every restart.
-    let paused = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    let observers = WorkerObservers::default();
-    let registration = crate::auto_register::shared_initial();
+    let observers = WorkerObservers::with_global_worker_log();
 
-    let stop_clone = stop.clone();
+    let stop_clone = control.stop.clone();
     tokio::spawn(async move {
         let signal = wait_for_shutdown_signal().await;
         request_shutdown(&stop_clone, signal);
     });
 
-    // Block on auto-register until the operator approves (or rejects).
-    // Polls every 30s; aborts on Ctrl-C.  A stop signal that arrives
-    // before approval is a clean shutdown (the pre-approval wait is the
-    // normal state of a fresh worker), so exit Ok rather than letting
-    // `run_cli` log it at error and exit non-zero.
-    // Start the always-on local image API before the registration gate so it
-    // works even when the worker is not (yet) registered with a studio.
-    // It shares the one-job gate with the WS session so a local job and
-    // a studio job never run concurrently on the same GPU.
+    // The local API (and with it the model host and stream listener) starts
+    // before the registration gate, so it serves even when the worker is not
+    // (yet) registered with a studio.  It shares the one-job gate with the
+    // WS session so a local job and a studio job never share the GPU.
     let gate = crate::job_gate::JobGate::from_shared(busy.clone());
-    let local_api = spawn_local_api(cfg.clone(), &path, observers.clone(), gate, stop.clone());
+    let local_api = spawn_local_api(&control, observers.clone(), gate);
 
-    let outcome = match ensure_registered(&cfg, &path, &registration, &stop).await {
-        Ok(RegistrationGate::Stopped) => {
-            info!(
-                target: TRACE_TARGET,
-                op = "shutdown",
-                "stopped before registration completed; exiting cleanly"
-            );
-            Ok(())
-        }
-        Ok(_) => {
-            run_loops(
-                cfg,
-                stop.clone(),
-                logs,
-                busy,
-                paused,
-                observers,
-                LoopSchedule::default(),
-            )
-            .await
-        }
-        Err(err) => Err(err),
-    };
+    let outcome = serve_studio(&control, logs, busy, observers, LoopSchedule::default()).await;
 
     // Shutting down: ensure the local API thread observes `stop` and joins.
-    stop.store(true, Ordering::SeqCst);
+    control.stop.store(true, Ordering::SeqCst);
     if let Some(handle) = local_api {
         let _ = handle.join();
     }
     outcome
+}
+
+/// How often the rejection wait checks for a reset or a stop.
+pub const REGISTRATION_RESET_POLL: Duration = Duration::from_millis(250);
+
+/// Register with the studio, then run the studio loops.  A rejection does
+/// not end the daemon: it keeps serving locally and waits for a
+/// registration reset (from the tray UI) or a stop.
+pub async fn serve_studio(
+    control: &crate::control::DaemonControl,
+    logs: Arc<Mutex<Vec<LogEntry>>>,
+    busy: Arc<AtomicBool>,
+    observers: WorkerObservers,
+    schedule: LoopSchedule,
+) -> Result<()> {
+    loop {
+        match ensure_registered(
+            &control.cfg,
+            &control.config_path,
+            &control.registration,
+            &control.stop,
+        )
+        .await
+        {
+            Ok(RegistrationGate::Stopped) => {
+                info!(
+                    target: TRACE_TARGET,
+                    op = "shutdown",
+                    "stopped before registration completed; exiting cleanly"
+                );
+                return Ok(());
+            }
+            Ok(RegistrationGate::Ready) => {
+                return run_loops(
+                    control.cfg.clone(),
+                    control.stop.clone(),
+                    logs,
+                    busy,
+                    control.paused.clone(),
+                    observers,
+                    schedule,
+                )
+                .await;
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    op = "registration",
+                    error = %err,
+                    "studio registration rejected; the local API keeps serving; \
+                     reset the registration from the tray UI to ask again"
+                );
+                if !wait_for_registration_reset(control).await {
+                    return Ok(());
+                }
+                reset_registration(control)?;
+            }
+        }
+    }
+}
+
+/// Wait for a registration reset (`true`) or a stop (`false`).
+async fn wait_for_registration_reset(control: &crate::control::DaemonControl) -> bool {
+    loop {
+        if control.stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        if control.reset_requested.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+        tokio::time::sleep(REGISTRATION_RESET_POLL).await;
+    }
+}
+
+/// Clear the local registration state, as `register --reset` does.
+pub fn clear_registration(cfg: &mut Config) {
+    cfg.worker_id = None;
+    cfg.auth_token = None;
+    cfg.registration_request_id = None;
+    cfg.registration_secret = None;
+    cfg.install_id = None;
+}
+
+/// Clear and persist the registration state so the next tick asks the
+/// studio afresh.
+fn reset_registration(control: &crate::control::DaemonControl) -> Result<()> {
+    let snapshot = {
+        let mut cfg = control.cfg.lock();
+        clear_registration(&mut cfg);
+        cfg.clone()
+    };
+    config::save(&snapshot, &control.config_path)?;
+    *control.registration.lock() = crate::auto_register::RegistrationState::Pristine;
+    info!(
+        target: TRACE_TARGET,
+        op = "registration",
+        "registration reset; asking the studio again"
+    );
+    Ok(())
 }
 
 /// Flip the `stop` flag and emit a shutdown breadcrumb so an operator
@@ -748,7 +895,33 @@ pub const DEFAULT_LOCAL_API_PORT: u16 = 4787;
 /// file can't quietly move the API.  Pure so every branch is
 /// unit-testable.
 pub fn resolve_local_api_port(env_value: Option<&str>, cfg_port: Option<u16>) -> u16 {
-    let fallback = cfg_port.unwrap_or(DEFAULT_LOCAL_API_PORT);
+    resolve_port(
+        "STUDIO_WORKER_LOCAL_API_PORT",
+        env_value,
+        cfg_port,
+        DEFAULT_LOCAL_API_PORT,
+    )
+}
+
+/// The LAN stream listener's port: `STUDIO_WORKER_STREAM_PORT`, else the
+/// config's `stream_port`, else [`crate::stt_stream::server::DEFAULT_STREAM_PORT`].
+pub fn resolve_stream_port(env_value: Option<&str>, cfg_port: Option<u16>) -> u16 {
+    resolve_port(
+        "STUDIO_WORKER_STREAM_PORT",
+        env_value,
+        cfg_port,
+        crate::stt_stream::server::DEFAULT_STREAM_PORT,
+    )
+}
+
+/// Env beats config beats default; an invalid env value falls back, logged.
+fn resolve_port(
+    env_name: &str,
+    env_value: Option<&str>,
+    cfg_port: Option<u16>,
+    default: u16,
+) -> u16 {
+    let fallback = cfg_port.unwrap_or(default);
     match env_value {
         Some(raw) => match raw.parse::<u16>() {
             Ok(port) => port,
@@ -758,7 +931,7 @@ pub fn resolve_local_api_port(env_value: Option<&str>, cfg_port: Option<u16>) ->
                     op = "resolve_port",
                     invalid = raw,
                     fallback,
-                    "STUDIO_WORKER_LOCAL_API_PORT is not a valid port; falling back"
+                    "{env_name} is not a valid port; falling back"
                 );
                 fallback
             }
@@ -792,16 +965,53 @@ pub fn ensure_local_api_token(cfg: &SharedConfig, config_path: &std::path::Path)
     token
 }
 
+/// Bind the LAN streaming speech listener and serve it on its own thread.
+/// A failed bind is logged and leaves the port at 0, so stream-token
+/// requests answer `stream_listener_down` instead of pointing nowhere.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn spawn_stream_listener(
+    cfg: &SharedConfig,
+    services: &crate::local_api::ModelServices,
+    observers: &WorkerObservers,
+    stop: Arc<AtomicBool>,
+) {
+    let port = resolve_stream_port(
+        std::env::var("STUDIO_WORKER_STREAM_PORT").ok().as_deref(),
+        cfg.lock().stream_port,
+    );
+    let addr = format!("0.0.0.0:{port}");
+    match crate::stt_stream::server::StreamServer::bind(
+        &addr,
+        services.host.clone(),
+        services.tokens.clone(),
+        observers.clone(),
+    ) {
+        Ok(server) => {
+            let bound = server.local_addr().port();
+            services.stream_port.store(bound, Ordering::SeqCst);
+            tracing::info!(target: "studio_worker::stt_stream", addr = %server.local_addr(), "stream listener listening");
+            std::thread::spawn(move || server.serve(&stop));
+        }
+        Err(err) => tracing::warn!(
+            target: "studio_worker::stt_stream",
+            %addr,
+            error = %err,
+            "stream listener could not bind; streaming speech is unavailable"
+        ),
+    }
+}
+
 /// Build the engine + catalog and start the local image API server on a
 /// background thread. Returns the thread handle, or `None` when it could not
 /// start (logged, non-fatal — the studio session keeps running).
 pub fn spawn_local_api(
-    cfg: SharedConfig,
-    config_path: &std::path::Path,
+    control: &crate::control::DaemonControl,
     observers: WorkerObservers,
     gate: crate::job_gate::JobGate,
-    stop: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
+    let cfg = control.cfg.clone();
+    let config_path = control.config_path.as_path();
+    let stop = control.stop.clone();
     let engine: Arc<dyn crate::engine::Engine> = match crate::engine::build(&cfg.lock()) {
         Ok(engine) => engine.into(),
         Err(err) => {
@@ -830,6 +1040,16 @@ pub fn spawn_local_api(
     );
 
     let models_root = Some(cfg.lock().models_root.clone());
+    let host = crate::host::ModelHost::new(
+        catalog.clone(),
+        Arc::new(crate::loaders::Loaders::new(cfg.lock().models_root.clone())),
+        Arc::new(crate::admission::SystemProbe),
+        crate::residency::Residency::load_for_serving(crate::config::residency_path_for(
+            config_path,
+        )),
+    );
+    let services = crate::local_api::ModelServices::new(host.clone());
+    spawn_stream_listener(&cfg, &services, &observers, stop.clone());
     let api = crate::local_api::LocalApi::bind(
         &format!("127.0.0.1:{port}"),
         engine.clone(),
@@ -839,6 +1059,7 @@ pub fn spawn_local_api(
         token.clone(),
         gate.clone(),
         models_root.clone(),
+        services.clone(),
     )
     .or_else(|_| {
         crate::local_api::LocalApi::bind(
@@ -850,11 +1071,12 @@ pub fn spawn_local_api(
             token.clone(),
             gate.clone(),
             models_root,
+            services.clone(),
         )
     });
 
     let api = match api {
-        Ok(api) => api,
+        Ok(api) => api.with_control(control.clone()),
         Err(err) => {
             tracing::warn!(target: "studio_worker::local_api", error = %err, "local api: bind failed");
             return None;
@@ -868,6 +1090,9 @@ pub fn spawn_local_api(
         &observers,
         crate::engine::sd_provision::vulkan_runtime_status(),
     );
+
+    // Bring back the models the operator left loaded.
+    host.restore_residents();
 
     let url = api.url();
     *observers.local_api_url.lock() = Some(url.clone());
@@ -1154,7 +1379,9 @@ pub fn build_capabilities_with(
         vram_total_gb: vram,
         vram_threshold_gb: cfg.vram_threshold_gb,
         auto_enabled,
-        auto_start: cfg.auto_start,
+        // The tray UI always installs its login entry, so a build with the
+        // UI starts on its own; a headless build relies on the OS service.
+        auto_start: cfg!(feature = "ui"),
         supported_models,
         task_kinds,
         supported_models_per_kind,
@@ -1283,11 +1510,7 @@ pub fn push_log_with_observers(
         queue.push(entry.clone());
     }
     if let Some(o) = observers {
-        let mut ring = o.recent_logs.lock();
-        ring.push_back(entry);
-        while ring.len() > RECENT_LOGS_CAP {
-            ring.pop_front();
-        }
+        o.worker_log().push(entry);
     }
 }
 
@@ -1311,6 +1534,53 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::engine::SyntheticEngine;
+
+    fn push_messages(observers: &WorkerObservers, count: usize) {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        for i in 0..count {
+            push_log_with_observers(&logs, Some(observers), "info", "t", &format!("m{i}"), None);
+        }
+    }
+
+    #[test]
+    fn recent_logs_after_answers_only_newer_entries() {
+        let observers = WorkerObservers::default();
+        push_messages(&observers, 3);
+        let (all, newest) = recent_logs_after(&observers, 0);
+        assert_eq!((all.len(), newest), (3, 3));
+        let (newer, _) = recent_logs_after(&observers, 2);
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].message, "m2");
+        assert!(recent_logs_after(&observers, 3).0.is_empty());
+    }
+
+    #[test]
+    fn the_daemons_observers_share_the_global_worker_log() {
+        let a = WorkerObservers::with_global_worker_log();
+        let b = WorkerObservers::with_global_worker_log();
+        assert!(Arc::ptr_eq(&a.recent_logs, &b.recent_logs));
+        assert!(!Arc::ptr_eq(
+            &a.recent_logs,
+            &WorkerObservers::default().recent_logs
+        ));
+    }
+
+    #[test]
+    fn recent_logs_after_a_restart_answers_the_whole_ring() {
+        let observers = WorkerObservers::default();
+        push_messages(&observers, 2);
+        assert_eq!(recent_logs_after(&observers, 99).0.len(), 2);
+    }
+
+    #[test]
+    fn recent_logs_after_skips_entries_that_left_the_ring() {
+        let observers = WorkerObservers::default();
+        push_messages(&observers, RECENT_LOGS_CAP + 5);
+        let (all, newest) = recent_logs_after(&observers, 0);
+        assert_eq!(all.len(), RECENT_LOGS_CAP);
+        assert_eq!(all[0].message, "m5");
+        assert_eq!(newest, (RECENT_LOGS_CAP + 5) as u64);
+    }
 
     #[test]
     fn is_unsupported_kind_detects_typed_unsupported_task() {

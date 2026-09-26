@@ -625,6 +625,7 @@ async fn apply_with_errors_when_installer_asset_missing() {
 // ---------------------------------------------------------------------------
 
 /// sha256 of the b"#!/bin/sh\necho ok\n" body the checksum fakes write.
+#[cfg(not(target_os = "windows"))]
 const OK_BODY_SHA256: &str = "b4d644d4279594903f1a9911956432d9473041f2984fc6014c14d7402c7d126c";
 
 struct ChecksumRunner {

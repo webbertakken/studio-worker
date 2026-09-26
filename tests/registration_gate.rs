@@ -193,3 +193,131 @@ async fn passes_the_gate_when_the_studio_approves() {
     // The gate observed a non-shutdown stop flag throughout.
     assert!(!stop.load(Ordering::SeqCst));
 }
+
+// ---------------------------------------------------------------------------
+// `runtime::serve_studio` — a rejection keeps the daemon serving locally and
+// waits for a registration reset instead of ending the process.
+// ---------------------------------------------------------------------------
+
+fn control_for(cfg: Config, path: std::path::PathBuf) -> studio_worker::control::DaemonControl {
+    studio_worker::control::DaemonControl::new(config::shared(cfg), path, 0.0)
+}
+
+async fn wait_until(what: &str, check: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test]
+async fn a_rejection_waits_for_a_reset_then_asks_the_studio_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/graphics/api/workers/register-requests/rr-gate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "rejected",
+            "reason": "unknown host",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/register-request"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "rr-fresh",
+            "status": "pending",
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let cfg = polling_cfg(&server.uri());
+    let path = write_cfg(&dir, &cfg);
+    let control = control_for(cfg, path.clone());
+    let serving = tokio::spawn({
+        let control = control.clone();
+        async move {
+            runtime::serve_studio(
+                &control,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                runtime::WorkerObservers::default(),
+                runtime::LoopSchedule::fast_for_tests(),
+            )
+            .await
+        }
+    });
+
+    wait_until("the rejection", || {
+        matches!(
+            *control.registration.lock(),
+            RegistrationState::Rejected { .. }
+        )
+    })
+    .await;
+    assert!(
+        !serving.is_finished(),
+        "a rejection must not end the daemon"
+    );
+
+    control.request_registration_reset().unwrap();
+    wait_until("a fresh request", || {
+        control.cfg.lock().registration_request_id.as_deref() == Some("rr-fresh")
+    })
+    .await;
+    let (saved, _) = config::load(Some(&path.to_string_lossy())).unwrap();
+    assert_ne!(saved.install_id.as_deref(), Some("install-abc"));
+
+    control.shutdown();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("stops promptly")
+        .unwrap();
+    assert!(outcome.is_ok());
+}
+
+#[tokio::test]
+async fn a_stop_during_the_rejection_wait_ends_cleanly() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/graphics/api/workers/register-requests/rr-gate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "rejected",
+            "reason": "no",
+        })))
+        .mount(&server)
+        .await;
+    let dir = tempdir().unwrap();
+    let cfg = polling_cfg(&server.uri());
+    let path = write_cfg(&dir, &cfg);
+    let control = control_for(cfg, path);
+    let serving = tokio::spawn({
+        let control = control.clone();
+        async move {
+            runtime::serve_studio(
+                &control,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                runtime::WorkerObservers::default(),
+                runtime::LoopSchedule::fast_for_tests(),
+            )
+            .await
+        }
+    });
+    wait_until("the rejection", || {
+        matches!(
+            *control.registration.lock(),
+            RegistrationState::Rejected { .. }
+        )
+    })
+    .await;
+    control.shutdown();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("stops promptly")
+        .unwrap();
+    assert!(outcome.is_ok());
+}

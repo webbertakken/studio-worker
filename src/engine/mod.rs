@@ -97,7 +97,9 @@ impl EngineCapabilities {
 
 #[cfg(feature = "image-candle")]
 pub mod candle_image;
+pub mod chat_template;
 pub mod download;
+pub mod llm_core;
 // llama-cpp-2 doesn't link on Windows MSVC (see Cargo.toml), so the
 // `llama` feature is a no-op there even when enabled via `--features all`.
 #[cfg(all(feature = "llama", not(target_os = "windows")))]
@@ -109,8 +111,10 @@ pub mod llama_subprocess;
 pub mod multi;
 #[cfg(feature = "image-onnx")]
 pub mod onnx;
-#[cfg(feature = "image-onnx")]
+#[cfg(any(feature = "image-onnx", feature = "stt-stream"))]
 pub mod onnx_provision;
+#[cfg(feature = "stt-stream")]
+pub mod parakeet;
 pub mod sd_provision;
 pub mod sdcpp;
 #[cfg(feature = "tts")]

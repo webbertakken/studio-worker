@@ -19,6 +19,13 @@ top-level [`README.md`](../README.md).  For active plans, see
 
 ## Runtime
 
+- [Daemon and tray UI](runtime/daemon-and-tray.md) — the headless daemon hosts every
+  model and job; the always-on tray UI is its client over the local API: per-job logs,
+  thumbnails, model lifecycle, display wait.
+- [Model lifecycle](runtime/model-lifecycle.md) — loaded models, residency, admission.
+- [Local API](local-api.md) — loopback HTTP API: generation, catalogue, lifecycle,
+  daemon control.
+
 - [ModelSource](runtime/model-source.md) — studio-driven download
   spec attached to every Offer.  The contract that lets the worker
   serve any model the studio adds without a rebuild.
@@ -48,7 +55,9 @@ top-level [`README.md`](../README.md).  For active plans, see
 
 [Status](screenshots/status.png) ·
 [Jobs](screenshots/jobs.png) ·
+[Models](screenshots/models.png) ·
 [Config](screenshots/config.png) ·
 [Logs](screenshots/logs.png) ·
 [About](screenshots/about.png) ·
-[Status (unregistered / pre-approval)](screenshots/status-register.png)
+[Status (unregistered / pre-approval)](screenshots/status-register.png) ·
+[Daemon not reachable](screenshots/daemon-unreachable.png)

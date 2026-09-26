@@ -29,7 +29,6 @@ fn log_startup_banner_records_key_config_fields() {
     let cfg = Config {
         api_base_url: "https://studio.example.com".into(),
         vram_threshold_gb: 8.5,
-        auto_start: false,
         auto_update_enabled: true,
         auto_update_interval_secs: 900,
         models_root: PathBuf::from("/tmp/audit-models"),
@@ -61,10 +60,6 @@ fn log_startup_banner_records_key_config_fields() {
     assert!(
         logs.contains("vram_threshold_gb=8.5"),
         "expected vram_threshold_gb field: {logs}"
-    );
-    assert!(
-        logs.contains("auto_start=false"),
-        "expected auto_start field: {logs}"
     );
     assert!(
         logs.contains("auto_update_enabled=true"),

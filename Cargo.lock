@@ -693,7 +693,7 @@ dependencies = [
  "rayon",
  "safetensors",
  "thiserror 2.0.18",
- "tokenizers",
+ "tokenizers 0.22.2",
  "yoke",
  "zip 7.2.0",
 ]
@@ -1081,6 +1081,12 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "daachorse"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5614204febbc33cc07a2806aa6440b904ac012b68eecc37f4493ea4a76455a3d"
 
 [[package]]
 name = "darling"
@@ -1604,6 +1610,17 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
+]
+
+[[package]]
+name = "eyre"
+version = "0.6.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08309dbcc659c5549a24ddb9b27027640641b282ef5768267c7e675558986a3"
+dependencies = [
+ "autocfg",
+ "indenter",
+ "once_cell",
 ]
 
 [[package]]
@@ -2776,6 +2793,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "indenter"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "964de6e86d545b246d84badc0fef527924ace5134f30641c203ef52ba83f58d5"
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3098,9 +3121,9 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llama-cpp-2"
-version = "0.1.146"
+version = "0.1.157"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3b0f368c76cc0fe475e8257aeeec269e0d6569bd48b1f503efd0963fc3ee397"
+checksum = "6a5e80d283163beac602b70e99ab2d596e1f1c35aa3ed3422faa0ad990869ac8"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -3112,9 +3135,9 @@ dependencies = [
 
 [[package]]
 name = "llama-cpp-sys-2"
-version = "0.1.146"
+version = "0.1.157"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b291e4bc2d10c43cd8dec16d49b6104cb3cb125f596ec380a753a5db1d965dd"
+checksum = "cdd0b39fc874267312983364d48379179a7945ad9d4c068c176304ae1cdca1ec"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
@@ -3211,6 +3234,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "memo-map"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5449c8c750f1a07ea702bbd212bd999fceece9b3d1508b17023b3e174583124b"
+
+[[package]]
 name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3233,6 +3262,29 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "minijinja"
+version = "2.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
+dependencies = [
+ "memo-map",
+ "serde",
+ "serde_json",
+ "unicase",
+ "unicode-ident",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd3e5f077bc2379f0f7d911e7cfdd921114ed99fc884533dca502944cb355b11"
+dependencies = [
+ "minijinja",
+ "serde",
 ]
 
 [[package]]
@@ -3965,9 +4017,9 @@ dependencies = [
 
 [[package]]
 name = "ort"
-version = "2.0.0-rc.12"
+version = "2.0.0-rc.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7de3af33d24a745ffb8fab904b13478438d1cd52868e6f17735ef6e1f8bf133"
+checksum = "4336a1e2b38848325241c72889086886004e589b7c74f335e60a8e8db5138a0b"
 dependencies = [
  "libloading 0.9.0",
  "ndarray",
@@ -3978,9 +4030,9 @@ dependencies = [
 
 [[package]]
 name = "ort-sys"
-version = "2.0.0-rc.12"
+version = "2.0.0-rc.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7b497d21a8b6fbb4b5a544f8fadb77e801a09ae0add9e411d31c6f89e3c1e90"
+checksum = "cf211e3776eea6aec988552fa118dd746d70e1b1e5e244058d1c98015f3e5872"
 
 [[package]]
 name = "os_info"
@@ -4021,6 +4073,22 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "parakeet-rs"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f54545a861dca6b43c8d44e3dd932764ca196d84bcf0d1b48ea212b43b29666"
+dependencies = [
+ "eyre",
+ "hound",
+ "ndarray",
+ "ort",
+ "realfft",
+ "serde",
+ "serde_json",
+ "tokenizers 0.23.2",
 ]
 
 [[package]]
@@ -4221,6 +4289,15 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "primal-check"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc0d895b311e3af9902528fbb8f928688abbd95872819320517cc24ca6b2bd08"
+dependencies = [
+ "num-integer",
 ]
 
 [[package]]
@@ -4523,6 +4600,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "realfft"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f821338fddb99d089116342c46e9f1fbf3828dba077674613e734e01d6ea8677"
+dependencies = [
+ "rustfft",
+]
+
+[[package]]
 name = "reborrow"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4759,6 +4845,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustfft"
+version = "6.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21db5f9893e91f41798c88680037dba611ca6674703c1a18601b01a72c8adb89"
+dependencies = [
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "primal-check",
+ "strength_reduce",
+ "transpose",
 ]
 
 [[package]]
@@ -5363,6 +5463,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strength_reduce"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5396,8 +5502,11 @@ dependencies = [
  "ksni",
  "libloading 0.8.9",
  "llama-cpp-2",
+ "minijinja",
+ "minijinja-contrib",
  "notify-rust",
  "ort",
+ "parakeet-rs",
  "parking_lot",
  "reqwest 0.12.28",
  "rfd",
@@ -5412,13 +5521,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tiny_http",
- "tokenizers",
+ "tokenizers 0.22.2",
  "tokio",
  "tokio-tungstenite",
  "toml",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "tungstenite",
  "url",
  "whisper-rs",
  "whoami",
@@ -5707,6 +5817,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenizers"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
+dependencies = [
+ "ahash",
+ "compact_str",
+ "daachorse",
+ "dary_heap",
+ "derive_builder",
+ "esaxx-rs",
+ "getrandom 0.3.4",
+ "itertools 0.14.0",
+ "log",
+ "macro_rules_attribute",
+ "monostate",
+ "onig",
+ "paste",
+ "rand",
+ "rayon",
+ "rayon-cond",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "spm_precompiled",
+ "thiserror 2.0.18",
+ "unicode-normalization-alignments",
+ "unicode-segmentation",
+ "unicode_categories",
+]
+
+[[package]]
 name = "tokio"
 version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5953,6 +6096,16 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "transpose"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad61aed86bc3faea4300c7aee358b4c6d0c8d6ccc36524c96e4c92ccf26e77e"
+dependencies = [
+ "num-integer",
+ "strength_reduce",
 ]
 
 [[package]]

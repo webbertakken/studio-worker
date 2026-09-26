@@ -20,6 +20,11 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Render each model's own Jinja chat template (GGUF `tokenizer.chat_template`).
+# Real templates use macros, namespace() and loop controls: keep the defaults.
+# pycompat covers the Python string methods real templates call.
+minijinja = { version = "2", features = ["json", "loop_controls", "serde", "unicode"] }
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 toml = "0.8"
 # Tiny synchronous HTTP server for the always-on local image API
 # (127.0.0.1 only). Pure-Rust, no native deps.
@@ -79,6 +84,10 @@ libloading = "0.8"
 # windows-sys are already in the tree (tempfile / everything).
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Streaming ASR (Nemotron / Parakeet EOU) over the same load-dynamic ort.
+parakeet-rs = { version = "=0.3.8", optional = true, default-features = false, features = ["load-dynamic", "api-24"] }
+# LAN streaming speech listener (sync, thread per session, like the local API).
+tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
 # Direct rustls dep so we can call `crypto::ring::default_provider`.
 # rustls 0.23 stopped auto-picking a CryptoProvider from cargo
 # features; the first wss/https handshake panics without an explicit
@@ -167,7 +176,7 @@ winreg = "0.52"
 # the other modalities still work); Linux + macOS keep it.  The `llama`
 # feature's `dep:` edges below are simply inactive on Windows.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-llama-cpp-2 = { version = "0.1.124", optional = true, default-features = false }
+llama-cpp-2 = { version = "0.1.157", optional = true, default-features = false }
 encoding_rs = { version = "0.8", optional = true }
 
 [features]
@@ -178,8 +187,12 @@ encoding_rs = { version = "0.8", optional = true }
 # llama.cpp; bare boxes can use the prebuilt installer script, or
 # `--no-default-features` for the headless core. Conflicting engines
 # (whisper, image-candle) stay opt-in.
-default = ["ui", "llama", "video", "tts", "image-onnx"]
+default = ["ui", "llama", "video", "tts", "image-onnx", "stt-stream"]
 llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# In-process LLM on NVIDIA GPUs (all layers offloaded).  Needs the CUDA
+# toolkit (nvcc) at build time, so it is opt-in: CI and release builds
+# stay CPU-only.
+cuda = ["llama", "llama-cpp-2/cuda"]
 whisper = ["dep:whisper-rs"]
 image-candle = [
     "dep:candle-core",
@@ -189,9 +202,14 @@ image-candle = [
     "dep:hf-hub",
 ]
 # ONNX-runtime image engine.  Serves the LaMa object-removal model
-# (Carve/LaMa-ONNX) used by Find-the-Differences removals.  Single
-# self-contained binary (ort `download-binaries` links onnxruntime).
+# (Carve/LaMa-ONNX) used by Find-the-Differences removals.  ort runs in
+# load-dynamic mode: ONNX Runtime is provisioned at runtime
+# (engine/onnx_provision.rs), so the binary links nothing native.
 image-onnx = ["dep:ort", "dep:flate2", "dep:tar"]
+# Streaming speech-to-text (parakeet-rs: Nemotron streaming, Parakeet EOU)
+# on the shared, runtime-provisioned ONNX Runtime; CUDA when the host has a
+# complete CUDA runtime (see engine/onnx_provision.rs), CPU otherwise.
+stt-stream = ["dep:parakeet-rs", "dep:ort", "ort/cuda", "dep:flate2", "dep:tar"]
 video = ["dep:gif"]
 tts = []
 # Desktop UI — brings in egui / eframe / tray-icon / notify-rust.
@@ -214,7 +232,7 @@ all-engines-stt = ["whisper", "image-candle", "video", "tts"]
 # binary (llama in-process + candle image + media).  whisper is excluded
 # — it static-links a second ggml that clashes with llama's.  This is the
 # feature set the cargo-dist release binaries are built with.
-all = ["ui", "llama", "image-candle", "image-onnx", "video", "tts"]
+all = ["ui", "llama", "image-candle", "image-onnx", "stt-stream", "video", "tts"]
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -259,7 +277,7 @@ targets = [
 # is turnkey: UI (default) + in-process llama.cpp LLM + media engines.
 # whisper is excluded — it static-links a second ggml that clashes with
 # llama's; image stays sd-cli (subprocess) to avoid the same clash.
-features = ["llama", "video", "tts", "image-onnx"]
+features = ["llama", "video", "tts", "image-onnx", "stt-stream"]
 # PR checks run plan-only to catch issues early
 pr-run-mode = "plan"
 

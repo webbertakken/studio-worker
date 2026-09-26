@@ -1,4 +1,4 @@
-//! The five tabs the UI exposes.  Pure data + tiny enum impl so the
+//! The tabs the UI exposes.  Pure data + tiny enum impl so the
 //! contract is testable without egui in scope.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -6,18 +6,27 @@ pub enum Tab {
     #[default]
     Status,
     Jobs,
+    Models,
     Config,
     Logs,
     About,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Status, Tab::Jobs, Tab::Config, Tab::Logs, Tab::About];
+    pub const ALL: [Tab; 6] = [
+        Tab::Status,
+        Tab::Jobs,
+        Tab::Models,
+        Tab::Config,
+        Tab::Logs,
+        Tab::About,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Status => "Status",
             Tab::Jobs => "Jobs",
+            Tab::Models => "Models",
             Tab::Config => "Config",
             Tab::Logs => "Logs",
             Tab::About => "About",
@@ -31,6 +40,7 @@ impl Tab {
         match name.trim().to_ascii_lowercase().as_str() {
             "status" => Some(Self::Status),
             "jobs" => Some(Self::Jobs),
+            "models" => Some(Self::Models),
             "config" => Some(Self::Config),
             "logs" => Some(Self::Logs),
             "about" => Some(Self::About),
@@ -52,11 +62,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_returns_five_tabs_in_render_order() {
+    fn all_returns_every_tab_in_render_order() {
         let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
         assert_eq!(
             labels,
-            ["Status", "Jobs", "Config", "Logs", "About"],
+            ["Status", "Jobs", "Models", "Config", "Logs", "About"],
             "tab labels + order are part of the UI contract"
         );
     }

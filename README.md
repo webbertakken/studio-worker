@@ -65,17 +65,20 @@ drive your GPU via CSRF or DNS rebinding.
 
 Models come from a local catalog (`<config dir>/models.json`, seeded with
 Z-Image) that you can extend the same way the studio adds models. Local jobs
-show up in the desktop UI's **Local queue**. See
+show up in the tray UI's **Local queue**. See
 [`docs/local-api.md`](docs/local-api.md).
 
-## Desktop UI (on by default)
+## Tray UI (on by default)
 
-The worker ships a native desktop window built on `egui`/`eframe` that
-surfaces every config knob, the live job in flight, the recent-jobs
-history, the rolling log tail, and a system-tray icon with Open /
-Pause-Resume / Quit.  It is **on by default** — `cargo install
-studio-worker` gives you the windowed worker, and `studio-worker ui`
-launches it.
+The worker is two processes from one binary: the **daemon**
+(`studio-worker run`) hosts the studio session, the local API, the model
+host and every job; the **tray UI** (`studio-worker ui`) is a native
+`egui`/`eframe` window and system-tray icon that shows what the daemon
+does and sends your actions back over the local API.  The UI starts the
+daemon when none is running, starts itself at every login (always; there
+is no setting to turn that off), and waits for the display when the
+graphical session is not ready yet.  Design:
+[`docs/runtime/daemon-and-tray.md`](docs/runtime/daemon-and-tray.md).
 
 The UI build is free of GTK: the window uses `eframe`/`glow` (OpenGL via
 dlopen), notifications use `notify-rust` (pure-Rust zbus on Linux), and
@@ -88,32 +91,30 @@ sentry use rustls).  Headless rigs can still opt out:
 cargo install studio-worker --no-default-features   # service / `run` only
 ```
 
-Five tabs:
-
 | Tab     | What it shows                                                     |
 | ------- | ----------------------------------------------------------------- |
-| Status  | Worker id, API URL, VRAM total + threshold, busy / idle / paused badge, last heartbeat age + outcome.  When the worker isn't registered, an in-window Register form. |
-| Jobs    | Current job in flight (kind, model, prompt, elapsed time) + bounded ring of the last 50 finished jobs with completed / failed badges. |
-| Config  | Every `config.toml` field as an editable widget grouped into Connection / Worker / Engine / Auto-update / Models / Notifications / Background mode.  Save writes through `config::save` and the runtime picks up new values on the next tick.  Engine swaps surface a "restart required" banner. |
-| Logs    | Level filter (info / warn / error), free-text search across category / message / job id, auto-scroll toggle, windowed at the last 500 entries. |
-| About   | Version, Sentry release name, resolved config path, "Check for updates" button. |
+| Status  | Registration, studio connection, heartbeat, GPU runtime, busy / idle / paused badge, Pause / Resume; Reset registration after a rejection. |
+| Jobs    | Every running job (studio offers, local API jobs, chats on a loaded model, streaming speech sessions), the studio jobs and the local queue.  Image jobs show a thumbnail; selecting a job shows its log. |
+| Models  | Each catalogue model's lifecycle state, residency and memory estimate, with Load / Unload. |
+| Config  | The operator-editable settings; Save sends them to the daemon, which validates, saves and applies them. |
+| Logs    | Everything the daemon logs: level filter, free-text search, auto-scroll. |
+| About   | Tray UI and daemon versions, config path, "Check for updates". |
 
-![Status tab](docs/screenshots/status.png)
+![Jobs tab](docs/screenshots/jobs.png)
+
+A status line at the top always says whether the daemon answers.  While it
+does not, the tabs are replaced by a "daemon not reachable" view rather
+than stale data.
 
 The tray icon reflects state (idle = green, busy = amber,
 disconnected = red) and exposes:
 
 - **Open Window** — re-show the window after hide-to-tray.
-- **Pause / Resume claiming** — toggles `auto_enabled`, persisted to
-  `config.toml`.
-- **Quit** — signals the runtime loops to stop, awaits any in-flight
-  job briefly, then exits.
+- **Pause / Resume** — stop / resume claiming studio jobs (runtime-only).
+- **Quit** — stops the daemon (it lets an in-flight job finish briefly)
+  and closes the UI.
 
-Closing the window hides it to the tray; the worker keeps running.
-For an autostart-on-login workflow, tick the **Run in tray on login**
-toggle on the Config tab (writes `~/.config/autostart/studio-worker-ui.desktop`
-on Linux, a LaunchAgent plist on macOS, an `HKCU\…\Run` registry
-value on Windows).
+Closing the window hides it to the tray; the daemon keeps running.
 
 ### Build-time deps
 
@@ -185,26 +186,23 @@ the worker's next 30s poll picks up its `worker_id` + `auth_token`
 and starts heartbeating.  Two ways to launch:
 
 ```bash
-# Windowed (recommended) — Status tab shows 'Waiting for approval'
-# until the operator approves.
+# Tray UI (recommended) — starts the daemon for you; the Status tab shows
+# 'Waiting for approval' until the operator approves.
 studio-worker ui
 
-# Headless — same flow, no window; pipe to journalctl in production.
+# Headless — the daemon alone; pipe to journalctl in production.
 studio-worker run
 ```
 
 Optional pre-launch tweaks (none of these talk to the network):
 
 ```bash
-# Pre-set the human label shown in the dashboard's Pending Workers panel.
-studio-worker register --label "alice's gaming rig"
-
 # Point at a self-hosted studio instead of studio.minis.gg.
 studio-worker register --api-base-url https://my-studio.example.com
 
 # Optionally install the auto-start OS service (systemd --user on Linux,
-# launchd on macOS, scheduled task on Windows).  Alternative: the desktop
-# UI's Config tab has a `Run in tray on login` toggle.
+# launchd on macOS, scheduled task on Windows), for a daemon that runs
+# before anyone logs in.  The tray UI starts at login on its own.
 studio-worker install-service
 ```
 
@@ -219,14 +217,12 @@ studio-worker register --reset
 
 | Subcommand           | Purpose                                                         |
 | -------------------- | --------------------------------------------------------------- |
-| `run`                | Auto-register if needed, then hold the WS session + auto-update loop. |
-| `ui` (default)       | Same as `run` plus the desktop window + tray + notifications. Built unless installed with `--no-default-features`. |
-| `register`           | Persist `--label` / `--api-base-url`; `--reset` clears local state. |
+| `run`                | The daemon: local API + model host, auto-register if needed, then the WS session + auto-update loop.  One per config directory. |
+| `ui` (default)       | The tray UI, a client of the daemon (starts one if none runs). Built unless installed with `--no-default-features`. |
+| `register`           | Persist `--api-base-url`; `--reset` clears local state. |
 | `status`             | Print the local config + registration state.                    |
 | `install-service`    | Install the auto-start OS service.                              |
 | `uninstall-service`  | Remove the auto-start OS service.                               |
-| `enable`             | Set `auto_enabled = true` (resume claiming).                    |
-| `disable`            | Set `auto_enabled = false` (worker online but doesn't claim).   |
 | `set-threshold <gb>` | Set the max VRAM (GB) the worker is willing to claim per job.   |
 | `config`             | Print the resolved config + its on-disk path.                   |
 | `check-update`       | Check the release feed for a newer version (does not install).  |
@@ -243,7 +239,7 @@ api_base_url        = "https://studio.minis.gg"
 worker_id           = "<filled on operator approval>"
 auth_token          = "<filled on operator approval>"
 vram_threshold_gb   = 12.0                       # max GB per claim
-auto_start          = true
+start_minimised     = true                       # tray UI window starts minimised
 
 # Where on-demand model files are cached (defaults to ~/models).
 models_root         = "~/models"

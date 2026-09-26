@@ -13,8 +13,9 @@
 //! What lives here vs. what's stripped from the user-editable surface:
 //!
 //! * **Operator-facing**: `api_base_url`, `vram_threshold_gb`,
-//!   `auto_start`, `auto_update_*`, `models_root`.
-//!   These are exposed in the desktop UI's Config tab.
+//!   `start_minimised`, `auto_update_*`, `models_root`.
+//!   These are exposed in the tray UI's Config tab (through the daemon's
+//!   `PUT /daemon/config`).
 //! * **Internal state, persisted but not user-editable**: `worker_id`,
 //!   `auth_token`, `install_id`, `registration_request_id`,
 //!   `registration_secret`.  The auto-register flow owns them; the UI
@@ -48,8 +49,6 @@ pub struct Config {
     pub auth_token: Option<String>,
     /// VRAM threshold the worker reports as its max claim size, in GB.
     pub vram_threshold_gb: f32,
-    /// Whether to auto-launch the run loop at boot via the OS service.
-    pub auto_start: bool,
     /// Start the desktop UI minimised (taskbar only — not hidden, so
     /// the window stays reachable even when no tray host exists).
     /// Default `true`: a worker auto-started at login must not pop a
@@ -87,6 +86,10 @@ pub struct Config {
     /// `STUDIO_WORKER_LOCAL_API_PORT` env var overrides both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_api_port: Option<u16>,
+    /// Port of the LAN streaming speech listener (`0.0.0.0`).  `None` uses
+    /// the built-in default; `STUDIO_WORKER_STREAM_PORT` overrides both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_port: Option<u16>,
     /// Bearer token local API clients must present.  Generated once
     /// on first launch and persisted.  Internal — never surfaced in
     /// the UI and redacted from log events; local clients discover it
@@ -180,7 +183,6 @@ impl Default for Config {
             worker_id: None,
             auth_token: None,
             vram_threshold_gb: 12.0,
-            auto_start: true,
             start_minimised: default_start_minimised(),
             auto_update_enabled: default_auto_update_enabled(),
             auto_update_interval_secs: default_auto_update_interval(),
@@ -189,6 +191,7 @@ impl Default for Config {
             models_root: default_models_root(),
             ws_reconnect_attempts: None,
             local_api_port: None,
+            stream_port: None,
             local_api_token: None,
             install_id: None,
             registration_request_id: None,
@@ -210,6 +213,12 @@ fn default_config_path() -> Result<PathBuf> {
 /// real per-user state.
 pub fn catalog_path_for(config_path: &Path) -> Option<PathBuf> {
     config_path.parent().map(|dir| dir.join("models.json"))
+}
+
+/// Path to the model residency file (`residency.json`), next to the
+/// active config file, for the same isolation reason as [`catalog_path_for`].
+pub fn residency_path_for(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent().map(|dir| dir.join("residency.json"))
 }
 
 /// Path to the local API discovery file (`local-api.json`), next to
@@ -244,6 +253,16 @@ pub fn clamp_initial_threshold(default_threshold: f32, detected_vram: f32) -> f3
     }
 }
 
+/// Read the config at `path` without ever writing it: defaults when it is
+/// missing or unreadable.  For the tray UI, which reads a few window
+/// preferences before the daemon answers but never owns the file.
+pub fn peek(path: &Path) -> Config {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
     let path = resolve_path(override_path)?;
     if !path.exists() {
@@ -262,7 +281,6 @@ pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
             config_path = %path.display(),
             api_base_url = %cfg.api_base_url,
             vram_threshold_gb = cfg.vram_threshold_gb,
-            auto_start = cfg.auto_start,
             models_root = %cfg.models_root.display(),
             "config file missing — bootstrapped defaults"
         );
@@ -309,7 +327,6 @@ pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
         config_path = %path.display(),
         api_base_url = %cfg.api_base_url,
         vram_threshold_gb = cfg.vram_threshold_gb,
-        auto_start = cfg.auto_start,
         models_root = %cfg.models_root.display(),
         worker_id = cfg.worker_id.as_deref().unwrap_or("(unregistered)"),
         has_auth_token = cfg.auth_token.is_some(),
@@ -326,8 +343,7 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
                 op = "save",
                 config_path = %path.display(),
                 vram_threshold_gb = cfg.vram_threshold_gb,
-                auto_start = cfg.auto_start,
-                models_root = %cfg.models_root.display(),
+                    models_root = %cfg.models_root.display(),
                 bytes = bytes,
                 "persisted config to disk"
             );
@@ -401,6 +417,38 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Names of the operator-editable fields that differ between `a` and `b`,
+/// in declaration order.  Backs the tray UI's dirty-check and the daemon's
+/// config-update breadcrumb, so both agree on what the operator can change.
+pub fn changed_fields(a: &Config, b: &Config) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if a.api_base_url != b.api_base_url {
+        fields.push("api_base_url");
+    }
+    if (a.vram_threshold_gb - b.vram_threshold_gb).abs() >= f32::EPSILON {
+        fields.push("vram_threshold_gb");
+    }
+    if a.start_minimised != b.start_minimised {
+        fields.push("start_minimised");
+    }
+    if a.auto_update_enabled != b.auto_update_enabled {
+        fields.push("auto_update_enabled");
+    }
+    if a.auto_update_interval_secs != b.auto_update_interval_secs {
+        fields.push("auto_update_interval_secs");
+    }
+    if a.auto_update_feed != b.auto_update_feed {
+        fields.push("auto_update_feed");
+    }
+    if a.auto_update_prerelease != b.auto_update_prerelease {
+        fields.push("auto_update_prerelease");
+    }
+    if a.models_root != b.models_root {
+        fields.push("models_root");
+    }
+    fields
+}
+
 /// Wrap a Config in a mutex for use across the runtime.
 pub type SharedConfig = std::sync::Arc<Mutex<Config>>;
 
@@ -421,7 +469,6 @@ mod tests {
             r#"
             api_base_url = "https://studio.minis.gg/"
             vram_threshold_gb = 12.0
-            auto_start = true
             "#,
         )
         .unwrap();
@@ -429,10 +476,54 @@ mod tests {
     }
 
     #[test]
+    fn a_config_that_still_sets_auto_start_loads_and_drops_it_on_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "api_base_url = \"https://studio.minis.gg/\"\nvram_threshold_gb = 8.0\nauto_start = false\n",
+        )
+        .unwrap();
+        let (cfg, _) = load(Some(&path.to_string_lossy())).unwrap();
+        save(&cfg, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("auto_start"), "{text}");
+    }
+
+    #[test]
+    fn peek_reads_without_writing_and_falls_back_to_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(peek(&path).start_minimised);
+        assert!(!path.exists(), "peek never creates the file");
+        std::fs::write(
+            &path,
+            "api_base_url = \"https://x/\"\nvram_threshold_gb = 1.0\nstart_minimised = false\n",
+        )
+        .unwrap();
+        assert!(!peek(&path).start_minimised);
+        std::fs::write(&path, "not toml [").unwrap();
+        assert!(peek(&path).start_minimised);
+    }
+
+    #[test]
+    fn changed_fields_names_only_the_differing_editable_fields() {
+        let base = Config::default();
+        let mut edited = base.clone();
+        edited.vram_threshold_gb = base.vram_threshold_gb + 8.0;
+        edited.models_root = PathBuf::from("/tmp/other-models");
+        edited.worker_id = Some("not-editable".into());
+        assert_eq!(
+            changed_fields(&base, &edited),
+            vec!["vram_threshold_gb", "models_root"]
+        );
+        assert!(changed_fields(&base, &base).is_empty());
+    }
+
+    #[test]
     fn default_values_are_sensible() {
         let cfg = Config::default();
         assert_eq!(cfg.api_base_url, "https://studio.minis.gg/");
-        assert!(cfg.auto_start);
         assert!(
             cfg.start_minimised,
             "the UI must start minimised by default"
@@ -524,7 +615,6 @@ mod tests {
             r#"
             api_base_url = "https://studio.minis.gg/"
             vram_threshold_gb = 12.0
-            auto_start = true
             "#,
         )
         .unwrap();
@@ -583,6 +673,10 @@ mod tests {
             local_api_discovery_path_for(cfg),
             Some(PathBuf::from("/tmp/custom-dir/local-api.json"))
         );
+        assert_eq!(
+            residency_path_for(cfg),
+            Some(PathBuf::from("/tmp/custom-dir/residency.json"))
+        );
         // A parentless path yields None rather than a panic.
         assert_eq!(catalog_path_for(Path::new("/")), None);
     }
@@ -615,7 +709,6 @@ mod tests {
         let legacy = r#"
             api_base_url = "https://example.invalid"
             vram_threshold_gb = 8.0
-            auto_start = true
             engine = "multi"
             engines = ["llama", "synthetic"]
             auto_enabled = false
@@ -636,7 +729,6 @@ mod tests {
         let raw = r#"
             api_base_url = "https://x.invalid"
             vram_threshold_gb = 4.0
-            auto_start = true
             auto_update_enabled = false
             auto_update_interval_secs = 1
             auto_update_feed = "https://x.invalid"

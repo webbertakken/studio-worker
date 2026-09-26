@@ -39,9 +39,12 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::catalog::{Catalog, CatalogModel};
 use crate::engine::Engine;
+use crate::host::{HostError, ModelHost, ModelStatus};
 use crate::job_gate::JobGate;
-use crate::local::{run_image, run_kind, LocalError, LocalImageRequest};
+use crate::lifecycle::ModelState;
+use crate::local::{chat_on_lane, run_image, run_kind, LocalError, LocalImageRequest};
 use crate::runtime::{JobOutcome, WorkerObservers};
+use crate::stt_stream::tokens::StreamTokens;
 use crate::types::{
     AudioSttParams, AudioTtsParams, ChatMessage, LlmParams, Task, TaskKind, TaskResult, VideoParams,
 };
@@ -149,7 +152,45 @@ pub struct LocalApi {
     /// Root the engine downloads models into.  Reported (with its free
     /// space) on `/healthz` so a stuck first-use download is visible.
     models_root: Option<PathBuf>,
+    /// The model host and streaming tokens.
+    services: ModelServices,
+    /// The daemon's runtime handles, for the `/daemon/*` routes.  `None`
+    /// answers them `503 daemon_control_unavailable`.
+    control: Option<crate::control::DaemonControl>,
 }
+
+/// What the local API offers besides one-off jobs: the model host, and the
+/// tokens that open streaming sessions on the LAN listener.
+#[derive(Clone)]
+pub struct ModelServices {
+    pub host: ModelHost,
+    pub tokens: Arc<StreamTokens>,
+    /// Port of the running LAN stream listener; 0 while it is not listening.
+    pub stream_port: Arc<std::sync::atomic::AtomicU16>,
+}
+
+impl ModelServices {
+    pub fn new(host: ModelHost) -> Self {
+        Self {
+            host,
+            tokens: Arc::new(StreamTokens::default()),
+            stream_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamTokenBody {
+    model: String,
+    #[serde(default)]
+    ttl_secs: Option<i64>,
+}
+
+/// A stream token lives this long unless the request says otherwise.
+/// The holder (Runa) refreshes well before expiry.  Safe range: within
+/// the token store's clamp (30 s..=1 h).
+const DEFAULT_STREAM_TOKEN_TTL_SECS: i64 = 600;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,6 +226,9 @@ struct ChatBody {
     top_p: Option<f32>,
     #[serde(default)]
     stop: Option<Vec<String>>,
+    /// llama-server compatible template switches (e.g. `enable_thinking`).
+    #[serde(default)]
+    chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +296,7 @@ impl LocalApi {
         token: String,
         gate: JobGate,
         models_root: Option<PathBuf>,
+        services: ModelServices,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !token.is_empty(),
@@ -273,7 +318,15 @@ impl LocalApi {
             token,
             gate,
             models_root,
+            services,
+            control: None,
         })
+    }
+
+    /// Serve the `/daemon/*` routes with `control`.
+    pub fn with_control(mut self, control: crate::control::DaemonControl) -> Self {
+        self.control = Some(control);
+        self
     }
 
     /// The bound socket address.
@@ -297,7 +350,9 @@ impl LocalApi {
     /// `std::thread::scope` lets the workers borrow `&self` + `stop`
     /// without an `Arc`, so the public signature is unchanged.
     pub fn serve(&self, stop: &AtomicBool) {
-        const WORKERS: usize = 4;
+        // Long generations each hold a thread while the tray UI polls once a
+        // second; eight keeps the cheap routes answering alongside them.
+        const WORKERS: usize = 8;
         std::thread::scope(|scope| {
             for _ in 0..WORKERS {
                 scope.spawn(|| {
@@ -380,6 +435,30 @@ impl LocalApi {
             (Method::Get, "/models") => self.handle_list_models(request),
             (Method::Post, "/models") => self.handle_add_model(request),
             (Method::Get, "/jobs") => self.handle_jobs(request),
+            (Method::Post, "/stream-tokens") => self.handle_stream_token(request),
+            (_, p) if p.starts_with("/daemon/") => self.handle_daemon(request, &method, &url),
+            (Method::Get, p) if job_route(p, "/log").is_some() => {
+                let id = job_route(p, "/log").unwrap_or_default().to_string();
+                self.handle_job_log(request, &id)
+            }
+            (Method::Get, p) if job_route(p, "/thumbnail").is_some() => {
+                let id = job_route(p, "/thumbnail").unwrap_or_default().to_string();
+                self.handle_job_thumbnail(request, &id)
+            }
+            (Method::Get, p) if lifecycle_route(p, "/state").is_some() => {
+                let id = lifecycle_route(p, "/state").unwrap_or_default().to_string();
+                self.respond_lifecycle(request, self.services.host.status(&id), 200)
+            }
+            (Method::Post, p) if lifecycle_route(p, "/load").is_some() => {
+                let id = lifecycle_route(p, "/load").unwrap_or_default().to_string();
+                self.respond_lifecycle(request, self.services.host.load(&id), 202)
+            }
+            (Method::Post, p) if lifecycle_route(p, "/unload").is_some() => {
+                let id = lifecycle_route(p, "/unload")
+                    .unwrap_or_default()
+                    .to_string();
+                self.respond_lifecycle(request, self.services.host.unload(&id), 202)
+            }
             (Method::Delete, p) if p.starts_with("/models/") => {
                 let id = p.trim_start_matches("/models/").to_string();
                 self.handle_delete_model(request, &id)
@@ -505,13 +584,25 @@ impl LocalApi {
             temperature: parsed.temperature.unwrap_or(0.7),
             top_p: parsed.top_p,
             stop: parsed.stop,
+            chat_template_kwargs: parsed.chat_template_kwargs,
             ..Default::default()
         };
+        let catalog = self.catalog.lock().clone();
+        // A loaded model answers on its own lane, outside the job gate.
+        if let Some(result) = chat_on_lane(
+            &self.services.host,
+            &catalog,
+            &self.observers,
+            parsed.model.as_deref(),
+            &prompt_preview,
+            params.clone(),
+        ) {
+            return respond_llm(request, result);
+        }
         let Some(_reservation) = self.gate.try_reserve() else {
             return respond_busy(request);
         };
-        let catalog = self.catalog.lock().clone();
-        match run_kind(
+        let outcome = run_kind(
             self.engine.as_ref(),
             &catalog,
             &self.observers,
@@ -519,14 +610,8 @@ impl LocalApi {
             parsed.model.as_deref(),
             &prompt_preview,
             Task::Llm(params),
-        ) {
-            Ok(TaskResult::Llm { json }) => match serde_json::to_vec(&json) {
-                Ok(bytes) => respond(request, 200, "application/json", &bytes),
-                Err(e) => respond(request, 500, "text/plain", e.to_string().as_bytes()),
-            },
-            Ok(_) => respond(request, 500, "text/plain", b"unexpected non-llm result"),
-            Err(err) => respond_local_err(request, err),
-        }
+        );
+        respond_llm(request, outcome)
     }
 
     fn handle_tts(&self, mut request: Request) -> std::io::Result<()> {
@@ -671,8 +756,28 @@ impl LocalApi {
     }
 
     fn handle_list_models(&self, request: Request) -> std::io::Result<()> {
-        let catalog = self.catalog.lock();
-        match serde_json::to_vec(&catalog.models) {
+        let models = self.catalog.lock().models.clone();
+        let statuses = self.services.host.statuses();
+        let listed: Vec<serde_json::Value> = models
+            .iter()
+            .map(|model| {
+                let mut value = serde_json::to_value(model).unwrap_or_default();
+                if let (Some(obj), Some(status)) = (
+                    value.as_object_mut(),
+                    statuses.iter().find(|s| s.id == model.id),
+                ) {
+                    obj.insert("state".into(), status.state.name().into());
+                    obj.insert("resident".into(), status.resident.into());
+                    obj.insert("since".into(), status.since.to_rfc3339().into());
+                    obj.insert("loadable".into(), self.services.host.can_load(model).into());
+                    if let ModelState::Failed { reason } = &status.state {
+                        obj.insert("error".into(), reason.clone().into());
+                    }
+                }
+                value
+            })
+            .collect();
+        match serde_json::to_vec(&listed) {
             Ok(body) => respond(request, 200, "application/json", &body),
             Err(err) => respond(request, 500, "text/plain", err.to_string().as_bytes()),
         }
@@ -706,6 +811,16 @@ impl LocalApi {
     }
 
     fn handle_delete_model(&self, request: Request, id: &str) -> std::io::Result<()> {
+        // Free the weights and drop the residency before the entry goes.
+        if let Err(err) = self.services.host.unload(id) {
+            if !matches!(err, HostError::UnknownModel(_)) {
+                return respond_json(
+                    request,
+                    500,
+                    &serde_json::json!({ "error": "unload_failed", "message": err.to_string() }),
+                );
+            }
+        }
         let (existed, saved) = {
             let mut catalog = self.catalog.lock();
             let existed = catalog.remove(id);
@@ -718,6 +833,128 @@ impl LocalApi {
             Ok(()) => respond(request, 200, "application/json", b"{\"ok\":true}"),
             Err(err) => respond(request, 500, "text/plain", err.to_string().as_bytes()),
         }
+    }
+
+    /// Answer a lifecycle call: the model's status, or a named error.
+    /// `pending_status` is used while the model is still transitioning.
+    fn respond_lifecycle(
+        &self,
+        request: Request,
+        outcome: Result<ModelStatus, HostError>,
+        pending_status: u16,
+    ) -> std::io::Result<()> {
+        match outcome {
+            Ok(status) => {
+                let code = match status.state {
+                    ModelState::Loading | ModelState::Unloading => pending_status,
+                    _ => 200,
+                };
+                respond_json(request, code, &status_json(&status))
+            }
+            Err(err) => {
+                let (code, body) = match &err {
+                    HostError::UnknownModel(_) => {
+                        (404, serde_json::json!({ "error": "unknown_model" }))
+                    }
+                    HostError::Disabled(_) => {
+                        (400, serde_json::json!({ "error": "model_disabled" }))
+                    }
+                    HostError::Refused(r) => (
+                        409,
+                        serde_json::json!({
+                            "error": "insufficient_memory",
+                            "neededGib": r.needed_gib,
+                            "freeGib": r.free_gib,
+                            "marginGib": r.margin_gib,
+                        }),
+                    ),
+                    HostError::NotLoaded { state, .. } => (
+                        409,
+                        serde_json::json!({ "error": "model_not_loaded", "state": state }),
+                    ),
+                    HostError::Persist(_) => {
+                        (500, serde_json::json!({ "error": "residency_not_saved" }))
+                    }
+                    HostError::LaneBusy(_) => (409, serde_json::json!({ "error": "model_busy" })),
+                };
+                let mut body = body;
+                body["message"] = err.to_string().into();
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    op = "lifecycle",
+                    status = code,
+                    error = %err,
+                    "lifecycle request refused"
+                );
+                respond_json(request, code, &body)
+            }
+        }
+    }
+
+    /// Mint a short-lived token that opens one streaming model on the LAN
+    /// listener (\`ws://<host>:<port>/transcribe?token=...\`).
+    fn handle_stream_token(&self, mut request: Request) -> std::io::Result<()> {
+        let body = match read_body(&mut request)? {
+            BodyOutcome::Ok(body) => body,
+            BodyOutcome::TooLarge => return respond_too_large(request),
+        };
+        let parsed: StreamTokenBody = match serde_json::from_str(&body) {
+            Ok(p) => p,
+            Err(err) => {
+                return respond_json(
+                    request,
+                    400,
+                    &serde_json::json!({ "error": "bad_request", "message": err.to_string() }),
+                )
+            }
+        };
+        let model = self.catalog.lock().get(&parsed.model).cloned();
+        let Some(model) = model else {
+            return respond_json(
+                request,
+                404,
+                &serde_json::json!({ "error": "unknown_model" }),
+            );
+        };
+        if model.source.engine != crate::types::ModelEngine::Parakeet {
+            return respond_json(
+                request,
+                400,
+                &serde_json::json!({ "error": "not_a_stream_model" }),
+            );
+        }
+        let port = self.services.stream_port.load(Ordering::SeqCst);
+        if port == 0 {
+            return respond_json(
+                request,
+                503,
+                &serde_json::json!({ "error": "stream_listener_down" }),
+            );
+        }
+        let ttl =
+            chrono::Duration::seconds(parsed.ttl_secs.unwrap_or(DEFAULT_STREAM_TOKEN_TTL_SECS));
+        let grant = self
+            .services
+            .tokens
+            .mint(&model.id, ttl, chrono::Utc::now());
+        tracing::info!(
+            target: TRACE_TARGET,
+            op = "stream_token",
+            model = %model.id,
+            expires_at = %grant.expires_at,
+            "stream token minted"
+        );
+        respond_json(
+            request,
+            200,
+            &serde_json::json!({
+                "token": grant.token,
+                "model": grant.model,
+                "expiresAt": grant.expires_at.to_rfc3339(),
+                "port": port,
+                "path": crate::stt_stream::server::STREAM_PATH,
+            }),
+        )
     }
 
     fn handle_jobs(&self, request: Request) -> std::io::Result<()> {
@@ -746,6 +983,91 @@ impl LocalApi {
         match serde_json::to_vec(&jobs) {
             Ok(body) => respond(request, 200, "application/json", &body),
             Err(err) => respond(request, 500, "text/plain", err.to_string().as_bytes()),
+        }
+    }
+
+    /// `/daemon/*`: what the tray UI sees and does.
+    fn handle_daemon(
+        &self,
+        mut request: Request,
+        method: &Method,
+        url: &str,
+    ) -> std::io::Result<()> {
+        let Some(control) = &self.control else {
+            return respond_json(
+                request,
+                503,
+                &serde_json::json!({ "error": "daemon_control_unavailable" }),
+            );
+        };
+        let path = url.split('?').next().unwrap_or("/");
+        match (method, path) {
+            (Method::Get, "/daemon/status") => {
+                let status = control.status(&self.observers, self.gate.is_busy());
+                respond_serialised(request, 200, &status)
+            }
+            (Method::Get, "/daemon/logs") => {
+                let after = query_param(url, "after")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let (entries, seq) = crate::runtime::recent_logs_after(&self.observers, after);
+                respond_serialised(request, 200, &crate::daemon_api::LogsPage { entries, seq })
+            }
+            (Method::Post, "/daemon/pause") => {
+                let paused = control.set_paused(true);
+                respond_json(request, 200, &serde_json::json!({ "paused": paused }))
+            }
+            (Method::Post, "/daemon/resume") => {
+                let paused = control.set_paused(false);
+                respond_json(request, 200, &serde_json::json!({ "paused": paused }))
+            }
+            (Method::Get, "/daemon/config") => {
+                respond_serialised(request, 200, &control.editable_config())
+            }
+            (Method::Put, "/daemon/config") => {
+                let body = match read_body(&mut request)? {
+                    BodyOutcome::Ok(body) => body,
+                    BodyOutcome::TooLarge => return respond_too_large(request),
+                };
+                let edit: crate::daemon_api::EditableConfig = match serde_json::from_str(&body) {
+                    Ok(edit) => edit,
+                    Err(err) => {
+                        return respond_error(request, 400, "bad_request", &err.to_string())
+                    }
+                };
+                match control.update_config(edit) {
+                    Ok(saved) => respond_serialised(request, 200, &saved),
+                    Err(err @ crate::control::ControlError::Invalid(_)) => {
+                        respond_error(request, 400, "invalid_config", &err.to_string())
+                    }
+                    Err(err) => respond_error(request, 500, "config_not_saved", &err.to_string()),
+                }
+            }
+            (Method::Post, "/daemon/registration/reset") => {
+                match control.request_registration_reset() {
+                    Ok(()) => respond_json(request, 202, &serde_json::json!({ "ok": true })),
+                    Err(err) => respond_error(request, 409, "not_rejected", &err.to_string()),
+                }
+            }
+            (Method::Post, "/daemon/shutdown") => {
+                control.shutdown();
+                respond_json(request, 202, &serde_json::json!({ "ok": true }))
+            }
+            _ => respond_error(request, 404, "not_found", "no such daemon route"),
+        }
+    }
+
+    fn handle_job_log(&self, request: Request, id: &str) -> std::io::Result<()> {
+        match crate::job_log::global().get(id) {
+            Some(log) => respond_serialised(request, 200, &log),
+            None => respond_error(request, 404, "unknown_job", "no log captured for that job"),
+        }
+    }
+
+    fn handle_job_thumbnail(&self, request: Request, id: &str) -> std::io::Result<()> {
+        match self.observers.thumbnails.get(id) {
+            Some(png) => respond(request, 200, "image/png", &png),
+            None => respond_error(request, 404, "no_thumbnail", "no thumbnail for that job"),
         }
     }
 
@@ -872,6 +1194,78 @@ fn respond_local_err(request: Request, err: LocalError) -> std::io::Result<()> {
     respond(request, status, "text/plain", err.to_string().as_bytes())
 }
 
+fn respond_llm(request: Request, outcome: Result<TaskResult, LocalError>) -> std::io::Result<()> {
+    match outcome {
+        Ok(TaskResult::Llm { json }) => match serde_json::to_vec(&json) {
+            Ok(bytes) => respond(request, 200, "application/json", &bytes),
+            Err(e) => respond(request, 500, "text/plain", e.to_string().as_bytes()),
+        },
+        Ok(_) => respond(request, 500, "text/plain", b"unexpected non-llm result"),
+        Err(err) => respond_local_err(request, err),
+    }
+}
+
+/// `/models/<id><suffix>` -> `Some(id)` for a non-empty id without slashes.
+fn lifecycle_route<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let id = path.strip_prefix("/models/")?.strip_suffix(suffix)?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// `/jobs/<id><suffix>` -> `Some(id)` for a non-empty id without slashes.
+fn job_route<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let id = path.strip_prefix("/jobs/")?.strip_suffix(suffix)?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// The value of query parameter `name` in `url`, if present.
+fn query_param<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+    url.split_once('?')?
+        .1
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// The wire shape of a model's status.
+fn status_json(status: &ModelStatus) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "id": status.id,
+        "state": status.state.name(),
+        "resident": status.resident,
+        "since": status.since.to_rfc3339(),
+    });
+    if let ModelState::Failed { reason } = &status.state {
+        body["error"] = reason.clone().into();
+    }
+    body
+}
+
+fn respond_serialised<T: serde::Serialize>(
+    request: Request,
+    status: u16,
+    body: &T,
+) -> std::io::Result<()> {
+    match serde_json::to_vec(body) {
+        Ok(bytes) => respond(request, status, "application/json", &bytes),
+        Err(err) => respond(request, 500, "text/plain", err.to_string().as_bytes()),
+    }
+}
+
+fn respond_error(request: Request, status: u16, code: &str, message: &str) -> std::io::Result<()> {
+    respond_serialised(
+        request,
+        status,
+        &crate::daemon_api::ErrorBody {
+            error: code.to_string(),
+            message: Some(message.to_string()),
+        },
+    )
+}
+
+fn respond_json(request: Request, status: u16, body: &serde_json::Value) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    respond(request, status, "application/json", &bytes)
+}
+
 fn respond(request: Request, status: u16, content_type: &str, body: &[u8]) -> std::io::Result<()> {
     let header = Header::from_bytes(b"Content-Type".as_slice(), content_type.as_bytes())
         .expect("static content-type header is valid");
@@ -927,6 +1321,7 @@ mod tests {
                 synthetic_model_of("stt", TaskKind::AudioStt),
                 synthetic_model_of("vid", TaskKind::Video),
             ],
+            ..Default::default()
         }
     }
 
@@ -950,6 +1345,7 @@ mod tests {
             },
             enabled: true,
             origin: "local".into(),
+            exclusive_group: None,
         }
     }
 
@@ -958,6 +1354,8 @@ mod tests {
     struct Harness {
         url: String,
         observers: WorkerObservers,
+        host: crate::host::ModelHost,
+        services: ModelServices,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
@@ -968,17 +1366,38 @@ mod tests {
         }
 
         fn start_with_gate(catalog: Catalog, gate: JobGate) -> Self {
+            Self::start_full(catalog, gate, 20.0)
+        }
+
+        /// Start with a device reporting `free_gib` of free memory.
+        fn start_with_free(catalog: Catalog, free_gib: f32) -> Self {
+            Self::start_full(catalog, JobGate::new(), free_gib)
+        }
+
+        fn start_full(catalog: Catalog, gate: JobGate, free_gib: f32) -> Self {
             let engine: Arc<dyn Engine> = Arc::new(SyntheticEngine::new());
             let observers = WorkerObservers::default();
+            let catalog = Arc::new(Mutex::new(catalog));
+            let host = crate::host::ModelHost::new(
+                catalog.clone(),
+                Arc::new(crate::test_support::InstantRuntime),
+                Arc::new(crate::test_support::FixedProbe(free_gib)),
+                crate::residency::Residency::load_for_serving(None),
+            );
+            let services = ModelServices::new(host.clone());
+            services
+                .stream_port
+                .store(4798, std::sync::atomic::Ordering::SeqCst);
             let api = LocalApi::bind(
                 "127.0.0.1:0",
                 engine,
-                Arc::new(Mutex::new(catalog)),
+                catalog,
                 None,
                 observers.clone(),
                 TEST_TOKEN.to_string(),
                 gate.clone(),
                 None,
+                services.clone(),
             )
             .unwrap();
             let url = api.url();
@@ -988,6 +1407,8 @@ mod tests {
             Harness {
                 url,
                 observers,
+                host,
+                services,
                 stop,
                 handle: Some(handle),
             }
@@ -1017,9 +1438,19 @@ mod tests {
         }
     }
 
+    fn test_host(catalog: &Arc<Mutex<Catalog>>) -> crate::host::ModelHost {
+        crate::host::ModelHost::new(
+            catalog.clone(),
+            Arc::new(crate::test_support::InstantRuntime),
+            Arc::new(crate::test_support::FixedProbe(20.0)),
+            crate::residency::Residency::load_for_serving(None),
+        )
+    }
+
     fn seeded_catalog() -> Catalog {
         Catalog {
             models: vec![synthetic_model("synthetic-img")],
+            ..Default::default()
         }
     }
 
@@ -1057,6 +1488,298 @@ mod tests {
         let h = Harness::start(seeded_catalog());
         let body = h.get("/models").send().unwrap().text().unwrap();
         assert!(body.contains("synthetic-img"));
+    }
+
+    fn json(res: reqwest::blocking::Response) -> (u16, serde_json::Value) {
+        let status = res.status().as_u16();
+        (status, res.json().unwrap())
+    }
+
+    fn wait_state(h: &Harness, id: &str, want: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (status, body) = json(h.get(&format!("/models/{id}/state")).send().unwrap());
+            assert_eq!(status, 200, "{body}");
+            if body["state"] == want {
+                return body;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never reached {want}: {body}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn get_models_carries_state_and_residency() {
+        let h = Harness::start(seeded_catalog());
+        let (status, body) = json(h.get("/models").send().unwrap());
+        assert_eq!(status, 200);
+        let first = &body.as_array().unwrap()[0];
+        assert_eq!(first["state"], "unloaded");
+        assert_eq!(first["resident"], false);
+        assert!(first["id"].is_string(), "catalogue fields stay: {first}");
+    }
+
+    #[test]
+    fn load_reaches_loaded_and_marks_resident() {
+        let h = Harness::start(seeded_catalog());
+        let (status, body) = json(h.post("/models/synthetic-img/load").send().unwrap());
+        assert!(status == 202 || status == 200, "{status} {body}");
+        assert_eq!(body["id"], "synthetic-img");
+        assert_eq!(body["resident"], true);
+        let body = wait_state(&h, "synthetic-img", "loaded");
+        assert!(body["since"].is_string());
+        let (status, _) = json(h.post("/models/synthetic-img/load").send().unwrap());
+        assert_eq!(status, 200, "loading a loaded model is a no-op");
+    }
+
+    #[test]
+    fn unload_frees_and_clears_residency() {
+        let h = Harness::start(seeded_catalog());
+        h.post("/models/synthetic-img/load").send().unwrap();
+        wait_state(&h, "synthetic-img", "loaded");
+        let (status, body) = json(h.post("/models/synthetic-img/unload").send().unwrap());
+        assert!(status == 202 || status == 200, "{status} {body}");
+        assert_eq!(body["resident"], false);
+        wait_state(&h, "synthetic-img", "unloaded");
+        let (status, _) = json(h.post("/models/synthetic-img/unload").send().unwrap());
+        assert_eq!(status, 200, "unloading an unloaded model is a no-op");
+    }
+
+    #[test]
+    fn a_load_that_does_not_fit_is_a_409_with_the_numbers() {
+        let mut catalog = seeded_catalog();
+        catalog.models[0].vram_gb_estimate = 8.0;
+        let h = Harness::start_with_free(catalog, 4.0);
+        let (status, body) = json(h.post("/models/synthetic-img/load").send().unwrap());
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"], "insufficient_memory");
+        assert_eq!(body["neededGib"], 8.0);
+        assert_eq!(body["freeGib"], 4.0);
+        assert!(body["marginGib"].is_number());
+        wait_state(&h, "synthetic-img", "unloaded");
+    }
+
+    #[test]
+    fn unknown_models_are_404_on_every_lifecycle_route() {
+        let h = Harness::start(seeded_catalog());
+        for res in [
+            h.get("/models/nope/state").send().unwrap(),
+            h.post("/models/nope/load").send().unwrap(),
+            h.post("/models/nope/unload").send().unwrap(),
+        ] {
+            let (status, body) = json(res);
+            assert_eq!(status, 404);
+            assert_eq!(body["error"], "unknown_model");
+        }
+    }
+
+    #[test]
+    fn a_disabled_model_cannot_be_loaded() {
+        let mut catalog = seeded_catalog();
+        catalog.models[0].enabled = false;
+        let h = Harness::start(catalog);
+        let (status, body) = json(h.post("/models/synthetic-img/load").send().unwrap());
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "model_disabled");
+    }
+
+    #[test]
+    fn lifecycle_routes_need_the_token() {
+        let h = Harness::start(seeded_catalog());
+        let res = reqwest::blocking::Client::new()
+            .post(format!("{}/models/synthetic-img/load", h.url))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 401);
+        wait_state(&h, "synthetic-img", "unloaded");
+    }
+
+    #[test]
+    fn deleting_a_loaded_model_unloads_it_first() {
+        let h = Harness::start(seeded_catalog());
+        h.post("/models/synthetic-img/load").send().unwrap();
+        wait_state(&h, "synthetic-img", "loaded");
+        let res = reqwest::blocking::Client::new()
+            .delete(format!("{}/models/synthetic-img", h.url))
+            .bearer_auth(TEST_TOKEN)
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let unloaded = h.host.wait_for(
+            "synthetic-img",
+            |s| *s == crate::lifecycle::ModelState::Unloaded,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(unloaded.is_some(), "weights freed after delete");
+        assert_eq!(h.host.loaded_gib(), 0.0);
+    }
+
+    fn llm_catalog() -> Catalog {
+        Catalog {
+            models: vec![synthetic_model_of("chat-llm", TaskKind::Llm)],
+            ..Default::default()
+        }
+    }
+
+    fn chat(h: &Harness, body: serde_json::Value) -> (u16, serde_json::Value) {
+        json(h.post("/v1/chat/completions").json(&body).send().unwrap())
+    }
+
+    #[test]
+    fn chat_is_served_on_the_lane_of_a_loaded_model() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let (status, body) = chat(
+            &h,
+            serde_json::json!({ "model": "chat-llm", "messages": [{ "role": "user", "content": "hi" }] }),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "resident:hi");
+    }
+
+    #[test]
+    fn chat_uses_the_default_llm_when_it_is_loaded() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let (_, body) = chat(
+            &h,
+            serde_json::json!({ "messages": [{ "role": "user", "content": "yo" }] }),
+        );
+        assert_eq!(body["choices"][0]["message"]["content"], "resident:yo");
+    }
+
+    #[test]
+    fn chat_template_kwargs_reach_the_model() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let (_, body) = chat(
+            &h,
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "chat_template_kwargs": { "enable_thinking": false },
+            }),
+        );
+        assert_eq!(
+            body["kwargs"],
+            serde_json::json!({ "enable_thinking": false })
+        );
+    }
+
+    #[test]
+    fn chat_on_an_unloaded_model_runs_as_a_transient_job() {
+        let h = Harness::start(llm_catalog());
+        let (status, body) = chat(
+            &h,
+            serde_json::json!({ "model": "chat-llm", "messages": [{ "role": "user", "content": "hi" }] }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(!content.starts_with("resident:"), "{content}");
+    }
+
+    #[test]
+    fn a_resident_chat_is_recorded_as_a_local_job_and_skips_the_job_gate() {
+        let gate = JobGate::new();
+        let h = Harness::start_with_gate(llm_catalog(), gate.clone());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let _held = gate.try_reserve().expect("a transient job holds the gate");
+        let (status, _) = chat(
+            &h,
+            serde_json::json!({ "model": "chat-llm", "messages": [{ "role": "user", "content": "lane" }] }),
+        );
+        assert_eq!(status, 200, "a loaded model serves on its own lane");
+        let jobs = h.observers.local_jobs.lock().clone();
+        let last = jobs.front().expect("recorded");
+        assert_eq!(last.model, "chat-llm");
+        assert_eq!(last.prompt, "lane");
+    }
+
+    fn stream_catalog() -> Catalog {
+        let mut stt = synthetic_model_of("stt-a", TaskKind::AudioStt);
+        stt.source.engine = crate::types::ModelEngine::Parakeet;
+        Catalog {
+            models: vec![stt, synthetic_model_of("chat-llm", TaskKind::Llm)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stream_tokens_are_minted_for_streaming_models() {
+        let h = Harness::start(stream_catalog());
+        let (status, body) = json(
+            h.post("/stream-tokens")
+                .json(&serde_json::json!({ "model": "stt-a", "ttlSecs": 600 }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 200, "{body}");
+        let token = body["token"].as_str().unwrap();
+        assert_eq!(token.len(), 64);
+        assert_eq!(body["model"], "stt-a");
+        assert_eq!(body["port"], 4798);
+        assert_eq!(body["path"], "/transcribe");
+        assert!(body["expiresAt"].is_string());
+        assert_eq!(
+            h.services.tokens.check(token, chrono::Utc::now()),
+            Ok("stt-a".to_string()),
+            "the listener accepts it"
+        );
+    }
+
+    #[test]
+    fn stream_tokens_are_refused_for_other_models() {
+        let h = Harness::start(stream_catalog());
+        let (status, body) = json(
+            h.post("/stream-tokens")
+                .json(&serde_json::json!({ "model": "chat-llm" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "not_a_stream_model");
+        let (status, body) = json(
+            h.post("/stream-tokens")
+                .json(&serde_json::json!({ "model": "nope" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 404);
+        assert_eq!(body["error"], "unknown_model");
+    }
+
+    #[test]
+    fn stream_tokens_need_a_running_listener() {
+        let mut h = Harness::start(stream_catalog());
+        h.services
+            .stream_port
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = json(
+            h.post("/stream-tokens")
+                .json(&serde_json::json!({ "model": "stt-a" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 503);
+        assert_eq!(body["error"], "stream_listener_down");
+        let _ = &mut h;
+    }
+
+    #[test]
+    fn stream_tokens_need_the_install_token() {
+        let h = Harness::start(stream_catalog());
+        let res = reqwest::blocking::Client::new()
+            .post(format!("{}/stream-tokens", h.url))
+            .json(&serde_json::json!({ "model": "stt-a" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 401);
     }
 
     #[test]
@@ -1306,6 +2029,67 @@ mod tests {
     }
 
     #[test]
+    fn daemon_routes_need_daemon_control() {
+        let h = Harness::start(multi_kind_catalog());
+        let resp = h.get("/daemon/status").send().unwrap();
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["error"], "daemon_control_unavailable");
+    }
+
+    #[test]
+    fn daemon_routes_need_the_token() {
+        let h = Harness::start(multi_kind_catalog());
+        let resp = reqwest::blocking::Client::new()
+            .get(format!("{}/daemon/status", h.url))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[test]
+    fn an_unknown_daemon_route_is_not_found() {
+        let daemon = crate::test_support::DaemonHarness::start();
+        let resp = reqwest::blocking::Client::new()
+            .get(format!("{}/daemon/nope", daemon.url))
+            .bearer_auth(crate::test_support::HARNESS_TOKEN)
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[test]
+    fn a_malformed_config_body_is_a_bad_request() {
+        let daemon = crate::test_support::DaemonHarness::start();
+        let resp = reqwest::blocking::Client::new()
+            .put(format!("{}/daemon/config", daemon.url))
+            .bearer_auth(crate::test_support::HARNESS_TOKEN)
+            .body("{")
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[test]
+    fn the_models_listing_carries_since_and_the_failure() {
+        let daemon = crate::test_support::DaemonHarness::start();
+        let models = daemon.client().models().unwrap();
+        assert!(models.iter().all(|m| m.since.is_some() && m.loadable));
+        assert!(models.iter().all(|m| m.error.is_none()));
+    }
+
+    #[test]
+    fn job_routes_and_query_params_parse() {
+        assert_eq!(job_route("/jobs/local-1/log", "/log"), Some("local-1"));
+        assert_eq!(job_route("/jobs//log", "/log"), None);
+        assert_eq!(job_route("/jobs/a/b/log", "/log"), None);
+        assert_eq!(query_param("/daemon/logs?after=12", "after"), Some("12"));
+        assert_eq!(query_param("/daemon/logs?x=1&after=3", "after"), Some("3"));
+        assert_eq!(query_param("/daemon/logs?afterx=3", "after"), None);
+        assert_eq!(query_param("/daemon/logs", "after"), None);
+    }
+
+    #[test]
     fn healthz_needs_no_token() {
         let h = Harness::start(seeded_catalog());
         let res = reqwest::blocking::get(format!("{}/healthz", h.url)).unwrap();
@@ -1323,15 +2107,17 @@ mod tests {
             delay: std::time::Duration::from_millis(400),
         });
         let observers = WorkerObservers::default();
+        let catalog = Arc::new(Mutex::new(seeded_catalog()));
         let api = LocalApi::bind(
             "127.0.0.1:0",
             engine,
-            Arc::new(Mutex::new(seeded_catalog())),
+            catalog.clone(),
             None,
             observers,
             TEST_TOKEN.to_string(),
             JobGate::new(),
             None,
+            ModelServices::new(test_host(&catalog)),
         )
         .unwrap();
         let url = api.url();
@@ -1437,15 +2223,17 @@ mod tests {
     #[test]
     fn bind_refuses_an_empty_token() {
         let engine: Arc<dyn Engine> = Arc::new(SyntheticEngine::new());
+        let catalog = Arc::new(Mutex::new(seeded_catalog()));
         let err = LocalApi::bind(
             "127.0.0.1:0",
             engine,
-            Arc::new(Mutex::new(seeded_catalog())),
+            catalog.clone(),
             None,
             WorkerObservers::default(),
             String::new(),
             JobGate::new(),
             None,
+            ModelServices::new(test_host(&catalog)),
         )
         .err()
         .expect("empty token must be refused")

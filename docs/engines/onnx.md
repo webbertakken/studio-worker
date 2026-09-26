@@ -48,6 +48,25 @@ downloads the `.onnx` (role `model`) on demand like any other.
 | windows-arm64 | `onnxruntime-win-arm64-<ver>.zip` | ✅ |
 | macOS-Intel | — (none published upstream) | binary builds; onnx jobs error clearly |
 
+### Flavour: CPU or CUDA
+
+A process loads one ONNX Runtime library, shared by every ONNX engine (LaMa
+image removal, streaming speech-to-text).  `ensure_runtime` picks the flavour
+once:
+
+1. `STUDIO_WORKER_ORT_FLAVOUR=cpu|cuda12|cuda13` pins it;
+2. else, on x64 Linux, a complete CUDA runtime in `ldconfig -p` (cudart,
+   cuBLAS, cuBLASLt of one major, cuRAND 10, cuDNN 9) selects the matching GPU
+   build, preferring CUDA 13;
+3. else the CPU build.
+
+GPU builds (`onnxruntime-{linux,win}-x64-gpu[_cuda13]-<ver>`) are cached under
+`<models_root>/onnxruntime/<flavour>/` with their `providers_shared` and
+`providers_cuda` libraries beside the main one; they include the CPU provider.
+Engines register CUDA with `error_on_failure`: a CUDA session that cannot load
+fails the model load instead of running on the CPU unnoticed.  An
+operator-set `ORT_DYLIB_PATH` is used as-is (CPU unless the flavour is pinned).
+
 Bumping ONNX Runtime: change `ORT_VERSION` in `onnx_provision.rs` to a version
 whose `ORT_API_VERSION` is ≥ the `api-NN` feature on the `ort` dependency.
 

@@ -73,25 +73,22 @@ pub fn autostart_command(exe: &Path) -> String {
     format!("\"{}\" ui", exe.display())
 }
 
-/// What a launch-time autostart sync should do.
+/// What keeping the login entry current takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutostartSync {
-    Enable,
-    Disable,
-    Noop,
+pub enum EnsureAction {
+    /// The entry is missing or points elsewhere: (re)write it.
+    Write,
+    /// The entry already says exactly what it should.
+    AlreadyCurrent,
 }
 
-/// Decide how to reconcile the on-login autostart artefact with the
-/// configured `auto_start`, given whether it is `currently_enabled`.
-/// Keeping this pure means the UI's launch-time sync is unit-tested
-/// without touching the registry / filesystem: enable when the operator
-/// wants autostart but it isn't set up, disable when they turned it off
-/// but a stale entry lingers, otherwise leave it alone.
-pub fn launch_sync_action(auto_start: bool, currently_enabled: bool) -> AutostartSync {
-    match (auto_start, currently_enabled) {
-        (true, false) => AutostartSync::Enable,
-        (false, true) => AutostartSync::Disable,
-        _ => AutostartSync::Noop,
+/// Decide whether the login entry needs writing, given what it holds now
+/// (`None` when absent) and what it should hold.  The tray UI is always
+/// started at login, so there is no "disabled" outcome.
+pub fn ensure_action(existing: Option<&str>, wanted: &str) -> EnsureAction {
+    match existing {
+        Some(current) if current == wanted => EnsureAction::AlreadyCurrent,
+        _ => EnsureAction::Write,
     }
 }
 
@@ -106,6 +103,13 @@ pub fn launch_sync_action(auto_start: bool, currently_enabled: bool) -> Autostar
 // they forward to is the unit-tested `*_at` seams plus `autostart_path`.
 // Exclude them from the coverage number rather than leave permanent
 // misses for code the measured build cannot exercise.
+
+/// Make sure the tray UI starts at login from `exe`: write the entry when
+/// it is missing or points at another executable.  Logs the outcome.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn ensure(exe: &Path) -> Result<()> {
+    backend::ensure(exe)
+}
 
 /// Whether autostart-on-login is currently enabled.
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -155,6 +159,29 @@ mod backend {
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn disable() -> Result<()> {
         disable_at(&autostart_path()?)
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub fn ensure(exe: &Path) -> Result<()> {
+        ensure_at(&autostart_path()?, exe)
+    }
+
+    /// Write the entry at `path` unless it already holds what `exe` needs.
+    pub(super) fn ensure_at(path: &Path, exe: &Path) -> Result<()> {
+        let wanted = render_artefact(exe);
+        let existing = std::fs::read_to_string(path).ok();
+        match super::ensure_action(existing.as_deref(), &wanted) {
+            super::EnsureAction::AlreadyCurrent => {
+                info!(
+                    target: TRACE_TARGET,
+                    op = "ensure",
+                    path = %path.display(),
+                    "autostart-on-login already current"
+                );
+                Ok(())
+            }
+            super::EnsureAction::Write => write_entry(path, &wanted),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -265,6 +292,37 @@ mod backend {
         use super::*;
         use crate::test_support::capture;
         use tempfile::tempdir;
+
+        #[test]
+        fn ensure_at_writes_a_missing_or_stale_entry_and_leaves_a_current_one() {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("autostart").join("entry");
+            let exe = Path::new("/opt/new/studio-worker");
+
+            let logs = capture({
+                let path = path.clone();
+                move || ensure_at(&path, Path::new("/opt/new/studio-worker")).unwrap()
+            });
+            assert!(logs.contains("autostart-on-login enabled"), "{logs}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                render_artefact(exe)
+            );
+
+            let logs = capture({
+                let path = path.clone();
+                move || ensure_at(&path, Path::new("/opt/new/studio-worker")).unwrap()
+            });
+            assert!(logs.contains("op=\"ensure\""), "{logs}");
+            assert!(logs.contains("already current"), "{logs}");
+
+            std::fs::write(&path, render_artefact(Path::new("/old/studio-worker"))).unwrap();
+            ensure_at(&path, exe).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                render_artefact(exe)
+            );
+        }
 
         #[test]
         fn write_entry_creates_file_and_emits_enable_event() {
@@ -466,6 +524,27 @@ mod backend {
             .is_ok()
     }
 
+    pub fn ensure(exe: &Path) -> Result<()> {
+        let wanted = autostart_command(exe);
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let existing = hkcu
+            .open_subkey(RUN_KEY)
+            .and_then(|k| k.get_value::<String, _>(ENTRY_NAME))
+            .ok();
+        match super::ensure_action(existing.as_deref(), &wanted) {
+            super::EnsureAction::AlreadyCurrent => {
+                info!(
+                    target: TRACE_TARGET,
+                    op = "ensure",
+                    value = ENTRY_NAME,
+                    "autostart-on-login already current (HKCU Run)"
+                );
+                Ok(())
+            }
+            super::EnsureAction::Write => enable(exe),
+        }
+    }
+
     pub fn enable(exe: &Path) -> Result<()> {
         let command = autostart_command(exe);
         let result = (|| -> std::io::Result<()> {
@@ -608,10 +687,9 @@ mod tests {
     }
 
     #[test]
-    fn launch_sync_action_covers_every_combination() {
-        assert_eq!(launch_sync_action(true, false), AutostartSync::Enable);
-        assert_eq!(launch_sync_action(false, true), AutostartSync::Disable);
-        assert_eq!(launch_sync_action(true, true), AutostartSync::Noop);
-        assert_eq!(launch_sync_action(false, false), AutostartSync::Noop);
+    fn ensure_action_writes_unless_the_entry_is_current() {
+        assert_eq!(ensure_action(None, "x"), EnsureAction::Write);
+        assert_eq!(ensure_action(Some("old"), "x"), EnsureAction::Write);
+        assert_eq!(ensure_action(Some("x"), "x"), EnsureAction::AlreadyCurrent);
     }
 }

@@ -155,15 +155,18 @@ pub fn check_disk_space(available: u64, approx_bytes: u64, filename: &str) -> Re
 }
 
 /// IO half of the preflight: probe the free space under `dir` and run
-/// [`check_disk_space`].  A file with no (or zero) declared size, or a
-/// failed probe (exotic filesystems), skips the check — the preflight
-/// is an early-warning gate, not a correctness gate; the length +
-/// sha256 verification after the stream stays authoritative.
+/// [`check_disk_space`].  A `dir` that does not exist yet (a model's
+/// first download) is measured at its nearest existing ancestor, the
+/// filesystem it will be created on.  A file with no (or zero) declared
+/// size, or a failed probe (exotic filesystems), skips the check — the
+/// preflight is an early-warning gate, not a correctness gate; the
+/// length + sha256 verification after the stream stays authoritative.
 pub fn preflight_disk_space(dir: &Path, filename: &str, approx_bytes: Option<u64>) -> Result<()> {
     let Some(needed) = approx_bytes.filter(|b| *b > 0) else {
         return Ok(());
     };
-    match fs4::available_space(dir) {
+    let probed = dir.ancestors().find(|p| p.exists()).unwrap_or(dir);
+    match fs4::available_space(probed) {
         Ok(available) => check_disk_space(available, needed, filename),
         Err(e) => {
             warn!(
@@ -815,6 +818,17 @@ mod tests {
         preflight_disk_space(dir.path(), "m.gguf", Some(1024)).unwrap();
         // An absurd size fails against real free space.
         assert!(preflight_disk_space(dir.path(), "m.gguf", Some(u64::MAX / 2)).is_err());
+    }
+
+    #[test]
+    fn preflight_checks_a_directory_that_does_not_exist_yet() {
+        // First use of a model: its download dir is created later, so the
+        // probe must measure the filesystem it will land on, not skip.
+        let dir = tempdir().unwrap();
+        let fresh = dir.path().join("llm").join("new-model");
+        assert!(preflight_disk_space(&fresh, "m.gguf", Some(u64::MAX / 2)).is_err());
+        preflight_disk_space(&fresh, "m.gguf", Some(1024)).unwrap();
+        assert!(!fresh.exists(), "the probe creates nothing");
     }
 
     // -----------------------------------------------------------------

@@ -39,16 +39,16 @@ clone (it's an `Arc`).
 The flag is **runtime-only** by design.  No persistence to
 `config.toml`; no resurrection across restarts; a service-managed
 worker that gets restarted by systemd comes back unpaused.  The
-operator can re-pause from the UI or by `studio-worker pause`
-(future — not yet a CLI subcommand).
+operator can re-pause from the tray UI (or `POST /daemon/pause`).
 
 ## Where the flag flips
 
 | Surface | Mechanism |
 |---|---|
-| **UI Status tab** | Pause / Resume button.  `paused_flag.fetch_xor(true, SeqCst)`.  See [`src/ui/tabs/status.rs`](../../src/ui/tabs/status.rs). |
-| **Tray menu** | The "Pause" / "Resume" item (label flips based on current state).  Same `fetch_xor`. |
-| **Programmatic** | Any holder of the `Arc<AtomicBool>` can flip it; the WS session reads via `paused.load(Ordering::SeqCst)`. |
+| **Local API** | `POST /daemon/pause` / `POST /daemon/resume` → `DaemonControl::set_paused` (logs `op="control"`).  See [`src/control.rs`](../../src/control.rs). |
+| **Tray UI Status tab** | Pause / Resume button; sends the route above.  See [`src/ui/tabs/status.rs`](../../src/ui/tabs/status.rs). |
+| **Tray menu** | The "Pause" / "Resume" item (label follows the daemon's state); sends the same route. |
+| **Programmatic** | Any holder of the daemon's `Arc<AtomicBool>` can flip it; the WS session reads via `paused.load(Ordering::SeqCst)`. |
 
 ## Where the flag is read
 
@@ -56,7 +56,7 @@ operator can re-pause from the UI or by `studio-worker pause`
 |---|---|
 | `build_capabilities_with` | Emits `auto_enabled: !paused` in every Hello / Heartbeat |
 | `handle_offer` | Early-rejects new offers when `paused.load() == true` |
-| UI Status tab | Renders the **PAUSED** badge + button label.  See `StatusView::Registered.paused`. |
+| `GET /daemon/status` | `paused`; the tray UI renders the **PAUSED** badge + button label from it.  See `StatusView::Registered.paused`. |
 | Tray icon | Currently does **not** change variant based on pause (the variant is `idle / busy / disconnected` keyed off busy + last_heartbeat).  Future: add a paused variant. |
 
 ## Why not a config-persisted toggle
@@ -70,6 +70,6 @@ The persisted `auto_enabled` field had two problems:
    back willing to take work.  A persisted `auto_enabled=false`
    silently kept the worker idle indefinitely.
 
-Runtime-only flag fixes both.  If you want persistent pause across
-restarts, install the worker without auto-start (`auto_start =
-false` in config), so the service won't relaunch on boot.
+Runtime-only flag fixes both.  There is no persistent pause: a worker that
+should not claim studio jobs at all is left unregistered (the local API and
+model host serve without a studio).
