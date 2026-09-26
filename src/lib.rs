@@ -24,6 +24,7 @@ pub mod lifecycle;
 pub mod local;
 pub mod local_api;
 pub mod net;
+pub mod residency;
 pub mod runtime;
 pub mod secrets;
 pub mod service;

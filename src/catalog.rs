@@ -222,7 +222,7 @@ impl Catalog {
 
 /// Where a corrupt catalog gets parked: `<name>.corrupt-<unix-ts>`,
 /// beside the original so the operator can recover their edits.
-fn quarantine_path(path: &Path) -> PathBuf {
+pub(crate) fn quarantine_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
