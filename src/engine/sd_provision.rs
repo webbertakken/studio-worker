@@ -49,6 +49,63 @@ fn needs_provision(binary_present: bool, marker: Option<&str>, wanted_url: &str)
     !binary_present || marker.map(str::trim) != Some(wanted_url)
 }
 
+/// Shortest sha prefix treated as identifying a commit.
+const MIN_SHA_LEN: usize = 7;
+
+/// The commit an `sd-cli --version` output reports
+/// (`stable-diffusion.cpp version <v>, commit <sha>`), if any.
+pub fn reported_commit(version_output: &str) -> Option<&str> {
+    let (_, rest) = version_output.rsplit_once("commit ")?;
+    let sha = rest.split_whitespace().next()?;
+    (!sha.is_empty() && sha.chars().all(|c| c.is_ascii_hexdigit())).then_some(sha)
+}
+
+/// Whether a found binary's `reported` commit serves the `pinned` one.
+/// Short shas match by prefix either way.  An unknown pin (a full URL
+/// override) trusts whatever is installed; a binary that reports no
+/// commit never matches a known pin.
+pub fn matches_pin(reported: Option<&str>, pinned: Option<&str>) -> bool {
+    let Some(pinned) = pinned else { return true };
+    let Some(reported) = reported else {
+        return false;
+    };
+    let shared = reported.len().min(pinned.len());
+    shared >= MIN_SHA_LEN && reported[..shared].eq_ignore_ascii_case(&pinned[..shared])
+}
+
+/// The commit the pin names, or `None` when a full URL override makes
+/// it unknown.  Pure over the tag and override.
+pub fn pinned_commit_for(tag: &str, url_override: Option<&str>) -> Option<String> {
+    if url_override.is_some_and(|url| !url.trim().is_empty()) {
+        return None;
+    }
+    sha_from_tag(tag).ok().map(str::to_string)
+}
+
+/// The commit of the release this worker would provision (env-aware).
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn pinned_commit() -> Option<String> {
+    pinned_commit_for(&release_tag(), std::env::var(URL_ENV).ok().as_deref())
+}
+
+/// Run `<sd_cli> --version` and return the commit it reports.  Excluded
+/// from coverage: spawns a host binary.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn probe_commit(sd_cli: &Path) -> Option<String> {
+    let mut command = std::process::Command::new(sd_cli);
+    command.arg("--version");
+    if let Some((var, dir)) = library_path_env(sd_cli) {
+        command.env(var, dir);
+    }
+    let output = command.output().ok()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    reported_commit(&text).map(str::to_string)
+}
+
 /// Env override for the release tag.
 const RELEASE_ENV: &str = "STUDIO_WORKER_SDCPP_RELEASE";
 /// Env override for the full zip URL (tests / air-gapped mirrors).
@@ -536,6 +593,48 @@ fn now_nanos() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_commit_reads_the_commit_from_version_output() {
+        assert_eq!(
+            reported_commit("stable-diffusion.cpp version master-920-2f88688, commit 2f88688\n"),
+            Some("2f88688")
+        );
+        assert_eq!(
+            reported_commit("stable-diffusion.cpp version unknown, commit 29ab511"),
+            Some("29ab511")
+        );
+        assert_eq!(reported_commit("usage: sd-cli [options]"), None);
+        assert_eq!(reported_commit("commit "), None);
+    }
+
+    #[test]
+    fn matches_pin_compares_short_shas_and_trusts_an_unknown_pin() {
+        assert!(matches_pin(Some("2f88688"), Some("2f88688")));
+        assert!(matches_pin(Some("2f886881a2b3"), Some("2f88688")));
+        assert!(matches_pin(Some("2f88688"), Some("2f886881a2b3")));
+        assert!(!matches_pin(Some("29ab511"), Some("2f88688")));
+        // A binary that does not report a commit cannot be trusted to serve the pin.
+        assert!(!matches_pin(None, Some("2f88688")));
+        // A full URL override leaves the pinned commit unknown: accept what is installed.
+        assert!(matches_pin(Some("29ab511"), None));
+        assert!(matches_pin(None, None));
+        // Too-short fragments never match by accident.
+        assert!(!matches_pin(Some("2f"), Some("2f88688")));
+    }
+
+    #[test]
+    fn pinned_commit_follows_the_release_tag() {
+        assert_eq!(
+            pinned_commit_for("master-920-2f88688", None),
+            Some("2f88688".to_string())
+        );
+        assert_eq!(
+            pinned_commit_for("master-920-2f88688", Some("https://mirror/sd.zip")),
+            None
+        );
+        assert_eq!(pinned_commit_for("master", None), None);
+    }
 
     #[test]
     fn needs_provision_when_missing_unmarked_or_from_another_release() {

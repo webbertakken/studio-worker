@@ -93,12 +93,13 @@ impl SdCppEngine {
     }
 
     /// Resolve the `sd-cli` binary, provisioning it on first use.
-    /// Resolution order (operator installs win): a cached path from a
-    /// previous job, then the env override, then the provisioner's own
+    /// Resolution order: a cached path from a previous job, then the env
+    /// override (warned about when off-pin), then the provisioner's own
     /// `<models_root>/bin` slot (re-provisioned when its release marker
-    /// no longer matches the pin), then `~/.local/bin` / `$PATH`, then
-    /// a fresh auto-provisioned download into `<models_root>/bin/`.  The
-    /// result is cached for the worker's lifetime.
+    /// no longer matches the pin), then `~/.local/bin` / `$PATH` when its
+    /// `--version` reports the pinned commit (else the pinned build is
+    /// provisioned), then a fresh download into `<models_root>/bin/`.
+    /// The result is cached for the worker's lifetime.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn ensure_sd_cli(&self) -> Result<PathBuf> {
         let mut guard = self.sd_cli.lock();
@@ -111,8 +112,21 @@ impl SdCppEngine {
             .models_root
             .join("bin")
             .join(sd_provision::binary_name());
+        let pinned = sd_provision::pinned_commit();
         let resolved = match env_sd_cli() {
             Some(p) => {
+                // The explicit override is honoured even off-pin, but never silently.
+                let found = sd_provision::probe_commit(&p);
+                if !sd_provision::matches_pin(found.as_deref(), pinned.as_deref()) {
+                    warn!(
+                        target: TRACE_TARGET,
+                        op = "resolve",
+                        sd_cli = %p.display(),
+                        found = found.as_deref().unwrap_or("unknown"),
+                        pinned = pinned.as_deref().unwrap_or("unknown"),
+                        "STUDIO_WORKER_SD_CLI is not the pinned stable-diffusion.cpp commit; newer models may fail"
+                    );
+                }
                 info!(target: TRACE_TARGET, op = "resolve", sd_cli = %p.display(), source = "env", "using existing sd-cli");
                 p
             }
@@ -131,13 +145,39 @@ impl SdCppEngine {
             },
             None => match implicit_sd_cli() {
                 Some(p) => {
-                    info!(
-                        target: TRACE_TARGET,
-                        op = "resolve",
-                        sd_cli = %p.display(),
-                        "using existing sd-cli"
-                    );
-                    p
+                    let found = sd_provision::probe_commit(&p);
+                    if sd_provision::matches_pin(found.as_deref(), pinned.as_deref()) {
+                        info!(
+                            target: TRACE_TARGET,
+                            op = "resolve",
+                            sd_cli = %p.display(),
+                            commit = found.as_deref().unwrap_or("unknown"),
+                            "using existing sd-cli (pinned commit)"
+                        );
+                        p
+                    } else {
+                        warn!(
+                            target: TRACE_TARGET,
+                            op = "resolve",
+                            sd_cli = %p.display(),
+                            found = found.as_deref().unwrap_or("unknown"),
+                            pinned = pinned.as_deref().unwrap_or("unknown"),
+                            "installed sd-cli is not the pinned commit; provisioning the pinned build"
+                        );
+                        match sd_provision::provision(&self.models_root) {
+                            Ok(provisioned) => provisioned,
+                            Err(e) => {
+                                warn!(
+                                    target: TRACE_TARGET,
+                                    op = "resolve",
+                                    sd_cli = %p.display(),
+                                    error = %e,
+                                    "could not provision the pinned sd-cli; falling back to the installed one"
+                                );
+                                p
+                            }
+                        }
+                    }
                 }
                 None => sd_provision::provision(&self.models_root)
                     .context("auto-provisioning sd-cli (stable-diffusion.cpp)")?,
