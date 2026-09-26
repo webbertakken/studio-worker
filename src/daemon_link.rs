@@ -30,6 +30,11 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// exits at once.
 pub const SPAWN_BACKOFF: Duration = Duration::from_secs(10);
 
+/// How long no daemon must be running before the UI starts one.  Longer
+/// than a supervisor's restart gap (PM2 and systemd restart within about a
+/// second), so a supervised daemon is never raced.  Safe range 5..=120 s.
+pub const SPAWN_GRACE: Duration = Duration::from_secs(20);
+
 /// The UI's view of its daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkState {
@@ -315,6 +320,9 @@ pub struct Poller {
     starter: Box<dyn DaemonStarter>,
     last_spawn: Option<Instant>,
     spawn_backoff: Duration,
+    /// Since when no daemon has been running (none while one runs).
+    absent_since: Option<Instant>,
+    spawn_grace: Duration,
 }
 
 impl Poller {
@@ -325,7 +333,15 @@ impl Poller {
             starter,
             last_spawn: None,
             spawn_backoff: SPAWN_BACKOFF,
+            absent_since: None,
+            spawn_grace: SPAWN_GRACE,
         }
+    }
+
+    /// Override [`SPAWN_GRACE`] (tests).
+    pub fn with_spawn_grace(mut self, grace: Duration) -> Self {
+        self.spawn_grace = grace;
+        self
     }
 
     /// Override [`SPAWN_BACKOFF`] (tests).
@@ -337,7 +353,10 @@ impl Poller {
     /// Poll once and update the link state.
     pub fn tick(&mut self) {
         let state = match self.poll() {
-            Ok(state) => state,
+            Ok(state) => {
+                self.absent_since = None;
+                state
+            }
             Err(err) => {
                 self.replica.clear();
                 self.recover(err)
@@ -375,8 +394,18 @@ impl Poller {
     fn recover(&mut self, err: ClientError) -> LinkState {
         let error = err.to_string();
         match self.starter.is_running() {
-            Ok(true) => LinkState::Starting { error },
+            Ok(true) => {
+                self.absent_since = None;
+                LinkState::Starting { error }
+            }
             Ok(false) => {
+                let since = *self.absent_since.get_or_insert_with(Instant::now);
+                if since.elapsed() < self.spawn_grace {
+                    return LinkState::Unreachable {
+                        error,
+                        started_daemon: false,
+                    };
+                }
                 let due = self
                     .last_spawn
                     .is_none_or(|at| at.elapsed() >= self.spawn_backoff);
@@ -563,7 +592,9 @@ mod tests {
 
     fn poller_for(config: &Path, starter: FakeStarter) -> (Poller, Replica) {
         let replica = Replica::default();
-        let poller = Poller::new(replica.clone(), config.to_path_buf(), Box::new(starter));
+        // No grace in tests that are about spawning itself.
+        let poller = Poller::new(replica.clone(), config.to_path_buf(), Box::new(starter))
+            .with_spawn_grace(Duration::ZERO);
         (poller, replica)
     }
 
@@ -617,6 +648,55 @@ mod tests {
                 .filter(|m| *m == "hello from the daemon")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn a_daemon_briefly_missing_is_not_replaced() {
+        // A supervisor (PM2, systemd) restarting its daemon leaves a gap of
+        // about a second; starting our own then would take the lock from it.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let starter = FakeStarter::default();
+        let (poller, replica) = poller_for(&config, starter.clone());
+        let mut poller = poller.with_spawn_grace(Duration::from_millis(200));
+        poller.tick();
+        poller.tick();
+        assert_eq!(starter.starts.load(Ordering::SeqCst), 0, "within the grace");
+        assert!(matches!(
+            *replica.link.lock(),
+            LinkState::Unreachable {
+                started_daemon: false,
+                ..
+            }
+        ));
+        std::thread::sleep(Duration::from_millis(250));
+        poller.tick();
+        assert_eq!(
+            starter.starts.load(Ordering::SeqCst),
+            1,
+            "missing for longer than the grace"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_comes_back_resets_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let starter = FakeStarter::default();
+        let (poller, _replica) = poller_for(&config, starter.clone());
+        let mut poller = poller.with_spawn_grace(Duration::from_millis(200));
+        poller.tick();
+        std::thread::sleep(Duration::from_millis(150));
+        starter.running.store(true, Ordering::SeqCst);
+        poller.tick();
+        starter.running.store(false, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        poller.tick();
+        assert_eq!(
+            starter.starts.load(Ordering::SeqCst),
+            0,
+            "the absence restarted"
         );
     }
 

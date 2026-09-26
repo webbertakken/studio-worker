@@ -29,10 +29,11 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | Method | Path            | Auth | Body / params                              | Returns |
 | ------ | --------------- | ---- | ------------------------------------------ | ------- |
 | POST   | `/image`        | yes  | JSON image request (below)                 | image bytes (`image/webp` etc.) |
-| POST   | `/v1/chat/completions` | yes | OpenAI-compatible chat body (`model?`, `messages`, `max_tokens?`, `temperature?`, `top_p?`, `stop?`, `chat_template_kwargs?`) | `chat.completion` JSON |
+| POST   | `/v1/chat/completions` | yes | OpenAI-compatible chat body (`model?`, `messages`, `max_tokens?`, `temperature?`, `top_p?`, `stop?`, `chat_template_kwargs?`, `stream?`) | `chat.completion` JSON |
 | POST   | `/tts`          | yes  | `{text, model?, voice?, speed?, language?, ext?}` | audio bytes (`audio/wav` etc.) |
 | POST   | `/stt`          | yes  | `{inputUrl, model?, language?}`            | transcript JSON |
 | POST   | `/video`        | yes  | `{prompt, model?, negativePrompt?, seconds?, width?, height?, ext?}` | video bytes (`video/mp4` etc.) |
+| POST   | `/tokenize`     | yes  | `{content, model?, add_special?}` (llama-server shape) | `{tokens: [...]}` from a loaded chat model |
 | GET    | `/models`       | yes  | —                                          | catalog as JSON array, each entry with `state`, `resident`, `since`, `loadable` (+ `error` when failed) |
 | GET    | `/models/:id/state` | yes | —                                        | `{id, state, resident, since, error?}` |
 | POST   | `/models/:id/load`  | yes | —                                        | `202` loading / `200` loaded; marks it resident |
@@ -233,6 +234,22 @@ llama-server) overrides the model's `chatTemplateKwargs`, e.g.
 in the answer is returned as `reasoning_content`.  `usage` carries real token
 counts, and `finish_reason` is `length` when the budget ran out.  A prompt that
 does not fit the model's `contextSize` is refused, never truncated.
+
+**Streaming.** `"stream": true` answers with server-sent events in OpenAI's
+`chat.completion.chunk` shape: `delta.content` as the answer is generated (a
+leading `<think>` block arrives as `delta.reasoning_content`), then a chunk with
+`finish_reason` and `usage`, then `data: [DONE]`.  Stop strings are never
+streamed, even when split across tokens.  Streaming needs the model loaded
+(`409 model_not_loaded` otherwise); a client that disconnects ends the
+generation.  An error after the stream started arrives as a final
+`{"error":{"message":…}}` event.
+
+**Token counts.** `POST /tokenize` returns the loaded model's token ids for
+`content` (`404 unknown_model`, `409 model_not_loaded`), so a client can size
+prompts against the model's `contextSize` (in its `cliDefaults` on `GET /models`).
+
+**Model files.** An LLM file already at the top of `models_root` (same name,
+same size) is used where it is; only a missing file is downloaded.
 
 A **loaded** model answers on its own lane, next to any running job and
 without the one-job gate; an unloaded model runs as a transient job (loaded

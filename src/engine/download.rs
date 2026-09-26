@@ -68,6 +68,55 @@ pub fn model_dir(models_root: &Path, model_id: &str) -> PathBuf {
     models_root.join(sanitise_model_dir(model_id))
 }
 
+/// A copy of `file` already on disk: in the engine's cache `dir`, else at
+/// the top of `models_root` (where an operator keeps models they placed by
+/// hand).  A root copy whose size differs from the declared size is a
+/// different file and is not reused.
+pub fn existing_copy(dir: &Path, models_root: &Path, file: &ModelFile) -> Result<Option<PathBuf>> {
+    let cached = model_cache_path(dir, &file.filename)?;
+    if cached.is_file() {
+        return Ok(Some(cached));
+    }
+    let root_copy = model_cache_path(models_root, &file.filename)?;
+    let Ok(meta) = std::fs::metadata(&root_copy) else {
+        return Ok(None);
+    };
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    match file.approx_bytes {
+        Some(want) if want != meta.len() => {
+            tracing::info!(
+                target: TRACE_TARGET,
+                op = "ensure_file",
+                path = %root_copy.display(),
+                want,
+                have = meta.len(),
+                "same-named file in the models root has another size; not reused"
+            );
+            Ok(None)
+        }
+        _ => {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                op = "ensure_file",
+                path = %root_copy.display(),
+                "reusing the copy in the models root"
+            );
+            Ok(Some(root_copy))
+        }
+    }
+}
+
+/// [`ensure_file`] into `dir`, unless [`existing_copy`] finds one.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn ensure_file_reusing(dir: &Path, models_root: &Path, file: &ModelFile) -> Result<PathBuf> {
+    match existing_copy(dir, models_root, file)? {
+        Some(path) => Ok(path),
+        None => ensure_file(dir, file),
+    }
+}
+
 /// Like [`ensure_file`] but scopes the download to a per-model subdir
 /// so two models naming the same file don't collide.  A file already
 /// present in the **legacy flat** `<models_root>/<filename>` (from a
@@ -818,6 +867,62 @@ mod tests {
         preflight_disk_space(dir.path(), "m.gguf", Some(1024)).unwrap();
         // An absurd size fails against real free space.
         assert!(preflight_disk_space(dir.path(), "m.gguf", Some(u64::MAX / 2)).is_err());
+    }
+
+    fn model_file(name: &str, bytes: Option<u64>) -> ModelFile {
+        ModelFile {
+            role: crate::types::ModelFileRole::Model,
+            url: "https://example.invalid/m".into(),
+            filename: name.into(),
+            approx_bytes: bytes,
+            sha256: None,
+        }
+    }
+
+    #[test]
+    fn existing_copy_prefers_the_cache_then_the_models_root() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join("llm");
+        std::fs::create_dir_all(&cache).unwrap();
+        let file = model_file("m.gguf", Some(3));
+        assert_eq!(existing_copy(&cache, root.path(), &file).unwrap(), None);
+        std::fs::write(root.path().join("m.gguf"), b"abc").unwrap();
+        assert_eq!(
+            existing_copy(&cache, root.path(), &file).unwrap(),
+            Some(root.path().join("m.gguf"))
+        );
+        std::fs::write(cache.join("m.gguf"), b"abc").unwrap();
+        assert_eq!(
+            existing_copy(&cache, root.path(), &file).unwrap(),
+            Some(cache.join("m.gguf"))
+        );
+    }
+
+    #[test]
+    fn existing_copy_skips_a_root_file_of_the_wrong_size() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("m.gguf"), b"abcd").unwrap();
+        let logs = crate::test_support::capture({
+            let root = root.path().to_path_buf();
+            move || {
+                let found = existing_copy(&root.join("llm"), &root, &model_file("m.gguf", Some(3)))
+                    .unwrap();
+                assert_eq!(found, None);
+            }
+        });
+        assert!(logs.contains("not reused"), "{logs}");
+        let unknown_size = model_file("m.gguf", None);
+        assert!(
+            existing_copy(&root.path().join("llm"), root.path(), &unknown_size)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn existing_copy_refuses_unsafe_names() {
+        let root = tempdir().unwrap();
+        assert!(existing_copy(root.path(), root.path(), &model_file("../x", None)).is_err());
     }
 
     #[test]

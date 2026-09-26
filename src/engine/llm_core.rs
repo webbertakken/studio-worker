@@ -133,6 +133,211 @@ pub fn completion_json(
     })
 }
 
+/// Releases generated text as it becomes safe to stream: text that could
+/// still turn into a stop string is held back until it either does (and is
+/// cut) or cannot.
+#[derive(Debug)]
+pub struct StopHold {
+    stops: Vec<String>,
+    out: String,
+    emitted: usize,
+    stopped: Option<usize>,
+}
+
+impl StopHold {
+    pub fn new(stops: &[String]) -> Self {
+        Self {
+            stops: stops.iter().filter(|s| !s.is_empty()).cloned().collect(),
+            out: String::new(),
+            emitted: 0,
+            stopped: None,
+        }
+    }
+
+    /// Add a piece; returns the text now safe to stream.
+    pub fn push(&mut self, piece: &str) -> String {
+        if self.stopped.is_some() {
+            return String::new();
+        }
+        let search_from = self.emitted;
+        self.out.push_str(piece);
+        if let Some(at) = self
+            .stops
+            .iter()
+            .filter_map(|s| {
+                self.out[search_from..]
+                    .find(s.as_str())
+                    .map(|i| i + search_from)
+            })
+            .min()
+        {
+            self.out.truncate(at);
+            self.stopped = Some(at);
+            return self.release(at);
+        }
+        let held = self.held_suffix();
+        self.release(self.out.len() - held)
+    }
+
+    /// Everything still held (generation ended).
+    pub fn finish(&mut self) -> String {
+        self.release(self.out.len())
+    }
+
+    /// Where a stop string cut the text, if one did.
+    pub fn stopped(&self) -> Option<usize> {
+        self.stopped
+    }
+
+    /// The whole text so far (after any stop cut).
+    pub fn text(&self) -> &str {
+        &self.out
+    }
+
+    /// Length of the longest pending suffix that is a proper prefix of a stop.
+    fn held_suffix(&self) -> usize {
+        let pending = &self.out[self.emitted..];
+        pending
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| {
+                let tail = &pending[i..];
+                self.stops
+                    .iter()
+                    .any(|s| s.len() > tail.len() && s.starts_with(tail))
+            })
+            .map_or(0, |i| pending.len() - i)
+    }
+
+    fn release(&mut self, upto: usize) -> String {
+        let upto = upto.max(self.emitted);
+        let text = self.out[self.emitted..upto].to_string();
+        self.emitted = upto;
+        text
+    }
+}
+
+/// A piece of a streamed answer: the model's thinking or the answer itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delta {
+    Reasoning(String),
+    Content(String),
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum ThinkState {
+    /// Not yet known whether the answer opens with a think block.
+    #[default]
+    Undecided,
+    Thinking,
+    Answering,
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Streams a `<think>...</think>` block (if the answer opens with one) as
+/// reasoning and the rest as content, the same split `completion_json`
+/// makes on a whole answer.
+#[derive(Debug, Default)]
+pub struct ThinkSplitter {
+    state: ThinkState,
+    buf: String,
+}
+
+impl ThinkSplitter {
+    pub fn push(&mut self, piece: &str) -> Vec<Delta> {
+        self.buf.push_str(piece);
+        let mut out = Vec::new();
+        loop {
+            match self.state {
+                ThinkState::Undecided => {
+                    let trimmed = self.buf.trim_start();
+                    if let Some(rest) = trimmed.strip_prefix(THINK_OPEN) {
+                        self.buf = rest.to_string();
+                        self.state = ThinkState::Thinking;
+                    } else if THINK_OPEN.starts_with(trimmed) {
+                        return out; // could still become <think>
+                    } else {
+                        self.state = ThinkState::Answering;
+                    }
+                }
+                ThinkState::Thinking => match self.buf.find(THINK_CLOSE) {
+                    Some(at) => {
+                        let thought = self.buf[..at].trim().to_string();
+                        if !thought.is_empty() {
+                            out.push(Delta::Reasoning(thought));
+                        }
+                        self.buf = self.buf[at + THINK_CLOSE.len()..].trim_start().to_string();
+                        self.state = ThinkState::Answering;
+                    }
+                    None => return out, // reasoning is sent whole, at its end
+                },
+                ThinkState::Answering => {
+                    if !self.buf.is_empty() {
+                        out.push(Delta::Content(std::mem::take(&mut self.buf)));
+                    }
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// Generation ended: whatever is buffered goes out as what it was.
+    pub fn finish(&mut self) -> Vec<Delta> {
+        let rest = std::mem::take(&mut self.buf);
+        match self.state {
+            ThinkState::Thinking if !rest.trim().is_empty() => {
+                vec![Delta::Reasoning(rest.trim().to_string())]
+            }
+            ThinkState::Undecided | ThinkState::Answering if !rest.is_empty() => {
+                vec![Delta::Content(rest)]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// One streamed `chat.completion.chunk`.
+pub fn chunk_frame(model: &str, delta: &Delta) -> serde_json::Value {
+    let delta = match delta {
+        Delta::Content(t) => serde_json::json!({ "content": t }),
+        Delta::Reasoning(t) => serde_json::json!({ "reasoning_content": t }),
+    };
+    serde_json::json!({
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+    })
+}
+
+/// The last chunk: why generation stopped, and the token counts.
+pub fn final_frame(
+    model: &str,
+    finish: Finish,
+    prompt_tokens: usize,
+    completion_tokens: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish.as_str() }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens as usize,
+        },
+    })
+}
+
+/// A server-sent event carrying `value`.
+pub fn sse_event(value: &serde_json::Value) -> Vec<u8> {
+    format!("data: {value}\n\n").into_bytes()
+}
+
+/// The event that ends an OpenAI stream.
+pub const SSE_DONE: &[u8] = b"data: [DONE]\n\n";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +461,121 @@ mod tests {
             .get("reasoning_content")
             .is_none());
         assert_eq!(json["choices"][0]["finish_reason"], "length");
+    }
+
+    fn drain(hold: &mut StopHold, pieces: &[&str]) -> String {
+        let mut out = String::new();
+        for p in pieces {
+            out.push_str(&hold.push(p));
+        }
+        out
+    }
+
+    #[test]
+    fn stop_hold_releases_text_that_cannot_start_a_stop() {
+        let mut hold = StopHold::new(&["</s>".to_string()]);
+        assert_eq!(hold.push("hello "), "hello ");
+        assert_eq!(hold.push("world"), "world");
+        assert_eq!(hold.finish(), "");
+    }
+
+    #[test]
+    fn stop_hold_never_leaks_a_stop_split_across_pieces() {
+        let mut hold = StopHold::new(&["END".to_string()]);
+        let streamed = drain(&mut hold, &["one E", "N", "D two"]);
+        assert_eq!(hold.stopped(), Some("one ".len()));
+        assert_eq!(streamed + &hold.finish(), "one ");
+    }
+
+    #[test]
+    fn stop_hold_without_stops_holds_nothing() {
+        let mut hold = StopHold::new(&[]);
+        assert_eq!(hold.push("a"), "a");
+        assert_eq!(hold.push("é"), "é");
+        assert_eq!(hold.stopped(), None);
+    }
+
+    #[test]
+    fn stop_hold_keeps_multibyte_characters_whole() {
+        let mut hold = StopHold::new(&["xyz".to_string()]);
+        let mut out = hold.push("ééé");
+        out.push_str(&hold.finish());
+        assert_eq!(out, "ééé");
+    }
+
+    fn split(pieces: &[&str]) -> (String, String) {
+        let mut s = ThinkSplitter::default();
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for p in pieces.iter().copied().map(Some).chain([None]) {
+            let deltas = match p {
+                Some(p) => s.push(p),
+                None => s.finish(),
+            };
+            for d in deltas {
+                match d {
+                    Delta::Reasoning(t) => reasoning.push_str(&t),
+                    Delta::Content(t) => content.push_str(&t),
+                }
+            }
+        }
+        (reasoning, content)
+    }
+
+    #[test]
+    fn think_splitter_passes_plain_answers_as_content() {
+        assert_eq!(
+            split(&["{\"a\"", ":1}"]),
+            (String::new(), "{\"a\":1}".into())
+        );
+    }
+
+    #[test]
+    fn think_splitter_routes_a_think_block_to_reasoning() {
+        assert_eq!(
+            split(&["<th", "ink>\nhmm", " ok</th", "ink>\n\nanswer"]),
+            ("hmm ok".into(), "answer".into())
+        );
+    }
+
+    #[test]
+    fn think_splitter_treats_text_that_only_looks_like_a_start_as_content() {
+        assert_eq!(split(&["<t", "able>"]), (String::new(), "<table>".into()));
+        assert_eq!(split(&["<th"]), (String::new(), "<th".into()));
+    }
+
+    #[test]
+    fn think_splitter_flushes_an_unfinished_think_as_reasoning() {
+        assert_eq!(split(&["<think>still"]), ("still".into(), String::new()));
+    }
+
+    #[test]
+    fn stream_frames_are_openai_chunks() {
+        let content = chunk_frame("m", &Delta::Content("hi".into()));
+        assert_eq!(
+            content,
+            serde_json::json!({
+                "object": "chat.completion.chunk",
+                "model": "m",
+                "choices": [{ "index": 0, "delta": { "content": "hi" }, "finish_reason": null }],
+            })
+        );
+        let reasoning = chunk_frame("m", &Delta::Reasoning("r".into()));
+        assert_eq!(
+            reasoning["choices"][0]["delta"],
+            serde_json::json!({ "reasoning_content": "r" })
+        );
+        let last = final_frame("m", Finish::Length, 10, 3);
+        assert_eq!(last["choices"][0]["delta"], serde_json::json!({}));
+        assert_eq!(last["choices"][0]["finish_reason"], "length");
+        assert_eq!(last["usage"]["total_tokens"], 13);
+    }
+
+    #[test]
+    fn sse_events_are_data_lines() {
+        assert_eq!(
+            sse_event(&serde_json::json!({ "a": 1 })),
+            b"data: {\"a\":1}\n\n"
+        );
+        assert_eq!(SSE_DONE, b"data: [DONE]\n\n");
     }
 }

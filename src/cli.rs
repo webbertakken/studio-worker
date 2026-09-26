@@ -17,8 +17,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, PartialEq)]
 pub enum Command {
-    /// Start the heartbeat + claim loop.
-    Run,
+    /// Start the daemon: local API, model host, studio session.
+    Run {
+        /// Under a supervisor (PM2, systemd): if another daemon holds the
+        /// lock, wait and take over when it ends, instead of exiting.
+        #[arg(long)]
+        wait_for_lock: bool,
+    },
     /// Pre-set registration metadata before the next launch.
     ///
     /// On a fresh install you don't need this — `run` and `ui`
@@ -59,7 +64,7 @@ impl Command {
     /// process is running.  Matches clap's derived subcommand names.
     pub fn name(&self) -> &'static str {
         match self {
-            Command::Run => "run",
+            Command::Run { .. } => "run",
             Command::Setup => "setup",
             Command::Register { .. } => "register",
             Command::Status => "status",
@@ -79,9 +84,25 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn run_can_wait_for_the_lock_under_a_supervisor() {
+        let cli = Cli::try_parse_from(["studio-worker", "run", "--wait-for-lock"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                wait_for_lock: true
+            }
+        ));
+    }
+
+    #[test]
     fn parses_run() {
         let cli = Cli::parse_from(["studio-worker", "run"]);
-        assert!(matches!(cli.command, Command::Run));
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                wait_for_lock: false
+            }
+        ));
         assert!(cli.config.is_none());
     }
 
@@ -89,7 +110,12 @@ mod tests {
     fn parses_run_with_config_override() {
         let cli = Cli::parse_from(["studio-worker", "--config", "/etc/x.toml", "run"]);
         assert_eq!(cli.config.as_deref(), Some("/etc/x.toml"));
-        assert!(matches!(cli.command, Command::Run));
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                wait_for_lock: false
+            }
+        ));
     }
 
     #[test]
@@ -150,7 +176,13 @@ mod tests {
 
     #[test]
     fn name_is_stable_kebab_case_for_every_subcommand() {
-        assert_eq!(Command::Run.name(), "run");
+        assert_eq!(
+            Command::Run {
+                wait_for_lock: false
+            }
+            .name(),
+            "run"
+        );
         assert_eq!(
             Command::Register {
                 api_base_url: None,

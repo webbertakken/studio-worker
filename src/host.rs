@@ -57,13 +57,20 @@ pub trait StreamingModel {
 
 /// A loaded model that answers chat completions.
 pub trait ChatModel {
-    /// Run one completion; `cancelled` turns true when an unload starts.
-    /// Returns OpenAI `chat.completion`-shaped JSON.
+    /// Run one completion; `cancelled` turns true when an unload starts
+    /// (or a streaming client leaves).  `on_piece` receives the answer's
+    /// text as it is generated, stop strings already cut.  Returns OpenAI
+    /// `chat.completion`-shaped JSON for the whole answer.
     fn chat(
         &self,
         params: crate::types::LlmParams,
         cancelled: &dyn Fn() -> bool,
+        on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<serde_json::Value>;
+
+    /// The model's token ids for `text`; `add_special` adds BOS as the
+    /// model would for a prompt.
+    fn tokenize(&self, text: &str, add_special: bool) -> anyhow::Result<Vec<i32>>;
 }
 
 /// Loads catalogue models into memory.  Freed by dropping the result.

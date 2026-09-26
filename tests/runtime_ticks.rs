@@ -229,7 +229,7 @@ models_root = "/tmp/studio-worker-test-models"
 
     let path_str = cfg_path.to_string_lossy().to_string();
     let run_handle = tokio::spawn(async move {
-        let _ = studio_worker::runtime::run(Some(&path_str)).await;
+        let _ = studio_worker::runtime::run(Some(&path_str), false).await;
     });
 
     // Let the loops spin up briefly then abort the future so the test exits.

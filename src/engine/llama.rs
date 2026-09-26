@@ -10,6 +10,7 @@ use crate::catalog::CatalogModel;
 use crate::engine::chat_template::{merge_kwargs, render_chat, TemplateVars};
 use crate::engine::llm_core::{
     chat_messages, completion_json, effective_context, finish_for, plan_budget, should_add_bos,
+    StopHold,
 };
 use crate::engine::{Engine, EngineCapabilities};
 use crate::host::{ChatModel, LoadedModel};
@@ -247,6 +248,7 @@ pub fn complete(
     defaults: &ModelCliDefaults,
     params: LlmParams,
     cancelled: &dyn Fn() -> bool,
+    on_piece: &mut dyn FnMut(&str),
 ) -> Result<serde_json::Value> {
     let started = Instant::now();
     let prompt = render_request(model, defaults, &params)?;
@@ -282,7 +284,7 @@ pub fn complete(
     let last = tokens.len() - 1;
     for chunk in tokens.chunks(PROMPT_BATCH) {
         if cancelled() {
-            bail!("cancelled: model is unloading");
+            bail!("cancelled: the model is unloading or the client left");
         }
         batch.clear();
         for token in chunk {
@@ -305,15 +307,15 @@ pub fn complete(
         chain.push(LlamaSampler::dist(1234));
         LlamaSampler::chain_simple(chain)
     };
-    let stops = params.stop.clone().unwrap_or_default();
+    let mut hold = StopHold::new(&params.stop.clone().unwrap_or_default());
     // One decoder for the whole completion: a character split across two
     // tokens decodes once both halves arrive.
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut out = String::new();
+    let mut piece = String::new();
     let (mut generated, mut hit_end, mut decode_failures) = (0u32, false, 0u32);
     while generated < budget {
         if cancelled() {
-            bail!("cancelled: model is unloading");
+            bail!("cancelled: the model is unloading or the client left");
         }
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
@@ -321,18 +323,19 @@ pub fn complete(
             hit_end = true;
             break;
         }
+        piece.clear();
         append_piece(
-            &mut out,
+            &mut piece,
             generated as usize,
             model.token_to_piece(token, &mut decoder, false, None),
             &mut decode_failures,
         );
         generated += 1;
-        if let Some(cut) = stops
-            .iter()
-            .find_map(|s| out.rfind(s.as_str()).filter(|_| !s.is_empty()))
-        {
-            out.truncate(cut);
+        let safe = hold.push(&piece);
+        if !safe.is_empty() {
+            on_piece(&safe);
+        }
+        if hold.stopped().is_some() {
             hit_end = true;
             break;
         }
@@ -343,6 +346,11 @@ pub fn complete(
         pos += 1;
         ctx.decode(&mut batch).context("decoding token")?;
     }
+    let rest = hold.finish();
+    if !rest.is_empty() {
+        on_piece(&rest);
+    }
+    let out = hold.text().to_string();
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let finish = finish_for(generated, budget, hit_end);
     info!(
@@ -385,7 +393,12 @@ impl LoadedModel for LoadedLlm {
 }
 
 impl ChatModel for LoadedLlm {
-    fn chat(&self, params: LlmParams, cancelled: &dyn Fn() -> bool) -> Result<serde_json::Value> {
+    fn chat(
+        &self,
+        params: LlmParams,
+        cancelled: &dyn Fn() -> bool,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<serde_json::Value> {
         complete(
             &self.model,
             &self.backend,
@@ -393,7 +406,23 @@ impl ChatModel for LoadedLlm {
             &self.defaults,
             params,
             cancelled,
+            on_piece,
         )
+    }
+
+    fn tokenize(&self, text: &str, add_special: bool) -> Result<Vec<i32>> {
+        let add_bos = if add_special {
+            AddBos::Always
+        } else {
+            AddBos::Never
+        };
+        Ok(self
+            .model
+            .str_to_token(text, add_bos)
+            .map_err(|e| anyhow!("tokenize: {e:?}"))?
+            .into_iter()
+            .map(|t| t.0)
+            .collect())
     }
 }
 
@@ -436,7 +465,12 @@ fn ensure_llm_files(
     source
         .files
         .iter()
-        .map(|file| Ok((file.role, crate::engine::download::ensure_file(&dir, file)?)))
+        .map(|file| {
+            Ok((
+                file.role,
+                crate::engine::download::ensure_file_reusing(&dir, models_root, file)?,
+            ))
+        })
         .collect()
 }
 
@@ -496,17 +530,25 @@ impl LlamaEngine {
         llm: LlmParams,
     ) -> Result<TaskResult> {
         let loaded = self.load_transient(model, path)?;
-        let json =
-            complete(&loaded, &self.backend, model, defaults, llm, &|| false).inspect_err(|e| {
-                warn!(
-                    target: TRACE_TARGET,
-                    op = "dispatch",
-                    kind = "llm",
-                    model,
-                    error = %e,
-                    "generation failed"
-                );
-            })?;
+        let json = complete(
+            &loaded,
+            &self.backend,
+            model,
+            defaults,
+            llm,
+            &|| false,
+            &mut |_| {},
+        )
+        .inspect_err(|e| {
+            warn!(
+                target: TRACE_TARGET,
+                op = "dispatch",
+                kind = "llm",
+                model,
+                error = %e,
+                "generation failed"
+            );
+        })?;
         Ok(TaskResult::Llm { json })
     }
 }
