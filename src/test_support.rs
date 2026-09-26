@@ -72,7 +72,14 @@ fn install_once() {
         // when several integration suites link the same lib).  We
         // tolerate that because the existing subscriber will also
         // route through our thread-local writer once installed.
-        let _ = tracing_subscriber::registry().with(layer).try_init();
+        // The job-log layer writes to the process-wide store, so tests can
+        // assert what a job logged (see `install_job_log_capture`).
+        let job_logs = crate::job_log::JobLogLayer::global()
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG);
+        let _ = tracing_subscriber::registry()
+            .with(layer)
+            .with(job_logs)
+            .try_init();
     });
 }
 
@@ -103,6 +110,13 @@ pub fn capture<F: FnOnce() + Send + 'static>(f: F) -> String {
     })
     .join()
     .expect("capture thread panicked")
+}
+
+/// Route job-scoped events into [`crate::job_log::global`] for the rest of
+/// the process, so a test can read back what a job logged.
+pub fn install_job_log_capture() {
+    install_once();
+    tracing::callsite::rebuild_interest_cache();
 }
 
 /// A device-memory probe that always reports `free` GiB (of 24 total).

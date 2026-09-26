@@ -22,6 +22,7 @@ pub mod engine;
 pub mod host;
 pub mod http;
 pub mod job_gate;
+pub mod job_log;
 pub mod lifecycle;
 pub mod loaders;
 pub mod local;

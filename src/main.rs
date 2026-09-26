@@ -21,6 +21,7 @@ fn main() -> Result<()> {
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .with(telemetry::tracing_layer())
+        .with(studio_worker::job_log::JobLogLayer::global())
         .init();
 
     // rustls 0.23+ no longer auto-installs a process-wide
