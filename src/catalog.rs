@@ -296,6 +296,8 @@ fn zimage_turbo() -> CatalogModel {
                 flow_shift: None,
                 zero_cond_t: None,
                 offload_to_cpu: None,
+                context_size: None,
+                chat_template_kwargs: None,
             },
         },
         enabled: true,

@@ -141,6 +141,10 @@ pub struct LlmParams {
     /// backends only; ignored elsewhere.
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// Extra chat-template variables for this request (e.g.
+    /// `{"enable_thinking": false}`); overrides the model's own defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -435,6 +439,13 @@ pub struct ModelCliDefaults {
     /// `--offload-to-cpu` — keep weights in RAM, stream to VRAM, so a large model fits a small card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offload_to_cpu: Option<bool>,
+    /// LLM context window in tokens (the KV-cache size).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_size: Option<u32>,
+    /// LLM chat-template variables every request gets unless it overrides
+    /// them (e.g. `{"enable_thinking": false}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

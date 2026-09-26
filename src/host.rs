@@ -35,6 +35,22 @@ pub const SWAP_TIMEOUT: Duration = Duration::from_secs(30);
 /// their own type through `as_any`.
 pub trait LoadedModel: Send + Sync {
     fn as_any(&self) -> &dyn Any;
+
+    /// The chat interface, for loaded LLMs.
+    fn as_chat(&self) -> Option<&dyn ChatModel> {
+        None
+    }
+}
+
+/// A loaded model that answers chat completions.
+pub trait ChatModel {
+    /// Run one completion; `cancelled` turns true when an unload starts.
+    /// Returns OpenAI `chat.completion`-shaped JSON.
+    fn chat(
+        &self,
+        params: crate::types::LlmParams,
+        cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<serde_json::Value>;
 }
 
 /// Loads catalogue models into memory.  Freed by dropping the result.

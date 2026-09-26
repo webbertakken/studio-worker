@@ -1102,6 +1102,8 @@ mod tests {
                 flow_shift: Some(3.0),
                 zero_cond_t: Some(true),
                 offload_to_cpu: Some(true),
+                context_size: None,
+                chat_template_kwargs: None,
             },
         }
     }
