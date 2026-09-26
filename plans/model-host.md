@@ -38,9 +38,10 @@ Design: [`docs/runtime/model-lifecycle.md`](../docs/runtime/model-lifecycle.md).
 
 ## Phase 3 - daemon and tray UI
 
-- [ ] 3.1 Event stream on the local API: model states, jobs, per-job log lines.
+- [x] 3.1 Event stream on the local API: model states, jobs, per-job log lines (polled snapshot,
+      incremental logs, job log and thumbnail routes; see `docs/runtime/daemon-and-tray.md`).
 - [ ] 3.2 Tray UI as a client of the daemon; waits for the display; always on at login.
-- [ ] 3.3 Per-job log capture for local and studio jobs.
+- [x] 3.3 Per-job log capture for local and studio jobs.
 - [ ] 3.4 Jobs tab: per-job log, image thumbnail inline, model state panel.
 
 ## Phase 4 - release
