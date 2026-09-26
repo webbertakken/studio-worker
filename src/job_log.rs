@@ -132,6 +132,22 @@ pub fn job_span(job_id: &str) -> tracing::Span {
 /// The job id a span carries, kept in the span's extensions.
 struct SpanJobId(String);
 
+/// Keep a new span's `job_id` in its extensions, once (both layers call
+/// this; an extension type may only be inserted once per span).
+fn remember_job_id<S>(attrs: &Attributes<'_>, id: &Id, ctx: &Context<'_, S>)
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let mut fields = Fields::default();
+    attrs.record(&mut fields);
+    if let (Some(job_id), Some(span)) = (fields.job_id, ctx.span(id)) {
+        let mut extensions = span.extensions_mut();
+        if extensions.get_mut::<SpanJobId>().is_none() {
+            extensions.insert(SpanJobId(job_id));
+        }
+    }
+}
+
 /// Collects the `job_id` field and renders the rest as `message k=v …`.
 #[derive(Default)]
 struct Fields {
@@ -170,6 +186,94 @@ impl Fields {
     }
 }
 
+/// The worker log ring the Logs tab shows: the entries and the sequence
+/// number of the newest (see `runtime::recent_logs_after`).
+#[derive(Clone, Default)]
+pub struct WorkerLogRing {
+    pub entries: Arc<Mutex<VecDeque<crate::types::LogEntry>>>,
+    pub seq: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl WorkerLogRing {
+    /// Append `entry`, keeping the newest [`crate::runtime::RECENT_LOGS_CAP`].
+    pub fn push(&self, entry: crate::types::LogEntry) {
+        let mut ring = self.entries.lock();
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ring.push_back(entry);
+        while ring.len() > crate::runtime::RECENT_LOGS_CAP {
+            ring.pop_front();
+        }
+    }
+}
+
+/// The process-wide worker log ring the installed [`WorkerLogLayer`]
+/// writes to; the daemon's observers share it.
+pub fn global_worker_log() -> &'static WorkerLogRing {
+    static RING: OnceLock<WorkerLogRing> = OnceLock::new();
+    RING.get_or_init(WorkerLogRing::default)
+}
+
+/// Copies the worker's own info / warn / error events into a
+/// [`WorkerLogRing`], so the Logs tab shows everything the daemon does,
+/// not only the studio session's breadcrumbs.  Events on the bare
+/// `studio_worker` target are skipped: `runtime::push_log` writes those
+/// into the ring itself.
+pub struct WorkerLogLayer {
+    ring: WorkerLogRing,
+}
+
+impl WorkerLogLayer {
+    pub fn new(ring: WorkerLogRing) -> Self {
+        Self { ring }
+    }
+
+    /// A layer writing to [`global_worker_log`].
+    pub fn global() -> Self {
+        Self::new(global_worker_log().clone())
+    }
+}
+
+impl<S> Layer<S> for WorkerLogLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        remember_job_id(attrs, id, &ctx);
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let meta = event.metadata();
+        let target = meta.target();
+        if *meta.level() > tracing::Level::INFO
+            || target == "studio_worker"
+            || !target.starts_with("studio_worker")
+        {
+            return;
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        let job_id = fields.job_id.take().or_else(|| {
+            ctx.event_scope(event)?
+                .find_map(|span| span.extensions().get::<SpanJobId>().map(|j| j.0.clone()))
+        });
+        let mut message = fields.rendered();
+        if message.chars().count() > JOB_LOG_LINE_CHARS {
+            message = message.chars().take(JOB_LOG_LINE_CHARS).collect();
+            message.push('…');
+        }
+        self.ring.push(crate::types::LogEntry {
+            ts: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            level: meta.level().as_str().to_ascii_lowercase(),
+            category: target
+                .strip_prefix("studio_worker::")
+                .unwrap_or(target)
+                .to_string(),
+            message,
+            job_id,
+        });
+    }
+}
+
 /// Copies job-scoped events into a [`JobLogStore`].
 pub struct JobLogLayer {
     store: JobLogStore,
@@ -192,11 +296,7 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
-        let mut fields = Fields::default();
-        attrs.record(&mut fields);
-        if let (Some(job_id), Some(span)) = (fields.job_id, ctx.span(id)) {
-            span.extensions_mut().insert(SpanJobId(job_id));
-        }
+        remember_job_id(attrs, id, &ctx);
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
@@ -305,6 +405,62 @@ mod tests {
             tracing::info!("background chatter");
         });
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn the_worker_log_takes_the_workers_own_info_and_up() {
+        let ring = WorkerLogRing::default();
+        let subscriber = tracing_subscriber::registry().with(WorkerLogLayer::new(ring.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let span = job_span("job-w");
+            let _entered = span.enter();
+            tracing::info!(target: "studio_worker::host", op = "load", "model loaded");
+            tracing::warn!(target: "studio_worker::local_api", "denied");
+            tracing::debug!(target: "studio_worker::host", "too chatty");
+            tracing::info!(target: "studio_worker", "[ws] pushed by push_log");
+            tracing::info!(target: "hyper::client", "not ours");
+        });
+        let entries: Vec<_> = ring.entries.lock().iter().cloned().collect();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].category, "host");
+        assert_eq!(entries[0].message, "model loaded op=\"load\"");
+        assert_eq!(entries[0].job_id.as_deref(), Some("job-w"));
+        assert_eq!(entries[1].level, "warn");
+        assert_eq!(ring.seq.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn both_layers_together_share_the_span_job_id() {
+        let store = JobLogStore::default();
+        let ring = WorkerLogRing::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(JobLogLayer::new(store.clone()))
+            .with(WorkerLogLayer::new(ring.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let span = job_span("job-both");
+            let _entered = span.enter();
+            tracing::info!(target: "studio_worker::host", "loaded");
+        });
+        assert_eq!(store.get("job-both").unwrap().lines.len(), 1);
+        assert_eq!(ring.entries.lock()[0].job_id.as_deref(), Some("job-both"));
+    }
+
+    #[test]
+    fn the_worker_log_keeps_only_the_newest_entries() {
+        let ring = WorkerLogRing::default();
+        for i in 0..(crate::runtime::RECENT_LOGS_CAP + 2) {
+            ring.push(crate::types::LogEntry {
+                ts: String::new(),
+                level: "info".into(),
+                category: "c".into(),
+                message: format!("m{i}"),
+                job_id: None,
+            });
+        }
+        assert_eq!(ring.entries.lock().len(), crate::runtime::RECENT_LOGS_CAP);
+        assert_eq!(ring.entries.lock()[0].message, "m2");
     }
 
     #[test]

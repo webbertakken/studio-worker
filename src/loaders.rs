@@ -20,6 +20,16 @@ impl Loaders {
 }
 
 impl ModelRuntime for Loaders {
+    fn can_load(&self, model: &CatalogModel) -> bool {
+        match model.source.engine {
+            #[cfg(all(feature = "llama", not(target_os = "windows")))]
+            crate::types::ModelEngine::LlamaCpp => true,
+            #[cfg(feature = "stt-stream")]
+            crate::types::ModelEngine::Parakeet => true,
+            _ => false,
+        }
+    }
+
     fn load(&self, model: &CatalogModel) -> anyhow::Result<Arc<dyn LoadedModel>> {
         match &model.source.engine {
             #[cfg(all(feature = "llama", not(target_os = "windows")))]
@@ -63,14 +73,34 @@ mod tests {
             origin: "local".into(),
             exclusive_group: None,
         };
-        let err = Loaders::new(PathBuf::from("/nonexistent"))
-            .load(&model)
-            .err()
-            .expect("refused");
+        let loaders = Loaders::new(PathBuf::from("/nonexistent"));
+        assert!(!loaders.can_load(&model));
+        let err = loaders.load(&model).err().expect("refused");
         assert!(
             err.to_string()
                 .contains("no in-process loader for engine SdCpp"),
             "{err}"
         );
+    }
+
+    #[cfg(all(feature = "llama", not(target_os = "windows")))]
+    #[test]
+    fn an_llm_can_be_loaded() {
+        let model = CatalogModel {
+            id: "m".into(),
+            display_name: "m".into(),
+            kind: TaskKind::Llm,
+            vram_gb_estimate: 1.0,
+            description: None,
+            source: ModelSource {
+                engine: ModelEngine::LlamaCpp,
+                files: vec![],
+                cli_defaults: Default::default(),
+            },
+            enabled: true,
+            origin: "local".into(),
+            exclusive_group: None,
+        };
+        assert!(Loaders::new(PathBuf::from("/nonexistent")).can_load(&model));
     }
 }

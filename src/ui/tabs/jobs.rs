@@ -125,8 +125,12 @@ impl JobCard {
     }
 }
 
-/// Render a `chrono::Duration` as `12s` / `3m 04s` / `1h 12m`.
+/// Render a `chrono::Duration` as `118 ms` / `12s` / `3m 04s` / `1h 12m`.
 pub fn format_duration(d: chrono::Duration) -> String {
+    let millis = d.num_milliseconds().max(0);
+    if millis < 1000 {
+        return format!("{millis} ms");
+    }
     let secs = d.num_seconds().max(0);
     if secs < 60 {
         return format!("{secs}s");
@@ -147,11 +151,31 @@ pub fn toggle_selection(selected: Option<&str>, clicked: &str) -> Option<String>
     (selected != Some(clicked)).then(|| clicked.to_string())
 }
 
-/// One log line as the log panel shows it: `HH:MM:SS level message`.
-pub fn format_log_line(line: &crate::job_log::JobLogLine) -> String {
+/// Which job an initial-selection override picks: a job id, or `latest`
+/// for the newest finished job.  For screenshots and headless inspection
+/// (`STUDIO_WORKER_UI_JOB`), like `STUDIO_WORKER_UI_TAB`.
+pub fn resolve_initial_selection(spec: &str, view: &JobsView) -> Option<String> {
+    let spec = spec.trim();
+    if spec.eq_ignore_ascii_case("latest") {
+        return view
+            .recent
+            .iter()
+            .chain(&view.local)
+            .max_by_key(|c| c.finished_at)
+            .map(|c| c.job_id.clone());
+    }
+    view.job_ids().find(|id| *id == spec).map(str::to_string)
+}
+
+/// One log line as the log panel shows it: `HH:MM:SS level message`, the
+/// time in `tz` (the operator's local zone on screen).
+pub fn format_log_line<Tz: chrono::TimeZone>(line: &crate::job_log::JobLogLine, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
     format!(
         "{} {:<5} {}",
-        line.ts.format("%H:%M:%S"),
+        line.ts.with_timezone(tz).format("%H:%M:%S"),
         line.level,
         line.message
     )
@@ -379,7 +403,7 @@ fn render_log(ui: &mut egui::Ui, job_id: &str, log: Option<&JobLog>) {
                     _ => egui::Color32::from_gray(210),
                 };
                 ui.label(
-                    egui::RichText::new(format_log_line(line))
+                    egui::RichText::new(format_log_line(line, &chrono::Local))
                         .monospace()
                         .color(colour),
                 );
@@ -471,6 +495,31 @@ mod tests {
     }
 
     #[test]
+    fn an_initial_selection_picks_the_newest_or_a_named_job() {
+        let observers = WorkerObservers::default();
+        let mut older = recent("old", JobOutcome::Completed, JobSource::Studio);
+        older.finished_at -= chrono::Duration::seconds(10);
+        observers.recent_jobs.lock().push_front(older);
+        observers.local_jobs.lock().push_front(recent(
+            "new",
+            JobOutcome::Completed,
+            JobSource::Local,
+        ));
+        let view = JobsView::build(&observers, Utc::now());
+        assert_eq!(
+            resolve_initial_selection("latest", &view).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            resolve_initial_selection("old", &view).as_deref(),
+            Some("old")
+        );
+        assert_eq!(resolve_initial_selection("missing", &view), None);
+        let empty = JobsView::build(&WorkerObservers::default(), Utc::now());
+        assert_eq!(resolve_initial_selection("latest", &empty), None);
+    }
+
+    #[test]
     fn selecting_a_card_toggles() {
         assert_eq!(toggle_selection(None, "a").as_deref(), Some("a"));
         assert_eq!(toggle_selection(Some("a"), "a"), None);
@@ -485,7 +534,7 @@ mod tests {
             target: "t".into(),
             message: "slow download".into(),
         };
-        assert_eq!(format_log_line(&line), "03:04:05 warn  slow download");
+        assert_eq!(format_log_line(&line, &Utc), "03:04:05 warn  slow download");
     }
 
     #[test]
@@ -558,6 +607,10 @@ mod tests {
             format_duration(chrono::Duration::seconds(3600 + 12 * 60)),
             "1h 12m"
         );
-        assert_eq!(format_duration(chrono::Duration::seconds(-5)), "0s");
+        assert_eq!(format_duration(chrono::Duration::seconds(-5)), "0 ms");
+        assert_eq!(
+            format_duration(chrono::Duration::milliseconds(118)),
+            "118 ms"
+        );
     }
 }

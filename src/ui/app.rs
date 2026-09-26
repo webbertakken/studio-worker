@@ -66,6 +66,9 @@ pub fn tray_variant_for(link: &LinkState, replica: &Replica) -> TrayVariant {
 /// Everything `App` needs to render and act on the world.
 pub struct AppDeps {
     pub replica: Replica,
+    /// Minimise the window on its first frame (the config's
+    /// `start_minimised`, read before the daemon answers).
+    pub start_minimised: bool,
     pub actions: ActionRunner,
     pub config_path: PathBuf,
     pub tokio: Handle,
@@ -82,6 +85,8 @@ pub struct App {
     log_filter: LogFilter,
     about_state: AboutState,
     textures: ThumbnailTextures,
+    /// `STUDIO_WORKER_UI_JOB`: a job to select once it shows up.
+    initial_job: Option<String>,
     /// Identity (`job_id` + `finished_at`) of the newest recent-job we
     /// have already raised a notification for.  Tracking identity
     /// rather than ring length means a saturated, capped
@@ -109,10 +114,8 @@ impl App {
 
     /// Used by tests to inject a `CapturingNotifier`.
     pub fn with_notifier(deps: AppDeps, notifier: Box<dyn Notifier + Send + Sync>) -> Self {
-        let (config_draft, start_minimised_pending) = {
-            let cfg = deps.replica.cfg.lock();
-            (ConfigDraft::from(&cfg), cfg.start_minimised)
-        };
+        let config_draft = ConfigDraft::from(&deps.replica.cfg.lock());
+        let start_minimised_pending = deps.start_minimised;
         Self {
             deps,
             tab: Tab::initial(),
@@ -121,6 +124,7 @@ impl App {
             log_filter: LogFilter::default(),
             about_state: AboutState::default(),
             textures: ThumbnailTextures::default(),
+            initial_job: std::env::var("STUDIO_WORKER_UI_JOB").ok(),
             last_notified: None,
             notifier,
             notification_prefs: NotificationPrefs::default(),
@@ -260,7 +264,8 @@ impl App {
                 }
                 LinkState::Unreachable { .. } => egui::Color32::LIGHT_RED,
             };
-            ui.label(egui::RichText::new("\u{25cf}").color(colour));
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 4.0, colour);
             ui.label(egui::RichText::new(link.summary()).small());
             if let Some(feedback) = self.deps.actions.feedback.lock().clone() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -340,6 +345,12 @@ impl App {
     fn render_jobs(&mut self, ui: &mut egui::Ui) {
         let replica = &self.deps.replica;
         let view = jobs_tab::JobsView::build(&replica.observers, chrono::Utc::now());
+        if let Some(spec) = &self.initial_job {
+            if let Some(id) = jobs_tab::resolve_initial_selection(spec, &view) {
+                *replica.selected_job.lock() = Some(id);
+                self.initial_job = None;
+            }
+        }
         let selected = replica.selected_job.lock().clone();
         let log = replica.selected_log.lock().clone();
         let changed = jobs_tab::render(
@@ -533,6 +544,7 @@ mod tests {
         AppDeps {
             actions: ActionRunner::new(config_path.clone(), replica.clone()),
             replica,
+            start_minimised: true,
             config_path,
             tokio: tokio_handle(),
         }
@@ -550,8 +562,10 @@ mod tests {
         let app = App::new(mock_deps());
         assert!(app.start_minimised_pending());
 
-        let deps = mock_deps();
-        deps.replica.cfg.lock().start_minimised = false;
+        let deps = AppDeps {
+            start_minimised: false,
+            ..mock_deps()
+        };
         let app = App::new(deps);
         assert!(!app.start_minimised_pending());
     }

@@ -228,6 +228,27 @@ pub fn recent_logs_after(observers: &WorkerObservers, after: u64) -> (Vec<LogEnt
     (ring.iter().skip(skip).cloned().collect(), newest)
 }
 
+impl WorkerObservers {
+    /// Observers whose worker log is the process-wide ring the installed
+    /// [`crate::job_log::WorkerLogLayer`] fills: the daemon's.
+    pub fn with_global_worker_log() -> Self {
+        let ring = crate::job_log::global_worker_log();
+        Self {
+            recent_logs: ring.entries.clone(),
+            recent_logs_seq: ring.seq.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// The worker log ring, as a handle.
+    pub fn worker_log(&self) -> crate::job_log::WorkerLogRing {
+        crate::job_log::WorkerLogRing {
+            entries: self.recent_logs.clone(),
+            seq: self.recent_logs_seq.clone(),
+        }
+    }
+}
+
 /// Record the WS lifecycle state for the UI to read.
 pub fn set_session_state(observers: &WorkerObservers, state: SessionState) {
     *observers.session_state.lock() = state;
@@ -576,7 +597,7 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     );
     let busy = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    let observers = WorkerObservers::default();
+    let observers = WorkerObservers::with_global_worker_log();
 
     let stop_clone = control.stop.clone();
     tokio::spawn(async move {
@@ -1489,12 +1510,7 @@ pub fn push_log_with_observers(
         queue.push(entry.clone());
     }
     if let Some(o) = observers {
-        let mut ring = o.recent_logs.lock();
-        o.recent_logs_seq.fetch_add(1, Ordering::SeqCst);
-        ring.push_back(entry);
-        while ring.len() > RECENT_LOGS_CAP {
-            ring.pop_front();
-        }
+        o.worker_log().push(entry);
     }
 }
 
@@ -1536,6 +1552,17 @@ mod tests {
         assert_eq!(newer.len(), 1);
         assert_eq!(newer[0].message, "m2");
         assert!(recent_logs_after(&observers, 3).0.is_empty());
+    }
+
+    #[test]
+    fn the_daemons_observers_share_the_global_worker_log() {
+        let a = WorkerObservers::with_global_worker_log();
+        let b = WorkerObservers::with_global_worker_log();
+        assert!(Arc::ptr_eq(&a.recent_logs, &b.recent_logs));
+        assert!(!Arc::ptr_eq(
+            &a.recent_logs,
+            &WorkerObservers::default().recent_logs
+        ));
     }
 
     #[test]

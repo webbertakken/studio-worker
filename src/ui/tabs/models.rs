@@ -26,6 +26,8 @@ pub struct ModelRow {
     pub since: Option<DateTime<Utc>>,
     pub error: Option<String>,
     pub enabled: bool,
+    /// The daemon can keep this model loaded.
+    pub loadable: bool,
     pub exclusive_group: Option<String>,
     pub can_load: bool,
     pub can_unload: bool,
@@ -33,7 +35,7 @@ pub struct ModelRow {
 
 impl ModelRow {
     pub fn from_entry(entry: &ModelEntry) -> Self {
-        let (can_load, can_unload) = controls_for(&entry.state, entry.enabled);
+        let (can_load, can_unload) = controls_for(&entry.state, entry.enabled && entry.loadable);
         let engine = serde_json::to_value(&entry.source.engine)
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
@@ -49,6 +51,7 @@ impl ModelRow {
             since: entry.since,
             error: entry.error.clone(),
             enabled: entry.enabled,
+            loadable: entry.loadable,
             exclusive_group: entry.exclusive_group.clone(),
             can_load,
             can_unload,
@@ -59,9 +62,9 @@ impl ModelRow {
 /// Which of Load / Unload the lifecycle allows from `state`
 /// (see `docs/runtime/model-lifecycle.md`): load from unloaded or failed;
 /// unload from loaded or loading (the load completes first).  A disabled
-/// model cannot be loaded.
-pub fn controls_for(state: &str, enabled: bool) -> (bool, bool) {
-    let can_load = enabled && matches!(state, "unloaded" | "failed");
+/// model, or one without an in-process loader, cannot be loaded.
+pub fn controls_for(state: &str, loadable: bool) -> (bool, bool) {
+    let can_load = loadable && matches!(state, "unloaded" | "failed");
     let can_unload = matches!(state, "loaded" | "loading");
     (can_load, can_unload)
 }
@@ -92,81 +95,87 @@ pub fn render(ui: &mut egui::Ui, rows: &[ModelRow]) -> Option<ModelAction> {
         return None;
     }
     let mut action = None;
-    egui::Grid::new("models_grid")
-        .num_columns(7)
-        .striped(true)
-        .spacing([14.0, 8.0])
-        .show(ui, |ui| {
-            for header in ["Model", "Kind", "Engine", "Memory", "State", "Since", ""] {
-                ui.label(egui::RichText::new(header).strong());
-            }
-            ui.end_row();
-            let now = Utc::now();
-            for row in rows {
-                ui.vertical(|ui| {
-                    ui.label(&row.name);
-                    if row.name != row.id {
-                        ui.label(
-                            egui::RichText::new(&row.id)
-                                .small()
-                                .color(egui::Color32::from_gray(150)),
-                        );
-                    }
-                    if let Some(group) = &row.exclusive_group {
-                        ui.label(
-                            egui::RichText::new(format!("one of group {group}"))
-                                .small()
-                                .color(egui::Color32::from_gray(150)),
-                        );
-                    }
-                });
-                ui.monospace(row.kind);
-                ui.monospace(&row.engine);
-                ui.label(format!("{:.1} GB", row.vram_gb));
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(&row.state)
-                                .color(state_colour(&row.state))
-                                .strong(),
-                        );
-                        if row.resident {
-                            ui.label(
-                                egui::RichText::new("resident")
-                                    .small()
-                                    .color(egui::Color32::from_rgb(140, 180, 230)),
-                            )
-                            .on_hover_text("loaded again when the daemon restarts");
-                        }
-                        if !row.enabled {
-                            ui.label(egui::RichText::new("disabled").small());
-                        }
-                    });
-                    if let Some(error) = &row.error {
-                        ui.colored_label(egui::Color32::from_rgb(230, 140, 130), error);
-                    }
-                });
-                match row.since {
-                    Some(since) => ui.label(super::status::format_age(now, since)),
-                    None => ui.label("\u{2014}"),
-                };
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(row.can_load, egui::Button::new("Load"))
-                        .clicked()
-                    {
-                        action = Some(ModelAction::Load(row.id.clone()));
-                    }
-                    if ui
-                        .add_enabled(row.can_unload, egui::Button::new("Unload"))
-                        .clicked()
-                    {
-                        action = Some(ModelAction::Unload(row.id.clone()));
-                    }
-                });
-                ui.end_row();
-            }
+    let now = Utc::now();
+    for row in rows {
+        if let Some(clicked) = render_row(ui, row, now) {
+            action = Some(clicked);
+        }
+        ui.add_space(4.0);
+    }
+    action
+}
+
+/// One model as a card: identity and controls on top, lifecycle below.
+fn render_row(ui: &mut egui::Ui, row: &ModelRow, now: DateTime<Utc>) -> Option<ModelAction> {
+    let mut action = None;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&row.name).strong());
+            ui.label(
+                egui::RichText::new(&row.id)
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(row.can_unload, egui::Button::new("Unload"))
+                    .clicked()
+                {
+                    action = Some(ModelAction::Unload(row.id.clone()));
+                }
+                if ui
+                    .add_enabled(row.can_load, egui::Button::new("Load"))
+                    .clicked()
+                {
+                    action = Some(ModelAction::Load(row.id.clone()));
+                }
+            });
         });
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(&row.state)
+                    .color(state_colour(&row.state))
+                    .strong(),
+            );
+            if row.resident {
+                ui.label(
+                    egui::RichText::new("resident").color(egui::Color32::from_rgb(140, 180, 230)),
+                )
+                .on_hover_text("loaded again when the daemon restarts");
+            }
+            if !row.enabled {
+                ui.label("disabled");
+            } else if !row.loadable {
+                ui.label(egui::RichText::new("runs per job").color(egui::Color32::from_gray(150)))
+                    .on_hover_text("no in-process loader for this engine: it loads for each job");
+            }
+            let since = row
+                .since
+                .map(|since| format!("since {}", super::status::format_age(now, since)))
+                .unwrap_or_default();
+            let group = row
+                .exclusive_group
+                .as_ref()
+                .map(|g| format!(" \u{00b7} one of group {g}"))
+                .unwrap_or_default();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} \u{00b7} {} \u{00b7} {:.1} GB \u{00b7} {since}{group}",
+                    row.kind, row.engine, row.vram_gb
+                ))
+                .color(egui::Color32::from_gray(170)),
+            );
+        });
+        if let Some(error) = &row.error {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(error).color(egui::Color32::from_rgb(230, 140, 130)),
+                )
+                .wrap(),
+            );
+        }
+    });
     action
 }
 
@@ -191,6 +200,7 @@ mod tests {
             resident: state == "loaded",
             since: Some(Utc::now()),
             error: (state == "failed").then(|| "out of memory".to_string()),
+            loadable: true,
         }
     }
 
@@ -211,6 +221,14 @@ mod tests {
         assert_eq!(row.engine, "llama-cpp");
         assert_eq!(row.error.as_deref(), Some("out of memory"));
         assert!(row.can_load && !row.can_unload);
+    }
+
+    #[test]
+    fn a_model_without_a_loader_offers_no_load() {
+        let mut model = entry("unloaded", true);
+        model.loadable = false;
+        let row = ModelRow::from_entry(&model);
+        assert!(!row.can_load && !row.can_unload);
     }
 
     #[test]

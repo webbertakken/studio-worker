@@ -769,6 +769,7 @@ impl LocalApi {
                     obj.insert("state".into(), status.state.name().into());
                     obj.insert("resident".into(), status.resident.into());
                     obj.insert("since".into(), status.since.to_rfc3339().into());
+                    obj.insert("loadable".into(), self.services.host.can_load(model).into());
                     if let ModelState::Failed { reason } = &status.state {
                         obj.insert("error".into(), reason.clone().into());
                     }
@@ -2073,7 +2074,7 @@ mod tests {
     fn the_models_listing_carries_since_and_the_failure() {
         let daemon = crate::test_support::DaemonHarness::start();
         let models = daemon.client().models().unwrap();
-        assert!(models.iter().all(|m| m.since.is_some()));
+        assert!(models.iter().all(|m| m.since.is_some() && m.loadable));
         assert!(models.iter().all(|m| m.error.is_none()));
     }
 

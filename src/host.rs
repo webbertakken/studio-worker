@@ -69,6 +69,12 @@ pub trait ChatModel {
 /// Loads catalogue models into memory.  Freed by dropping the result.
 pub trait ModelRuntime: Send + Sync {
     fn load(&self, model: &CatalogModel) -> anyhow::Result<Arc<dyn LoadedModel>>;
+
+    /// Whether this runtime has an in-process loader for `model`'s engine;
+    /// the tray UI offers Load only when it does.
+    fn can_load(&self, _model: &CatalogModel) -> bool {
+        true
+    }
 }
 
 /// One model's observable status.
@@ -373,6 +379,11 @@ impl ModelHost {
                 state: e.lifecycle.state().name(),
             }),
         }
+    }
+
+    /// Whether `model` can be loaded (its engine has an in-process loader).
+    pub fn can_load(&self, model: &CatalogModel) -> bool {
+        self.inner.runtime.can_load(model)
     }
 
     /// Block until `id`'s state satisfies `pred`, or `timeout` passes.

@@ -253,6 +253,16 @@ pub fn clamp_initial_threshold(default_threshold: f32, detected_vram: f32) -> f3
     }
 }
 
+/// Read the config at `path` without ever writing it: defaults when it is
+/// missing or unreadable.  For the tray UI, which reads a few window
+/// preferences before the daemon answers but never owns the file.
+pub fn peek(path: &Path) -> Config {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 pub fn load(override_path: Option<&str>) -> Result<(Config, PathBuf)> {
     let path = resolve_path(override_path)?;
     if !path.exists() {
@@ -478,6 +488,22 @@ mod tests {
         save(&cfg, &path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("auto_start"), "{text}");
+    }
+
+    #[test]
+    fn peek_reads_without_writing_and_falls_back_to_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(peek(&path).start_minimised);
+        assert!(!path.exists(), "peek never creates the file");
+        std::fs::write(
+            &path,
+            "api_base_url = \"https://x/\"\nvram_threshold_gb = 1.0\nstart_minimised = false\n",
+        )
+        .unwrap();
+        assert!(!peek(&path).start_minimised);
+        std::fs::write(&path, "not toml [").unwrap();
+        assert!(peek(&path).start_minimised);
     }
 
     #[test]

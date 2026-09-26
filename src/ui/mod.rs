@@ -105,6 +105,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     let actions = actions::ActionRunner::new(path.clone(), replica.clone());
     let deps = app::AppDeps {
         replica: replica.clone(),
+        start_minimised: config::peek(&path).start_minimised,
         actions: actions.clone(),
         config_path: path,
         tokio: tokio::runtime::Handle::current(),

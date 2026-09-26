@@ -261,6 +261,9 @@ pub struct ModelEntry {
     pub since: Option<DateTime<Utc>>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The daemon has an in-process loader for the model's engine.
+    #[serde(default)]
+    pub loadable: bool,
 }
 
 fn default_true() -> bool {
@@ -429,11 +432,12 @@ mod tests {
             "source": { "engine": "llama-cpp", "files": [] },
             "enabled": true, "origin": "local",
             "state": "failed", "resident": true,
-            "since": "2026-01-01T00:00:00Z", "error": "out of memory"
+            "since": "2026-01-01T00:00:00Z", "error": "out of memory", "loadable": true
         });
         let entry: ModelEntry = serde_json::from_value(json).unwrap();
         assert_eq!(entry.source.engine, ModelEngine::LlamaCpp);
         assert_eq!(entry.state, "failed");
         assert_eq!(entry.error.as_deref(), Some("out of memory"));
+        assert!(entry.loadable);
     }
 }
