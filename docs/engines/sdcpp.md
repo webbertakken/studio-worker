@@ -142,16 +142,30 @@ The legacy `with_builtin(models_root)` returned a hardcoded
      --diffusion-model <local diffusion file>
      --vae             <local vae file>          # if present
      --llm             <local text encoder>      # if present
+     --llm_vision      <local vision tower>      # text-encoder-vision role, if present
      -p                <prompt from the task>
+     -r                <reference image>         # instruction edits (refImageUrl)
+     --mask            <mask>                    # if the task carries one
      --cfg-scale       <cli_defaults.cfgScale>
      --steps           <cli_defaults.steps or task.steps if explicit>
      -W                <cli_defaults.width or task.width>
      -H                <cli_defaults.height or task.height>
      -o                /tmp/studio-worker-sdcpp/out-<pid>-<nanos>.webp
      --sampling-method <cli_defaults.samplingMethod>  # if present
+     --flow-shift      <cli_defaults.flowShift>        # if present
+     --model-args      qwen_image_zero_cond_t=true     # if cli_defaults.zeroCondT
+     --offload-to-cpu                                 # if cli_defaults.offloadToCpu
+     --mmap                                           # if cli_defaults.mmap
+     --max-vram        <cli_defaults.maxVramGib>      # if present
      --diffusion-fa                                   # always
      --seed            <task.seed>                    # if explicit
    ```
+
+   `offloadToCpu` + `mmap` + `maxVramGib` together let a large model
+   (Qwen-Image-2.1 at ~23 GB unmanaged) share a card with other
+   tenants: weights stay memory-mapped in RAM and stream into a fixed
+   device budget. sd.cpp master-9xx replaced `--qwen-image-zero-cond-t`
+   with the `qwen_image_zero_cond_t` model argument.
 
    The CLI defaults from the studio's source win over the task's
    when the task is at its parameter-default value (e.g. `steps=20`

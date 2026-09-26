@@ -17,7 +17,7 @@ on:
       sd_ref:
         description: "Upstream stable-diffusion.cpp release tag (master-<n>-<sha>)"
         required: true
-        default: "master-669-2d40a8b"
+        default: "master-920-2f88688"
 
 permissions:
   contents: write

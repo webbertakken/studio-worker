@@ -436,7 +436,8 @@ pub struct ModelCliDefaults {
     /// `--flow-shift` for Flow models (SD3.x / WAN / Qwen-Image). Model-level constant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_shift: Option<f32>,
-    /// `--qwen-image-zero-cond-t` — mandatory for Qwen-Image edit quality.
+    /// Qwen-Image zero-cond-t, mandatory for Qwen-Image edit quality. Emitted as
+    /// `--model-args qwen_image_zero_cond_t=true` (sd.cpp master-9xx dropped the dedicated flag).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zero_cond_t: Option<bool>,
     /// `--offload-to-cpu` — keep weights in RAM, stream to VRAM, so a large model fits a small card.
@@ -449,6 +450,13 @@ pub struct ModelCliDefaults {
     /// them (e.g. `{"enable_thinking": false}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+    /// `--mmap` — memory-map the weights, so offloaded models stream without a RAM copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmap: Option<bool>,
+    /// `--max-vram <GiB>` — device budget for managed weights and buffers, so a large model shares
+    /// the card with other tenants (pairs with `offload_to_cpu`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vram_gib: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

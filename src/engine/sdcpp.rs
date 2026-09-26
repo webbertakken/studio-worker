@@ -581,10 +581,18 @@ fn build_sdcli_args(
         args.push(shift.to_string().into());
     }
     if source.cli_defaults.zero_cond_t == Some(true) {
-        args.push("--qwen-image-zero-cond-t".into());
+        args.push("--model-args".into());
+        args.push("qwen_image_zero_cond_t=true".into());
     }
     if source.cli_defaults.offload_to_cpu == Some(true) {
         args.push("--offload-to-cpu".into());
+    }
+    if source.cli_defaults.mmap == Some(true) {
+        args.push("--mmap".into());
+    }
+    if let Some(budget) = source.cli_defaults.max_vram_gib {
+        args.push("--max-vram".into());
+        args.push(budget.to_string().into());
     }
     // VRAM-saving flags that are safe on every box.
     args.push("--diffusion-fa".into());
@@ -1102,8 +1110,7 @@ mod tests {
                 flow_shift: Some(3.0),
                 zero_cond_t: Some(true),
                 offload_to_cpu: Some(true),
-                context_size: None,
-                chat_template_kwargs: None,
+                ..Default::default()
             },
         }
     }
@@ -1139,8 +1146,42 @@ mod tests {
         // Vision encoder + Qwen flow flags emitted.
         assert_eq!(s[idx_after(&s, "--llm_vision").unwrap()], "/mmproj.gguf");
         assert_eq!(s[idx_after(&s, "--flow-shift").unwrap()], "3");
-        assert!(s.contains(&"--qwen-image-zero-cond-t".to_string()));
+        // sd.cpp master-9xx dropped --qwen-image-zero-cond-t for a model arg.
+        assert!(!s.contains(&"--qwen-image-zero-cond-t".to_string()));
+        assert_eq!(
+            s[idx_after(&s, "--model-args").unwrap()],
+            "qwen_image_zero_cond_t=true"
+        );
         assert!(s.contains(&"--offload-to-cpu".to_string()));
+    }
+
+    #[test]
+    fn build_sdcli_args_emits_memory_budget_flags_from_the_registry() {
+        let params = ImageParams {
+            prompt: "Remove the red rowing boat".into(),
+            ..Default::default()
+        };
+        let mut source = qwen_edit_source();
+        source.cli_defaults.mmap = Some(true);
+        source.cli_defaults.max_vram_gib = Some(12.0);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/qwen21.gguf"),
+            Some(Path::new("/vae.safetensors")),
+            Some(Path::new("/llm.gguf")),
+            Some(Path::new("/mmproj.gguf")),
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            Some(Path::new("/tmp/ref.webp")),
+            false,
+        );
+        let s = args_to_strings(&args);
+        assert!(s.contains(&"--mmap".to_string()));
+        assert_eq!(s[idx_after(&s, "--max-vram").unwrap()], "12");
+        // Mask-free reference edit: no --mask without a mask path.
+        assert!(!s.contains(&"--mask".to_string()));
     }
 
     #[test]
@@ -1168,6 +1209,9 @@ mod tests {
         assert!(!s.contains(&"--flow-shift".to_string()));
         assert!(!s.contains(&"--qwen-image-zero-cond-t".to_string()));
         assert!(!s.contains(&"--offload-to-cpu".to_string()));
+        assert!(!s.contains(&"--model-args".to_string()));
+        assert!(!s.contains(&"--mmap".to_string()));
+        assert!(!s.contains(&"--max-vram".to_string()));
         assert!(!s.contains(&"--llm_vision".to_string()));
         assert!(!s.contains(&"-r".to_string()));
     }

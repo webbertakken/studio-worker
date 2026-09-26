@@ -78,7 +78,7 @@ the .so.
 #!/usr/bin/env bash
 set -euo pipefail
 
-URL='https://github.com/leejet/stable-diffusion.cpp/releases/download/master-669-2d40a8b/sd-master-2d40a8b-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip'
+URL='https://github.com/leejet/stable-diffusion.cpp/releases/download/master-920-2f88688/sd-master-2f88688-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip'
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -104,7 +104,7 @@ sd-cli -h | head -1
 The URL is pinned to the same `master-N-<sha>` build the worker
 auto-provisions - the `DEFAULT_RELEASE_TAG` const in
 [`src/engine/sd_provision.rs`](../../src/engine/sd_provision.rs)
-(`master-669-2d40a8b`) and the `sdcpp-prebuilt.yml` workflow default.
+(`master-920-2f88688`) and the `sdcpp-prebuilt.yml` workflow default.
 Keeping them identical means a manual install and the auto-provisioned
 binary share one known-good sd.cpp commit, so there's no flag drift
 between them.  When you bump `DEFAULT_RELEASE_TAG`, update this URL in

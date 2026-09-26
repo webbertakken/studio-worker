@@ -36,7 +36,7 @@ const TRACE_TARGET: &str = "studio_worker::engine::sd_provision";
 /// `sdcpp-prebuilt.yml` workflow default so the manual playbook, the
 /// self-hosted arm64 build, and the auto-provisioner all share one
 /// known-good sd.cpp commit.
-const DEFAULT_RELEASE_TAG: &str = "master-669-2d40a8b";
+const DEFAULT_RELEASE_TAG: &str = "master-920-2f88688";
 
 /// Env override for the release tag.
 const RELEASE_ENV: &str = "STUDIO_WORKER_SDCPP_RELEASE";
