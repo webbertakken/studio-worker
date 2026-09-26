@@ -172,7 +172,7 @@ src/
 │   ├── sd_provision.rs  Auto-provisioned sd-cli binary + Vulkan preflight.
 │   ├── onnx.rs       (feature `image-onnx`) ONNX Runtime image engine (LaMa).
 │   ├── onnx_provision.rs  Shared ONNX Runtime, provisioned at runtime (CPU or CUDA flavour).
-│   └── parakeet.rs   (feature `stt-stream`) streaming speech models (Nemotron, Parakeet EOU).
+│   ├── parakeet.rs   (feature `stt-stream`) streaming speech models (Nemotron, Parakeet EOU).
 │   ├── whisper.rs    (feature `whisper`) whisper-rs wrapper for STT.
 │   ├── candle_image.rs (feature `image-candle`) candle-transformers SD pipeline.
 │   ├── video.rs      (feature `video`) animated-GIF video stand-in (no ffmpeg).
