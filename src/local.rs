@@ -49,6 +49,16 @@ pub enum LocalError {
     },
     #[error("engine error: {0}")]
     Engine(String),
+    #[error("deadline passed: the caller stopped waiting")]
+    DeadlineExceeded,
+}
+
+/// Why a job is refused or stopped once its caller's deadline has passed.
+pub const DEADLINE_PASSED: &str = "deadline passed: the caller stopped waiting";
+
+/// True once `deadline` is in the past; `None` never passes.
+pub fn deadline_passed(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|d| std::time::Instant::now() >= d)
 }
 
 pub(crate) fn next_job_id() -> String {
@@ -127,7 +137,9 @@ pub fn run_kind(
 
 /// Serve a chat on the lane of a loaded model, recording it like any
 /// local job.  `None` when the resolved model is not loaded (or is not
-/// a chat model): the caller runs it as a transient job instead.
+/// a chat model): the caller runs it as a transient job instead.  Past
+/// `deadline` the caller has stopped waiting, so the chat is not started
+/// (a queued job is dropped) or is stopped where it stands.
 pub fn chat_on_lane(
     host: &crate::host::ModelHost,
     catalog: &Catalog,
@@ -135,6 +147,7 @@ pub fn chat_on_lane(
     model_id: Option<&str>,
     prompt_preview: &str,
     params: crate::types::LlmParams,
+    deadline: Option<std::time::Instant>,
 ) -> Option<Result<TaskResult, LocalError>> {
     let model = match model_id {
         Some(id) => catalog.get(id)?,
@@ -156,9 +169,17 @@ pub fn chat_on_lane(
                 source: JobSource::Lane,
             },
         );
-        let result = run
-            .span()
-            .in_scope(|| chat.chat(params, &|| lane.cancelled(), &mut |_| {}));
+        let result = if deadline_passed(deadline) {
+            Err(anyhow::anyhow!(DEADLINE_PASSED))
+        } else {
+            run.span().in_scope(|| {
+                chat.chat(
+                    params,
+                    &|| lane.cancelled() || deadline_passed(deadline),
+                    &mut |_| {},
+                )
+            })
+        };
         Some((run, result))
     });
     let (run, result) = match served {
@@ -166,9 +187,15 @@ pub fn chat_on_lane(
         // Not loaded, or loaded but not a chat model: the transient path decides.
         Ok(None) | Err(_) => return None,
     };
-    let result = result.map(|json| TaskResult::Llm { json });
+    let result = result.map(|json| TaskResult::Llm { json }).map_err(|err| {
+        if deadline_passed(deadline) {
+            LocalError::DeadlineExceeded
+        } else {
+            LocalError::Engine(err.to_string())
+        }
+    });
     run.finish(outcome_of(&result));
-    Some(result.map_err(|err| LocalError::Engine(err.to_string())))
+    Some(result)
 }
 
 /// The chat model a request names, or the default one: it must exist and
@@ -199,12 +226,14 @@ pub fn resolve_llm<'a>(
 /// `send` (which answers `false` once the client has gone, ending the
 /// generation).  Recorded like any local job.  The caller has checked the
 /// model is loaded; if it unloads first, the stream carries the error.
+/// Past `deadline` the stream ends on an error instead of generating.
 pub fn stream_on_lane(
     host: &crate::host::ModelHost,
     observers: &WorkerObservers,
     model_id: &str,
     prompt_preview: &str,
     params: crate::types::LlmParams,
+    deadline: Option<std::time::Instant>,
     send: &mut dyn FnMut(Vec<u8>) -> bool,
 ) {
     use crate::engine::llm_core::{
@@ -232,12 +261,27 @@ pub fn stream_on_lane(
             },
         );
         let mut splitter = ThinkSplitter::default();
-        let result = run.span().in_scope(|| {
-            chat.chat(params, &|| lane.cancelled() || gone.get(), &mut |piece| {
-                for delta in splitter.push(piece) {
-                    emit(sse_event(&chunk_frame(model_id, &delta)));
-                }
+        let result = if deadline_passed(deadline) {
+            Err(anyhow::anyhow!(DEADLINE_PASSED))
+        } else {
+            run.span().in_scope(|| {
+                chat.chat(
+                    params,
+                    &|| lane.cancelled() || gone.get() || deadline_passed(deadline),
+                    &mut |piece| {
+                        for delta in splitter.push(piece) {
+                            emit(sse_event(&chunk_frame(model_id, &delta)));
+                        }
+                    },
+                )
             })
+        }
+        .map_err(|err| {
+            if deadline_passed(deadline) {
+                anyhow::anyhow!(DEADLINE_PASSED)
+            } else {
+                err
+            }
         });
         for delta in splitter.finish() {
             emit(sse_event(&chunk_frame(model_id, &delta)));
@@ -444,7 +488,7 @@ mod tests {
             ..Default::default()
         };
 
-        let answer = chat_on_lane(&host, &catalog, &observers, None, "hello", params)
+        let answer = chat_on_lane(&host, &catalog, &observers, None, "hello", params, None)
             .expect("served on the lane")
             .unwrap();
 

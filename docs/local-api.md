@@ -30,7 +30,7 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | Method | Path            | Auth | Body / params                              | Returns |
 | ------ | --------------- | ---- | ------------------------------------------ | ------- |
 | POST   | `/image`        | yes  | JSON image request (below)                 | image bytes (`image/webp` etc.) |
-| POST   | `/v1/chat/completions` | yes | OpenAI-compatible chat body (`model?`, `messages`, `max_tokens?`, `temperature?`, `top_p?`, `stop?`, `chat_template_kwargs?`, `stream?`) | `chat.completion` JSON |
+| POST   | `/v1/chat/completions` | yes | OpenAI-compatible chat body (`model?`, `messages`, `max_tokens?`, `temperature?`, `top_p?`, `stop?`, `chat_template_kwargs?`, `stream?`, `deadline_ms?`) | `chat.completion` JSON |
 | POST   | `/tts`          | yes  | `{text, model?, voice?, speed?, language?, ext?}` | audio bytes (`audio/wav` etc.) |
 | POST   | `/stt`          | yes  | `{inputUrl, model?, language?}`            | transcript JSON |
 | POST   | `/video`        | yes  | `{prompt, model?, negativePrompt?, seconds?, width?, height?, ext?}` | video bytes (`video/mp4` etc.) |
@@ -244,6 +244,14 @@ streamed, even when split across tokens.  Streaming needs the model loaded
 (`409 model_not_loaded` otherwise); a client that disconnects ends the
 generation.  An error after the stream started arrives as a final
 `{"error":{"message":…}}` event.
+
+**Deadline.** `deadline_ms` is how long the caller will wait, counted from
+when the request arrived. A non-streamed chat only ever sees the client
+leave once it answers, so this is how an abandoned one is freed: past the
+deadline a chat still queued on the lane is dropped without running, and a
+running one stops at its next prompt batch or token. The answer is `504` (a
+stream ends on its error event), and the job is recorded as failed with
+`deadline passed`. Without it a chat runs to the end.
 
 **Token counts.** `POST /tokenize` returns the loaded model's token ids for
 `content` (`404 unknown_model`, `409 model_not_loaded`), so a client can size
