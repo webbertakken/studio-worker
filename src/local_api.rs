@@ -232,6 +232,10 @@ struct ChatBody {
     /// Stream the answer as server-sent events (a loaded model only).
     #[serde(default)]
     stream: bool,
+    /// How long the caller will wait, from arrival.  Past it a queued
+    /// chat is dropped and a running one stopped (`504`).
+    #[serde(default)]
+    deadline_ms: Option<u64>,
 }
 
 /// llama-server compatible `/tokenize` request.
@@ -595,6 +599,7 @@ impl LocalApi {
     /// returns the engine's JSON verbatim (the synthetic + llama
     /// engines already emit a `chat.completion`-shaped body).
     fn handle_chat(&self, mut request: Request) -> std::io::Result<()> {
+        let received = std::time::Instant::now();
         let body = match read_body(&mut request)? {
             BodyOutcome::Ok(body) => body,
             BodyOutcome::TooLarge => return respond_too_large(request),
@@ -631,6 +636,9 @@ impl LocalApi {
             chat_template_kwargs: parsed.chat_template_kwargs,
             ..Default::default()
         };
+        let deadline = parsed
+            .deadline_ms
+            .and_then(|ms| received.checked_add(std::time::Duration::from_millis(ms)));
         let catalog = self.catalog.lock().clone();
         if parsed.stream {
             return self.stream_chat(
@@ -639,6 +647,7 @@ impl LocalApi {
                 parsed.model.as_deref(),
                 &prompt_preview,
                 params,
+                deadline,
             );
         }
         // A loaded model answers on its own lane, outside the job gate.
@@ -649,6 +658,7 @@ impl LocalApi {
             parsed.model.as_deref(),
             &prompt_preview,
             params.clone(),
+            deadline,
         ) {
             return respond_llm(request, result);
         }
@@ -676,6 +686,7 @@ impl LocalApi {
         model_id: Option<&str>,
         prompt_preview: &str,
         params: LlmParams,
+        deadline: Option<std::time::Instant>,
     ) -> std::io::Result<()> {
         let model = match crate::local::resolve_llm(catalog, model_id) {
             Ok(model) => model.id.clone(),
@@ -695,6 +706,7 @@ impl LocalApi {
                 &model,
                 &preview,
                 params,
+                deadline,
                 &mut |bytes| tx.send(bytes).is_ok(),
             );
         });
@@ -1360,6 +1372,7 @@ fn content_type_for(ext: &str) -> &'static str {
 fn respond_local_err(request: Request, err: LocalError) -> std::io::Result<()> {
     let status = match err {
         LocalError::Engine(_) => 500,
+        LocalError::DeadlineExceeded => 504,
         _ => 400,
     };
     respond(request, status, "text/plain", err.to_string().as_bytes())
@@ -1810,6 +1823,79 @@ mod tests {
         );
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["choices"][0]["message"]["content"], "resident:hi");
+    }
+
+    #[test]
+    fn a_chat_whose_deadline_has_passed_is_dropped_without_running() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let res = h
+            .post("/v1/chat/completions")
+            .json(&serde_json::json!({
+                "model": "chat-llm",
+                "deadline_ms": 0,
+                "messages": [{ "role": "user", "content": "hi" }],
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 504);
+        assert!(res.text().unwrap().contains("deadline"));
+        let job = h
+            .observers
+            .local_jobs
+            .lock()
+            .front()
+            .cloned()
+            .expect("recorded");
+        assert!(
+            matches!(&job.outcome, JobOutcome::Failed { reason } if reason.contains("deadline")),
+            "{:?}",
+            job.outcome
+        );
+    }
+
+    #[test]
+    fn a_chat_within_its_deadline_is_answered() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let (status, body) = chat(
+            &h,
+            serde_json::json!({
+                "model": "chat-llm",
+                "deadline_ms": 60_000,
+                "messages": [{ "role": "user", "content": "hi" }],
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["choices"][0]["message"]["content"], "resident:hi");
+    }
+
+    #[test]
+    fn a_stream_whose_deadline_has_passed_ends_on_an_error() {
+        let h = Harness::start(llm_catalog());
+        h.post("/models/chat-llm/load").send().unwrap();
+        wait_state(&h, "chat-llm", "loaded");
+        let res = h
+            .post("/v1/chat/completions")
+            .json(&serde_json::json!({
+                "model": "chat-llm",
+                "stream": true,
+                "deadline_ms": 0,
+                "messages": [{ "role": "user", "content": "hi" }],
+            }))
+            .send()
+            .unwrap();
+        let (frames, done) = sse(&res.text().unwrap());
+        assert!(done);
+        let last = frames.last().unwrap();
+        assert!(
+            last["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("deadline")),
+            "{last}"
+        );
     }
 
     #[test]
