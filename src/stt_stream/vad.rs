@@ -12,21 +12,39 @@ pub const VAD_WINDOW_MS: usize = 200;
 /// RMS at or above which a window counts as speech (mic levels measured
 /// on the phone by the Python server; safe range 0.005..=0.05).
 pub const VAD_THRESHOLD: f32 = 0.018;
-/// Post-speech silence that ends the utterance (matches the app's Google
-/// STT `pauseFor`; safe range 800..=3000).
+/// Post-speech silence that ends a server-endpointed utterance; safe range
+/// 800..=3000.  Clients that need longer pauses ask for client endpointing.
 pub const VAD_SILENCE_MS: usize = 1500;
 
 const WINDOW: usize = SAMPLE_RATE * VAD_WINDOW_MS / 1000;
 
 /// Tracks speech and the silence run after it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Vad {
     carry: Vec<f32>,
     speech_ms: usize,
     silence_ms: usize,
+    ends_after_ms: usize,
+}
+
+impl Default for Vad {
+    fn default() -> Self {
+        Self::with_silence_ms(VAD_SILENCE_MS)
+    }
 }
 
 impl Vad {
+    /// A detector that ends the utterance after `ends_after_ms` of
+    /// post-speech silence.
+    pub fn with_silence_ms(ends_after_ms: usize) -> Self {
+        Self {
+            carry: Vec::new(),
+            speech_ms: 0,
+            silence_ms: 0,
+            ends_after_ms,
+        }
+    }
+
     /// Feed samples; true once speech was heard and silence has lasted
     /// long enough since.
     pub fn feed(&mut self, samples: &[f32]) -> bool {
@@ -42,7 +60,7 @@ impl Vad {
             }
         }
         self.carry.drain(..whole);
-        self.speech_ms > 0 && self.silence_ms >= VAD_SILENCE_MS
+        self.speech_ms > 0 && self.silence_ms >= self.ends_after_ms
     }
 }
 
@@ -95,6 +113,14 @@ mod tests {
             ended |= vad.feed(&tone(50, 0.0));
         }
         assert!(ended);
+    }
+
+    #[test]
+    fn a_longer_silence_threshold_waits_longer() {
+        let mut vad = Vad::with_silence_ms(3000);
+        vad.feed(&tone(400, 0.2));
+        assert!(!vad.feed(&tone(2800, 0.0)), "2.8 s is under 3 s");
+        assert!(vad.feed(&tone(200, 0.0)), "3 s of silence ends it");
     }
 
     #[test]
