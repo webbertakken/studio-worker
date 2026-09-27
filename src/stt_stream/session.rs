@@ -4,6 +4,10 @@
 //! Client: binary frames of 16 kHz mono s16le PCM; text `end` finalises;
 //! text `cancel` closes without a final.  Server: `{"partial":true,"text"}`
 //! as the transcript grows, `{"final":true,"text"}` once, `{"error"}`.
+//!
+//! Who ends the utterance is the client's choice at the handshake
+//! ([`Endpointing`]): the server's own VAD after a short pause, or the
+//! client, which sends `end` when it decides the user has finished.
 
 use super::vad::{Vad, SAMPLE_RATE};
 
@@ -11,6 +15,41 @@ use super::vad::{Vad, SAMPLE_RATE};
 /// streaming model lags its input by up to a chunk plus look-ahead).
 /// Measured: 1.5 s flushed the last word in the spike.  Safe range 0.5..=3 s.
 pub const FLUSH_SILENCE_MS: usize = 1500;
+
+/// Post-speech silence that ends a client-endpointed session anyway, so a
+/// client that never sends `end` cannot hold the model's lane.  Safe range
+/// 10_000..=120_000.
+pub const CLIENT_SILENCE_CEILING_MS: usize = 30_000;
+
+/// Who decides that the utterance is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Endpointing {
+    /// The server's VAD finalises after [`super::vad::VAD_SILENCE_MS`].
+    #[default]
+    Server,
+    /// The client sends `end`; the server only finalises after
+    /// [`CLIENT_SILENCE_CEILING_MS`] of silence.
+    Client,
+}
+
+impl Endpointing {
+    /// The `endpoint` query value; absent means [`Endpointing::Server`],
+    /// anything unknown is `None`.
+    pub fn parse(value: Option<&str>) -> Option<Self> {
+        match value {
+            None | Some("server") => Some(Self::Server),
+            Some("client") => Some(Self::Client),
+            Some(_) => None,
+        }
+    }
+
+    fn vad(self) -> Vad {
+        match self {
+            Self::Server => Vad::default(),
+            Self::Client => Vad::with_silence_ms(CLIENT_SILENCE_CEILING_MS),
+        }
+    }
+}
 
 /// A streaming speech model with per-utterance state.
 pub trait StreamingTranscriber {
@@ -85,6 +124,14 @@ pub struct StreamSession<'a> {
 
 impl<'a> StreamSession<'a> {
     pub fn new(transcriber: &'a mut dyn StreamingTranscriber) -> Self {
+        Self::with_endpointing(transcriber, Endpointing::Server)
+    }
+
+    /// A session whose utterance ends as [`Endpointing`] says.
+    pub fn with_endpointing(
+        transcriber: &'a mut dyn StreamingTranscriber,
+        endpointing: Endpointing,
+    ) -> Self {
         transcriber.reset();
         Self {
             transcriber,
@@ -92,7 +139,7 @@ impl<'a> StreamSession<'a> {
             odd_byte: None,
             raw: String::new(),
             sent: String::new(),
-            vad: Vad::default(),
+            vad: endpointing.vad(),
         }
     }
 
@@ -299,6 +346,46 @@ mod tests {
         let (out, next) = s.handle(ClientFrame::Audio(pcm(1600, 0)));
         assert_eq!(next, Next::Close);
         assert_eq!(texts(&out).last().unwrap(), "final:hi");
+    }
+
+    #[test]
+    fn client_endpointing_keeps_going_through_a_pause() {
+        let mut t = Scripted::new(&["hi", " there"]);
+        let mut s = StreamSession::with_endpointing(&mut t, Endpointing::Client);
+        s.handle(ClientFrame::Audio(pcm(400, 8000)));
+        let (_, next) = s.handle(ClientFrame::Audio(pcm(2000, 0)));
+        assert_eq!(next, Next::Continue, "a 2 s pause does not finalise");
+        let (_, next) = s.handle(ClientFrame::Audio(pcm(400, 8000)));
+        assert_eq!(next, Next::Continue);
+        let (out, next) = s.handle(ClientFrame::End);
+        assert_eq!(next, Next::Close);
+        assert!(texts(&out).last().unwrap().starts_with("final:"));
+    }
+
+    #[test]
+    fn client_endpointing_still_ends_a_forgotten_session() {
+        let mut t = Scripted::new(&["hi"]);
+        let mut s = StreamSession::with_endpointing(&mut t, Endpointing::Client);
+        s.handle(ClientFrame::Audio(pcm(400, 8000)));
+        let (_, next) = s.handle(ClientFrame::Audio(pcm(CLIENT_SILENCE_CEILING_MS - 200, 0)));
+        assert_eq!(next, Next::Continue);
+        let (out, next) = s.handle(ClientFrame::Audio(pcm(200, 0)));
+        assert_eq!(next, Next::Close);
+        assert_eq!(texts(&out).last().unwrap(), "final:hi");
+    }
+
+    #[test]
+    fn endpointing_parses_from_the_query_value() {
+        assert_eq!(Endpointing::parse(None), Some(Endpointing::Server));
+        assert_eq!(
+            Endpointing::parse(Some("server")),
+            Some(Endpointing::Server)
+        );
+        assert_eq!(
+            Endpointing::parse(Some("client")),
+            Some(Endpointing::Client)
+        );
+        assert_eq!(Endpointing::parse(Some("both")), None);
     }
 
     #[test]

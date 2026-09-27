@@ -6,7 +6,7 @@
 //! Binds the LAN on purpose (a phone streams to it); the stream token is the
 //! guard.  One session per model at a time (`try_with_lane`).
 
-use super::session::{ClientFrame, Next, ServerFrame, StreamSession};
+use super::session::{ClientFrame, Endpointing, Next, ServerFrame, StreamSession};
 pub use super::tokens::StreamTokens;
 use crate::host::{Lane, LoadedModel, ModelHost};
 use crate::job_run::JobRun;
@@ -113,6 +113,7 @@ fn reject(status: u16, message: &str) -> ErrorResponse {
 struct Handshake<'a> {
     tokens: &'a StreamTokens,
     model: &'a mut Option<String>,
+    endpointing: &'a mut Endpointing,
 }
 
 impl Callback for Handshake<'_> {
@@ -120,6 +121,11 @@ impl Callback for Handshake<'_> {
         if req.uri().path() != STREAM_PATH {
             return Err(reject(404, "not found; stream to /transcribe"));
         }
+        let Some(endpointing) = Endpointing::parse(query_param(req.uri().query(), "endpoint"))
+        else {
+            return Err(reject(400, "endpoint must be server or client"));
+        };
+        *self.endpointing = endpointing;
         match query_param(req.uri().query(), "token").map(|t| self.tokens.check(t, Utc::now())) {
             Some(Ok(m)) => {
                 *self.model = Some(m);
@@ -154,9 +160,11 @@ fn session(
         return;
     }
     let mut model: Option<String> = None;
+    let mut endpointing = Endpointing::Server;
     let handshake = Handshake {
         tokens,
         model: &mut model,
+        endpointing: &mut endpointing,
     };
     let mut ws = match tungstenite::accept_hdr(stream, handshake) {
         Ok(ws) => ws,
@@ -169,7 +177,7 @@ fn session(
     if ws.get_ref().set_read_timeout(Some(POLL)).is_err() {
         return;
     }
-    tracing::info!(target: TRACE_TARGET, op = "stream", %peer, model = %model, "stream opened");
+    tracing::info!(target: TRACE_TARGET, op = "stream", %peer, model = %model, ?endpointing, "stream opened");
     let served = host.try_with_lane(&model, |loaded, lane| {
         let job = JobRun::begin(
             observers,
@@ -182,7 +190,9 @@ fn session(
                 source: JobSource::Stream,
             },
         );
-        let summary = job.span().in_scope(|| run(&mut ws, loaded, lane));
+        let summary = job
+            .span()
+            .in_scope(|| run(&mut ws, loaded, lane, endpointing));
         (job, summary)
     });
     match served {
@@ -218,7 +228,12 @@ fn session(
 }
 
 /// Serve one session on a loaded model's lane.
-fn run(ws: &mut Socket, loaded: &dyn LoadedModel, lane: &Lane) -> Summary {
+fn run(
+    ws: &mut Socket,
+    loaded: &dyn LoadedModel,
+    lane: &Lane,
+    endpointing: Endpointing,
+) -> Summary {
     let summary = Summary::default();
     let Some(streaming) = loaded.as_stream() else {
         return fail(ws, summary, "model is not a streaming speech model".into());
@@ -227,7 +242,7 @@ fn run(ws: &mut Socket, loaded: &dyn LoadedModel, lane: &Lane) -> Summary {
         Ok(t) => t,
         Err(e) => return fail(ws, summary, format!("could not open a stream: {e:#}")),
     };
-    let mut session = StreamSession::new(transcriber.as_mut());
+    let mut session = StreamSession::with_endpointing(transcriber.as_mut(), endpointing);
     let mut summary = summary;
     loop {
         if lane.cancelled() {
@@ -440,6 +455,42 @@ mod tests {
                 Ok(_) => {}
             }
         }
+    }
+
+    #[test]
+    fn client_endpointing_holds_the_session_through_a_pause() {
+        let h = start(true);
+        let t = token(&h);
+        let mut ws = connect_to(&h, "/transcribe", &format!("{t}&endpoint=client")).unwrap();
+        ws.send(Message::Binary(pcm(400, 8000).into())).unwrap();
+        ws.send(Message::Binary(pcm(2000, 0).into())).unwrap();
+        ws.send(Message::Binary(pcm(400, 8000).into())).unwrap();
+        ws.send(Message::Text("end".into())).unwrap();
+        let frames = drain(&mut ws);
+        let finals: Vec<_> = frames.iter().filter(|f| f["final"] == true).collect();
+        assert_eq!(finals.len(), 1, "one final, only after end: {frames:?}");
+        assert_eq!(frames.last().unwrap()["final"], true);
+    }
+
+    #[test]
+    fn server_endpointing_still_finalises_on_a_pause() {
+        let h = start(true);
+        let t = token(&h);
+        let mut ws = connect_to(&h, "/transcribe", &format!("{t}&endpoint=server")).unwrap();
+        ws.send(Message::Binary(pcm(400, 8000).into())).unwrap();
+        ws.send(Message::Binary(pcm(2000, 0).into())).unwrap();
+        let frames = drain(&mut ws);
+        assert_eq!(frames.last().unwrap()["final"], true);
+    }
+
+    #[test]
+    fn an_unknown_endpointing_is_refused_at_the_handshake() {
+        let h = start(true);
+        let t = token(&h);
+        assert_eq!(
+            connect_to(&h, "/transcribe", &format!("{t}&endpoint=both")).err(),
+            Some(400)
+        );
     }
 
     #[test]

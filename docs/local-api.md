@@ -146,7 +146,8 @@ A token lives 10 minutes by default (`ttlSecs`, clamped to 30 s–1 h); the hold
 mints a fresh one before it expires.  Errors: `404 unknown_model`,
 `400 not_a_stream_model`, `503 stream_listener_down`.
 
-Then `ws://<host>:4798/transcribe?token=<token>`:
+Then `ws://<host>:4798/transcribe?token=<token>`, optionally with `&endpoint=server` (the
+default) or `&endpoint=client`:
 
 | Direction | Frame | Meaning |
 | --- | --- | --- |
@@ -157,8 +158,15 @@ Then `ws://<host>:4798/transcribe?token=<token>`:
 | worker -> client | `{"final":true,"text":…}` | the settled transcript, then close |
 | worker -> client | `{"error":…}` | e.g. not loaded, busy, model unloaded |
 
-After speech, 1.5 s of silence finalises by itself (energy VAD, RMS 0.018 over
-200 ms windows).  One session per model at a time; a second gets
+Who ends the utterance:
+
+- `endpoint=server` (default): after speech, 1.5 s of silence finalises by itself (energy
+  VAD, RMS 0.018 over 200 ms windows).
+- `endpoint=client`: pauses never finalise; the client sends `end` when the user has
+  finished.  30 s of post-speech silence still finalises, so a client that never sends
+  `end` cannot hold the model.
+
+Any other `endpoint` value is refused at the handshake (400).  One session per model at a time; a second gets
 `busy`.  Unloading the model ends a session with `model unloaded`.  A bad or
 expired token is refused at the handshake (401); any other path is 404.
 Every session is recorded in the local queue.
