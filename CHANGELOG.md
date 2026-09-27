@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.12](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.11...studio-worker-v0.4.12) (2026-09-27)
+
+
+### Features
+
+* **local-api:** drop chats past the caller deadline ([#142](https://github.com/webbertakken/studio-worker/issues/142)) ([af3935d](https://github.com/webbertakken/studio-worker/commit/af3935dfebc66f6067f8be64b3916411821f862a))
+
 ## [0.4.11](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.10...studio-worker-v0.4.11) (2026-09-26)
 
 
