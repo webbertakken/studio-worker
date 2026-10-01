@@ -43,6 +43,8 @@ top-level [`README.md`](../README.md).  For active plans, see
 
 ## Operations
 
+- [Releases](operations/release.md) — the release pipeline and its assets; the CUDA variant of
+  the x86_64 Linux build, how the installer picks it and how auto-update keeps it.
 - [Installing sd-cli](operations/sd-cli-install.md) — the worker
   auto-provisions `sd-cli`; this is the override / manual-install
   playbook (CUDA build, air-gapped mirror, unsupported targets).

@@ -13,11 +13,12 @@ TARGET="${TARGET:-x86_64-unknown-linux-gnu}"
 #   61 Pascal (GTX 10xx)   70 Volta (V100)        75 Turing (RTX 20xx, T4)   80 Ampere (A100)
 #   86 Ampere (RTX 30xx)   89 Ada (RTX 40xx, L4)  90 Hopper (H100)           120a Blackwell (RTX 50xx)
 CUDA_ARCHS="${CUDA_ARCHS:-61-real;70-real;75-real;80-real;86-real;89-real;90-real;90-virtual;120a-real}"
-EXPECTED_SASS="${EXPECTED_SASS:-sm_61 sm_70 sm_75 sm_80 sm_86 sm_89 sm_90 sm_120a}"
-EXPECTED_PTX="${EXPECTED_PTX:-sm_90}"
+EXPECTED_SASS="${EXPECTED_SASS-sm_61 sm_70 sm_75 sm_80 sm_86 sm_89 sm_90 sm_120a}"
+EXPECTED_PTX="${EXPECTED_PTX-sm_90}"
 PROFILE=dist
 BIN="target/${TARGET}/${PROFILE}/studio-worker"
 ARCHIVE_STEM="studio-worker-${TARGET}-cuda"
+CUOBJDUMP="${CUDA_HOME:-/usr/local/cuda}/bin/cuobjdump"
 
 log() { printf '[cuda-variant] %s\n' "$*" >&2; }
 die() { printf '[cuda-variant] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -54,8 +55,8 @@ verify() {
   lib="$(ggml_cuda_lib)"
 
   # Device code: exactly the architectures asked for (a stale CMake cache keeps an old list).
-  sass="$(cuobjdump --list-elf "$lib" | grep -o 'sm_[0-9]*a\?' | sort -u | tr '\n' ' ')"
-  ptx="$(cuobjdump --list-ptx "$lib" | grep -o 'sm_[0-9]*a\?' | sort -u | tr '\n' ' ')"
+  sass="$("$CUOBJDUMP" --list-elf "$lib" | grep -o 'sm_[0-9]*a\?' | sort -u | tr '\n' ' ')"
+  ptx="$("$CUOBJDUMP" --list-ptx "$lib" | grep -o 'sm_[0-9]*a\?' | sort -u | tr '\n' ' ')"
   log "ggml-cuda device code: sass=[${sass% }] ptx=[${ptx% }]"
   for arch in $EXPECTED_SASS; do
     grep -qw "$arch" <<<"$sass" || die "no ${arch} device code in ${lib}"

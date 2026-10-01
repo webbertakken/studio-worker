@@ -271,8 +271,11 @@ same size) is used where it is; only a missing file is downloaded.
 A **loaded** model answers on its own lane, next to any running job and
 without the one-job gate; an unloaded model runs as a transient job (loaded
 for the request, freed after).  Keep a chat model loaded
-(`POST /models/:id/load`) for warm answers.  GPU offload needs a build with
-the `cuda` feature; release builds run LLMs on the CPU.
+(`POST /models/:id/load`) for warm answers.  GPU offload (every layer) needs a
+build with the `cuda` feature: the CUDA release build on x86_64 Linux, which the
+installer picks when the NVIDIA driver is present
+([release: CUDA variant](operations/release.md#cuda-variant)).  Other builds run
+LLMs on the CPU.
 
 ## Local model catalog
 

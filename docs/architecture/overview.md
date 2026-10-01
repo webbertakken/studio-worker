@@ -179,7 +179,9 @@ src/
 │   └── server.rs     LAN WebSocket listener; one session per loaded model's lane.
 ├── service.rs        Per-OS service file writers (systemd --user / launchd / schtasks XML).
 ├── autostart.rs      Cross-OS tray-UI login entry, always installed by `ui::run` (logged).
-├── update.rs         GitHub release feed poll + installer script download + re-exec on success.
+├── update.rs         GitHub release feed poll + installer script download + re-exec on success;
+│                     keeps the build variant (CPU or CUDA).
+├── variant.rs        The build variant (`cpu` or `cuda`) and the release target of this binary.
 ├── telemetry.rs      Sentry init (opt-in via SENTRY_DSN env var) + tracing-subscriber layer.
 ├── test_support.rs   #[doc(hidden)] tracing capture + host doubles for tests.
 │
@@ -715,7 +717,13 @@ Every `auto_update_interval_secs` (default 30 min):
    default).
 3. Compare highest published semver to `AGENT_VERSION`.
 4. If newer:
-   - Download the per-platform cargo-dist installer script.
+   - Pick the build variant: the one this binary runs as (`variant::Variant::current()`,
+     `cpu` or `cuda`).  A CUDA build falls back to CPU, with a warning (`op="variant"`), only
+     when the release ships no CUDA archive for its target.  See
+     [release: CUDA variant](../operations/release.md#cuda-variant).
+   - Download the per-platform cargo-dist installer script and verify it against its
+     `<installer>.sha256` sidecar.  A CUDA update refuses an installer without the variant
+     switch, so it can never install the CPU build in its place.
    - On Windows only: **park** the running exe first (rename to
      `<exe>.old` — NTFS allows renaming a running binary but not
      overwriting it, so without this the installer's `Copy-Item`
@@ -723,7 +731,8 @@ Every `auto_update_interval_secs` (default 30 min):
      runs, confirm a new binary landed at the original path; roll
      the rename back otherwise.  The parked file is removed on the
      next start (`update::cleanup_parked_artifact`).
-   - Run the installer (overwrites the binary in place).
+   - Run the installer with `STUDIO_WORKER_VARIANT=<variant>` (overwrites the binary in
+     place).
    - On unix: `execvp` the new binary, replacing this process.
    - On Windows: spawn the successor + exit, since `execvp` isn't
      a clean fit.
@@ -871,7 +880,8 @@ captures them.
   install_id + secret — no `rand` dep, smaller surface area.
 - **Auto-update binary swap** runs the cargo-dist installer the same
   way the user did on first install — same HTTPS + checksum
-  verification (cargo-dist's own).
+  verification (cargo-dist's own), after checking the installer itself
+  against the release's `<installer>.sha256` sidecar.
 
 ---
 

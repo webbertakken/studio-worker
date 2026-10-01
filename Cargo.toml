@@ -190,8 +190,8 @@ encoding_rs = { version = "0.8", optional = true }
 default = ["ui", "llama", "video", "tts", "image-onnx", "stt-stream"]
 llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
 # In-process LLM on NVIDIA GPUs (all layers offloaded).  Needs the CUDA
-# toolkit (nvcc) at build time, so it is opt-in: CI and release builds
-# stay CPU-only.
+# toolkit (nvcc) at build time, so it is opt-in; releases ship it as a second
+# x86_64 Linux archive (scripts/release/cuda-variant.sh, docs/operations/release.md).
 cuda = ["llama", "llama-cpp-2/cuda"]
 whisper = ["dep:whisper-rs"]
 image-candle = [
