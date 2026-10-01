@@ -21,7 +21,7 @@ Verified against both codebases on 2026-06-11.
 9. [Studio realtime UI broadcast](#9-studio-realtime-ui-broadcast)
 10. [Process startup + shutdown](#10-process-startup--shutdown)
 11. [Auto-update](#11-auto-update)
-12. [Service install + autostart](#12-service-install--autostart)
+12. [Install + autostart](#12-install--autostart)
 13. [Tray UI observation](#13-tray-ui-observation)
 14. [Telemetry](#14-telemetry)
 15. [Model lifecycle](#15-model-lifecycle)
@@ -325,13 +325,14 @@ next interval.  Manual check via
 `check-update` CLI or the UI Worker page.  No studio involvement —
 the feed is GitHub.
 
-## 12. Service install + autostart
+## 12. Install + autostart
 
-Two coexisting worker-side mechanisms, no studio involvement:
+Installed, the worker runs as the tray UI only; no studio involvement:
 
-- **`install-service`** ([`src/service.rs`](../../src/service.rs)):
-  systemd `--user` unit / launchd plist / Windows scheduled-task XML
-  for headless rigs.
+- **`setup`** ([`src/setup.rs`](../../src/setup.rs)), run by the installers: the login
+  entry, then the tray UI started detached.
+- **Legacy services** ([`src/legacy_service.rs`](../../src/legacy_service.rs)): the tray UI
+  deregisters and deletes a headless unit an older version installed, at start.
 - **Tray UI at login** ([`src/autostart.rs`](../../src/autostart.rs)):
   `.desktop` entry / LaunchAgent / HKCU `…\Run` registry value, always
   installed (and kept pointing at the current executable) by every

@@ -1,7 +1,7 @@
 # Local image API
 
 The worker exposes an always-on local HTTP API so you can generate images
-(e.g. Z-Image) **without the studio**. The daemon (`studio-worker run`, which the tray UI
+(e.g. Z-Image) **without the studio**. The daemon (which the tray UI
 starts when none runs) serves it, before the studio-registration gate, so it
 works even when the worker is not registered with any studio.  The tray UI is
 itself a client of this API (see [daemon control](#daemon-control)).

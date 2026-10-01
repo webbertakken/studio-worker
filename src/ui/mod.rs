@@ -6,8 +6,8 @@
 //! local API.  When no daemon runs, the poller starts one.  One tray UI runs
 //! per config directory (`single_instance`).
 //!
-//! Gated behind the `ui` cargo feature so headless installs and the
-//! service path don't pull in egui / eframe / the tray backends.
+//! Gated behind the `ui` cargo feature so the CI-only headless core builds without
+//! egui / eframe / the tray backends.  Installed, the worker always runs as this UI.
 
 pub mod actions;
 pub mod app;

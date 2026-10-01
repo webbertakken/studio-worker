@@ -262,8 +262,8 @@ auto_update_prerelease    = false
 # WebSocket reconnect cap.  When the session drops the worker tries
 # to reconnect with exponential backoff up to this many times before
 # exiting non-zero (the tray UI then starts a new daemon).
-# `0` = infinite.  Omit to use the default of 5.
-ws_reconnect_attempts     = 5
+# `0` = infinite, the default when omitted.
+ws_reconnect_attempts     = 0
 
 # Internal state written by the auto-register flow.  Don't edit by hand.
 install_id              = "<uuidv4>"

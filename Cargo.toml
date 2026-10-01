@@ -212,8 +212,8 @@ image-onnx = ["dep:ort", "dep:flate2", "dep:tar"]
 stt-stream = ["dep:parakeet-rs", "dep:ort", "ort/cuda", "dep:flate2", "dep:tar"]
 video = ["dep:gif"]
 tts = []
-# Desktop UI — brings in egui / eframe / tray-icon / notify-rust.
-# Headless rigs and the systemd / launchd service path leave this off.
+# Desktop UI — brings in egui / eframe / tray-icon / notify-rust.  Installed, the
+# worker always runs as the tray UI; only CI builds without it (the headless core).
 ui = [
     "dep:egui",
     "dep:eframe",

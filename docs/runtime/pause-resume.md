@@ -37,8 +37,8 @@ clone (it's an `Arc`).
   pausing only affects acceptance of new work.
 
 The flag is **runtime-only** by design.  No persistence to
-`config.toml`; no resurrection across restarts; a service-managed
-worker that gets restarted by systemd comes back unpaused.  The
+`config.toml`; no resurrection across restarts; a daemon the tray UI
+starts again comes back unpaused.  The
 operator can re-pause from the tray UI (or `POST /daemon/pause`).
 
 ## Where the flag flips

@@ -7,8 +7,8 @@
 //!
 //! Reconnect policy: on a transport error or non-auth close, back off
 //! `BASE_BACKOFF_MS * 2^attempt` and try again, up to
-//! `cfg.ws_reconnect_attempts`.  Out of retries → return `Err` and the
-//! systemd / launchd unit restarts the binary.
+//! `cfg.ws_reconnect_attempts`.  Out of retries → return `Err`; the daemon
+//! exits and the tray UI starts a new one.
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -49,8 +49,8 @@ const MAX_BACKOFF_MS: u64 = 30_000;
 /// laptop that sleeps through a wifi outage used to wake as a dead
 /// worker after 5 failed reconnects.  Infinite-with-capped-backoff is
 /// the only default that keeps "approve once, never touch again" true.
-/// Operators who want fail-fast under systemd can still set a finite
-/// `ws_reconnect_attempts`.
+/// A finite `ws_reconnect_attempts` makes the daemon exit instead; the
+/// tray UI then starts a new one.
 const DEFAULT_RECONNECT_ATTEMPTS: u32 = 0;
 /// Extra attempts for the multipart result upload when the studio
 /// returns a 5xx / transport error.  A blip is far cheaper to retry

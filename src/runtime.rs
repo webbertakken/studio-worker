@@ -744,11 +744,9 @@ pub fn request_shutdown(stop: &AtomicBool, signal: &str) {
 /// the signal that fired.
 ///
 /// On Unix we wait on **both** SIGINT (interactive Ctrl-C) and SIGTERM.
-/// SIGTERM is the signal `systemctl stop` / `launchctl unload` / host
-/// shutdown deliver by default, and the worker ships as a `Type=simple`
-/// systemd unit (see `service::render_service`).  Listening for Ctrl-C
-/// alone meant the service manager's stop never reached the graceful
-/// path: the WS session was killed mid-`close`, the studio saw an
+/// SIGTERM is the signal host shutdown, `kill` and a logout deliver by
+/// default.  Listening for Ctrl-C alone meant such a stop never reached
+/// the graceful path: the WS session was killed mid-`close`, the studio saw an
 /// abrupt disconnect, and the final log batch never flushed.  If the
 /// SIGTERM handler can't be installed we degrade to Ctrl-C only rather
 /// than abort the shutdown task.

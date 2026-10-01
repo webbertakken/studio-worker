@@ -22,7 +22,7 @@ jobs:
           - label: default-turnkey
             flags: ""
             fmt: true
-          # Headless core (service / `run`), no UI deps.
+          # Headless core, no UI deps: CI only, never installed.
           - label: headless
             flags: "--no-default-features"
             fmt: false
