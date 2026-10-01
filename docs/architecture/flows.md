@@ -314,8 +314,8 @@ exhausts its reconnect budget.
 `runtime.rs`.  Every `auto_update_interval_secs` (default 30 min),
 when enabled and not mid-job: poll the GitHub Releases feed →
 compare semver vs `AGENT_VERSION` → on newer, download the
-cargo-dist installer, run it for the build variant this binary runs as
-(`cpu` or `cuda`; see [release](../operations/release.md#cuda-variant)), `execvp` into the new binary (unix) or
+cargo-dist installer, run it for the build variant (CUDA stays CUDA, CPU moves to CUDA when the
+NVIDIA driver is present; see [release](../operations/release.md#cuda-variant)), `execvp` into the new binary (unix) or
 spawn-successor + exit (Windows).  Windows-specific: the running exe
 is **parked** (renamed to `<exe>.old`) before the installer runs —
 NTFS locks a running binary against overwrite but allows the rename

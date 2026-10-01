@@ -190,7 +190,8 @@ with every layer on the GPU: on an RTX 4090 a 0.8B model answers a
 3,600-token chat in 0.3 s, against 13.5 s on the CPU.  It needs only the
 driver (525 or newer), not the CUDA toolkit, and covers GTX 10xx through
 RTX 50xx and datacentre GPUs from V100 to H100.  It is a larger download:
-565 MB against 10 MB.  Auto-update keeps the build you have.  To choose
+565 MB against 10 MB.  Auto-update keeps a CUDA install on
+CUDA, and moves a CPU install to CUDA once the driver is installed.  To choose
 yourself:
 
 ```bash

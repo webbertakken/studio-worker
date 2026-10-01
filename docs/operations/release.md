@@ -140,17 +140,24 @@ generated installer and fake archives.
 
 ### Auto-update
 
-The updater ([`src/update.rs`](../../src/update.rs)) installs the variant the running binary was
-built as (`variant::Variant::current()`, from `cfg!(feature = "cuda")`), and passes it to the
-installer as `STUDIO_WORKER_VARIANT`:
+The updater ([`src/update.rs`](../../src/update.rs)) decides the variant from the build it runs as
+(`variant::Variant::current()`, from `cfg!(feature = "cuda")`), whether the release ships the CUDA
+archive for its target, and whether the NVIDIA driver's `libcuda.so.1` loads
+(`variant::nvidia_driver_present()`).  It passes the variant to the installer as
+`STUDIO_WORKER_VARIANT`.  CUDA never reverts by choice; a CPU install moves to CUDA once the
+driver is there:
 
-| Running | Release has the CUDA archive | Installs | Log (`op="variant"`) |
-| --- | --- | --- | --- |
-| CPU | either | CPU | info: keeping the running build variant |
-| CUDA | yes | CUDA | info: keeping the running build variant |
-| CUDA | no | CPU | warn: release ships no cuda build for this target |
+| Running | CUDA archive in the release | Driver | Installs | Log (`op="variant"`) |
+| --- | --- | --- | --- | --- |
+| CUDA | yes | either | CUDA | info: keeping the CUDA build |
+| CUDA | no | either | CPU | warn: release ships no CUDA build for this target; installing the CPU build |
+| CPU | yes | yes | CUDA | info: NVIDIA driver found; moving to the CUDA build |
+| CPU | yes | no | CPU | info: no NVIDIA driver; keeping the CPU build |
+| CPU | no | either | CPU | info: release ships no CUDA build for this target; keeping the CPU build |
 
-A CUDA update also refuses an installer that does not read `STUDIO_WORKER_VARIANT` (one cargo-dist
+Every line carries `running`, `installing`, `release_target`, `nvidia_driver` and `latest`.
+
+An update to CUDA also refuses an installer that does not read `STUDIO_WORKER_VARIANT` (one cargo-dist
 generated without the patch): it would install the CPU build, so the update is not applied and is
 retried on the next check. `studio-worker --version` and the daemon's startup banner name the
 variant: `studio-worker 0.4.13 (cuda)`.

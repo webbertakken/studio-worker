@@ -717,12 +717,12 @@ Every `auto_update_interval_secs` (default 30 min):
    default).
 3. Compare highest published semver to `AGENT_VERSION`.
 4. If newer:
-   - Pick the build variant: the one this binary runs as (`variant::Variant::current()`,
-     `cpu` or `cuda`).  A CUDA build falls back to CPU, with a warning (`op="variant"`), only
-     when the release ships no CUDA archive for its target.  See
+   - Pick the build variant (`op="variant"`): a CUDA build stays CUDA, falling back to CPU
+     with a warning only when the release ships no CUDA archive for its target; a CPU build
+     moves to CUDA when the release ships one and the NVIDIA driver (`libcuda.so.1`) loads.  See
      [release: CUDA variant](../operations/release.md#cuda-variant).
    - Download the per-platform cargo-dist installer script and verify it against its
-     `<installer>.sha256` sidecar.  A CUDA update refuses an installer without the variant
+     `<installer>.sha256` sidecar.  An update to CUDA refuses an installer without the variant
      switch, so it can never install the CPU build in its place.
    - On Windows only: **park** the running exe first (rename to
      `<exe>.old` — NTFS allows renaming a running binary but not

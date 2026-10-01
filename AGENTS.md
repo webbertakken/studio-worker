@@ -235,6 +235,9 @@ weights, run with the matching feature):
   Cargo manifest changes + weekly cron; accepted informational
   advisories live in `.cargo/audit.toml`.
 - `.github/workflows/build.yml` — matrix release build on every PR.
+- `.github/workflows/build-cuda.yml` — the CUDA variant of the x86_64 Linux release binary
+  (release tags, and PRs touching the build inputs).
+- `.github/workflows/installer.yml` — the patched shell installer installs every variant.
 - `.github/workflows/commit-lint.yml` — semantic PR title check.
 - `.github/workflows/lint-workflows.yml` — actionlint on workflow files.
 - `.github/workflows/release-please.yml` — bump version + changelog.

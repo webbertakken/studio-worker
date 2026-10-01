@@ -879,10 +879,12 @@ mod variant {
         (server, feed)
     }
 
-    /// Run an update as a `running` build on x86_64 Linux; the variants installed and the logs.
+    /// Run an update as a `running` build on x86_64 Linux, with or without the NVIDIA driver;
+    /// the variants installed and the logs.
     fn apply(
         feed: String,
         running: Variant,
+        nvidia_driver: bool,
         installer: &'static [u8],
     ) -> (anyhow::Result<()>, Vec<Variant>, String) {
         let runner = Arc::new(VariantRunner {
@@ -894,13 +896,13 @@ mod variant {
         let result_slot = slot.clone();
         // `capture` runs the closure on its own thread, off the tokio runtime (blocking reqwest).
         let logs = captured_logs_for(move || {
-            let result = update::apply_variant_with(
-                &feed,
-                &Version::new(0, 2, 0),
+            let host = update::UpdateHost {
                 running,
-                Some(LINUX_X64),
-                &*in_thread,
-            );
+                target: Some(LINUX_X64),
+                nvidia_driver,
+            };
+            let result =
+                update::apply_variant_with(&feed, &Version::new(0, 2, 0), host, &*in_thread);
             *result_slot.lock().unwrap() = Some(result);
         });
         let result = slot.lock().unwrap().take().expect("the update ran");
@@ -912,10 +914,10 @@ mod variant {
     #[tokio::test]
     async fn a_cuda_worker_updates_to_the_cuda_build() {
         let (_server, feed) = feed(true).await;
-        let (result, installs, logs) = apply(feed, Variant::Cuda, PATCHED);
+        let (result, installs, logs) = apply(feed, Variant::Cuda, true, PATCHED);
         result.unwrap();
         assert_eq!(installs, [Variant::Cuda]);
-        assert!(logs.contains("keeping the running build variant"), "{logs}");
+        assert!(logs.contains("keeping the CUDA build"), "{logs}");
         assert!(logs.contains("variant=cuda"), "{logs}");
     }
 
@@ -923,17 +925,17 @@ mod variant {
     #[tokio::test]
     async fn a_cuda_worker_falls_back_to_cpu_loudly_when_the_release_has_no_cuda_build() {
         let (_server, feed) = feed(false).await;
-        let (result, installs, logs) = apply(feed, Variant::Cuda, UNPATCHED);
+        let (result, installs, logs) = apply(feed, Variant::Cuda, true, UNPATCHED);
         result.unwrap();
         assert_eq!(installs, [Variant::Cpu]);
         assert!(logs.contains("WARN"), "{logs}");
-        assert!(logs.contains("no cuda build for this target"), "{logs}");
+        assert!(logs.contains("no CUDA build for this target"), "{logs}");
     }
 
     #[tokio::test]
     async fn a_cuda_worker_refuses_an_installer_that_cannot_install_cuda() {
         let (_server, feed) = feed(true).await;
-        let (result, installs, _logs) = apply(feed, Variant::Cuda, UNPATCHED);
+        let (result, installs, _logs) = apply(feed, Variant::Cuda, true, UNPATCHED);
         let err = result.unwrap_err().to_string();
         assert!(err.contains("STUDIO_WORKER_VARIANT"), "{err}");
         assert!(installs.is_empty(), "the installer must not run");
@@ -941,11 +943,48 @@ mod variant {
 
     #[cfg(not(target_os = "windows"))] // apply parks the real exe on Windows
     #[tokio::test]
-    async fn a_cpu_worker_stays_on_the_cpu_build() {
+    async fn a_cpu_worker_without_the_driver_stays_on_the_cpu_build() {
         let (_server, feed) = feed(true).await;
-        let (result, installs, logs) = apply(feed, Variant::Cpu, UNPATCHED);
+        let (result, installs, logs) = apply(feed, Variant::Cpu, false, UNPATCHED);
         result.unwrap();
         assert_eq!(installs, [Variant::Cpu]);
-        assert!(logs.contains("variant=cpu"), "{logs}");
+        assert!(
+            logs.contains("no NVIDIA driver; keeping the CPU build"),
+            "{logs}"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))] // apply parks the real exe on Windows
+    #[tokio::test]
+    async fn a_cpu_worker_with_the_driver_moves_to_the_cuda_build() {
+        let (_server, feed) = feed(true).await;
+        let (result, installs, logs) = apply(feed, Variant::Cpu, true, PATCHED);
+        result.unwrap();
+        assert_eq!(installs, [Variant::Cuda]);
+        assert!(
+            logs.contains("NVIDIA driver found; moving to the CUDA build"),
+            "{logs}"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))] // apply parks the real exe on Windows
+    #[tokio::test]
+    async fn a_cpu_worker_stays_cpu_when_the_release_has_no_cuda_build() {
+        let (_server, feed) = feed(false).await;
+        let (result, installs, logs) = apply(feed, Variant::Cpu, true, UNPATCHED);
+        result.unwrap();
+        assert_eq!(installs, [Variant::Cpu]);
+        assert!(logs.contains("keeping the CPU build"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_cpu_worker_moving_to_cuda_refuses_an_installer_that_cannot_install_it() {
+        let (_server, feed) = feed(true).await;
+        let (result, installs, _logs) = apply(feed, Variant::Cpu, true, UNPATCHED);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("STUDIO_WORKER_VARIANT"));
+        assert!(installs.is_empty(), "the installer must not run");
     }
 }

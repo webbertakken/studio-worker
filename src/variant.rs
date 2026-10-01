@@ -1,8 +1,9 @@
 //! The build variant: which GPU backend this binary was compiled for.
 //!
 //! Each release ships cargo-dist's CPU archive for every target and, on x86_64 Linux, a CUDA
-//! archive beside it (`studio-worker-<target>-cuda.tar.xz`).  The shell installer picks one;
-//! the auto-updater keeps the one it runs as ([`crate::update::choose_variant`]).
+//! archive beside it (`studio-worker-<target>-cuda.tar.xz`).  The shell installer picks one; the
+//! auto-updater keeps CUDA and moves CPU to CUDA once the driver loads
+//! ([`crate::update::choose_variant`]).
 //! Docs: `docs/operations/release.md`.
 
 use std::fmt;
@@ -69,6 +70,21 @@ const RELEASE_TARGET: Option<&str> = Some("x86_64-pc-windows-msvc");
     all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"),
 )))]
 const RELEASE_TARGET: Option<&str> = None;
+
+/// Whether the NVIDIA driver's `libcuda.so.1`, the one library the CUDA build links
+/// dynamically, loads here: the CUDA build starts exactly when this is true.  Linux only;
+/// `false` elsewhere (no CUDA build).  Excluded from coverage: the answer depends on the
+/// host's GPU stack.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn nvidia_driver_present() -> bool {
+    #[cfg(target_os = "linux")]
+    let present = // SAFETY: loading the driver library runs only its initialisers, as the
+        // CUDA build itself does at start; the handle is dropped straight away.
+        unsafe { libloading::Library::new("libcuda.so.1") }.is_ok();
+    #[cfg(not(target_os = "linux"))]
+    let present = false;
+    present
+}
 
 /// The release archive holding the CUDA variant for `target`.
 pub fn cuda_archive_name(target: &str) -> String {

@@ -170,76 +170,93 @@ pub fn resolve_installer_url(release: &GithubRelease) -> Option<&str> {
         .map(|a| a.browser_download_url.as_str())
 }
 
-/// The variant an update installs, and whether it had to leave the running one.
+/// Why an update installs the variant it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariantReason {
+    /// A CUDA build stays CUDA: the release ships the CUDA archive.
+    KeepCuda,
+    /// A CUDA build whose release has no CUDA archive for its target installs the CPU build.
+    CudaFallback,
+    /// A CPU build on a machine with the NVIDIA driver moves to the CUDA build.
+    DriverFound,
+    /// A CPU build without the NVIDIA driver stays CPU.
+    NoDriver,
+    /// A CPU build stays CPU: the release ships no CUDA archive for its target.
+    NoCudaBuild,
+}
+
+/// The variant an update installs, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VariantChoice {
     pub variant: Variant,
-    /// The running variant has no build in the release: the update falls back to the CPU one.
-    pub fallback: bool,
+    pub reason: VariantReason,
 }
 
-/// Pick the variant an update installs: the one this binary runs as, so an update never
-/// trades a CUDA build for a CPU one; the CPU build only when the release ships no CUDA
-/// archive for `target`.
+/// Pick the variant an update installs.  A CUDA build stays CUDA (the CPU build only when
+/// the release has no CUDA archive for `target`); a CPU build moves to CUDA once the NVIDIA
+/// driver is present and the release ships the CUDA archive.  CUDA never reverts by choice.
 pub fn choose_variant(
     release: &GithubRelease,
     running: Variant,
     target: Option<&str>,
+    nvidia_driver: bool,
 ) -> VariantChoice {
-    let keep = VariantChoice {
-        variant: running,
-        fallback: false,
+    let cuda_shipped = target.is_some_and(|target| {
+        let name = variant::cuda_archive_name(target);
+        release.assets.iter().any(|a| a.name == name)
+    });
+    let (variant, reason) = match (running, cuda_shipped, nvidia_driver) {
+        (Variant::Cuda, true, _) => (Variant::Cuda, VariantReason::KeepCuda),
+        (Variant::Cuda, false, _) => (Variant::Cpu, VariantReason::CudaFallback),
+        (Variant::Cpu, true, true) => (Variant::Cuda, VariantReason::DriverFound),
+        (Variant::Cpu, true, false) => (Variant::Cpu, VariantReason::NoDriver),
+        (Variant::Cpu, false, _) => (Variant::Cpu, VariantReason::NoCudaBuild),
     };
-    match running {
-        Variant::Cpu => keep,
-        Variant::Cuda => {
-            let shipped = target.is_some_and(|target| {
-                let name = variant::cuda_archive_name(target);
-                release.assets.iter().any(|a| a.name == name)
-            });
-            if shipped {
-                keep
-            } else {
-                VariantChoice {
-                    variant: Variant::Cpu,
-                    fallback: true,
-                }
-            }
-        }
-    }
+    VariantChoice { variant, reason }
 }
 
-/// Log the variant decision: info when the running variant is kept, a warning when the
-/// update has to fall back to the CPU build.
+/// Log the variant decision with its reason: a warning when a CUDA build has to fall back
+/// to the CPU build, info otherwise.
 fn log_variant_choice(
     choice: VariantChoice,
     running: Variant,
     target: Option<&str>,
+    nvidia_driver: bool,
     latest: &Version,
 ) {
     let target = target.unwrap_or("(not a release target)");
-    if choice.fallback {
-        warn!(
-            target: TRACE_TARGET,
-            op = "variant",
-            running = %running,
-            installing = %choice.variant,
-            release_target = target,
-            latest = %latest,
-            "release ships no {running} build for this target; installing the CPU build \
-             (the LLM leaves the GPU until a release ships one again)"
-        );
-    } else {
-        info!(
-            target: TRACE_TARGET,
-            op = "variant",
-            running = %running,
-            installing = %choice.variant,
-            release_target = target,
-            latest = %latest,
-            "keeping the running build variant"
-        );
-    }
+    let message = match choice.reason {
+        VariantReason::KeepCuda => "keeping the CUDA build",
+        VariantReason::CudaFallback => {
+            warn!(
+                target: TRACE_TARGET,
+                op = "variant",
+                running = %running,
+                installing = %choice.variant,
+                release_target = target,
+                nvidia_driver,
+                latest = %latest,
+                "release ships no CUDA build for this target; installing the CPU build \
+                 (the LLM leaves the GPU until a release ships one again)"
+            );
+            return;
+        }
+        VariantReason::DriverFound => "NVIDIA driver found; moving to the CUDA build",
+        VariantReason::NoDriver => "no NVIDIA driver; keeping the CPU build",
+        VariantReason::NoCudaBuild => {
+            "release ships no CUDA build for this target; keeping the CPU build"
+        }
+    };
+    info!(
+        target: TRACE_TARGET,
+        op = "variant",
+        running = %running,
+        installing = %choice.variant,
+        release_target = target,
+        nvidia_driver,
+        latest = %latest,
+        "{message}"
+    );
 }
 
 /// Refuse an installer that cannot install the CUDA variant: a script without the variant
@@ -552,22 +569,36 @@ impl ExeReplaceGuard {
 }
 
 pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R) -> Result<()> {
-    apply_variant_with(
-        feed_url,
-        latest,
-        Variant::current(),
-        variant::release_target(),
-        runner,
-    )
+    apply_variant_with(feed_url, latest, UpdateHost::current(), runner)
 }
 
-/// [`apply_with`] for a given running variant and target, so both variants are testable
-/// from either build.
+/// What the updater knows about the machine it updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateHost<'a> {
+    /// The variant this binary was built as.
+    pub running: Variant,
+    /// The release target this binary was built for.
+    pub target: Option<&'a str>,
+    /// The NVIDIA driver (`libcuda.so.1`) loads on this machine.
+    pub nvidia_driver: bool,
+}
+
+impl UpdateHost<'static> {
+    /// This binary on this machine.
+    pub fn current() -> Self {
+        Self {
+            running: Variant::current(),
+            target: variant::release_target(),
+            nvidia_driver: variant::nvidia_driver_present(),
+        }
+    }
+}
+
+/// [`apply_with`] for a given host, so every variant decision is testable from either build.
 pub fn apply_variant_with<R: UpdateRunner>(
     feed_url: &str,
     latest: &Version,
-    running: Variant,
-    target: Option<&str>,
+    host: UpdateHost<'_>,
     runner: &R,
 ) -> Result<()> {
     info!(
@@ -589,8 +620,14 @@ pub fn apply_variant_with<R: UpdateRunner>(
             installer_asset_name()
         )
     })?;
-    let choice = choose_variant(release, running, target);
-    log_variant_choice(choice, running, target, latest);
+    let choice = choose_variant(release, host.running, host.target, host.nvidia_driver);
+    log_variant_choice(
+        choice,
+        host.running,
+        host.target,
+        host.nvidia_driver,
+        latest,
+    );
 
     let tmp = tempfile::tempdir().context("creating tempdir for installer")?;
     let installer_path = tmp.path().join(installer_asset_name());
@@ -1417,93 +1454,149 @@ mod tests {
         ])
     }
 
+    fn choice(variant: Variant, reason: VariantReason) -> VariantChoice {
+        VariantChoice { variant, reason }
+    }
+
     #[test]
     fn a_cuda_build_keeps_cuda_when_the_release_ships_it() {
-        let choice = choose_variant(&release_with_cuda(), Variant::Cuda, Some(LINUX_X64));
-        assert_eq!(
-            choice,
-            VariantChoice {
-                variant: Variant::Cuda,
-                fallback: false
-            }
-        );
+        for driver in [true, false] {
+            assert_eq!(
+                choose_variant(&release_with_cuda(), Variant::Cuda, Some(LINUX_X64), driver),
+                choice(Variant::Cuda, VariantReason::KeepCuda)
+            );
+        }
     }
 
     #[test]
     fn a_cuda_build_falls_back_to_cpu_when_the_release_has_no_cuda_archive() {
-        let choice = choose_variant(&release_without_cuda(), Variant::Cuda, Some(LINUX_X64));
         assert_eq!(
-            choice,
-            VariantChoice {
-                variant: Variant::Cpu,
-                fallback: true
-            }
+            choose_variant(
+                &release_without_cuda(),
+                Variant::Cuda,
+                Some(LINUX_X64),
+                true
+            ),
+            choice(Variant::Cpu, VariantReason::CudaFallback)
         );
     }
 
     #[test]
     fn a_cuda_archive_for_another_target_does_not_count() {
-        let choice = choose_variant(
+        let got = choose_variant(
             &release_with_cuda(),
             Variant::Cuda,
             Some("aarch64-unknown-linux-gnu"),
+            true,
         );
-        assert_eq!(choice.variant, Variant::Cpu);
-        assert!(choice.fallback);
+        assert_eq!(got, choice(Variant::Cpu, VariantReason::CudaFallback));
     }
 
     #[test]
     fn a_cuda_build_on_an_unknown_target_falls_back_to_cpu() {
-        let choice = choose_variant(&release_with_cuda(), Variant::Cuda, None);
-        assert_eq!(choice.variant, Variant::Cpu);
-        assert!(choice.fallback);
-    }
-
-    #[test]
-    fn a_cpu_build_stays_cpu_even_when_the_release_ships_cuda() {
-        let choice = choose_variant(&release_with_cuda(), Variant::Cpu, Some(LINUX_X64));
         assert_eq!(
-            choice,
-            VariantChoice {
-                variant: Variant::Cpu,
-                fallback: false
-            }
+            choose_variant(&release_with_cuda(), Variant::Cuda, None, true),
+            choice(Variant::Cpu, VariantReason::CudaFallback)
         );
     }
 
     #[test]
-    fn keeping_the_variant_is_logged_at_info() {
-        let out = crate::test_support::capture(|| {
-            let choice = choose_variant(&release_with_cuda(), Variant::Cuda, Some(LINUX_X64));
+    fn a_cpu_build_moves_to_cuda_when_the_driver_is_present() {
+        assert_eq!(
+            choose_variant(&release_with_cuda(), Variant::Cpu, Some(LINUX_X64), true),
+            choice(Variant::Cuda, VariantReason::DriverFound)
+        );
+    }
+
+    #[test]
+    fn a_cpu_build_stays_cpu_without_the_driver() {
+        assert_eq!(
+            choose_variant(&release_with_cuda(), Variant::Cpu, Some(LINUX_X64), false),
+            choice(Variant::Cpu, VariantReason::NoDriver)
+        );
+    }
+
+    #[test]
+    fn a_cpu_build_stays_cpu_when_the_release_has_no_cuda_archive() {
+        assert_eq!(
+            choose_variant(&release_without_cuda(), Variant::Cpu, Some(LINUX_X64), true),
+            choice(Variant::Cpu, VariantReason::NoCudaBuild)
+        );
+        assert_eq!(
+            choose_variant(&release_with_cuda(), Variant::Cpu, None, true),
+            choice(Variant::Cpu, VariantReason::NoCudaBuild)
+        );
+    }
+
+    /// The log line for one decision.
+    fn logged(release: GithubRelease, running: Variant, driver: bool) -> String {
+        crate::test_support::capture(move || {
+            let got = choose_variant(&release, running, Some(LINUX_X64), driver);
             log_variant_choice(
-                choice,
-                Variant::Cuda,
+                got,
+                running,
                 Some(LINUX_X64),
+                driver,
                 &Version::new(0, 5, 0),
             );
-        });
-        assert!(out.contains("INFO"), "{out}");
-        assert!(out.contains("keeping the running build variant"), "{out}");
-        assert!(out.contains("installing=cuda"), "{out}");
+        })
+    }
+
+    #[test]
+    fn every_variant_decision_is_logged_with_its_reason() {
+        let cases = [
+            (
+                release_with_cuda(),
+                Variant::Cuda,
+                true,
+                "INFO",
+                "keeping the CUDA build",
+                "installing=cuda",
+            ),
+            (
+                release_with_cuda(),
+                Variant::Cpu,
+                true,
+                "INFO",
+                "NVIDIA driver found; moving to the CUDA build",
+                "installing=cuda",
+            ),
+            (
+                release_with_cuda(),
+                Variant::Cpu,
+                false,
+                "INFO",
+                "no NVIDIA driver; keeping the CPU build",
+                "installing=cpu",
+            ),
+            (
+                release_without_cuda(),
+                Variant::Cpu,
+                true,
+                "INFO",
+                "release ships no CUDA build for this target; keeping the CPU build",
+                "installing=cpu",
+            ),
+        ];
+        for (release, running, driver, level, message, installing) in cases {
+            let out = logged(release, running, driver);
+            assert!(out.contains(level), "{out}");
+            assert!(out.contains(message), "{out}");
+            assert!(out.contains(installing), "{out}");
+            assert!(out.contains(&format!("nvidia_driver={driver}")), "{out}");
+            assert!(out.contains("variant"), "{out}");
+        }
     }
 
     #[test]
     fn falling_back_to_cpu_is_logged_as_a_warning() {
-        let out = crate::test_support::capture(|| {
-            let choice = choose_variant(&release_without_cuda(), Variant::Cuda, Some(LINUX_X64));
-            log_variant_choice(
-                choice,
-                Variant::Cuda,
-                Some(LINUX_X64),
-                &Version::new(0, 5, 0),
-            );
-        });
+        let out = logged(release_without_cuda(), Variant::Cuda, true);
         assert!(out.contains("WARN"), "{out}");
         assert!(
             out.contains("op=\"variant\"") || out.contains("op=variant"),
             "{out}"
         );
-        assert!(out.contains("no cuda build for this target"), "{out}");
+        assert!(out.contains("no CUDA build for this target"), "{out}");
         assert!(out.contains("installing=cpu"), "{out}");
     }
 
