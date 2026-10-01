@@ -255,6 +255,14 @@ pub fn daemon_log_path(config_path: &Path) -> PathBuf {
         .join("daemon.log")
 }
 
+/// The file a tray UI started by `setup` writes its output to.
+pub fn ui_log_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("ui.log")
+}
+
 impl DaemonStarter for ProcessStarter {
     fn is_running(&self) -> std::io::Result<bool> {
         crate::daemon_lock::is_held(&self.config_path)
@@ -791,6 +799,7 @@ mod tests {
         let _lock = crate::daemon_lock::acquire_with(&config, 1, Duration::from_millis(1)).unwrap();
         assert!(starter.is_running().unwrap());
         assert_eq!(daemon_log_path(&config), dir.path().join("daemon.log"));
+        assert_eq!(ui_log_path(&config), dir.path().join("ui.log"));
     }
 
     #[test]

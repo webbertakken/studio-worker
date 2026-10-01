@@ -24,17 +24,14 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, PartialEq)]
 pub enum Command {
-    /// Start the daemon: local API, model host, studio session.
-    Run {
-        /// Under a supervisor (PM2, systemd): if another daemon holds the
-        /// lock, wait and take over when it ends, instead of exiting.
-        #[arg(long)]
-        wait_for_lock: bool,
-    },
+    /// The daemon: local API, model host, studio session.  The tray UI starts it; hidden
+    /// because it is not an install method (`docs/runtime/daemon-and-tray.md`).
+    #[command(hide = true)]
+    Run,
     /// Pre-set registration metadata before the next launch.
     ///
-    /// On a fresh install you don't need this — `run` and `ui`
-    /// auto-register themselves.  Use it explicitly to:
+    /// On a fresh install you don't need this — the tray UI's daemon
+    /// auto-registers itself.  Use it explicitly to:
     ///   * point the worker at a different studio (`--api-base-url`)
     ///   * clear local registration state after a rejection or
     ///     between studios (`--reset`)
@@ -46,14 +43,9 @@ pub enum Command {
     },
     /// Print local config + last heartbeat info.
     Status,
-    /// Turnkey finish line: install + start the auto-start service and
-    /// print the studio-approval + local-API guidance.  Run this once
-    /// after installing.
+    /// Finish an install: the tray UI's login entry, start the tray UI, print the
+    /// studio-approval and local-API guidance.  The installers run it; idempotent.
     Setup,
-    /// Install platform-appropriate auto-start service.
-    InstallService,
-    /// Uninstall the auto-start service.
-    UninstallService,
     /// Set the VRAM threshold (GB) the worker reports.
     SetThreshold { gb: f32 },
     /// Print resolved config + relevant paths.
@@ -71,12 +63,10 @@ impl Command {
     /// process is running.  Matches clap's derived subcommand names.
     pub fn name(&self) -> &'static str {
         match self {
-            Command::Run { .. } => "run",
+            Command::Run => "run",
             Command::Setup => "setup",
             Command::Register { .. } => "register",
             Command::Status => "status",
-            Command::InstallService => "install-service",
-            Command::UninstallService => "uninstall-service",
             Command::SetThreshold { .. } => "set-threshold",
             Command::Config => "config",
             Command::CheckUpdate => "check-update",
@@ -101,25 +91,35 @@ mod tests {
     }
 
     #[test]
-    fn run_can_wait_for_the_lock_under_a_supervisor() {
-        let cli = Cli::try_parse_from(["studio-worker", "run", "--wait-for-lock"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Run {
-                wait_for_lock: true
-            }
-        ));
+    fn headless_install_commands_are_gone() {
+        for args in [
+            vec!["studio-worker", "install-service"],
+            vec!["studio-worker", "uninstall-service"],
+            vec!["studio-worker", "run", "--wait-for-lock"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{args:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn run_is_the_hidden_daemon_entry() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            !help.contains("\n  run "),
+            "run is not offered in --help: {help}"
+        );
+        assert!(help.contains("setup"), "{help}");
+        assert!(help.contains("ui"), "{help}");
     }
 
     #[test]
     fn parses_run() {
         let cli = Cli::parse_from(["studio-worker", "run"]);
-        assert!(matches!(
-            cli.command,
-            Command::Run {
-                wait_for_lock: false
-            }
-        ));
+        assert_eq!(cli.command, Command::Run);
         assert!(cli.config.is_none());
     }
 
@@ -127,12 +127,7 @@ mod tests {
     fn parses_run_with_config_override() {
         let cli = Cli::parse_from(["studio-worker", "--config", "/etc/x.toml", "run"]);
         assert_eq!(cli.config.as_deref(), Some("/etc/x.toml"));
-        assert!(matches!(
-            cli.command,
-            Command::Run {
-                wait_for_lock: false
-            }
-        ));
+        assert_eq!(cli.command, Command::Run);
     }
 
     #[test]
@@ -193,13 +188,7 @@ mod tests {
 
     #[test]
     fn name_is_stable_kebab_case_for_every_subcommand() {
-        assert_eq!(
-            Command::Run {
-                wait_for_lock: false
-            }
-            .name(),
-            "run"
-        );
+        assert_eq!(Command::Run.name(), "run");
         assert_eq!(
             Command::Register {
                 api_base_url: None,
@@ -210,8 +199,6 @@ mod tests {
         );
         assert_eq!(Command::Status.name(), "status");
         assert_eq!(Command::Setup.name(), "setup");
-        assert_eq!(Command::InstallService.name(), "install-service");
-        assert_eq!(Command::UninstallService.name(), "uninstall-service");
         assert_eq!(Command::SetThreshold { gb: 1.0 }.name(), "set-threshold");
         assert_eq!(Command::Config.name(), "config");
         assert_eq!(Command::CheckUpdate.name(), "check-update");
@@ -223,8 +210,6 @@ mod tests {
         let cases = [
             ("status", Command::Status),
             ("setup", Command::Setup),
-            ("install-service", Command::InstallService),
-            ("uninstall-service", Command::UninstallService),
             ("config", Command::Config),
             ("check-update", Command::CheckUpdate),
             ("ui", Command::Ui),

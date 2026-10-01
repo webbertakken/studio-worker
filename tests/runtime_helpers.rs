@@ -154,50 +154,17 @@ async fn run_cli_dispatches_register_subcommand() {
     assert_eq!(cfg.api_base_url, "http://cli.invalid");
 }
 
+#[cfg(not(feature = "ui"))]
 #[tokio::test]
-async fn run_cli_dispatches_install_and_uninstall_into_temp_xdg() {
-    // Redirect XDG_CONFIG_HOME so the systemd unit is written into a
-    // tempdir that we clean up.  This still exercises real fs writes
-    // (good!) but doesn't pollute the user's actual home.
-    let xdg = tempfile::tempdir().unwrap();
-    // SAFETY: the Rust test harness runs tests concurrently, so mutating
-    // the process-global XDG_CONFIG_HOME could race a parallel test that
-    // resolves the default config path. This is the only test in this
-    // binary that does (every other passes an explicit `config: Some`),
-    // so nothing reads the var concurrently; we still snapshot + restore
-    // it. If you add another default-path test here, serialise them
-    // through a shared lock (see tests/sd_provision.rs's URL_ENV_LOCK).
-    let previous = std::env::var("XDG_CONFIG_HOME").ok();
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", xdg.path()) };
-
-    let result_install = run_cli(cli::Cli {
+async fn run_cli_dispatches_setup_which_needs_the_tray_ui() {
+    // A build with the tray UI would start a real one; the headless build refuses.
+    let err = run_cli(cli::Cli {
         config: None,
-        command: cli::Command::InstallService,
+        command: cli::Command::Setup,
     })
-    .await;
-    let result_uninstall = run_cli(cli::Cli {
-        config: None,
-        command: cli::Command::UninstallService,
-    })
-    .await;
-
-    // Restore env regardless of outcome.
-    // SAFETY: see above.
-    unsafe {
-        match previous {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-    }
-
-    // The install attempt may or may not call systemctl, but the file
-    // write itself must succeed.  Uninstall must succeed (idempotent).
-    if let Err(e) = result_install {
-        // Acceptable to fail on platforms where the unit dir isn't writable
-        // (e.g. CI containers without HOME).  We still expect a useful error.
-        eprintln!("install service err (non-fatal in tests): {e:?}");
-    }
-    result_uninstall.expect("uninstall should be idempotent");
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("no tray UI"), "{err}");
 }
 
 #[tokio::test]
@@ -245,9 +212,7 @@ auto_update_prerelease = false
     let handle = tokio::spawn(async move {
         let _ = run_cli(cli::Cli {
             config: Some(path_str),
-            command: cli::Command::Run {
-                wait_for_lock: false,
-            },
+            command: cli::Command::Run,
         })
         .await;
     });

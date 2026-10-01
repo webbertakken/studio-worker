@@ -581,22 +581,17 @@ pub fn format_check_outcome(outcome: &update::CheckOutcome) -> String {
 // Long-running run loop
 // ---------------------------------------------------------------------------
 
-pub async fn run(config_path: Option<&str>, wait_for_lock: bool) -> Result<()> {
+pub async fn run(config_path: Option<&str>) -> Result<()> {
     let (cfg, path) = config::load(config_path)?;
     // One daemon per config directory: a second one would fight the first
     // over the local API port and the studio session.
     let _lock = match crate::daemon_lock::acquire(&path)? {
         crate::daemon_lock::Acquired::Mine(lock) => lock,
-        crate::daemon_lock::Acquired::HeldElsewhere if wait_for_lock => {
-            let path = path.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::daemon_lock::wait_until_acquired(&path, crate::daemon_lock::WAIT_POLL)
-            })
-            .await??
-        }
         crate::daemon_lock::Acquired::HeldElsewhere => return Ok(()),
     };
     log_startup_banner(&cfg, &path);
+    // A tray-started daemon writes to daemon.log; nothing else rotates it.
+    crate::log_trim::spawn(crate::daemon_link::daemon_log_path(&path));
 
     let control = crate::control::DaemonControl::new(
         config::shared(cfg),
