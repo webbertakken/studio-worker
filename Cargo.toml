@@ -280,6 +280,13 @@ targets = [
 features = ["llama", "video", "tts", "image-onnx", "stt-stream"]
 # PR checks run plan-only to catch issues early
 pr-run-mode = "plan"
+# The CUDA variant of the x86_64 Linux binary (.github/workflows/build-cuda.yml), attached to
+# the release beside cargo-dist's archives.  Docs: docs/operations/release.md#cuda-variant
+local-artifacts-jobs = ["./build-cuda"]
+# release.yml carries one hand-written step cargo-dist cannot generate: build-global-artifacts
+# patches the shell installer to offer the CUDA variant and publishes installer checksums.
+# Re-apply it after `dist init` / `dist generate` (see docs/operations/release.md).
+allow-dirty = ["ci"]
 
 # System build deps cargo-dist installs on the release runners.
 # llama-cpp-2 builds llama.cpp via cmake + a C/C++ toolchain.

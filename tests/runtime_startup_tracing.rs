@@ -81,6 +81,13 @@ fn log_startup_banner_records_key_config_fields() {
         logs.contains(&format!("version=\"{}\"", studio_worker::AGENT_VERSION)),
         "expected version field: {logs}"
     );
+    assert!(
+        logs.contains(&format!(
+            "variant=\"{}\"",
+            studio_worker::variant::Variant::current()
+        )),
+        "expected the build variant: {logs}"
+    );
 }
 
 #[test]

@@ -165,11 +165,21 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
+  custom-build-cuda:
+    needs:
+      - plan
+    if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}
+    uses: ./.github/workflows/build-cuda.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
       - plan
       - build-local-artifacts
+      - custom-build-cuda
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -204,21 +214,43 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      # studio-worker, hand-written (allow-dirty = ["ci"]): cargo-dist knows nothing of the
+      # CUDA variant built by custom-build-cuda.  Re-apply this step and its upload path after
+      # `dist generate`; see docs/operations/release.md#cuda-variant.
+      - id: studio-worker
+        name: Offer the CUDA variant in the installer, publish installer checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/patch-installer.sh target/distrib
+          scripts/release/test-installer.sh target/distrib
+          # The auto-updater verifies the installer it runs against these sidecars.
+          for name in studio-worker-installer.sh studio-worker-installer.ps1; do
+            (cd target/distrib && sha256sum -b "$name" > "$name.sha256")
+          done
+          {
+            echo "paths<<EOF"
+            echo target/distrib/studio-worker-installer.sh.sha256
+            echo target/distrib/studio-worker-installer.ps1.sha256
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v6
         with:
           name: artifacts-build-global
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
+            ${{ steps.studio-worker.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
   # Determines if we should publish/announce
   host:
     needs:
       - plan
       - build-local-artifacts
+      - custom-build-cuda
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.custom-build-cuda.result == 'skipped' || needs.custom-build-cuda.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"

@@ -8,6 +8,7 @@
 //! All side-effecting bits (HTTP, filesystem writes, process spawn) flow
 //! through testable helpers; see `apply_with` for the seam.
 use crate::types::GithubRelease;
+use crate::variant::{self, Variant};
 use anyhow::{anyhow, bail, Context, Result};
 use semver::Version;
 use std::path::{Path, PathBuf};
@@ -169,6 +170,96 @@ pub fn resolve_installer_url(release: &GithubRelease) -> Option<&str> {
         .map(|a| a.browser_download_url.as_str())
 }
 
+/// The variant an update installs, and whether it had to leave the running one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariantChoice {
+    pub variant: Variant,
+    /// The running variant has no build in the release: the update falls back to the CPU one.
+    pub fallback: bool,
+}
+
+/// Pick the variant an update installs: the one this binary runs as, so an update never
+/// trades a CUDA build for a CPU one; the CPU build only when the release ships no CUDA
+/// archive for `target`.
+pub fn choose_variant(
+    release: &GithubRelease,
+    running: Variant,
+    target: Option<&str>,
+) -> VariantChoice {
+    let keep = VariantChoice {
+        variant: running,
+        fallback: false,
+    };
+    match running {
+        Variant::Cpu => keep,
+        Variant::Cuda => {
+            let shipped = target.is_some_and(|target| {
+                let name = variant::cuda_archive_name(target);
+                release.assets.iter().any(|a| a.name == name)
+            });
+            if shipped {
+                keep
+            } else {
+                VariantChoice {
+                    variant: Variant::Cpu,
+                    fallback: true,
+                }
+            }
+        }
+    }
+}
+
+/// Log the variant decision: info when the running variant is kept, a warning when the
+/// update has to fall back to the CPU build.
+fn log_variant_choice(
+    choice: VariantChoice,
+    running: Variant,
+    target: Option<&str>,
+    latest: &Version,
+) {
+    let target = target.unwrap_or("(not a release target)");
+    if choice.fallback {
+        warn!(
+            target: TRACE_TARGET,
+            op = "variant",
+            running = %running,
+            installing = %choice.variant,
+            release_target = target,
+            latest = %latest,
+            "release ships no {running} build for this target; installing the CPU build \
+             (the LLM leaves the GPU until a release ships one again)"
+        );
+    } else {
+        info!(
+            target: TRACE_TARGET,
+            op = "variant",
+            running = %running,
+            installing = %choice.variant,
+            release_target = target,
+            latest = %latest,
+            "keeping the running build variant"
+        );
+    }
+}
+
+/// Refuse an installer that cannot install the CUDA variant: a script without the variant
+/// switch would install the CPU build in place of a CUDA one.
+pub fn ensure_installer_supports_variants(installer: &Path, variant: Variant) -> Result<()> {
+    if variant == Variant::Cpu {
+        return Ok(());
+    }
+    let script = std::fs::read_to_string(installer)
+        .with_context(|| format!("reading installer {}", installer.display()))?;
+    if !script.contains(variant::INSTALLER_ENV) {
+        bail!(
+            "the release installer does not read {}: it would replace this {variant} build \
+             with the CPU one, so the update is not applied",
+            variant::INSTALLER_ENV
+        );
+    }
+    Ok(())
+}
+
 /// Verify a streamed installer download wrote exactly the body the
 /// server promised.  `expected` is the response's `Content-Length`;
 /// it's `None` for chunked transfers, where there's nothing to check
@@ -204,7 +295,9 @@ pub trait UpdateRunner {
     /// failure is a hard `Err` so a blocked checksum fetch can't be
     /// mistaken for an absent one.
     fn fetch_checksum(&self, url: &str) -> Result<Option<String>>;
-    fn run_installer(&self, installer_path: &Path) -> Result<()>;
+    /// Run the installer for `variant` (the shell installer reads it from
+    /// [`variant::INSTALLER_ENV`]).
+    fn run_installer(&self, installer_path: &Path, variant: Variant) -> Result<()>;
 }
 
 pub struct RealRunner;
@@ -258,9 +351,10 @@ impl UpdateRunner for RealRunner {
         Ok(Some(response.text()?))
     }
 
-    fn run_installer(&self, installer_path: &Path) -> Result<()> {
+    fn run_installer(&self, installer_path: &Path, variant: Variant) -> Result<()> {
         if cfg!(target_os = "windows") {
             let status = std::process::Command::new("powershell")
+                .env(variant::INSTALLER_ENV, variant.as_str())
                 .args([
                     "-NoProfile",
                     "-ExecutionPolicy",
@@ -276,6 +370,7 @@ impl UpdateRunner for RealRunner {
             }
         } else {
             let status = std::process::Command::new("sh")
+                .env(variant::INSTALLER_ENV, variant.as_str())
                 .arg(installer_path)
                 .status()?;
             if !status.success() {
@@ -457,6 +552,24 @@ impl ExeReplaceGuard {
 }
 
 pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R) -> Result<()> {
+    apply_variant_with(
+        feed_url,
+        latest,
+        Variant::current(),
+        variant::release_target(),
+        runner,
+    )
+}
+
+/// [`apply_with`] for a given running variant and target, so both variants are testable
+/// from either build.
+pub fn apply_variant_with<R: UpdateRunner>(
+    feed_url: &str,
+    latest: &Version,
+    running: Variant,
+    target: Option<&str>,
+    runner: &R,
+) -> Result<()> {
     info!(
         target: TRACE_TARGET,
         feed_url,
@@ -476,6 +589,8 @@ pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R)
             installer_asset_name()
         )
     })?;
+    let choice = choose_variant(release, running, target);
+    log_variant_choice(choice, running, target, latest);
 
     let tmp = tempfile::tempdir().context("creating tempdir for installer")?;
     let installer_path = tmp.path().join(installer_asset_name());
@@ -515,10 +630,12 @@ pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R)
              verification (transport is https pinned to GitHub)"
         ),
     }
+    ensure_installer_supports_variants(&installer_path, choice.variant)?;
     info!(
         target: TRACE_TARGET,
         installer = %installer_path.display(),
         latest = %latest,
+        variant = %choice.variant,
         "running installer"
     );
     // Windows locks the running executable: the installer's Copy-Item
@@ -532,7 +649,7 @@ pub fn apply_with<R: UpdateRunner>(feed_url: &str, latest: &Version, runner: &R)
     } else {
         None
     };
-    match runner.run_installer(&installer_path) {
+    match runner.run_installer(&installer_path, choice.variant) {
         Ok(()) => {
             if let Some(guard) = guard {
                 if let Err(e) = guard.confirm_replaced() {
@@ -1235,7 +1352,7 @@ mod tests {
         // `sh <path>` reads the file directly, so no shebang or +x bit
         // is needed.
         std::fs::write(&script, "exit 0\n").unwrap();
-        RealRunner.run_installer(&script).unwrap();
+        RealRunner.run_installer(&script, Variant::Cpu).unwrap();
     }
 
     #[cfg(unix)]
@@ -1244,11 +1361,181 @@ mod tests {
         let dir = tempdir().unwrap();
         let script = dir.path().join("installer.sh");
         std::fs::write(&script, "exit 3\n").unwrap();
-        let err = RealRunner.run_installer(&script).unwrap_err().to_string();
+        let err = RealRunner
+            .run_installer(&script, Variant::Cpu)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("installer exited"),
             "a failed installer must surface a clear error, got: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_hands_the_variant_to_the_installer() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("installer.sh");
+        std::fs::write(&script, "[ \"$STUDIO_WORKER_VARIANT\" = cuda ] || exit 4\n").unwrap();
+        RealRunner.run_installer(&script, Variant::Cuda).unwrap();
+        assert!(RealRunner.run_installer(&script, Variant::Cpu).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Variant choice: an update keeps the build variant it runs as.
+    // -----------------------------------------------------------------
+
+    const LINUX_X64: &str = "x86_64-unknown-linux-gnu";
+
+    fn release_with_assets(names: &[&str]) -> GithubRelease {
+        GithubRelease {
+            tag_name: "studio-worker-v0.5.0".into(),
+            prerelease: false,
+            draft: false,
+            assets: names
+                .iter()
+                .map(|name| GithubReleaseAsset {
+                    name: (*name).to_string(),
+                    browser_download_url: format!("https://github.com/o/r/{name}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn release_with_cuda() -> GithubRelease {
+        release_with_assets(&[
+            "studio-worker-installer.sh",
+            "studio-worker-x86_64-unknown-linux-gnu.tar.xz",
+            "studio-worker-x86_64-unknown-linux-gnu-cuda.tar.xz",
+        ])
+    }
+
+    fn release_without_cuda() -> GithubRelease {
+        release_with_assets(&[
+            "studio-worker-installer.sh",
+            "studio-worker-x86_64-unknown-linux-gnu.tar.xz",
+        ])
+    }
+
+    #[test]
+    fn a_cuda_build_keeps_cuda_when_the_release_ships_it() {
+        let choice = choose_variant(&release_with_cuda(), Variant::Cuda, Some(LINUX_X64));
+        assert_eq!(
+            choice,
+            VariantChoice {
+                variant: Variant::Cuda,
+                fallback: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_cuda_build_falls_back_to_cpu_when_the_release_has_no_cuda_archive() {
+        let choice = choose_variant(&release_without_cuda(), Variant::Cuda, Some(LINUX_X64));
+        assert_eq!(
+            choice,
+            VariantChoice {
+                variant: Variant::Cpu,
+                fallback: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_cuda_archive_for_another_target_does_not_count() {
+        let choice = choose_variant(
+            &release_with_cuda(),
+            Variant::Cuda,
+            Some("aarch64-unknown-linux-gnu"),
+        );
+        assert_eq!(choice.variant, Variant::Cpu);
+        assert!(choice.fallback);
+    }
+
+    #[test]
+    fn a_cuda_build_on_an_unknown_target_falls_back_to_cpu() {
+        let choice = choose_variant(&release_with_cuda(), Variant::Cuda, None);
+        assert_eq!(choice.variant, Variant::Cpu);
+        assert!(choice.fallback);
+    }
+
+    #[test]
+    fn a_cpu_build_stays_cpu_even_when_the_release_ships_cuda() {
+        let choice = choose_variant(&release_with_cuda(), Variant::Cpu, Some(LINUX_X64));
+        assert_eq!(
+            choice,
+            VariantChoice {
+                variant: Variant::Cpu,
+                fallback: false
+            }
+        );
+    }
+
+    #[test]
+    fn keeping_the_variant_is_logged_at_info() {
+        let out = crate::test_support::capture(|| {
+            let choice = choose_variant(&release_with_cuda(), Variant::Cuda, Some(LINUX_X64));
+            log_variant_choice(
+                choice,
+                Variant::Cuda,
+                Some(LINUX_X64),
+                &Version::new(0, 5, 0),
+            );
+        });
+        assert!(out.contains("INFO"), "{out}");
+        assert!(out.contains("keeping the running build variant"), "{out}");
+        assert!(out.contains("installing=cuda"), "{out}");
+    }
+
+    #[test]
+    fn falling_back_to_cpu_is_logged_as_a_warning() {
+        let out = crate::test_support::capture(|| {
+            let choice = choose_variant(&release_without_cuda(), Variant::Cuda, Some(LINUX_X64));
+            log_variant_choice(
+                choice,
+                Variant::Cuda,
+                Some(LINUX_X64),
+                &Version::new(0, 5, 0),
+            );
+        });
+        assert!(out.contains("WARN"), "{out}");
+        assert!(
+            out.contains("op=\"variant\"") || out.contains("op=variant"),
+            "{out}"
+        );
+        assert!(out.contains("no cuda build for this target"), "{out}");
+        assert!(out.contains("installing=cpu"), "{out}");
+    }
+
+    #[test]
+    fn a_cuda_update_refuses_an_installer_without_the_variant_switch() {
+        let dir = tempdir().unwrap();
+        let installer = dir.path().join("installer.sh");
+        std::fs::write(&installer, "#!/bin/sh\necho cargo-dist as generated\n").unwrap();
+        let err = ensure_installer_supports_variants(&installer, Variant::Cuda)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("STUDIO_WORKER_VARIANT"), "{err}");
+        assert!(err.contains("not applied"), "{err}");
+        // A CPU update needs no switch: every installer installs the CPU build.
+        ensure_installer_supports_variants(&installer, Variant::Cpu).unwrap();
+    }
+
+    #[test]
+    fn a_cuda_update_accepts_an_installer_with_the_variant_switch() {
+        let dir = tempdir().unwrap();
+        let installer = dir.path().join("installer.sh");
+        std::fs::write(&installer, "case \"${STUDIO_WORKER_VARIANT:-auto}\" in\n").unwrap();
+        ensure_installer_supports_variants(&installer, Variant::Cuda).unwrap();
+    }
+
+    #[test]
+    fn a_missing_installer_is_an_error_for_cuda_updates() {
+        let dir = tempdir().unwrap();
+        let err = ensure_installer_supports_variants(&dir.path().join("gone.sh"), Variant::Cuda)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reading installer"), "{err}");
     }
 
     #[test]
@@ -1269,7 +1556,7 @@ mod tests {
     struct FakeRunner {
         downloaded: RefCell<Vec<(String, PathBuf)>>,
         checksum_fetches: RefCell<Vec<String>>,
-        ran: RefCell<Vec<PathBuf>>,
+        ran: RefCell<Vec<(PathBuf, Variant)>>,
         fail_download: bool,
         fail_run: bool,
         /// What `fetch_checksum` hands back (`None` = no sidecar).
@@ -1292,8 +1579,10 @@ mod tests {
             self.checksum_fetches.borrow_mut().push(url.to_string());
             Ok(self.checksum.clone())
         }
-        fn run_installer(&self, installer_path: &Path) -> Result<()> {
-            self.ran.borrow_mut().push(installer_path.to_path_buf());
+        fn run_installer(&self, installer_path: &Path, variant: Variant) -> Result<()> {
+            self.ran
+                .borrow_mut()
+                .push((installer_path.to_path_buf(), variant));
             if self.fail_run {
                 bail!("simulated installer failure");
             }
@@ -1369,7 +1658,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let dest = dir.path().join("installer.sh");
         runner.download("https://example.com/a", &dest).unwrap();
-        runner.run_installer(&dest).unwrap();
+        runner.run_installer(&dest, Variant::Cpu).unwrap();
         assert_eq!(runner.downloaded.borrow().len(), 1);
         assert_eq!(runner.ran.borrow().len(), 1);
         assert!(dest.exists());
@@ -1395,7 +1684,7 @@ mod tests {
         };
         let dir = tempdir().unwrap();
         let dest = dir.path().join("installer.sh");
-        let err = runner.run_installer(&dest).unwrap_err();
+        let err = runner.run_installer(&dest, Variant::Cpu).unwrap_err();
         assert!(err.to_string().contains("simulated installer"));
     }
 }
