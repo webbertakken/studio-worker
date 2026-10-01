@@ -1,8 +1,9 @@
 //! The build variant: which GPU backend this binary was compiled for.
 //!
 //! Each release ships cargo-dist's CPU archive for every target and, on x86_64 Linux, a CUDA
-//! archive beside it (`studio-worker-<target>-cuda.tar.xz`).  The shell installer picks one; the auto-updater keeps the one it runs as
-//! ([`crate::update::choose_variant`]).  Docs: `docs/operations/release.md`.
+//! archive beside it (`studio-worker-<target>-cuda.tar.xz`).  The shell installer picks one;
+//! the auto-updater keeps the one it runs as ([`crate::update::choose_variant`]).
+//! Docs: `docs/operations/release.md`.
 
 use std::fmt;
 
