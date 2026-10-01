@@ -74,8 +74,9 @@ GPU.
   future only. Blackwell must be `120a` (llama.cpp's FP4 paths need the arch-specific variant,
   which has no forward-compatible PTX), which is why the PTX is compute 9.0. Maxwell (50, 52) is
   left out: 4 GB cards on a 2014 architecture.
-- **Size**: MEASURED_SIZE. Most of it is static cuBLAS, which carries kernels for every
-  architecture whatever the list; ggml's own device code is about 60 MB per architecture.
+- **Size**: a 960 MB binary in a 565 MB archive (xz), against 36 MB and 10 MB for the CPU build.
+  About 550 MB is static cuBLAS, whatever the list; each architecture adds about 50 MB of ggml
+  device code (a build for `89-real` alone is 615 MB).
 
 ### Build
 
@@ -93,7 +94,10 @@ static libraries from NVIDIA's apt repository (no driver), then runs
 - `package`: `studio-worker-x86_64-unknown-linux-gnu-cuda.tar.xz` in cargo-dist's layout (one
   top-level directory: the binary, `CHANGELOG.md`, `LICENSE`, `README.md`) and its `.sha256`.
 
-Measured on GitHub's `ubuntu-22.04` runner (4 vCPU): MEASURED_BUILD.
+Measured on GitHub's `ubuntu-22.04` runner (4 vCPU): 85 minutes to compile, 2 to compress, about
+95 for the whole job, which therefore sets the pace of a release (the CPU builds take about 25).
+Performance, on an RTX 4090 with `qwen3.5-0.8b` loaded, for a 3,616-token prompt and 64 tokens
+out: 0.28-0.33 s with this build, 13.5 s with the CPU build of the same release.
 
 Locally, with the toolkit installed:
 

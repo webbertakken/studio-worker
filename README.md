@@ -186,11 +186,12 @@ Each release ships pre-built binaries for:
 On x86_64 Linux the install script picks the **CUDA build** when the NVIDIA
 driver is installed (it looks for `libcuda.so.1`), and the CPU build
 otherwise; it prints which one.  The CUDA build runs the in-process LLM
-with every layer on the GPU (a 0.8B model answers a ~4k-token chat in
-about half a second on an RTX 4090, against 15-21 s on the CPU).  It needs
-only the driver (525 or newer), not the CUDA toolkit, and covers GTX 10xx
-through RTX 50xx and datacentre GPUs from V100 to H100.  Auto-update keeps
-the build you have.  To choose yourself:
+with every layer on the GPU: on an RTX 4090 a 0.8B model answers a
+3,600-token chat in 0.3 s, against 13.5 s on the CPU.  It needs only the
+driver (525 or newer), not the CUDA toolkit, and covers GTX 10xx through
+RTX 50xx and datacentre GPUs from V100 to H100.  It is a larger download:
+565 MB against 10 MB.  Auto-update keeps the build you have.  To choose
+yourself:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
