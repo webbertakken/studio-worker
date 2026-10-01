@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Teach cargo-dist's shell installer the CUDA variant, and list the CUDA archives in sha256.sum.
+# Teach cargo-dist's installers what it cannot generate: the shell installer's CUDA variant,
+# the CUDA archives in sha256.sum, and, in both installers, starting the tray UI (`setup`).
 #
 #   patch-installer.sh <distrib dir>
 #
@@ -11,6 +12,10 @@
 # otherwise.  It anchors on cargo-dist 0.30's generated text and fails if any anchor is
 # missing, so a cargo-dist upgrade that moves them stops the release instead of shipping an
 # installer that silently ignores the variant.  Docs: docs/operations/release.md#cuda-variant
+#
+# Both installers run `<install dir>/studio-worker setup` after installing (it starts the tray
+# UI), except when STUDIO_WORKER_UPDATE=1: the auto-updater sets it, and the running tray UI
+# restarts itself on the new binary.  Docs: docs/runtime/daemon-and-tray.md#install
 set -euo pipefail
 
 CUDA_TARGETS="${CUDA_TARGETS:-x86_64-unknown-linux-gnu}"
@@ -21,6 +26,9 @@ log() { printf '[patch-installer] %s\n' "$*" >&2; }
 distrib="${1:?usage: patch-installer.sh <distrib dir>}"
 installer="$distrib/studio-worker-installer.sh"
 [ -f "$installer" ] || die "$installer not found"
+ps_installer="$distrib/studio-worker-installer.ps1"
+[ -f "$ps_installer" ] || die "$ps_installer not found"
+grep -q 'STUDIO_WORKER_UPDATE' "$ps_installer" && die "$ps_installer is already patched"
 grep -q 'STUDIO_WORKER_VARIANT' "$installer" && die "$installer is already patched"
 
 # Count the lines equal to $2 in file $1.
@@ -37,6 +45,7 @@ expect_once() {
 #    captures select_archive_for_arch's stdout as the archive name.
 expect_once "$installer" 'select_archive_for_arch() {'
 expect_once "$installer" '    local _archive'
+expect_once "$installer" "    say \"everything's installed!\""
 helpers="$(mktemp)"
 cat >"$helpers" <<EOF
 # studio-worker: the CUDA variant (STUDIO_WORKER_VARIANT=auto|cuda|cpu, default auto).
@@ -97,10 +106,25 @@ studio_worker_wants_cuda() {
     esac
 }
 
+studio_worker_start_tray() {
+    if [ "\${STUDIO_WORKER_UPDATE:-0}" = "1" ]; then
+        say "auto-update: the running tray UI restarts itself on the new binary"
+        return 0
+    fi
+    say "starting the studio-worker tray UI (studio-worker setup)"
+    if ! "\$1/studio-worker" setup; then
+        warn "could not start the tray UI; run: \$1/studio-worker setup"
+    fi
+}
+
 EOF
 
 patched="$(mktemp)"
-awk -v helpers="$helpers" '
+everything_installed="    say \"everything's installed!\""
+awk -v helpers="$helpers" -v everything="$everything_installed" '
+  $0 == everything {
+    print; print "    studio_worker_start_tray \"$_install_dir\""; next
+  }
   $0 == "select_archive_for_arch() {" {
     while ((getline line < helpers) > 0) print line
     print; in_select = 1; next
@@ -187,7 +211,48 @@ for target in $CUDA_TARGETS; do
   log "installer offers ${cuda_archive} (sha256 ${sha}) on ${target}"
 done
 
+expect_once "$patched" "    studio_worker_start_tray \"\$_install_dir\""
 sh -n "$patched" || die "patched installer is not valid sh"
 cat "$patched" >"$installer"
 rm -f "$patched" "$helpers"
 log "patched $installer"
+
+# 3. The PowerShell installer starts the tray UI after installing, unless it runs for an update.
+ps_function="$(mktemp)"
+cat >"$ps_function" <<'EOF'
+# studio-worker: start the tray UI after installing (docs/runtime/daemon-and-tray.md#install).
+function Start-StudioWorkerTray($dest_dir) {
+  if ($env:STUDIO_WORKER_UPDATE -eq "1") {
+    Write-Information "auto-update: the running tray UI restarts itself on the new binary"
+    return
+  }
+  Write-Information "starting the studio-worker tray UI (studio-worker setup)"
+  $exe = Join-Path $dest_dir "studio-worker.exe"
+  try {
+    & $exe setup
+    if ($LASTEXITCODE -ne 0) {
+      Write-Warning "could not start the tray UI; run: $exe setup"
+    }
+  } catch {
+    Write-Warning "could not start the tray UI ($_); run: $exe setup"
+  }
+}
+
+EOF
+ps_everything="  Write-Information \"everything's installed!\""
+expect_once "$ps_installer" "function Install-Binary(\$install_args) {"
+expect_once "$ps_installer" "$ps_everything"
+ps_patched="$(mktemp)"
+awk -v fn="$ps_function" -v everything="$ps_everything" '
+  $0 == "function Install-Binary($install_args) {" {
+    while ((getline line < fn) > 0) print line
+    print; next
+  }
+  $0 == everything { print; print "  Start-StudioWorkerTray $dest_dir"; next }
+  { print }
+' "$ps_installer" >"$ps_patched"
+expect_once "$ps_patched" "  Start-StudioWorkerTray \$dest_dir"
+expect_once "$ps_patched" "function Start-StudioWorkerTray(\$dest_dir) {"
+cat "$ps_patched" >"$ps_installer"
+rm -f "$ps_patched" "$ps_function"
+log "patched $ps_installer"

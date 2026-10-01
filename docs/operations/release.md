@@ -26,7 +26,7 @@ archive or its installer checksums.
 | `studio-worker-<target>.tar.xz` / `.zip` | cargo-dist's build for each of the five targets |
 | `studio-worker-x86_64-unknown-linux-gnu-cuda.tar.xz` | the CUDA variant (below) |
 | `<archive>.sha256` | the archive's sha256, `<hex> *<name>` |
-| `studio-worker-installer.sh` / `.ps1` | the installers; the shell one chooses the variant |
+| `studio-worker-installer.sh` / `.ps1` | the installers; the shell one chooses the variant, both start the tray UI |
 | `studio-worker-installer.{sh,ps1}.sha256` | what the auto-updater verifies an installer against |
 | `sha256.sum` | every archive's sha256, the CUDA one included |
 | `dist-manifest.json`, `source.tar.gz` | cargo-dist's manifest and the source |
@@ -129,7 +129,12 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   | STUDIO_WORKER_VARIANT=cpu sh
 ```
 
-The PowerShell installer is unchanged: Windows has no CUDA variant.
+The PowerShell installer has no variant: Windows has no CUDA build.
+
+The same step makes both installers finish by running `<install dir>/studio-worker setup`, which
+starts the tray UI, except when `STUDIO_WORKER_UPDATE=1` (the auto-updater sets it; the running
+tray UI restarts itself on the new binary). A failed `setup` is a warning naming the command; the
+install stands. See [daemon and tray UI: install](../runtime/daemon-and-tray.md#install).
 
 The patch anchors on cargo-dist 0.30's generated text and fails the release when an anchor moves,
 rather than ship an installer that ignores the variant.
