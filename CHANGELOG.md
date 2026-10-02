@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.13](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.12...studio-worker-v0.4.13) (2026-10-02)
+
+
+### Features
+
+* CUDA release variant ([#146](https://github.com/webbertakken/studio-worker/issues/146)) ([c982f1d](https://github.com/webbertakken/studio-worker/commit/c982f1dcd967198b572aa6ef111855a21afc0e19))
+* **stt-stream:** let clients end the utterance ([#143](https://github.com/webbertakken/studio-worker/issues/143)) ([e60d871](https://github.com/webbertakken/studio-worker/commit/e60d871828aca456c19ea322bf25819dad4963be))
+* tray-only installs, UI follows updates ([#147](https://github.com/webbertakken/studio-worker/issues/147)) ([31797ac](https://github.com/webbertakken/studio-worker/commit/31797ac225b35d82881724b3aa17d543cc3504a5))
+
 ## [0.4.12](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.11...studio-worker-v0.4.12) (2026-09-27)
 
 
