@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.14](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.13...studio-worker-v0.4.14) (2026-10-02)
+
+
+### Bug Fixes
+
+* **llama:** route llama.cpp logs through tracing ([#149](https://github.com/webbertakken/studio-worker/issues/149)) ([3f145b6](https://github.com/webbertakken/studio-worker/commit/3f145b6aa108c5b67cea18731d132bd643a02b95))
+* **ui:** tray icon follows the worker ([#148](https://github.com/webbertakken/studio-worker/issues/148)) ([a13aa7a](https://github.com/webbertakken/studio-worker/commit/a13aa7a3be1fc752525d6216f2f0f8c6371a7fc1))
+
 ## [0.4.13](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.12...studio-worker-v0.4.13) (2026-10-02)
 
 
