@@ -5,11 +5,8 @@
 //! ARGB byte order) free of any platform types so it stays
 //! unit-testable.
 
-use std::time::Duration;
-
-use chrono::Utc;
-
-use crate::runtime::HeartbeatStatus;
+use super::pulse::{Activity, Pulse};
+use super::theme::Tone;
 
 /// What the tray icon currently advertises about the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,29 +70,19 @@ pub fn rgba_to_argb32(rgba: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Derive the tray variant from live state.  A heartbeat that's
-/// missing or older than `disconnect_threshold` flips the variant
-/// to `Disconnected`.
-pub fn derive_variant(
-    busy: bool,
-    last_heartbeat: Option<&HeartbeatStatus>,
-    heartbeat_interval: Duration,
-) -> TrayVariant {
-    if busy {
-        return TrayVariant::Busy;
-    }
-    match last_heartbeat {
-        None => TrayVariant::Disconnected,
-        Some(hb) => {
-            let age = Utc::now().signed_duration_since(hb.last_attempt_at);
-            let stale =
-                age.num_milliseconds() as u128 > (heartbeat_interval.as_millis().saturating_mul(3));
-            if stale || !matches!(hb.outcome, crate::runtime::HeartbeatOutcome::Ok) {
-                TrayVariant::Disconnected
-            } else {
-                TrayVariant::Idle
-            }
+/// The tray colour for what the window's header says, so the two never disagree: red while
+/// the daemon does not answer or the studio refuses the worker (auth failed, registration
+/// rejected, a fatal session error), busy while a job runs, green otherwise. A worker waiting
+/// on the studio (approval, connecting, reconnecting) still runs and serves its local API, so
+/// it is green; the window says what it waits for.
+pub fn variant_of(pulse: &Pulse) -> TrayVariant {
+    match pulse.activity {
+        Activity::Offline => TrayVariant::Disconnected,
+        Activity::Busy | Activity::Running { .. } => TrayVariant::Busy,
+        Activity::Idle | Activity::Paused if pulse.studio.tone == Tone::Bad => {
+            TrayVariant::Disconnected
         }
+        Activity::Idle | Activity::Paused => TrayVariant::Idle,
     }
 }
 
@@ -131,65 +118,77 @@ pub fn menu_labels(auto_enabled: bool) -> MenuLabels {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::HeartbeatOutcome;
-    use chrono::Duration as ChronoDuration;
+    use crate::ui::pulse::Signal;
 
-    #[test]
-    fn variant_is_busy_when_busy_regardless_of_heartbeat() {
-        let hb = HeartbeatStatus {
-            last_attempt_at: Utc::now(),
-            outcome: HeartbeatOutcome::Err { reason: "x".into() },
+    fn pulse(activity: Activity, studio: Tone) -> Pulse {
+        let signal = |tone| Signal {
+            label: String::new(),
+            tone,
+            detail: String::new(),
         };
-        assert_eq!(
-            derive_variant(true, Some(&hb), Duration::from_secs(5)),
-            TrayVariant::Busy
-        );
+        Pulse {
+            activity,
+            daemon: signal(Tone::Good),
+            studio: signal(studio),
+            gpu: None,
+            can_pause: true,
+            paused: false,
+        }
     }
 
     #[test]
-    fn variant_is_disconnected_without_any_heartbeat() {
+    fn the_icon_is_red_while_the_daemon_does_not_answer() {
         assert_eq!(
-            derive_variant(false, None, Duration::from_secs(5)),
+            variant_of(&pulse(Activity::Offline, Tone::Neutral)),
             TrayVariant::Disconnected
         );
     }
 
     #[test]
-    fn variant_is_idle_when_heartbeat_recent_and_ok() {
-        let hb = HeartbeatStatus {
-            last_attempt_at: Utc::now() - ChronoDuration::seconds(1),
-            outcome: HeartbeatOutcome::Ok,
-        };
+    fn a_connected_idle_worker_is_green_with_no_heartbeat_at_all() {
+        // The regression: the icon read a heartbeat nothing wrote, so a
+        // connected, running worker showed red.
         assert_eq!(
-            derive_variant(false, Some(&hb), Duration::from_secs(5)),
+            variant_of(&pulse(Activity::Idle, Tone::Good)),
+            TrayVariant::Idle
+        );
+        assert_eq!(
+            variant_of(&pulse(Activity::Paused, Tone::Good)),
             TrayVariant::Idle
         );
     }
 
     #[test]
-    fn variant_is_disconnected_when_heartbeat_failed() {
-        let hb = HeartbeatStatus {
-            last_attempt_at: Utc::now(),
-            outcome: HeartbeatOutcome::Err {
-                reason: "5xx".into(),
-            },
-        };
+    fn a_worker_waiting_on_the_studio_is_still_running_so_green() {
+        // Awaiting approval, connecting, reconnecting: the worker runs and
+        // serves its local API; the window says what it waits for.
         assert_eq!(
-            derive_variant(false, Some(&hb), Duration::from_secs(5)),
+            variant_of(&pulse(Activity::Idle, Tone::Busy)),
+            TrayVariant::Idle
+        );
+    }
+
+    #[test]
+    fn a_studio_that_refuses_the_worker_turns_it_red() {
+        // Auth failed, registration rejected, a fatal session error.
+        assert_eq!(
+            variant_of(&pulse(Activity::Idle, Tone::Bad)),
             TrayVariant::Disconnected
         );
     }
 
     #[test]
-    fn variant_is_disconnected_when_heartbeat_stale() {
-        // Heartbeat 30s ago with 5s interval → 6x older than interval.
-        let hb = HeartbeatStatus {
-            last_attempt_at: Utc::now() - ChronoDuration::seconds(30),
-            outcome: HeartbeatOutcome::Ok,
+    fn a_job_makes_it_busy_whatever_the_studio_says() {
+        let running = Activity::Running {
+            kind: "llm".into(),
+            model: "m".into(),
+            elapsed: "1s".into(),
+            more: 0,
         };
+        assert_eq!(variant_of(&pulse(running, Tone::Bad)), TrayVariant::Busy);
         assert_eq!(
-            derive_variant(false, Some(&hb), Duration::from_secs(5)),
-            TrayVariant::Disconnected
+            variant_of(&pulse(Activity::Busy, Tone::Good)),
+            TrayVariant::Busy
         );
     }
 

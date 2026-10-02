@@ -352,7 +352,16 @@ selects a job once it shows up, for screenshots and headless inspection.
 
 ### Tray
 
-- The icon reflects the daemon: busy, idle, or disconnected (also when the link is down).
+- The icon says whether the worker is running, from the same pulse as the window's header, so
+  the two never disagree:
+  - **red** (`disconnected`) while the daemon does not answer, or the studio refuses the worker
+    (auth failed, registration rejected, a fatal session error);
+  - **busy** while a job runs;
+  - **green** (`idle`) otherwise, waiting on the studio included (approval, connecting,
+    reconnecting): the worker runs and serves its local API, and the window says what it waits
+    for.
+- The Studio card's last heartbeat is the last one the studio acked, or the last send that
+  failed (`record_heartbeat`).
 - Menu: Open window, Pause/Resume (sent to the daemon), Quit.
 - Quit stops the daemon (`POST /daemon/shutdown`) and closes the UI. Closing the window only
   hides it.
