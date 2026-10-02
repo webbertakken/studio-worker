@@ -13,6 +13,12 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 pub mod admission;
+
+/// The log filter when `RUST_LOG` is unset: the worker's own info, llama.cpp's info (model
+/// loads, `offloaded N/N layers to GPU`), and warnings from everything else. llama.cpp's debug
+/// level (per-layer cache setup, `CUDA Graph id N reused` on every decode) stays out: it is
+/// hundreds of lines per chat.
+pub const DEFAULT_LOG_FILTER: &str = "studio_worker=info,llama-cpp-2=info,warn";
 pub mod auto_register;
 pub mod autostart;
 pub mod catalog;
@@ -128,6 +134,22 @@ async fn run_ui(_config_path: Option<&str>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::capture;
+
+    #[test]
+    fn the_default_log_filter_keeps_llama_cpp_info_and_drops_its_debug() {
+        use tracing_subscriber::prelude::*;
+        let filter = tracing_subscriber::EnvFilter::try_new(DEFAULT_LOG_FILTER).expect("parses");
+        let subscriber = tracing_subscriber::registry().with(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            // llama.cpp's load summary (`offloaded N/N layers to GPU`) is info.
+            assert!(tracing::enabled!(target: "llama-cpp-2", tracing::Level::INFO));
+            // Its per-decode chatter (`CUDA Graph id N reused`) is debug.
+            assert!(!tracing::enabled!(target: "llama-cpp-2", tracing::Level::DEBUG));
+            assert!(tracing::enabled!(target: "studio_worker", tracing::Level::INFO));
+            assert!(!tracing::enabled!(target: "some_dependency", tracing::Level::INFO));
+            assert!(tracing::enabled!(target: "some_dependency", tracing::Level::WARN));
+        });
+    }
 
     #[test]
     fn startup_breadcrumb_names_version_and_command() {

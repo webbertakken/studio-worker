@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     // before `sentry::init` simply have nowhere to go — events emitted
     // after will flow to Sentry.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("studio_worker=info,warn"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(studio_worker::DEFAULT_LOG_FILTER));
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer().with_target(false))

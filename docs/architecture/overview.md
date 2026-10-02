@@ -756,7 +756,9 @@ trait — they're excluded from the 90% coverage gate
 ## Observability
 
 - **Local logs**: every `tracing` event is rendered through
-  `tracing-subscriber::fmt` to stderr.  Filter via
+  `tracing-subscriber::fmt` to stderr.  Without `RUST_LOG` the filter is
+  `DEFAULT_LOG_FILTER` (the worker's info, llama.cpp's info as target
+  `llama-cpp-2`, every warning).  Filter via
   `RUST_LOG=studio_worker=debug` (or any of the per-target filters
   documented per module: `studio_worker::http`,
   `studio_worker::config`, `studio_worker::runtime`,

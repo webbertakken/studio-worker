@@ -214,8 +214,19 @@ handles:
 - At most four files of about 10 MiB each, plus what one interval writes above the limit.
 - Each trim logs `op="log_trim"` (info) with the size it trimmed; a failure is a warning and
   never stops the process. A missing live file is not an error.
-- Output that never reaches tracing (llama.cpp's own messages, a panic) is in the file all the
-  same: the trim works on the file, not on a logging layer.
+- Output that never reaches tracing (a panic) is in the file all the same: the trim works on the
+  file, not on a logging layer.
+
+What reaches the file:
+
+- Every tracing event the filter lets through. Without `RUST_LOG` the filter is
+  `DEFAULT_LOG_FILTER`: the worker's own info, llama.cpp's info and every warning.
+- llama.cpp and ggml log through tracing (`send_logs_to_tracing`, installed before the backend
+  starts), target `llama-cpp-2`, with the module in a `module` field (`llama.cpp::load_tensors`).
+  Their info level carries the model loads and `offloaded N/N layers to GPU`; their debug level
+  (per-layer cache setup, `CUDA Graph id N reused` on every decode, hundreds of lines per chat)
+  appears only with `RUST_LOG=llama-cpp-2=debug`. Measured on a CUDA build: about 36 lines per
+  chat instead of 370.
 
 ### Restart after an update
 
