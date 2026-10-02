@@ -6,8 +6,8 @@
 //! local API.  When no daemon runs, the poller starts one.  One tray UI runs
 //! per config directory (`single_instance`).
 //!
-//! Gated behind the `ui` cargo feature so headless installs and the
-//! service path don't pull in egui / eframe / the tray backends.
+//! Gated behind the `ui` cargo feature so the CI-only headless core builds without
+//! egui / eframe / the tray backends.  Installed, the worker always runs as this UI.
 
 pub mod actions;
 pub mod app;
@@ -41,6 +41,8 @@ const TRACE_TARGET: &str = "studio_worker::ui";
 
 /// Carries the display-retry attempt across the restart in place.
 pub const DISPLAY_ATTEMPT_ENV: &str = "STUDIO_WORKER_UI_DISPLAY_ATTEMPT";
+/// Set to `update` on a tray UI restarted because its binary was replaced.
+pub const RESTART_ENV: &str = "STUDIO_WORKER_UI_RESTART";
 
 /// First wait before retrying the display, doubled per attempt.
 pub const DISPLAY_RETRY_BASE: Duration = Duration::from_secs(2);
@@ -76,31 +78,41 @@ pub fn log_display_wait(attempt: u32, error: &str) -> Duration {
 /// Entry point for `studio-worker ui`.
 pub fn run(config_path: Option<&str>) -> Result<()> {
     let path = config::resolve_path(config_path)?;
+    // Recorded before an update can replace the file: on Linux the path of a replaced running
+    // binary reads `… (deleted)` afterwards.
+    let launch = std::env::current_exe()?;
+    let launch_identity = crate::exe_watch::ExeIdentity::of(&launch);
     let attempt = display_attempt(std::env::var(DISPLAY_ATTEMPT_ENV).ok().as_deref());
+    let restarted = std::env::var(RESTART_ENV).ok();
     tracing::info!(
         target: TRACE_TARGET,
         op = "startup",
         config_path = %path.display(),
         display_attempt = attempt,
+        restarted = restarted.as_deref(),
+        launch_path = %launch.display(),
         "tray UI starting as a client of the daemon"
     );
-    let _ui_lock = match take_ui_lock(&path, attempt) {
+    let _ui_lock = match take_ui_lock(&path, attempt > 0 || restarted.is_some()) {
         UiLockOutcome::Held(lock) => lock,
         UiLockOutcome::HandedOver => return Ok(()),
     };
     ensure_autostart();
+    // Installed, the worker runs as the tray UI only: a legacy headless service goes.
+    std::thread::spawn(crate::legacy_service::remove);
+    crate::log_trim::spawn(crate::daemon_link::ui_log_path(&path));
+    spawn_exe_watch(launch.clone(), launch_identity);
 
     // The poller runs whether or not the window can open: it starts the
     // daemon when none runs, even while the UI waits for a display.
     let replica = Replica::default();
     let stop = Arc::new(AtomicBool::new(false));
     let repaint: Arc<Mutex<Option<eframe::egui::Context>>> = Arc::default();
-    let exe = std::env::current_exe()?;
     let poller = Poller::new(
         replica.clone(),
         path.clone(),
         Box::new(ProcessStarter {
-            exe,
+            exe: launch.clone(),
             config_path: path.clone(),
         }),
     );
@@ -200,7 +212,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         Err(err) => {
             let delay = log_display_wait(attempt, &err.to_string());
             std::thread::sleep(delay);
-            restart_for_display(attempt + 1)
+            restart_in_place(&launch, Restart::Display(attempt + 1))
         }
     }
 }
@@ -214,10 +226,10 @@ enum UiLockOutcome {
     HandedOver,
 }
 
-/// Take the UI lock, or hand over to the tray UI that holds it.  A UI
-/// restarting itself for the display waits for its predecessor's lock.
-fn take_ui_lock(path: &std::path::Path, display_attempt: u32) -> UiLockOutcome {
-    let (attempts, pause) = if display_attempt > 0 {
+/// Take the UI lock, or hand over to the tray UI that holds it.  A UI restarting itself in
+/// place (for the display, or on a replaced binary) waits for its predecessor's lock.
+fn take_ui_lock(path: &std::path::Path, restarting: bool) -> UiLockOutcome {
+    let (attempts, pause) = if restarting {
         (
             single_instance::RESTART_ATTEMPTS,
             single_instance::RESTART_PAUSE,
@@ -254,28 +266,90 @@ pub fn raise_window(ctx: &eframe::egui::Context) {
     ctx.request_repaint();
 }
 
-/// Start this UI again in place with the next display attempt.  The
-/// windowing library allows one event loop per process and caches a
-/// failed display connection, so a retry needs a fresh process.
+/// Why the tray UI restarts itself in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restart {
+    /// The next display attempt.
+    Display(u32),
+    /// The binary at the launch path was replaced.
+    Update,
+}
+
+/// Start this UI again in place, from the launch path, with the same arguments.  The windowing
+/// library allows one event loop per process and caches a failed display connection, so a
+/// display retry needs a fresh process; a replaced binary needs one to run the new code.
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn restart_for_display(attempt: u32) -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(std::env::args_os().skip(1))
-        .env(DISPLAY_ATTEMPT_ENV, attempt.to_string());
+fn restart_in_place(launch: &std::path::Path, reason: Restart) -> Result<()> {
+    let mut cmd = std::process::Command::new(launch);
+    cmd.args(std::env::args_os().skip(1));
+    match reason {
+        Restart::Display(attempt) => cmd.env(DISPLAY_ATTEMPT_ENV, attempt.to_string()),
+        Restart::Update => cmd
+            .env(RESTART_ENV, "update")
+            .env_remove(DISPLAY_ATTEMPT_ENV),
+    };
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         let err = cmd.exec();
-        Err(anyhow!(
-            "restarting the tray UI for the display failed: {err}"
-        ))
+        Err(anyhow!("restarting the tray UI ({reason:?}) failed: {err}"))
     }
     #[cfg(not(unix))]
     {
         cmd.spawn()
-            .map_err(|e| anyhow!("restarting the tray UI for the display failed: {e}"))?;
+            .map_err(|e| anyhow!("restarting the tray UI ({reason:?}) failed: {e}"))?;
         std::process::exit(0);
+    }
+}
+
+/// Watch the launch path and restart on the new binary once it was replaced and settled.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn spawn_exe_watch(launch: std::path::PathBuf, baseline: Option<crate::exe_watch::ExeIdentity>) {
+    use crate::exe_watch::{ExeIdentity, ExeWatch, WatchStep, EXE_SETTLE, EXE_WATCH_INTERVAL};
+    let spawned = std::thread::Builder::new()
+        .name("exe-watch".into())
+        .spawn(move || {
+            let mut watch = ExeWatch::new(baseline, EXE_SETTLE);
+            loop {
+                std::thread::sleep(EXE_WATCH_INTERVAL);
+                match watch.observe(ExeIdentity::of(&launch), std::time::Instant::now()) {
+                    WatchStep::Missing { first: true } => tracing::warn!(
+                        target: TRACE_TARGET,
+                        op = "update_restart",
+                        launch_path = %launch.display(),
+                        "the tray UI binary is missing; waiting for a new one"
+                    ),
+                    WatchStep::Restart => {
+                        tracing::info!(
+                            target: TRACE_TARGET,
+                            op = "update_restart",
+                            launch_path = %launch.display(),
+                            "the tray UI binary was replaced; restarting on it"
+                        );
+                        if let Err(e) = restart_in_place(&launch, Restart::Update) {
+                            tracing::error!(
+                                target: TRACE_TARGET,
+                                op = "update_restart",
+                                launch_path = %launch.display(),
+                                error = %e,
+                                "could not restart the tray UI on the new binary; it keeps \
+                                 running the old one"
+                            );
+                        }
+                    }
+                    WatchStep::Unchanged
+                    | WatchStep::Missing { first: false }
+                    | WatchStep::Settling => {}
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(
+            target: TRACE_TARGET,
+            op = "update_restart",
+            error = %e,
+            "could not start watching the tray UI binary; it will not restart after an update"
+        );
     }
 }
 
@@ -364,10 +438,10 @@ mod tests {
     fn a_second_ui_hands_over_to_the_first_and_leaves_a_raise_request() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
-        let first = take_ui_lock(&config, 0);
+        let first = take_ui_lock(&config, false);
         assert!(matches!(first, UiLockOutcome::Held(Some(_))));
         assert!(matches!(
-            take_ui_lock(&config, 0),
+            take_ui_lock(&config, false),
             UiLockOutcome::HandedOver
         ));
         assert!(single_instance::take_raise_request(&config));
@@ -377,13 +451,13 @@ mod tests {
     fn a_ui_restarting_for_the_display_waits_for_its_predecessors_lock() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
-        let predecessor = take_ui_lock(&config, 0);
+        let predecessor = take_ui_lock(&config, false);
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             drop(predecessor);
         });
         assert!(matches!(
-            take_ui_lock(&config, 1),
+            take_ui_lock(&config, true),
             UiLockOutcome::Held(Some(_))
         ));
         release.join().unwrap();
@@ -398,7 +472,7 @@ mod tests {
         let config = blocker.join("config.toml");
         let logs = crate::test_support::capture(move || {
             assert!(matches!(
-                take_ui_lock(&config, 0),
+                take_ui_lock(&config, false),
                 UiLockOutcome::Held(None)
             ));
         });

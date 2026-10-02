@@ -31,8 +31,8 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const SPAWN_BACKOFF: Duration = Duration::from_secs(10);
 
 /// How long no daemon must be running before the UI starts one.  Longer
-/// than a supervisor's restart gap (PM2 and systemd restart within about a
-/// second), so a supervised daemon is never raced.  Safe range 5..=120 s.
+/// than the gap while a daemon restarts itself after an update (about a
+/// second), so a restarting daemon is never raced.  Safe range 5..=120 s.
 pub const SPAWN_GRACE: Duration = Duration::from_secs(20);
 
 /// The UI's view of its daemon.
@@ -253,6 +253,14 @@ pub fn daemon_log_path(config_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("daemon.log")
+}
+
+/// The file a tray UI started by `setup` writes its output to.
+pub fn ui_log_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("ui.log")
 }
 
 impl DaemonStarter for ProcessStarter {
@@ -653,8 +661,8 @@ mod tests {
 
     #[test]
     fn a_daemon_briefly_missing_is_not_replaced() {
-        // A supervisor (PM2, systemd) restarting its daemon leaves a gap of
-        // about a second; starting our own then would take the lock from it.
+        // A daemon restarting itself after an update leaves a gap of about a
+        // second; starting another then would take the lock from it.
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         let starter = FakeStarter::default();
@@ -791,6 +799,7 @@ mod tests {
         let _lock = crate::daemon_lock::acquire_with(&config, 1, Duration::from_millis(1)).unwrap();
         assert!(starter.is_running().unwrap());
         assert_eq!(daemon_log_path(&config), dir.path().join("daemon.log"));
+        assert_eq!(ui_log_path(&config), dir.path().join("ui.log"));
     }
 
     #[test]

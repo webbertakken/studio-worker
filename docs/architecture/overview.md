@@ -29,7 +29,7 @@ For install / register / day-one instructions see the top-level
 9. [Tray UI](#tray-ui)
 10. [Auto-update](#auto-update)
 11. [Observability](#observability)
-12. [Service / autostart](#service--autostart)
+12. [Install / autostart](#install--autostart)
 13. [Failure modes + reconnect policy](#failure-modes--reconnect-policy)
 14. [Security model](#security-model)
 15. [Studio side (minigames repo)](#studio-side-minigames-repo)
@@ -124,12 +124,12 @@ The CLI surface from [`src/cli.rs`](../../src/cli.rs):
 
 | Subcommand | What it does |
 |---|---|
-| `run` | The daemon: local API + model host, ensure registered, then the WS session + auto-updater |
+| `setup` | Finish an install: the tray UI's login entry, start the tray UI detached, print guidance (the installers run it) |
+| `run` (hidden) | The daemon: local API + model host, ensure registered, then the WS session + auto-updater.  Started by the tray UI; not an install method |
 | `ui` (feature `ui`) | The tray UI: egui window + tray + notifications, a client of the daemon (starts one when absent) |
 | `register` | Persist api-base-url / clear state (`--reset`).  **No HTTP** — the next `run`/`ui` actually auto-registers |
 | `status` | Print config path, registration state, threshold, auto-update toggle |
 | `set-threshold <gb>` | Update `vram_threshold_gb` |
-| `install-service` / `uninstall-service` | Per-OS service file (systemd / launchd / scheduled task) |
 | `config` | Dump the resolved config |
 | `check-update` | One-shot release-feed poll, doesn't install |
 
@@ -177,7 +177,10 @@ src/
 │   ├── vad.rs        Energy voice-activity detection (hands-free finalise).
 │   ├── tokens.rs     Short-lived stream tokens (stored hashed).
 │   └── server.rs     LAN WebSocket listener; one session per loaded model's lane.
-├── service.rs        Per-OS service file writers (systemd --user / launchd / schtasks XML).
+├── setup.rs          `setup`: the tray UI's login entry, start the tray UI, print guidance.
+├── legacy_service.rs Removes the headless service older versions installed (tray UI start).
+├── exe_watch.rs      Notices a replaced launch path so the tray UI restarts on the new binary.
+├── log_trim.rs       Copy-truncate for daemon.log / ui.log (10 MiB + 3 copies).
 ├── autostart.rs      Cross-OS tray-UI login entry, always installed by `ui::run` (logged).
 ├── update.rs         GitHub release feed poll + installer script download + re-exec on success;
 │                     keeps the build variant (CPU or CUDA).
@@ -779,26 +782,21 @@ trait — they're excluded from the 90% coverage gate
 
 ---
 
-## Service / autostart
+## Install / autostart
 
-Two distinct mechanisms:
+Installed, the worker runs as the tray UI only; nothing installs the daemon on its own
+([daemon and tray UI](../runtime/daemon-and-tray.md#install)).
 
-### `studio-worker install-service` (headless background)
+### `studio-worker setup` (the installers run it)
 
-[`src/service.rs`](../../src/service.rs).  Writes a per-OS unit
-file:
+[`src/setup.rs`](../../src/setup.rs).  Installs the tray UI's login entry, starts the
+tray UI detached (output to `<config dir>/ui.log`) and prints the approval guidance.
 
-- Linux: `systemd --user` unit at
-  `~/.config/systemd/user/minis-studio-worker.service`
-- macOS: LaunchAgent plist at
-  `~/Library/LaunchAgents/gg.minis.studio-worker.plist`
-- Windows: `schtasks /Create` XML template (`%APPDATA%\\minis-studio-worker\\minis-studio-worker.task.xml`)
-  — written but **not registered**, since CreateTrigger needs
-  the operator to confirm.
+### Legacy headless services
 
-`uninstall-service` removes them.  Tested in
-[`tests/runtime_helpers.rs`](../../tests/runtime_helpers.rs)
-under an `XDG_CONFIG_HOME` override.
+[`src/legacy_service.rs`](../../src/legacy_service.rs).  Older versions wrote a systemd
+user unit, a LaunchAgent or a scheduled task that ran `studio-worker run`.  The tray UI
+deregisters and deletes it at start, without stopping a running legacy daemon.
 
 ### Tray UI login entry (always)
 
@@ -837,7 +835,7 @@ none runs.  The daemon lock keeps it to one daemon per config directory.
 | Engine `dispatch` returns generic `Err` | runtime job-runner | `Fail { retryable: true }` — server requeues |
 | `complete` multipart 5xx | runtime job-runner | `Fail` so the server can retry |
 | Auto-update download / install failure | `update::apply` | Log + leave worker running on the old version; try again next interval |
-| Auto-update `execvp` failure (unix) | `update::restart_self` | Should never happen; if it does, exit 0 and let systemd restart |
+| Auto-update `execvp` failure (unix) | `update::restart_self` | Should never happen; if it does, exit 1; the tray UI starts a new daemon |
 | Offer without `ModelSource` to sdcpp engine | engine `dispatch_with_source` | `Fail { retryable: false }` with "requires a ModelSource on the offer" |
 | Model file download fails | sdcpp `ensure_files` | `Fail { retryable: true }`; the next claim of the same job retries the download |
 | `sd-cli` non-zero exit | sdcpp `dispatch_image` | `Fail { retryable: true }` with the last stderr line included so operators can spot OOM / driver issues quickly |

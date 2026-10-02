@@ -1,9 +1,9 @@
 # Dev loop (PM2 + cargo-watch)
 
 How to run the worker locally for the kind of iterate-watch-restart
-loop you want during real development.  Production workers run the
-release binary under systemd / launchd, not this dev loop — see
-[`docs/architecture/overview.md`](../architecture/overview.md#service--autostart).
+loop you want during real development.  Installed workers run the
+release binary as the tray UI, not this dev loop — see
+[`docs/runtime/daemon-and-tray.md`](../runtime/daemon-and-tray.md#install).
 
 ## Why PM2
 
@@ -94,9 +94,12 @@ This is what you want when:
   llama.cpp backend (`--features all`) you only need `cmake` + a C/C++
   compiler on PATH.
 - **DISPLAY**.  The UI needs an X server.  Export
-  `DISPLAY=:0` (or your session's display).  Headless workers run
-  `studio-worker run` instead of `ui`; same wrapper minus the
-  `ui` arg and the DISPLAY export.
+  `DISPLAY=:0` (or your session's display).  The tray UI starts its own
+  daemon; to debug the daemon alone, run `studio-worker run` (the hidden
+  daemon entry) with the same wrapper minus the DISPLAY export.
+- **Self-restart**.  The tray UI restarts itself when its binary is
+  replaced, so a rebuild of `target/debug/studio-worker` restarts a dev UI
+  a few seconds later.
 
 ## Tailing logs
 

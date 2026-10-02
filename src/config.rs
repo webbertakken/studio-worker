@@ -74,11 +74,9 @@ pub struct Config {
     #[serde(default = "default_models_root_persisted")]
     pub models_root: PathBuf,
     /// Maximum number of WebSocket reconnect attempts before the
-    /// worker gives up and exits non-zero (relying on the service
-    /// manager to restart it).  `0` = infinite, which is the default:
-    /// the turnkey install runs with no service manager, so a worker
-    /// that exits on a transient outage would never come back.  Pin a
-    /// finite value only for a fail-fast setup behind systemd.
+    /// worker gives up and exits non-zero (the tray UI then starts a new
+    /// daemon after `SPAWN_GRACE`).  `0` = infinite, which is the default:
+    /// a transient outage is better ridden out than restarted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_reconnect_attempts: Option<u32>,
     /// Preferred TCP port for the always-on local API

@@ -581,22 +581,17 @@ pub fn format_check_outcome(outcome: &update::CheckOutcome) -> String {
 // Long-running run loop
 // ---------------------------------------------------------------------------
 
-pub async fn run(config_path: Option<&str>, wait_for_lock: bool) -> Result<()> {
+pub async fn run(config_path: Option<&str>) -> Result<()> {
     let (cfg, path) = config::load(config_path)?;
     // One daemon per config directory: a second one would fight the first
     // over the local API port and the studio session.
     let _lock = match crate::daemon_lock::acquire(&path)? {
         crate::daemon_lock::Acquired::Mine(lock) => lock,
-        crate::daemon_lock::Acquired::HeldElsewhere if wait_for_lock => {
-            let path = path.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::daemon_lock::wait_until_acquired(&path, crate::daemon_lock::WAIT_POLL)
-            })
-            .await??
-        }
         crate::daemon_lock::Acquired::HeldElsewhere => return Ok(()),
     };
     log_startup_banner(&cfg, &path);
+    // A tray-started daemon writes to daemon.log; nothing else rotates it.
+    crate::log_trim::spawn(crate::daemon_link::daemon_log_path(&path));
 
     let control = crate::control::DaemonControl::new(
         config::shared(cfg),
@@ -749,11 +744,9 @@ pub fn request_shutdown(stop: &AtomicBool, signal: &str) {
 /// the signal that fired.
 ///
 /// On Unix we wait on **both** SIGINT (interactive Ctrl-C) and SIGTERM.
-/// SIGTERM is the signal `systemctl stop` / `launchctl unload` / host
-/// shutdown deliver by default, and the worker ships as a `Type=simple`
-/// systemd unit (see `service::render_service`).  Listening for Ctrl-C
-/// alone meant the service manager's stop never reached the graceful
-/// path: the WS session was killed mid-`close`, the studio saw an
+/// SIGTERM is the signal host shutdown, `kill` and a logout deliver by
+/// default.  Listening for Ctrl-C alone meant such a stop never reached
+/// the graceful path: the WS session was killed mid-`close`, the studio saw an
 /// abrupt disconnect, and the final log batch never flushed.  If the
 /// SIGTERM handler can't be installed we degrade to Ctrl-C only rather
 /// than abort the shutdown task.

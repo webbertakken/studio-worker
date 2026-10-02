@@ -14,9 +14,8 @@
 //! unit-tested against a tempdir without mutating the process
 //! environment.
 //!
-//! Distinct from `service.rs`, which owns the systemd / launchd /
-//! Scheduled-Task path for the headless `run` subcommand; autostart is
-//! for the tray UI on a desktop.
+//! The only autostart there is: installed, the worker runs as the tray UI.
+//! `legacy_service.rs` removes the headless service older versions wrote.
 
 use std::path::Path;
 

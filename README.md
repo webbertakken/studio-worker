@@ -68,10 +68,11 @@ Z-Image) that you can extend the same way the studio adds models. Local jobs
 show up in the tray UI's **Local queue**. See
 [`docs/local-api.md`](docs/local-api.md).
 
-## Tray UI (on by default)
+## Tray UI
 
-The worker is two processes from one binary: the **daemon**
-(`studio-worker run`) hosts the studio session, the local API, the model
+Installed, the worker always runs as its tray UI, so you can always see
+whether it runs.  It is two processes from one binary: the **daemon**
+hosts the studio session, the local API, the model
 host and every job; the **tray UI** (`studio-worker ui`) is a native
 `egui`/`eframe` window and system-tray icon that shows what the daemon
 does and sends your actions back over the local API.  The UI starts the
@@ -85,11 +86,7 @@ dlopen), notifications use `notify-rust` (pure-Rust zbus on Linux), and
 the system tray uses `ksni` (pure-Rust StatusNotifierItem) on Linux and
 the native `tray-icon` APIs on macOS / Windows.  So a source build needs
 **no `pkg-config`, no `-dev` packages, and no OpenSSL** (reqwest +
-sentry use rustls).  Headless rigs can still opt out:
-
-```bash
-cargo install studio-worker --no-default-features   # service / `run` only
-```
+sentry use rustls).
 
 The window is a navigation rail, a header that always shows the worker's
 pulse (what runs, the daemon, the studio, GPU memory held, Pause / Resume)
@@ -140,38 +137,37 @@ C++ compiler are on `PATH`.
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/webbertakken/studio-worker/releases/latest/download/studio-worker-installer.sh | sh
-studio-worker setup      # install + start the service, print approval guidance
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
 irm https://github.com/webbertakken/studio-worker/releases/latest/download/studio-worker-installer.ps1 | iex
-studio-worker setup      # install + start the service, print approval guidance
 ```
 
-`studio-worker setup` is the one post-install step: it installs and
-starts the auto-start service (so the worker runs now and at every
-login), then prints the machine name the studio admin approves, the
-studio URL, and where the local API's URL + token are written. It is
-idempotent — safe to re-run. After an admin approves the worker it
+The installer finishes by running `studio-worker setup`: it starts the
+tray UI (look for its icon) and installs its login entry, so the worker
+runs now and at every login, then prints the machine name the studio
+admin approves, the studio URL, and where the local API's URL + token
+are written.  `setup` is idempotent; run it yourself after a
+`cargo install`.  A headless service from an older version is removed
+when the tray UI starts. After an admin approves the worker it
 claims jobs automatically and downloads its own models + GPU runtimes
 on demand; there is nothing else to do.
 
 ### From cargo
 
 ```bash
-cargo install studio-worker              # windowed UI by default
-cargo install studio-worker --features all   # + in-process llama.cpp + media (needs cmake)
-cargo install studio-worker --no-default-features  # headless service build
+cargo install studio-worker              # the tray UI and the turnkey engines (needs cmake)
+studio-worker setup                      # start the tray UI, now and at every login
 ```
 
 The **install script is the turnkey path**: its pre-built binaries
 already bundle the UI **and** every backend (in-process llama.cpp LLM +
 media engines), auto-start on login, auto-update, and auto-download
 models on demand — nothing else to install.  `cargo install
-studio-worker` from source is UI-first but ships only the synthetic
-engine unless you add `--features all` (which needs a C/C++ toolchain).
+studio-worker` builds the same turnkey set from source and needs a C/C++
+toolchain (cmake) for llama.cpp.
 
 Each release ships pre-built binaries for:
 
@@ -210,27 +206,14 @@ No shared secret to copy around.  The worker auto-registers against
 `https://studio.minis.gg` on first launch; the studio operator sees a
 row in the dashboard's Pending Workers panel and clicks Approve, and
 the worker's next 30s poll picks up its `worker_id` + `auth_token`
-and starts heartbeating.  Two ways to launch:
-
-```bash
-# Tray UI (recommended) — starts the daemon for you; the Worker page shows
-# 'Waiting for approval' until the operator approves.
-studio-worker ui
-
-# Headless — the daemon alone; pipe to journalctl in production.
-studio-worker run
-```
+and starts heartbeating.  The tray UI's Worker page shows `Waiting for
+approval` until then.  To open it by hand: `studio-worker ui`.
 
 Optional pre-launch tweaks (none of these talk to the network):
 
 ```bash
 # Point at a self-hosted studio instead of studio.minis.gg.
 studio-worker register --api-base-url https://my-studio.example.com
-
-# Optionally install the auto-start OS service (systemd --user on Linux,
-# launchd on macOS, scheduled task on Windows), for a daemon that runs
-# before anyone logs in.  The tray UI starts at login on its own.
-studio-worker install-service
 ```
 
 If your registration is rejected (or you want to move the worker to a
@@ -244,12 +227,10 @@ studio-worker register --reset
 
 | Subcommand           | Purpose                                                         |
 | -------------------- | --------------------------------------------------------------- |
-| `run`                | The daemon: local API + model host, auto-register if needed, then the WS session + auto-update loop.  One per config directory. |
-| `ui` (default)       | The tray UI, a client of the daemon (starts one if none runs). Built unless installed with `--no-default-features`. |
+| `setup`              | Start the tray UI and install its login entry; print the approval guidance.  The installers run it. |
+| `ui`                 | The tray UI, a client of the daemon (starts one if none runs). |
 | `register`           | Persist `--api-base-url`; `--reset` clears local state. |
 | `status`             | Print the local config + registration state.                    |
-| `install-service`    | Install the auto-start OS service.                              |
-| `uninstall-service`  | Remove the auto-start OS service.                               |
 | `set-threshold <gb>` | Set the max VRAM (GB) the worker is willing to claim per job.   |
 | `config`             | Print the resolved config + its on-disk path.                   |
 | `check-update`       | Check the release feed for a newer version (does not install).  |
@@ -280,9 +261,9 @@ auto_update_prerelease    = false
 
 # WebSocket reconnect cap.  When the session drops the worker tries
 # to reconnect with exponential backoff up to this many times before
-# exiting non-zero (and letting systemd/launchd/Task-Scheduler
-# restart it).  `0` = infinite.  Omit to use the default of 5.
-ws_reconnect_attempts     = 5
+# exiting non-zero (the tray UI then starts a new daemon).
+# `0` = infinite, the default when omitted.
+ws_reconnect_attempts     = 0
 
 # Internal state written by the auto-register flow.  Don't edit by hand.
 install_id              = "<uuidv4>"
@@ -317,11 +298,11 @@ for the full state machine + per-install identity details.
   after a successful upgrade.  The token was either revoked, the
   worker was deleted from the studio admin UI, or `config.toml`
   carries a stale token.  Clear local state and let the next launch
-  auto-register again: `studio-worker register --reset` then
-  `studio-worker run` (or `studio-worker ui`).
+  auto-register again: `studio-worker register --reset`, then quit
+  the tray UI and start it again (`studio-worker ui`).
 - **Worker exits with `ws reconnect cap reached`** — every reconnect
-  attempt failed (DNS, TLS, or the API is down).  Service manager will
-  restart us; if it keeps happening, check the API is reachable from
+  attempt failed (DNS, TLS, or the API is down).  The tray UI starts
+  a new daemon; if it keeps happening, check the API is reachable from
   the worker host.
 
 ## Engines
@@ -395,7 +376,8 @@ available the worker:
 1. Confirms no job is currently in flight (per a shared `busy` flag).
 2. Downloads the cargo-dist installer for the current platform.
 3. Runs it (it overwrites the binary in place).
-4. Re-execs itself so the new code takes over.
+4. Re-execs itself so the new code takes over; the tray UI notices its
+   binary was replaced and restarts itself on it too.
 
 Set `auto_update_enabled = false` to opt out.  Set
 `auto_update_prerelease = true` to track pre-releases.
@@ -433,7 +415,7 @@ purely for error/crash visibility.
 
 ```bash
 cargo test                              # default (UI) build
-cargo test --no-default-features        # headless core
+cargo test --no-default-features        # headless core (CI only, never installed)
 cargo test --features all               # + llama.cpp + candle (needs cmake)
 cargo clippy --tests -- -D warnings
 cargo fmt --check

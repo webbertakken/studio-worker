@@ -317,6 +317,10 @@ pub trait UpdateRunner {
     fn run_installer(&self, installer_path: &Path, variant: Variant) -> Result<()>;
 }
 
+/// Tells the installer it runs for an update: it then skips `setup`, because the running tray
+/// UI restarts itself on the new binary (`docs/runtime/daemon-and-tray.md#install`).
+pub const INSTALLER_UPDATE_ENV: &str = "STUDIO_WORKER_UPDATE";
+
 pub struct RealRunner;
 
 impl UpdateRunner for RealRunner {
@@ -372,6 +376,7 @@ impl UpdateRunner for RealRunner {
         if cfg!(target_os = "windows") {
             let status = std::process::Command::new("powershell")
                 .env(variant::INSTALLER_ENV, variant.as_str())
+                .env(INSTALLER_UPDATE_ENV, "1")
                 .args([
                     "-NoProfile",
                     "-ExecutionPolicy",
@@ -388,6 +393,7 @@ impl UpdateRunner for RealRunner {
         } else {
             let status = std::process::Command::new("sh")
                 .env(variant::INSTALLER_ENV, variant.as_str())
+                .env(INSTALLER_UPDATE_ENV, "1")
                 .arg(installer_path)
                 .status()?;
             if !status.success() {
@@ -1413,7 +1419,12 @@ mod tests {
     fn real_runner_hands_the_variant_to_the_installer() {
         let dir = tempdir().unwrap();
         let script = dir.path().join("installer.sh");
-        std::fs::write(&script, "[ \"$STUDIO_WORKER_VARIANT\" = cuda ] || exit 4\n").unwrap();
+        std::fs::write(
+            &script,
+            "[ \"$STUDIO_WORKER_VARIANT\" = cuda ] || exit 4\n\
+             [ \"$STUDIO_WORKER_UPDATE\" = 1 ] || exit 5\n",
+        )
+        .unwrap();
         RealRunner.run_installer(&script, Variant::Cuda).unwrap();
         assert!(RealRunner.run_installer(&script, Variant::Cpu).is_err());
     }

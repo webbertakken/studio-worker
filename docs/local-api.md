@@ -1,7 +1,7 @@
 # Local image API
 
 The worker exposes an always-on local HTTP API so you can generate images
-(e.g. Z-Image) **without the studio**. The daemon (`studio-worker run`, which the tray UI
+(e.g. Z-Image) **without the studio**. The daemon (which the tray UI
 starts when none runs) serves it, before the studio-registration gate, so it
 works even when the worker is not registered with any studio.  The tray UI is
 itself a client of this API (see [daemon control](#daemon-control)).
@@ -283,7 +283,8 @@ Models live in a local catalog at `<config dir>/models.json`
 (`~/.config/minis-studio-worker/models.json` on Linux). It mirrors the studio's
 model registry: each entry carries the same `ModelSource` (engine + files +
 `cliDefaults`) the studio would send on a job. The catalog is **seeded** with
-Z-Image-Turbo (image), Qwen3.5 0.8B (small LLM, reasoning off, 32K context),
+Z-Image-Turbo (image), Qwen3.5 0.8B and 2B (LLMs, reasoning off, 32K context; the 2B
+needs about 3 GB of VRAM at 32K),
 Nemotron 3.5 streaming and Parakeet EOU (streaming speech, one loaded at a time)
 — seeds a catalogue lacks are added at startup, except ones the operator deleted
 (`dismissedSeeds`) — and the files are downloaded on demand into

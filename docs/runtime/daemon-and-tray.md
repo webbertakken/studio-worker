@@ -10,6 +10,12 @@ The worker is two processes built from one binary:
 
 Closing or crashing the UI never stops a job. Stopping the daemon stops the worker.
 
+Installed, the worker always runs as the tray UI: the installers start it, its login entry
+starts it at every login, and it starts the daemon. Nothing installs the daemon on its own.
+`run` is the daemon's internal entry point, the command the tray UI starts; it is hidden from
+`--help` and is not an install method. The UI-less build (`--no-default-features`) exists only
+so CI can test the headless core; it is not shipped.
+
 ## Terms
 
 | Term | Meaning |
@@ -24,16 +30,13 @@ Closing or crashing the UI never stops a job. Stopping the daemon stops the work
 | job source | where a job came from: `studio`, `local` (transient local API job), `lane` (a request on a loaded model), `stream` (a streaming speech session) |
 | job log | the log lines emitted while a job ran, kept per job |
 | thumbnail | a small PNG of an image job's output, kept per job |
+| launch path | the executable file the tray UI started from, recorded when it starts |
+| legacy service | a headless daemon unit an older `install-service` or `setup` wrote: `minis-studio-worker.service` (systemd user unit), `gg.minis.studio-worker.plist` (LaunchAgent), `MinisStudioWorker` (scheduled task) |
 
 ## One daemon per config directory
 
 - `run` takes the daemon lock before anything else. When another process holds it, `run`
-  logs `op="daemon_lock"` "another daemon is already running for this config" and exits 0,
-  so a service manager does not treat it as a crash.
-- Under a supervisor (PM2, systemd), run `studio-worker run --wait-for-lock`: if another
-  daemon holds the lock (for example one the tray UI started), it logs "waiting for the daemon
-  lock" once, with the holder's pid, and takes over the moment that daemon ends, instead of
-  exiting and being restarted in a loop.
+  logs `op="daemon_lock"` "another daemon is already running for this config" and exits 0.
 - The daemon's pid is in `<config dir>/daemon.pid`, beside the lock (Windows locks are
   mandatory, so the locked file itself cannot be read).
 - The lock is released when the process exits, however it exits.
@@ -108,17 +111,64 @@ Every job, whatever its source, is visible while it runs and after it ends.
 - A thumbnail that cannot be made is logged (`op="thumbnail"`) in the job's log and the job
   itself is unaffected.
 
+## Install
+
+Every install method ends with the tray UI running:
+
+- **Shell installer** (Linux, macOS) and **PowerShell installer** (Windows): after installing the
+  binary they run `<install dir>/studio-worker setup`, and say so. When `setup` fails they warn
+  with the command to run by hand; the binary stays installed.
+- **The auto-updater** runs the same installer with `STUDIO_WORKER_UPDATE=1`: the installer skips
+  `setup`, because the running tray UI restarts itself on the new binary
+  ([restart after an update](#restart-after-an-update)) and a second launch would pop its window
+  up.
+- **From source** (`cargo install studio-worker`): run `studio-worker setup` once.
+
+`studio-worker setup`:
+
+1. installs (or refreshes) the tray UI's login entry, pointing at this executable;
+2. starts the tray UI (`<exe> [--config <path>] ui`) detached: its own process group, no
+   console, stdin closed, output appended to `<config dir>/ui.log`. When a tray UI already runs
+   for this config, the new one hands over and the running window comes forward;
+3. prints what to do next (the machine name the studio admin approves, the studio URL, where
+   the local API's URL and token are written) and logs `op="setup"`.
+
+`setup` returns once the UI is started; it never waits for it. In a build without the tray UI it
+fails, naming the reason. It is idempotent.
+
+### Legacy services
+
+Older versions installed a headless daemon as an OS service (`install-service`, and `setup`).
+`install-service`, `uninstall-service` and `run --wait-for-lock` (for supervisors) no longer exist. The
+tray UI removes it when it starts, so an upgraded machine ends tray-only:
+
+- Linux: `systemctl --user disable minis-studio-worker.service`, delete
+  `~/.config/systemd/user/minis-studio-worker.service`, `systemctl --user daemon-reload`.
+- macOS: delete `~/Library/LaunchAgents/gg.minis.studio-worker.plist`.
+- Windows: `schtasks /Delete /TN MinisStudioWorker /F`, and delete
+  `%APPDATA%\minis-studio-worker\minis-studio-worker.task.xml`.
+
+The removal never stops a running legacy daemon: it keeps serving, the tray UI uses it, and it
+does not start again at the next login (stopping it from the UI could kill the UI itself, which
+an older auto-updater may have started inside that service). Each step is logged
+(`op="legacy_service"`); a failed step is a warning and the UI carries on. With no legacy
+service present nothing happens.
+
 ## The tray UI
 
 ### Start-up
 
 1. Resolve the config path (the daemon owns the config; the UI never writes it; it only
    reads `start_minimised` from it before the daemon answers).
-2. Take the UI lock (see [one tray UI per config directory](#one-tray-ui-per-config-directory)),
+2. Record the launch path and its identity
+   ([restart after an update](#restart-after-an-update)).
+3. Take the UI lock (see [one tray UI per config directory](#one-tray-ui-per-config-directory)),
    or hand over to the tray UI that holds it and exit.
-3. Install the login autostart entry for the tray UI; it is always installed.
-4. Start the poller (below).
-5. Open the window. When there is no usable display (e.g. started at login before the
+4. Install the login autostart entry for the tray UI; it is always installed.
+5. Remove any [legacy service](#legacy-services).
+6. Start the poller (below), the launch-path watch, and the `ui.log` trim
+   ([log files](#log-files)).
+7. Open the window. When there is no usable display (e.g. started at login before the
    graphical session accepts clients), the UI logs `op="display_wait"` with the attempt and
    the error, waits (2 s doubling to 60 s) and starts itself again in place. It never exits
    for want of a display.
@@ -138,14 +188,58 @@ Once a second the poller:
 
 When the daemon cannot be reached, the link becomes `unreachable` and the replica is emptied,
 so no page shows stale data. If the daemon lock stays free for 20 s (`SPAWN_GRACE`, longer than
-a supervisor's restart gap, so a supervised daemon is never raced), no daemon is running: the
+the gap while a daemon restarts itself after an update), no daemon is running: the
 poller starts one (`studio-worker --config <path> run`, detached in its own process group, output
 appended to `<config dir>/daemon.log`) at most once every 10 s and logs `op="daemon_spawn"`;
 a thread reaps it and logs its exit. If the lock is held, a daemon is starting or wedged,
 and the link reads `starting`.
 
-A daemon the UI started outlives the UI.  (A process supervisor that kills whole process
-trees, such as PM2, also stops it when it stops the UI.)
+A daemon the UI started outlives the UI.
+
+### Log files
+
+A daemon the UI starts writes to `<config dir>/daemon.log`, and a tray UI that `setup` starts
+writes to `<config dir>/ui.log`. Both are kept small by copy-truncate, so the live file keeps
+its name (tools tail `daemon.log` by that exact path) and the processes writing to it keep their
+handles:
+
+- The daemon trims `daemon.log`, the tray UI trims `ui.log`: at start and every 60 s
+  (`LOG_TRIM_INTERVAL`).
+- When the live file is larger than 10 MiB (`LOG_TRIM_MAX_BYTES`): `<name>.2` becomes `<name>.3`
+  (the old `.3` is dropped), `.1` becomes `.2`, the live file is copied to `<name>.1`, then
+  truncated to zero. Three copies are kept (`LOG_TRIM_KEEP`).
+- Writers opened the file in append mode, so their next line lands at the start of the
+  truncated file; `tail -F` reports the truncation and follows on.
+- Lines written between the copy and the truncation (a few milliseconds) are lost.
+- At most four files of about 10 MiB each, plus what one interval writes above the limit.
+- Each trim logs `op="log_trim"` (info) with the size it trimmed; a failure is a warning and
+  never stops the process. A missing live file is not an error.
+- Output that never reaches tracing (llama.cpp's own messages, a panic) is in the file all the
+  same: the trim works on the file, not on a logging layer.
+
+### Restart after an update
+
+The tray UI comes back on the new binary whoever replaced it (the auto-updater, a manual
+reinstall):
+
+- At start it records its launch path (`current_exe()` then, before any update can replace the
+  file; on Linux the path of a replaced running binary reads `… (deleted)` afterwards) and the
+  file's identity: size and modification time, plus device and inode on Unix.
+- Every second (`EXE_WATCH_INTERVAL`) it reads the identity again. While it equals the recorded
+  one, nothing happens.
+- When it differs, the UI waits until the same new identity has held for 3 s
+  (`EXE_SETTLE`), because an installer may still be writing the file. A missing file waits
+  the same way; it is logged once (`op="update_restart"`, warn).
+- Then it logs `op="update_restart"` "the tray UI binary was replaced; restarting on it" and
+  restarts in place from the launch path with the same arguments: `exec` on Unix, a successor
+  plus exit on Windows. The successor sets `STUDIO_WORKER_UI_RESTART=update` and so waits up to
+  5 s for its predecessor's UI lock, as a display restart does.
+- A restart that fails is logged (error) and the UI keeps running on the old binary; it does
+  not retry until the file changes again.
+- The display restart starts from the launch path too.
+
+The daemon restarts itself after its own update (`update::restart_self`); the two restarts are
+independent, and the UI shows `Daemon starting` in between.
 
 ### One tray UI per config directory
 
@@ -268,8 +362,8 @@ selects a job once it shows up, for screenshots and headless inspection.
 - The tray UI's login entry is always installed and kept pointing at the current executable
   (Linux `.desktop`, macOS LaunchAgent, Windows `HKCU\…\Run`). There is no setting to turn it
   off.
-- The daemon is started by the UI when absent, or supervised by the OS service
-  (`install-service`) on machines that want it running before anyone logs in.
+- The daemon is started by the UI when absent, and only by the UI. There is no OS service for
+  it; a [legacy service](#legacy-services) is removed.
 
 ## Observability
 
@@ -288,3 +382,7 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `raise` | `studio_worker::ui` | a second launch asked this tray UI to show its window |
 | `prefs` | `studio_worker::ui` | UI preferences could not be read or saved |
 | `enable` / `ensure` | `studio_worker::autostart` | login entry written / already current / failed |
+| `setup` | `studio_worker::setup` | `setup` installed the login entry and started the tray UI, or failed to |
+| `legacy_service` | `studio_worker::legacy_service` | a legacy service step ran, failed, or none was found |
+| `update_restart` | `studio_worker::ui` | the launch path changed; the UI restarts on it, waits, or failed to |
+| `log_trim` | `studio_worker::log_trim` | `daemon.log` / `ui.log` trimmed, or the trim failed |

@@ -80,6 +80,7 @@ impl Catalog {
             models: vec![
                 zimage_turbo(),
                 qwen35_08b(),
+                qwen35_2b(),
                 nemotron_stream(),
                 parakeet_eou(),
             ],
@@ -325,6 +326,39 @@ fn qwen35_08b() -> CatalogModel {
     }
 }
 
+/// Qwen3.5 2B instruct (unsloth Q8_0): the chat model spinner uses.  Reasoning off, 32K
+/// context.  Measured peak per chat on CUDA at 32K: weights 1.9 GB + KV 0.4 GB + compute
+/// 0.5 GB, hence the 3 GB estimate.  Apache-2.0.
+fn qwen35_2b() -> CatalogModel {
+    let mut kwargs = serde_json::Map::new();
+    kwargs.insert("enable_thinking".into(), serde_json::Value::Bool(false));
+    CatalogModel {
+        id: "qwen3.5-2b".into(),
+        display_name: "Qwen3.5 2B instruct (Q8_0)".into(),
+        kind: TaskKind::Llm,
+        vram_gb_estimate: 3.0,
+        description: Some("Chat model: reasoning off, 32K context".into()),
+        source: ModelSource {
+            engine: ModelEngine::LlamaCpp,
+            files: vec![hf_file(
+                "unsloth/Qwen3.5-2B-GGUF",
+                "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+                "Qwen3.5-2B-Q8_0.gguf",
+                2_012_012_800,
+                "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1",
+            )],
+            cli_defaults: ModelCliDefaults {
+                context_size: Some(32_768),
+                chat_template_kwargs: Some(kwargs),
+                ..Default::default()
+            },
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: None,
+    }
+}
+
 /// Nemotron 3.5 streaming ASR (0.6B, multilingual, punctuated): 560 ms
 /// chunks.  Measured ~3.5 GiB on CUDA.  NVIDIA Open Model License.
 fn nemotron_stream() -> CatalogModel {
@@ -511,6 +545,7 @@ mod tests {
             [
                 "z-image-turbo-q4_k_m.gguf",
                 "qwen3.5-0.8b",
+                "qwen3.5-2b",
                 "nemotron-3.5-stream",
                 "parakeet-eou-120m"
             ]
@@ -567,6 +602,14 @@ mod tests {
             m.source.cli_defaults.chat_template_kwargs.as_ref().unwrap()["enable_thinking"],
             false
         );
+    }
+
+    #[test]
+    fn the_2b_llm_seed_is_the_entry_spinner_registers() {
+        // The entry a working install registers for spinner, verbatim: a fresh install must match it.
+        let expected = serde_json::json!({"id":"qwen3.5-2b","kind":"llm","displayName":"Qwen3.5 2B instruct (Q8_0)","description":"Chat model: reasoning off, 32K context","enabled":true,"vramGbEstimate":3.0,"source":{"engine":"llama-cpp","cliDefaults":{"cfgScale":0,"steps":0,"width":0,"height":0,"contextSize":32768,"chatTemplateKwargs":{"enable_thinking":false}},"files":[{"filename":"Qwen3.5-2B-Q8_0.gguf","role":"model","approxBytes":2012012800u64,"sha256":"1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1","url":"https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q8_0.gguf"}]},"origin":"local"});
+        let expected: CatalogModel = serde_json::from_value(expected).unwrap();
+        assert_eq!(Catalog::seed().get("qwen3.5-2b"), Some(&expected));
     }
 
     #[test]
