@@ -537,6 +537,7 @@ pub fn log_startup_banner(cfg: &Config, path: &std::path::Path) {
         target: TRACE_TARGET,
         op = "startup",
         version = AGENT_VERSION,
+        variant = crate::variant::Variant::current().as_str(),
         config_path = path.display().to_string(),
         api_base_url = cfg.api_base_url.as_str(),
         vram_threshold_gb = cfg.vram_threshold_gb,

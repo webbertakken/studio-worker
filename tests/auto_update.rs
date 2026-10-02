@@ -242,7 +242,11 @@ async fn apply_with_fake_runner_runs_full_flow() {
         fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
-        fn run_installer(&self, p: &Path) -> anyhow::Result<()> {
+        fn run_installer(
+            &self,
+            p: &Path,
+            _v: studio_worker::variant::Variant,
+        ) -> anyhow::Result<()> {
             self.installs.lock().unwrap().push(p.to_path_buf());
             Ok(())
         }
@@ -284,7 +288,11 @@ async fn apply_with_errors_when_release_missing() {
         fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
-        fn run_installer(&self, _p: &Path) -> anyhow::Result<()> {
+        fn run_installer(
+            &self,
+            _p: &Path,
+            _v: studio_worker::variant::Variant,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -316,7 +324,11 @@ async fn apply_with_propagates_download_errors() {
         fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
-        fn run_installer(&self, _p: &Path) -> anyhow::Result<()> {
+        fn run_installer(
+            &self,
+            _p: &Path,
+            _v: studio_worker::variant::Variant,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -350,7 +362,11 @@ async fn apply_with_propagates_run_installer_errors() {
         fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
-        fn run_installer(&self, _p: &Path) -> anyhow::Result<()> {
+        fn run_installer(
+            &self,
+            _p: &Path,
+            _v: studio_worker::variant::Variant,
+        ) -> anyhow::Result<()> {
             anyhow::bail!("simulated installer fail")
         }
     }
@@ -534,7 +550,11 @@ async fn apply_with_emits_info_events_for_every_state_transition() {
         fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
-        fn run_installer(&self, p: &Path) -> anyhow::Result<()> {
+        fn run_installer(
+            &self,
+            p: &Path,
+            _v: studio_worker::variant::Variant,
+        ) -> anyhow::Result<()> {
             self.installs.lock().unwrap().push(p.to_path_buf());
             Ok(())
         }
@@ -591,7 +611,11 @@ async fn apply_with_errors_when_installer_asset_missing() {
         fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
-        fn run_installer(&self, _p: &Path) -> anyhow::Result<()> {
+        fn run_installer(
+            &self,
+            _p: &Path,
+            _v: studio_worker::variant::Variant,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -645,7 +669,11 @@ impl studio_worker::update::UpdateRunner for ChecksumRunner {
         );
         Ok(self.checksum.clone())
     }
-    fn run_installer(&self, p: &std::path::Path) -> anyhow::Result<()> {
+    fn run_installer(
+        &self,
+        p: &std::path::Path,
+        _v: studio_worker::variant::Variant,
+    ) -> anyhow::Result<()> {
         self.installs.lock().unwrap().push(p.to_path_buf());
         Ok(())
     }
@@ -782,4 +810,181 @@ async fn real_runner_fetch_checksum_distinguishes_present_absent_and_broken() {
         broken.is_err(),
         "a 5xx must be a hard error so a blocked fetch can't pass for an absent sidecar"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Build variant: an update installs the variant the worker runs as.
+// ---------------------------------------------------------------------------
+
+mod variant {
+    use super::*;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use studio_worker::update::UpdateRunner;
+    use studio_worker::variant::Variant;
+
+    const LINUX_X64: &str = "x86_64-unknown-linux-gnu";
+    const PATCHED: &[u8] = b"#!/bin/sh\ncase \"${STUDIO_WORKER_VARIANT:-auto}\" in esac\n";
+    const UNPATCHED: &[u8] = b"#!/bin/sh\necho cargo-dist as generated\n";
+
+    struct VariantRunner {
+        installer: &'static [u8],
+        installs: Mutex<Vec<Variant>>,
+    }
+
+    impl UpdateRunner for VariantRunner {
+        fn download(&self, _u: &str, dest: &Path) -> anyhow::Result<()> {
+            std::fs::write(dest, self.installer).unwrap();
+            Ok(())
+        }
+        fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn run_installer(&self, _p: &Path, variant: Variant) -> anyhow::Result<()> {
+            self.installs.lock().unwrap().push(variant);
+            Ok(())
+        }
+    }
+
+    async fn feed(with_cuda: bool) -> (MockServer, String) {
+        let mut assets = vec![
+            serde_json::json!({
+                "name": update::installer_asset_name(),
+                "browser_download_url": "https://github.com/o/r/releases/download/v0.2.0/i",
+            }),
+            serde_json::json!({
+                "name": "studio-worker-x86_64-unknown-linux-gnu.tar.xz",
+                "browser_download_url": "https://github.com/o/r/releases/download/v0.2.0/cpu",
+            }),
+        ];
+        if with_cuda {
+            assets.push(serde_json::json!({
+                "name": "studio-worker-x86_64-unknown-linux-gnu-cuda.tar.xz",
+                "browser_download_url": "https://github.com/o/r/releases/download/v0.2.0/cuda",
+            }));
+        }
+        let body = serde_json::json!([{
+            "tag_name": "studio-worker-v0.2.0",
+            "prerelease": false,
+            "draft": false,
+            "assets": assets,
+        }]);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let feed = format!("{}/releases", server.uri());
+        (server, feed)
+    }
+
+    /// Run an update as a `running` build on x86_64 Linux, with or without the NVIDIA driver;
+    /// the variants installed and the logs.
+    fn apply(
+        feed: String,
+        running: Variant,
+        nvidia_driver: bool,
+        installer: &'static [u8],
+    ) -> (anyhow::Result<()>, Vec<Variant>, String) {
+        let runner = Arc::new(VariantRunner {
+            installer,
+            installs: Mutex::new(Vec::new()),
+        });
+        let in_thread = runner.clone();
+        let slot = Arc::new(Mutex::new(None));
+        let result_slot = slot.clone();
+        // `capture` runs the closure on its own thread, off the tokio runtime (blocking reqwest).
+        let logs = captured_logs_for(move || {
+            let host = update::UpdateHost {
+                running,
+                target: Some(LINUX_X64),
+                nvidia_driver,
+            };
+            let result =
+                update::apply_variant_with(&feed, &Version::new(0, 2, 0), host, &*in_thread);
+            *result_slot.lock().unwrap() = Some(result);
+        });
+        let result = slot.lock().unwrap().take().expect("the update ran");
+        let installs = runner.installs.lock().unwrap().clone();
+        (result, installs, logs)
+    }
+
+    #[cfg(not(target_os = "windows"))] // apply parks the real exe on Windows
+    #[tokio::test]
+    async fn a_cuda_worker_updates_to_the_cuda_build() {
+        let (_server, feed) = feed(true).await;
+        let (result, installs, logs) = apply(feed, Variant::Cuda, true, PATCHED);
+        result.unwrap();
+        assert_eq!(installs, [Variant::Cuda]);
+        assert!(logs.contains("keeping the CUDA build"), "{logs}");
+        assert!(logs.contains("variant=cuda"), "{logs}");
+    }
+
+    #[cfg(not(target_os = "windows"))] // apply parks the real exe on Windows
+    #[tokio::test]
+    async fn a_cuda_worker_falls_back_to_cpu_loudly_when_the_release_has_no_cuda_build() {
+        let (_server, feed) = feed(false).await;
+        let (result, installs, logs) = apply(feed, Variant::Cuda, true, UNPATCHED);
+        result.unwrap();
+        assert_eq!(installs, [Variant::Cpu]);
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("no CUDA build for this target"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_cuda_worker_refuses_an_installer_that_cannot_install_cuda() {
+        let (_server, feed) = feed(true).await;
+        let (result, installs, _logs) = apply(feed, Variant::Cuda, true, UNPATCHED);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("STUDIO_WORKER_VARIANT"), "{err}");
+        assert!(installs.is_empty(), "the installer must not run");
+    }
+
+    #[cfg(not(target_os = "windows"))] // apply parks the real exe on Windows
+    #[tokio::test]
+    async fn a_cpu_worker_without_the_driver_stays_on_the_cpu_build() {
+        let (_server, feed) = feed(true).await;
+        let (result, installs, logs) = apply(feed, Variant::Cpu, false, UNPATCHED);
+        result.unwrap();
+        assert_eq!(installs, [Variant::Cpu]);
+        assert!(
+            logs.contains("no NVIDIA driver; keeping the CPU build"),
+            "{logs}"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))] // apply parks the real exe on Windows
+    #[tokio::test]
+    async fn a_cpu_worker_with_the_driver_moves_to_the_cuda_build() {
+        let (_server, feed) = feed(true).await;
+        let (result, installs, logs) = apply(feed, Variant::Cpu, true, PATCHED);
+        result.unwrap();
+        assert_eq!(installs, [Variant::Cuda]);
+        assert!(
+            logs.contains("NVIDIA driver found; moving to the CUDA build"),
+            "{logs}"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))] // apply parks the real exe on Windows
+    #[tokio::test]
+    async fn a_cpu_worker_stays_cpu_when_the_release_has_no_cuda_build() {
+        let (_server, feed) = feed(false).await;
+        let (result, installs, logs) = apply(feed, Variant::Cpu, true, UNPATCHED);
+        result.unwrap();
+        assert_eq!(installs, [Variant::Cpu]);
+        assert!(logs.contains("keeping the CPU build"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_cpu_worker_moving_to_cuda_refuses_an_installer_that_cannot_install_it() {
+        let (_server, feed) = feed(true).await;
+        let (result, installs, _logs) = apply(feed, Variant::Cpu, true, UNPATCHED);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("STUDIO_WORKER_VARIANT"));
+        assert!(installs.is_empty(), "the installer must not run");
+    }
 }

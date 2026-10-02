@@ -1,0 +1,100 @@
+# The CUDA variant of the x86_64 Linux release binary.
+#
+# cargo-dist builds one binary per target; this job builds the second, CUDA-enabled one
+# (`--features <release features>,cuda`) and uploads it as `artifacts-build-cuda`, which the
+# release workflow attaches to the GitHub Release beside cargo-dist's archives.  The shell
+# installer is then patched to choose it on machines with an NVIDIA driver
+# (scripts/release/patch-installer.sh).  Docs: docs/operations/release.md#cuda-variant
+#
+# Runs as a cargo-dist `local-artifacts-jobs` entry on release tags, and on pull requests
+# that touch the build inputs, so a broken CUDA build is caught before a release.
+
+name: CUDA build
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/build-cuda.yml
+      - scripts/release/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-cuda-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # CUDA 12 runs on every Linux driver >= 525.60.13 for the real device code
+  # built here; CUDA 13 would need driver >= 580 and drops Pascal and Volta.
+  CUDA_VERSION: "12-9"
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build-cuda:
+    name: CUDA variant (x86_64-unknown-linux-gnu)
+    # The runner cargo-dist builds x86_64 Linux on, so both variants need the same glibc.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install the CUDA toolkit (compiler + static libraries only)
+        run: |
+          set -euo pipefail
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "cuda-nvcc-${CUDA_VERSION}" \
+            "cuda-cudart-dev-${CUDA_VERSION}" \
+            "cuda-driver-dev-${CUDA_VERSION}" \
+            "cuda-cccl-${CUDA_VERSION}" \
+            "cuda-cuobjdump-${CUDA_VERSION}" \
+            "libcublas-dev-${CUDA_VERSION}"
+          cuda_home="/usr/local/cuda-${CUDA_VERSION/-/.}"
+          {
+            echo "CUDA_HOME=$cuda_home"
+            echo "CUDA_PATH=$cuda_home"
+            echo "CUDACXX=$cuda_home/bin/nvcc"
+          } >> "$GITHUB_ENV"
+          echo "$cuda_home/bin" >> "$GITHUB_PATH"
+          "$cuda_home/bin/nvcc" --version
+          df -h /
+
+      - name: Build
+        run: scripts/release/cuda-variant.sh build
+
+      - name: Verify
+        run: scripts/release/cuda-variant.sh verify
+
+      - name: Package
+        run: scripts/release/cuda-variant.sh package target/distrib
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          # `artifacts-*` is the pattern the release jobs download and attach.
+          name: artifacts-build-cuda
+          path: |
+            target/distrib/studio-worker-${{ env.TARGET }}-cuda.tar.xz
+            target/distrib/studio-worker-${{ env.TARGET }}-cuda.tar.xz.sha256
+          if-no-files-found: error
+          compression-level: 0

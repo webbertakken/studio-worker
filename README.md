@@ -176,10 +176,33 @@ engine unless you add `--features all` (which needs a C/C++ toolchain).
 Each release ships pre-built binaries for:
 
 - `x86_64-pc-windows-msvc`
-- `x86_64-unknown-linux-gnu`
+- `x86_64-unknown-linux-gnu`, in two variants: CPU and **CUDA**
 - `aarch64-unknown-linux-gnu`
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
+
+### NVIDIA GPUs (x86_64 Linux)
+
+On x86_64 Linux the install script picks the **CUDA build** when the NVIDIA
+driver is installed (it looks for `libcuda.so.1`), and the CPU build
+otherwise; it prints which one.  The CUDA build runs the in-process LLM
+with every layer on the GPU: on an RTX 4090 a 0.8B model answers a
+3,600-token chat in 0.3 s, against 13.5 s on the CPU.  It needs only the
+driver (525 or newer), not the CUDA toolkit, and covers GTX 10xx through
+RTX 50xx and datacentre GPUs from V100 to H100.  It is a larger download:
+565 MB against 10 MB.  Auto-update keeps a CUDA install on
+CUDA, and moves a CPU install to CUDA once the driver is installed.  To choose
+yourself:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/webbertakken/studio-worker/releases/latest/download/studio-worker-installer.sh \
+  | STUDIO_WORKER_VARIANT=cpu sh     # or cuda
+```
+
+`studio-worker --version` names the build: `studio-worker 0.4.13 (cuda)`.
+Windows and macOS have no CUDA build.  Details:
+[`docs/operations/release.md`](docs/operations/release.md#cuda-variant).
 
 ## First run
 

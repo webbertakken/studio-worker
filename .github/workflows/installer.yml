@@ -1,0 +1,46 @@
+# The shell installer's CUDA variant, on every change to the release machinery.
+#
+# Generates cargo-dist's installer the way the release does, stages fake x86_64 Linux archives
+# (CPU + CUDA) beside it, patches it (scripts/release/patch-installer.sh) and installs each
+# variant into a throwaway HOME.  The runner has no NVIDIA driver, so `auto` must pick CPU.
+# The release job runs the same test against the real archives.
+
+name: Installer
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - .github/workflows/release.yml
+      - .github/workflows/installer.yml
+      - scripts/release/**
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    name: Installer variants
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: The release still patches the installer
+        run: |
+          # `dist generate` rewrites release.yml without the hand-written step.
+          grep -q 'scripts/release/patch-installer.sh target/distrib' .github/workflows/release.yml
+
+      - name: Install dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^cargo-dist-version = "\(.*\)"/\1/p' Cargo.toml)"
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh" | sh
+
+      - name: Generate the installer
+        run: dist build --artifacts=global --output-format=json > /dev/null
+
+      - name: Patch and install every variant
+        run: scripts/release/test-installer.sh --fake target/distrib

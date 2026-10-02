@@ -1,10 +1,17 @@
 //! Clap CLI definitions, kept out of `main.rs` so they're testable.
 use clap::{Parser, Subcommand};
 
+/// `--version`: the crate version and the build variant (`cpu` or `cuda`).
+#[cfg(feature = "cuda")]
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (cuda)");
+/// `--version`: the crate version and the build variant (`cpu` or `cuda`).
+#[cfg(not(feature = "cuda"))]
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (cpu)");
+
 #[derive(Parser, Debug)]
 #[command(
     name = "studio-worker",
-    version,
+    version = VERSION,
     about = "Studio worker — pull-based generation agent (image / llm / audio / video)"
 )]
 pub struct Cli {
@@ -82,6 +89,16 @@ impl Command {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn version_names_the_build_variant() {
+        let err = Cli::try_parse_from(["studio-worker", "--version"]).unwrap_err();
+        let variant = crate::variant::Variant::current();
+        assert_eq!(
+            err.to_string().trim(),
+            format!("studio-worker {} ({variant})", env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     #[test]
     fn run_can_wait_for_the_lock_under_a_supervisor() {
