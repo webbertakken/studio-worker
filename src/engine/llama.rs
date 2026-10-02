@@ -62,6 +62,10 @@ fn global_backend() -> Result<Arc<LlamaBackend>> {
     if let Some(b) = GLOBAL_BACKEND.get() {
         return Ok(b.clone());
     }
+    // llama.cpp and ggml print every level, debug included, to stderr unless told otherwise;
+    // through tracing they get their real levels, so `DEFAULT_LOG_FILTER` (or `RUST_LOG`)
+    // decides. Installed before init so the backend's own start-up is routed too.
+    llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
     let backend = LlamaBackend::init().map_err(|e| match e {
         // With init serialised by the lock, this can only mean some
         // other code path called `LlamaBackend::init()` directly — we
