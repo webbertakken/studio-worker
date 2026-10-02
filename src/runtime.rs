@@ -395,10 +395,6 @@ pub const AUTO_UPDATE_TICK: Duration = Duration::from_secs(60);
 /// the loop within ~250 ms instead of leaving `run_loops`' join blocked
 /// for a whole tick.
 pub const AUTO_UPDATE_SHUTDOWN_TICK: Duration = Duration::from_millis(250);
-/// Default WS heartbeat interval, re-exported here so the native UI
-/// (and any other downstream readers) get a stable constant without
-/// reaching into `ws::session`.
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Schedule for the long-running loops.
 #[derive(Debug, Clone, Copy)]

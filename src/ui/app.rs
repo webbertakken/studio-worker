@@ -16,7 +16,6 @@ use tokio::runtime::Handle;
 use crate::{
     daemon_api::EditableConfig,
     daemon_link::{Action, LinkState, Replica},
-    runtime::HEARTBEAT_INTERVAL,
 };
 
 use super::{
@@ -62,16 +61,9 @@ fn log_tray_variant_change(from: TrayVariant, to: TrayVariant) {
     );
 }
 
-/// The tray colour for the daemon's state: disconnected whenever the link
-/// is down, else derived from busy + heartbeat.
+/// The tray colour: what the header's pulse says ([`tray::variant_of`]).
 pub fn tray_variant_for(link: &LinkState, replica: &Replica) -> TrayVariant {
-    if !link.is_connected() {
-        return TrayVariant::Disconnected;
-    }
-    let busy =
-        replica.busy.load(Ordering::SeqCst) || !replica.observers.active_jobs.lock().is_empty();
-    let hb = replica.observers.last_heartbeat.lock().clone();
-    tray::derive_variant(busy, hb.as_ref(), HEARTBEAT_INTERVAL)
+    tray::variant_of(&pulse_of(link, replica, chrono::Utc::now()))
 }
 
 /// The pulse the header shows, from the replica.

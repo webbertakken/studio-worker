@@ -26,7 +26,8 @@ use crate::http::ApiClient;
 use crate::job_run::JobRun;
 use crate::runtime::{
     is_unsupported_kind, prompt_for, push_log_with_observers, set_session_state, truncate_prompt,
-    wait_with_stop, CurrentJob, JobOutcome, JobSource, SessionState, WorkerObservers,
+    wait_with_stop, CurrentJob, HeartbeatOutcome, HeartbeatStatus, JobOutcome, JobSource,
+    SessionState, WorkerObservers,
 };
 use crate::types::{LogEntry, TaskResult};
 use crate::ws::client::{connect, WsClientError, WsResult, WsSender};
@@ -629,7 +630,9 @@ async fn run_dispatch_loop(
                     // Heartbeat acks fire every ~5s; logging each would
                     // flood the operator log with no diagnostic value
                     // (a genuinely missed ack already surfaces via the
-                    // read-idle timeout + reconnect breadcrumb).
+                    // read-idle timeout + reconnect breadcrumb). It is
+                    // recorded for the Worker page instead.
+                    record_heartbeat(&ctx.observers, HeartbeatOutcome::Ok);
                 }
             },
         }
@@ -1104,10 +1107,24 @@ fn spawn_heartbeat_pump(
                 .await
             {
                 warn!(target: TRACE_TARGET, error = %e, "heartbeat send failed");
+                record_heartbeat(
+                    &observers,
+                    HeartbeatOutcome::Err {
+                        reason: e.to_string(),
+                    },
+                );
                 break;
             }
         }
     })
+}
+
+/// The Worker page's "Last heartbeat": the studio acked one, or sending one failed.
+fn record_heartbeat(observers: &WorkerObservers, outcome: HeartbeatOutcome) {
+    *observers.last_heartbeat.lock() = Some(HeartbeatStatus {
+        outcome,
+        last_attempt_at: chrono::Utc::now(),
+    });
 }
 
 fn heartbeat_current_job_id(observers: &WorkerObservers) -> Option<String> {
@@ -1378,6 +1395,33 @@ mod tests {
     }
 
     // (worker-reservation exclusivity now lives in `job_gate::tests`.)
+
+    #[test]
+    fn a_heartbeat_is_recorded_for_the_worker_page_ok_or_failed() {
+        let observers = WorkerObservers::default();
+        assert!(observers.last_heartbeat.lock().is_none());
+        record_heartbeat(&observers, HeartbeatOutcome::Ok);
+        let hb = observers.last_heartbeat.lock().clone().expect("recorded");
+        assert_eq!(hb.outcome, HeartbeatOutcome::Ok);
+        assert!(
+            chrono::Utc::now()
+                .signed_duration_since(hb.last_attempt_at)
+                .num_seconds()
+                < 5
+        );
+        record_heartbeat(
+            &observers,
+            HeartbeatOutcome::Err {
+                reason: "socket closed".into(),
+            },
+        );
+        assert_eq!(
+            observers.last_heartbeat.lock().clone().map(|h| h.outcome),
+            Some(HeartbeatOutcome::Err {
+                reason: "socket closed".into()
+            })
+        );
+    }
 
     #[test]
     fn heartbeat_current_job_id_uses_actual_job_id() {
