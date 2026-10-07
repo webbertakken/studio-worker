@@ -460,7 +460,47 @@ pub fn content_range_start(header: &str) -> Option<u64> {
 /// ([`verify_download_len`], [`model_cache_path`]) are unit-tested.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub fn download_file(url: &str, dest: &Path) -> Result<()> {
+    if url.starts_with("data:") {
+        return write_data_url(url, dest);
+    }
     download_file_verified(url, dest, None)
+}
+
+/// Write an inline input image (`data:image/<type>;base64,<bytes>`) to `dest`: how a local
+/// client hands the worker a base, reference or mask without serving it over HTTP.
+pub fn write_data_url(url: &str, dest: &Path) -> Result<()> {
+    let bytes = decode_image_data_url(url)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
+    info!(
+        target: TRACE_TARGET,
+        op = "download",
+        dest = %dest.display(),
+        bytes = bytes.len(),
+        "inline input image written"
+    );
+    Ok(())
+}
+
+/// The bytes of a `data:image/<type>;base64,<bytes>` URL; anything else is refused.
+pub fn decode_image_data_url(url: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let Some(rest) = url.strip_prefix("data:image/") else {
+        bail!("an inline input must be a data:image/... URL");
+    };
+    let Some((_, payload)) = rest.split_once(";base64,") else {
+        bail!("an inline input image must be base64: data:image/<type>;base64,<bytes>");
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .context("decoding the inline input image")?;
+    if bytes.is_empty() {
+        bail!("the inline input image is empty");
+    }
+    Ok(bytes)
 }
 
 /// [`download_file`] with an optional expected sha256 — the body is
@@ -678,6 +718,30 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn a_data_url_is_written_without_a_request() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("input.png");
+        // "PNG" in base64.
+        download_file("data:image/png;base64,UE5H", &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"PNG");
+    }
+
+    #[test]
+    fn a_data_url_that_is_not_base64_image_bytes_is_refused() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("input.png");
+        for url in [
+            "data:text/plain;base64,UE5H",
+            "data:image/png,PNG",
+            "data:image/png;base64,***",
+            "data:image/png;base64,",
+        ] {
+            assert!(download_file(url, &dest).is_err(), "{url}");
+            assert!(!dest.exists(), "{url}");
+        }
+    }
 
     // -----------------------------------------------------------------
     // sniff_image_extension / ensure_correct_image_extension — the guard

@@ -17,6 +17,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+# Inline input images (`data:image/...;base64,`) on the local image API.
+base64 = "0.23"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -28,6 +28,33 @@ pub struct LocalImageRequest {
     pub steps: Option<u32>,
     pub seed: Option<u64>,
     pub ext: Option<String>,
+    /// Inline (`data:image/...;base64,`) base for img2img or a masked removal.
+    pub init_image_url: Option<String>,
+    /// Inline reference image for an instruction edit (`sd-cli -r`).
+    pub ref_image_url: Option<String>,
+    /// Inline mask, white where the model may change the picture.
+    pub mask_url: Option<String>,
+    /// img2img strength (0 keeps the base, 1 repaints it).
+    pub denoise: Option<f32>,
+}
+
+/// The inline input images of a local request, refused unless each is a `data:` URL: the local
+/// API never makes the worker fetch an address a caller names.
+fn inline_inputs(req: &LocalImageRequest) -> Result<(), LocalError> {
+    for (name, url) in [
+        ("initImageUrl", &req.init_image_url),
+        ("refImageUrl", &req.ref_image_url),
+        ("maskUrl", &req.mask_url),
+    ] {
+        if let Some(url) = url {
+            if !url.starts_with("data:image/") {
+                return Err(LocalError::BadInput(format!(
+                    "{name} must be a data:image/...;base64, URL"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Why a local generation could not run.
@@ -49,6 +76,8 @@ pub enum LocalError {
     },
     #[error("engine error: {0}")]
     Engine(String),
+    #[error("bad input: {0}")]
+    BadInput(String),
     #[error("deadline passed: the caller stopped waiting")]
     DeadlineExceeded,
 }
@@ -86,6 +115,7 @@ pub fn run_image(
     if model.kind != TaskKind::Image {
         return Err(LocalError::NotImageModel(model.id.clone()));
     }
+    inline_inputs(req)?;
 
     let defaults = &model.source.cli_defaults;
     let params = ImageParams {
@@ -98,7 +128,10 @@ pub fn run_image(
         cfg_scale: Some(defaults.cfg_scale),
         sampling_method: defaults.sampling_method.clone(),
         ext: req.ext.clone().unwrap_or_else(|| "webp".to_string()),
-        ..Default::default()
+        init_image_url: req.init_image_url.clone(),
+        ref_image_url: req.ref_image_url.clone(),
+        mask_url: req.mask_url.clone(),
+        denoise: req.denoise,
     };
 
     dispatch_and_record(engine, model, observers, &req.prompt, Task::Image(params))
@@ -434,6 +467,67 @@ mod tests {
         assert_eq!(job.prompt, "a red fox");
         // The studio ring stays empty — local jobs are their own queue.
         assert!(observers.recent_jobs.lock().is_empty());
+    }
+
+    /// Records the task it was given and answers a tiny image.
+    struct CapturingEngine(parking_lot::Mutex<Option<Task>>);
+
+    impl Engine for CapturingEngine {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn capabilities(&self) -> crate::engine::EngineCapabilities {
+            SyntheticEngine::new().capabilities()
+        }
+        fn dispatch(&self, _model: &str, task: Task) -> anyhow::Result<TaskResult> {
+            *self.0.lock() = Some(task);
+            Ok(TaskResult::Image {
+                bytes: vec![1, 2, 3],
+                ext: "png".into(),
+            })
+        }
+    }
+
+    const PIXEL: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+    #[test]
+    fn an_edit_carries_its_input_images_to_the_engine() {
+        let engine = CapturingEngine(parking_lot::Mutex::new(None));
+        let catalog = catalog_with(vec![synthetic_model("edit", TaskKind::Image)]);
+        let req = LocalImageRequest {
+            prompt: "remove the mug".into(),
+            init_image_url: Some(PIXEL.into()),
+            ref_image_url: Some(PIXEL.into()),
+            mask_url: Some(PIXEL.into()),
+            denoise: Some(0.8),
+            ..Default::default()
+        };
+
+        run_image(&engine, &catalog, &WorkerObservers::default(), &req).unwrap();
+
+        let Some(Task::Image(params)) = engine.0.lock().clone() else {
+            panic!("expected an image task");
+        };
+        assert_eq!(params.init_image_url.as_deref(), Some(PIXEL));
+        assert_eq!(params.ref_image_url.as_deref(), Some(PIXEL));
+        assert_eq!(params.mask_url.as_deref(), Some(PIXEL));
+        assert_eq!(params.denoise, Some(0.8));
+    }
+
+    #[test]
+    fn a_local_input_image_must_be_a_data_url() {
+        let engine = CapturingEngine(parking_lot::Mutex::new(None));
+        let catalog = catalog_with(vec![synthetic_model("edit", TaskKind::Image)]);
+        let req = LocalImageRequest {
+            prompt: "remove the mug".into(),
+            ref_image_url: Some("https://example.com/base.png".into()),
+            ..Default::default()
+        };
+
+        let err = run_image(&engine, &catalog, &WorkerObservers::default(), &req).unwrap_err();
+
+        assert!(matches!(err, LocalError::BadInput(_)), "{err}");
+        assert!(engine.0.lock().is_none());
     }
 
     #[test]

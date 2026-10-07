@@ -56,6 +56,10 @@ const POLL: Duration = Duration::from_millis(200);
 /// string unbounded, so a single request could OOM the worker.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// Maximum body of `POST /image`, which may carry inline input images (a base, a reference and a
+/// mask as base64): a 4K PNG base is about 25 MiB, a third larger in base64.
+pub const MAX_IMAGE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Why a request was denied before reaching its handler.
 #[derive(Debug, PartialEq, Eq)]
 enum Denial {
@@ -210,6 +214,14 @@ struct ImageBody {
     seed: Option<u64>,
     #[serde(default)]
     ext: Option<String>,
+    #[serde(default)]
+    init_image_url: Option<String>,
+    #[serde(default)]
+    ref_image_url: Option<String>,
+    #[serde(default)]
+    mask_url: Option<String>,
+    #[serde(default)]
+    denoise: Option<f32>,
 }
 
 /// OpenAI-compatible chat-completions request (non-streaming subset).
@@ -551,9 +563,11 @@ impl LocalApi {
     }
 
     fn handle_image(&self, mut request: Request) -> std::io::Result<()> {
-        let body = match read_body(&mut request)? {
+        let body = match read_body_capped(&mut request, MAX_IMAGE_BODY_BYTES)? {
             BodyOutcome::Ok(body) => body,
-            BodyOutcome::TooLarge => return respond_too_large(request),
+            BodyOutcome::TooLarge => {
+                return respond_too_large_capped(request, MAX_IMAGE_BODY_BYTES)
+            }
         };
         let parsed: ImageBody = match serde_json::from_str(&body) {
             Ok(parsed) => parsed,
@@ -575,6 +589,10 @@ impl LocalApi {
             steps: parsed.steps,
             seed: parsed.seed,
             ext: parsed.ext,
+            init_image_url: parsed.init_image_url,
+            ref_image_url: parsed.ref_image_url,
+            mask_url: parsed.mask_url,
+            denoise: parsed.denoise,
         };
 
         // One GPU, one job: reserve the shared gate so a local
@@ -1269,8 +1287,13 @@ enum BodyOutcome {
 }
 
 fn read_body(request: &mut Request) -> std::io::Result<BodyOutcome> {
+    read_body_capped(request, MAX_BODY_BYTES)
+}
+
+/// [`read_body`] with its own cap.
+fn read_body_capped(request: &mut Request, cap: usize) -> std::io::Result<BodyOutcome> {
     // Declared length first — reject without reading a byte.
-    if matches!(request.body_length(), Some(len) if len > MAX_BODY_BYTES) {
+    if matches!(request.body_length(), Some(len) if len > cap) {
         return Ok(BodyOutcome::TooLarge);
     }
     // Then a hard cap on the reader for chunked / lying senders: read
@@ -1279,20 +1302,24 @@ fn read_body(request: &mut Request) -> std::io::Result<BodyOutcome> {
     use std::io::Read as _;
     request
         .as_reader()
-        .take(MAX_BODY_BYTES as u64 + 1)
+        .take(cap as u64 + 1)
         .read_to_string(&mut body)?;
-    if body.len() > MAX_BODY_BYTES {
+    if body.len() > cap {
         return Ok(BodyOutcome::TooLarge);
     }
     Ok(BodyOutcome::Ok(body))
 }
 
 fn respond_too_large(request: Request) -> std::io::Result<()> {
+    respond_too_large_capped(request, MAX_BODY_BYTES)
+}
+
+fn respond_too_large_capped(request: Request, cap: usize) -> std::io::Result<()> {
     respond(
         request,
         413,
         "text/plain",
-        format!("request body exceeds {MAX_BODY_BYTES} bytes").as_bytes(),
+        format!("request body exceeds {cap} bytes").as_bytes(),
     )
 }
 
@@ -2573,8 +2600,47 @@ mod tests {
     fn oversized_body_is_a_413() {
         let h = Harness::start(seeded_catalog());
         let big = "x".repeat(MAX_BODY_BYTES + 1);
+        let res = h.post("/tts").body(big).send().unwrap();
+        assert_eq!(res.status(), 413);
+    }
+
+    #[test]
+    fn an_image_body_has_its_own_larger_cap() {
+        let h = Harness::start(seeded_catalog());
+        let big = "x".repeat(MAX_IMAGE_BODY_BYTES + 1);
         let res = h.post("/image").body(big).send().unwrap();
         assert_eq!(res.status(), 413);
+    }
+
+    #[test]
+    fn an_edit_with_inline_images_past_the_general_cap_runs() {
+        let h = Harness::start(seeded_catalog());
+        // A base well past the general 1 MiB cap, as a local edit sends it.
+        let base = format!("data:image/png;base64,{}", "A".repeat(2 * MAX_BODY_BYTES));
+        let res = h
+            .post("/image")
+            .json(&serde_json::json!({ "prompt": "remove the mug", "refImageUrl": base }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
+    #[test]
+    fn an_input_image_by_address_is_refused() {
+        let h = Harness::start(seeded_catalog());
+        let res = h
+            .post("/image")
+            .json(&serde_json::json!({
+                "prompt": "remove the mug",
+                "refImageUrl": "https://example.com/base.png"
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        assert!(res
+            .text()
+            .unwrap()
+            .contains("refImageUrl must be a data:image"));
     }
 
     #[test]
@@ -2584,7 +2650,7 @@ mod tests {
         // size gate stayed out of the way).
         let h = Harness::start(seeded_catalog());
         let exact = "x".repeat(MAX_BODY_BYTES);
-        let res = h.post("/image").body(exact).send().unwrap();
+        let res = h.post("/tts").body(exact).send().unwrap();
         assert_eq!(res.status(), 400);
     }
 

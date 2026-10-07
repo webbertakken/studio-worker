@@ -21,7 +21,8 @@ itself a client of this API (see [daemon control](#daemon-control)).
   preferred port is taken the worker falls back to an ephemeral port and logs
   the chosen URL (also shown on the tray UI's Worker page and under the Jobs page's
   Local filter, and published in the discovery file).
-- Request bodies are capped at 1 MiB (`413` beyond that).
+- Request bodies are capped at 1 MiB (`413` beyond that); `POST /image` at 64 MiB, room for
+  inline input images.
 - Synchronous: `POST /image` blocks until the engine finishes and returns the
   image bytes. Each job is recorded in the in-app **Local queue**.
 
@@ -198,9 +199,18 @@ secrets or prompts) and answers even while a generation is in flight
   "width": 1024, "height": 1024,         // optional; fall back to the model's cliDefaults
   "steps": 8,                            // optional
   "seed": 42,                            // optional
-  "ext": "webp"                          // optional; webp/png/jpg/...
+  "ext": "webp",                         // optional; webp/png/jpg/...
+  "initImageUrl": "data:image/png;base64,...", // optional; img2img base, or the original of a LaMa removal
+  "refImageUrl": "data:image/png;base64,...",  // optional; instruction-edit reference (sd-cli -r)
+  "maskUrl": "data:image/png;base64,...",      // optional; white = the region the model may change
+  "denoise": 0.8                               // optional; img2img strength
 }
 ```
+
+Input images travel inline as `data:image/<type>;base64,` URLs, so an edit, a masked removal or an
+inpaint runs on the local API through the same engine paths a studio job takes. Any other address
+is refused (`400`): the local API never makes the worker fetch a URL a caller names. cfg and the
+sampler come from the model's `cliDefaults`, as for a studio job.
 
 Example (reading the URL + token from the discovery file with `jq`):
 
@@ -214,7 +224,7 @@ curl -s "$(jq -r .url $DISCOVERY)/image" \
 
 Errors: unknown / wrong-kind model or a bad request body return `400`; a
 missing/wrong token returns `401`; a non-loopback `Host`/`Origin` returns
-`403`; a body over 1 MiB returns `413`; a busy worker (a studio or local
+`403`; a body over its cap returns `413`; a busy worker (a studio or local
 job already running) returns `503` with `Retry-After`; an engine failure
 returns `500`.
 
