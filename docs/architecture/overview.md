@@ -142,7 +142,7 @@ src/
 ├── main.rs           Thin process entry; sets up tokio + sentry + tracing, dispatches to lib::run_cli.
 ├── lib.rs            Module re-exports + run_cli dispatch table.
 ├── cli.rs            clap definitions.  Tested in-module.
-├── config.rs         Config struct + load/save (~/.config/minis-studio-worker/config.toml).
+├── config.rs         Config struct + load/save (per-OS `ProjectDirs` config dir).
 ├── runtime.rs        run/run_loops/register/status/format_status, the auto-update tick,
 │                     the ensure_registered helper, WorkerObservers, JobOutcome.
 ├── auto_register.rs  State machine (Pristine/Pending/Approved/Rejected) + tick().
@@ -574,8 +574,9 @@ never reads them in-process.
 
 **File location** (via the `directories` crate):
 
-- Linux / macOS: `~/.config/minis-studio-worker/config.toml`
-- Windows: `%APPDATA%\minis-studio-worker\config.toml`
+- Linux: `~/.config/minis-studio-worker/config.toml` (honours `$XDG_CONFIG_HOME`)
+- macOS: `~/Library/Application Support/gg.minis.minis-studio-worker/config.toml`
+- Windows: `%APPDATA%\minis\minis-studio-worker\config\config.toml`
 
 **Operator-facing fields** (exposed in the UI's Config page):
 

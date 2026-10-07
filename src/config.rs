@@ -1,5 +1,7 @@
-//! Persistent config in `~/.config/minis-studio-worker/config.toml` (Linux/macOS)
-//! or `%APPDATA%\minis-studio-worker\config.toml` (Windows).
+//! Persistent config at `ProjectDirs::from("gg", "minis", "minis-studio-worker").config_dir()`:
+//! * Linux: `$XDG_CONFIG_HOME/minis-studio-worker/config.toml` (`~/.config/...` by default)
+//! * macOS: `~/Library/Application Support/gg.minis.minis-studio-worker/config.toml`
+//! * Windows: `%APPDATA%\minis\minis-studio-worker\config\config.toml`
 //!
 //! Every load/save emits a structured tracing breadcrumb so operators
 //! can tell from `journalctl` which file the worker actually consulted
