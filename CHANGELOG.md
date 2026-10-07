@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.15](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.14...studio-worker-v0.4.15) (2026-10-07)
+
+
+### Features
+
+* **local-api:** edits with inline input images ([#152](https://github.com/webbertakken/studio-worker/issues/152)) ([e0f4bb4](https://github.com/webbertakken/studio-worker/commit/e0f4bb47859e02f819e58fb7bf30c2b97c254b5d))
+
+
+### Bug Fixes
+
+* correct config paths and approval link ([#151](https://github.com/webbertakken/studio-worker/issues/151)) ([dec8381](https://github.com/webbertakken/studio-worker/commit/dec8381fca7643ca38c5a18acccf5b5e21b79688))
+
 ## [0.4.14](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.13...studio-worker-v0.4.14) (2026-10-02)
 
 
