@@ -239,8 +239,9 @@ studio-worker register --reset
 
 Config lives at:
 
-- Linux/macOS — `~/.config/minis-studio-worker/config.toml`
-- Windows — `%APPDATA%\minis-studio-worker\config.toml`
+- Linux — `~/.config/minis-studio-worker/config.toml` (honours `$XDG_CONFIG_HOME`)
+- macOS — `~/Library/Application Support/gg.minis.minis-studio-worker/config.toml`
+- Windows — `%APPDATA%\minis\minis-studio-worker\config\config.toml`
 
 ```toml
 api_base_url        = "https://studio.minis.gg"

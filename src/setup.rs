@@ -40,7 +40,7 @@ pub fn setup_summary(machine_name: &str, api_base_url: &str, discovery_path: &st
         "\nstudio-worker is installed and its tray UI is starting: look for its icon in the \
          system tray.\nIt starts again at every login.\n\n\
          Next step: approve this worker in the studio\n\
-         \u{2022} open {base}/graphics and find this machine in the workers list\n\
+         \u{2022} open {base}/workers and find this machine under Pending Workers\n\
          \u{2022} it appears as: {machine_name}\n\
          \u{2022} once an admin approves it, the worker starts claiming jobs automatically\n\n\
          Local image API (no studio needed):\n\
@@ -263,9 +263,9 @@ mod tests {
             "/home/alice/.config/minis-studio-worker/local-api.json",
         );
         assert!(s.contains("alices-rig"), "must name the machine: {s}");
-        assert!(s.contains("https://studio.minis.gg/graphics"), "got: {s}");
+        assert!(s.contains("https://studio.minis.gg/workers"), "got: {s}");
         assert!(
-            !s.contains(".gg//graphics"),
+            !s.contains(".gg//workers"),
             "trailing slash not trimmed: {s}"
         );
         assert!(
