@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.16](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.15...studio-worker-v0.4.16) (2026-10-07)
+
+
+### Features
+
+* **ui:** start with my machine toggle ([#154](https://github.com/webbertakken/studio-worker/issues/154)) ([d0450d3](https://github.com/webbertakken/studio-worker/commit/d0450d38de7511831a3b6eff729e6974c4cc5305))
+* user presence and only-when-idle ([#156](https://github.com/webbertakken/studio-worker/issues/156)) ([3eee982](https://github.com/webbertakken/studio-worker/commit/3eee982a0059727696f366123da4c04a00db8699))
+
 ## [0.4.15](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.14...studio-worker-v0.4.15) (2026-10-07)
 
 
