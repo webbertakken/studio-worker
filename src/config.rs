@@ -13,7 +13,7 @@
 //! What lives here vs. what's stripped from the user-editable surface:
 //!
 //! * **Operator-facing**: `api_base_url`, `vram_threshold_gb`,
-//!   `start_minimised`, `auto_update_*`, `models_root`.
+//!   `auto_start`, `start_minimised`, `auto_update_*`, `models_root`.
 //!   These are exposed in the tray UI's Config page (through the daemon's
 //!   `PUT /daemon/config`).
 //! * **Internal state, persisted but not user-editable**: `worker_id`,
@@ -49,6 +49,10 @@ pub struct Config {
     pub auth_token: Option<String>,
     /// VRAM threshold the worker reports as its max claim size, in GB.
     pub vram_threshold_gb: f32,
+    /// Start the tray UI at login (its login entry is installed while
+    /// true and removed while false).  Default `true`.
+    #[serde(default = "default_auto_start")]
+    pub auto_start: bool,
     /// Start the desktop UI minimised (taskbar only — not hidden, so
     /// the window stays reachable even when no tray host exists).
     /// Default `true`: a worker auto-started at login must not pop a
@@ -110,6 +114,9 @@ pub struct Config {
 }
 
 fn default_auto_update_enabled() -> bool {
+    true
+}
+fn default_auto_start() -> bool {
     true
 }
 fn default_start_minimised() -> bool {
@@ -181,6 +188,7 @@ impl Default for Config {
             worker_id: None,
             auth_token: None,
             vram_threshold_gb: 12.0,
+            auto_start: default_auto_start(),
             start_minimised: default_start_minimised(),
             auto_update_enabled: default_auto_update_enabled(),
             auto_update_interval_secs: default_auto_update_interval(),
@@ -426,6 +434,9 @@ pub fn changed_fields(a: &Config, b: &Config) -> Vec<&'static str> {
     if (a.vram_threshold_gb - b.vram_threshold_gb).abs() >= f32::EPSILON {
         fields.push("vram_threshold_gb");
     }
+    if a.auto_start != b.auto_start {
+        fields.push("auto_start");
+    }
     if a.start_minimised != b.start_minimised {
         fields.push("start_minimised");
     }
@@ -460,9 +471,9 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn start_minimised_defaults_true_for_configs_predating_the_field() {
+    fn start_up_toggles_default_on_for_configs_predating_them() {
         // Operators upgrading from a config.toml written before the
-        // field existed must get the minimised-by-default behaviour.
+        // fields existed get the defaults.
         let cfg: Config = toml::from_str(
             r#"
             api_base_url = "https://studio.minis.gg/"
@@ -471,10 +482,20 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.start_minimised);
+        assert!(cfg.auto_start);
+        assert!(cfg.auto_update_enabled);
     }
 
     #[test]
-    fn a_config_that_still_sets_auto_start_loads_and_drops_it_on_save() {
+    fn start_up_toggles_default_on_for_a_fresh_config() {
+        let cfg = Config::default();
+        assert!(cfg.start_minimised);
+        assert!(cfg.auto_start);
+        assert!(cfg.auto_update_enabled);
+    }
+
+    #[test]
+    fn auto_start_off_survives_a_load_and_save() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -483,9 +504,20 @@ mod tests {
         )
         .unwrap();
         let (cfg, _) = load(Some(&path.to_string_lossy())).unwrap();
+        assert!(!cfg.auto_start);
         save(&cfg, &path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("auto_start"), "{text}");
+        assert!(text.contains("auto_start = false"), "{text}");
+    }
+
+    #[test]
+    fn changed_fields_names_auto_start() {
+        let a = Config::default();
+        let b = Config {
+            auto_start: false,
+            ..a.clone()
+        };
+        assert_eq!(changed_fields(&a, &b), ["auto_start"]);
     }
 
     #[test]

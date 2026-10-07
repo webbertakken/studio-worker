@@ -11,7 +11,7 @@ The worker is two processes built from one binary:
 Closing or crashing the UI never stops a job. Stopping the daemon stops the worker.
 
 Installed, the worker always runs as the tray UI: the installers start it, its login entry
-starts it at every login, and it starts the daemon. Nothing installs the daemon on its own.
+starts it at every login (unless **Start with my machine** is off), and it starts the daemon. Nothing installs the daemon on its own.
 `run` is the daemon's internal entry point, the command the tray UI starts; it is hidden from
 `--help` and is not an install method. The UI-less build (`--no-default-features`) exists only
 so CI can test the headless core; it is not shipped.
@@ -126,7 +126,8 @@ Every install method ends with the tray UI running:
 
 `studio-worker setup`:
 
-1. installs (or refreshes) the tray UI's login entry, pointing at this executable;
+1. installs (or refreshes) the tray UI's login entry, pointing at this executable, or removes it
+   when `auto_start` is off;
 2. starts the tray UI (`<exe> [--config <path>] ui`) detached: its own process group, no
    console, stdin closed, output appended to `<config dir>/ui.log`. When a tray UI already runs
    for this config, the new one hands over and the running window comes forward;
@@ -164,7 +165,8 @@ service present nothing happens.
    ([restart after an update](#restart-after-an-update)).
 3. Take the UI lock (see [one tray UI per config directory](#one-tray-ui-per-config-directory)),
    or hand over to the tray UI that holds it and exit.
-4. Install the login autostart entry for the tray UI; it is always installed.
+4. Sync the tray UI's login entry with `auto_start` (read from the config, like
+   `start_minimised`): installed while on, removed while off.
 5. Remove any [legacy service](#legacy-services).
 6. Start the poller (below), the launch-path watch, and the `ui.log` trim
    ([log files](#log-files)).
@@ -350,7 +352,8 @@ The worker's identity and health on one page (formerly Status and About):
 
 #### Config
 
-- One card per section: Connection, Worker, Auto-update, Models, Start-up, sent to the daemon
+- One card per section: Connection, Worker, Auto-update, Models, Start-up (**Start with my
+  machine**, **Start the window minimised**; both on by default), sent to the daemon
   with **Save** (it validates, saves and applies them); and This window (appearance, reduce motion,
   notifications), applied and stored at once.
 - A footer that never changes height: Save, Reset, and the save state (`Up to date`,
@@ -379,9 +382,11 @@ selects a job once it shows up, for screenshots and headless inspection.
 
 ## Autostart
 
-- The tray UI's login entry is always installed and kept pointing at the current executable
-  (Linux `.desktop`, macOS LaunchAgent, Windows `HKCU\…\Run`). There is no setting to turn it
-  off.
+- **Start with my machine** (config `auto_start`, on by default) decides whether the tray UI's
+  login entry exists (Linux `.desktop`, macOS LaunchAgent, Windows `HKCU\…\Run`). While on, it is
+  kept pointing at the current executable.
+- The tray UI syncs the entry at start, and after every successful Config save; `setup` syncs it
+  too. A failed sync is a warning (`op="autostart"`); the UI carries on.
 - The daemon is started by the UI when absent, and only by the UI. There is no OS service for
   it; a [legacy service](#legacy-services) is removed.
 
@@ -401,7 +406,8 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `single_instance` | `studio_worker::ui` | another tray UI holds the UI lock; this one hands over and exits |
 | `raise` | `studio_worker::ui` | a second launch asked this tray UI to show its window |
 | `prefs` | `studio_worker::ui` | UI preferences could not be read or saved |
-| `enable` / `ensure` | `studio_worker::autostart` | login entry written / already current / failed |
+| `enable` / `ensure` / `disable` | `studio_worker::autostart` | login entry written / already current / removed / failed |
+| `autostart` | `studio_worker::ui` | the tray UI could not sync its login entry |
 | `setup` | `studio_worker::setup` | `setup` installed the login entry and started the tray UI, or failed to |
 | `legacy_service` | `studio_worker::legacy_service` | a legacy service step ran, failed, or none was found |
 | `update_restart` | `studio_worker::ui` | the launch path changed; the UI restarts on it, waits, or failed to |

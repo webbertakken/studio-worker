@@ -97,10 +97,16 @@ pub struct AppDeps {
     /// Minimise the window on its first frame (the config's
     /// `start_minimised`, read before the daemon answers).
     pub start_minimised: bool,
+    /// Make the tray UI's login entry match `auto_start`; called with the
+    /// saved value after every successful Config save.
+    pub login_entry: LoginEntry,
     pub actions: ActionRunner,
     pub config_path: PathBuf,
     pub tokio: Handle,
 }
+
+/// Installs (`true`) or removes (`false`) the tray UI's login entry.
+pub type LoginEntry = Arc<dyn Fn(bool) + Send + Sync>;
 
 /// A config save on its way to the daemon.
 type PendingSave = Arc<Mutex<Option<Result<EditableConfig, String>>>>;
@@ -553,6 +559,7 @@ impl App {
         };
         match result {
             Ok(saved) => {
+                (self.deps.login_entry)(saved.auto_start);
                 let mut cfg = self.deps.replica.cfg.lock();
                 saved.apply_to(&mut cfg);
                 self.config_draft.saved(&cfg);
@@ -606,6 +613,7 @@ mod tests {
             actions: ActionRunner::new(config_path.clone(), replica.clone()),
             replica,
             start_minimised: true,
+            login_entry: Arc::new(|_| {}),
             config_path,
             tokio: tokio_handle(),
         }
@@ -783,6 +791,28 @@ mod tests {
             app.config_draft.last_save_error.as_deref(),
             Some("invalid config")
         );
+    }
+
+    #[test]
+    fn a_saved_config_syncs_the_login_entry_and_a_refused_one_does_not() {
+        let calls: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let seen = calls.clone();
+        let deps = AppDeps {
+            login_entry: Arc::new(move |enabled| seen.lock().push(enabled)),
+            ..mock_deps()
+        };
+        let mut app = App::new(deps);
+        let mut saved = EditableConfig::from_config(&Config::default());
+        saved.auto_start = false;
+        *app.pending_save.lock() = Some(Ok(saved.clone()));
+        app.take_save_result();
+        saved.auto_start = true;
+        *app.pending_save.lock() = Some(Ok(saved));
+        app.take_save_result();
+        *app.pending_save.lock() = Some(Err("invalid config".into()));
+        app.take_save_result();
+        assert_eq!(*calls.lock(), [false, true]);
+        assert!(app.deps.replica.cfg.lock().auto_start);
     }
 
     fn completed_recent_job(id: &str) -> crate::runtime::RecentJob {

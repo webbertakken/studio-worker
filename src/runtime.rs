@@ -1376,9 +1376,9 @@ pub fn build_capabilities_with(
         vram_total_gb: vram,
         vram_threshold_gb: cfg.vram_threshold_gb,
         auto_enabled,
-        // The tray UI always installs its login entry, so a build with the
-        // UI starts on its own; a headless build relies on the OS service.
-        auto_start: cfg!(feature = "ui"),
+        // The tray UI's login entry exists while `auto_start` is on; a build
+        // without the UI has no login entry.
+        auto_start: cfg!(feature = "ui") && cfg.auto_start,
         supported_models,
         task_kinds,
         supported_models_per_kind,
@@ -1845,6 +1845,18 @@ mod tests {
         let engine = SyntheticEngine::new();
         let paused_caps = build_capabilities_with(&cfg, &engine, false);
         assert!(!paused_caps.auto_enabled);
+    }
+
+    #[test]
+    fn capabilities_auto_start_follows_the_config_in_a_ui_build() {
+        let engine = SyntheticEngine::new();
+        let on = build_capabilities(&Config::default(), &engine);
+        assert_eq!(on.auto_start, cfg!(feature = "ui"));
+        let off_cfg = Config {
+            auto_start: false,
+            ..Config::default()
+        };
+        assert!(!build_capabilities(&off_cfg, &engine).auto_start);
     }
 
     #[test]

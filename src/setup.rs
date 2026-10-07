@@ -15,8 +15,8 @@ const TRACE_TARGET: &str = "studio_worker::setup";
 pub trait SetupOps {
     /// The executable to start and to point the login entry at.
     fn exe(&self) -> Result<PathBuf>;
-    /// Install (or refresh) the tray UI's login entry.
-    fn ensure_login_entry(&self, exe: &Path) -> Result<()>;
+    /// Install (or refresh) the tray UI's login entry when `enabled`, remove it otherwise.
+    fn sync_login_entry(&self, exe: &Path, enabled: bool) -> Result<()>;
     /// Start `exe args` detached, output appended to `log`; its pid.
     fn start_ui(&self, exe: &Path, args: &[OsString], log: &Path) -> std::io::Result<u32>;
 }
@@ -34,11 +34,22 @@ pub fn ui_args(config_path: Option<&str>) -> Vec<OsString> {
 
 /// What `setup` prints once the tray UI is starting.  `machine_name` is what the studio admin
 /// approves; `discovery_path` is where local clients read the API's URL and token.
-pub fn setup_summary(machine_name: &str, api_base_url: &str, discovery_path: &str) -> String {
+/// `auto_start` says whether it starts again at every login.
+pub fn setup_summary(
+    machine_name: &str,
+    api_base_url: &str,
+    discovery_path: &str,
+    auto_start: bool,
+) -> String {
     let base = api_base_url.trim_end_matches('/');
+    let login = if auto_start {
+        "It starts again at every login."
+    } else {
+        "It does not start at login (\"Start with my machine\" is off in Config)."
+    };
     format!(
         "\nstudio-worker is installed and its tray UI is starting: look for its icon in the \
-         system tray.\nIt starts again at every login.\n\n\
+         system tray.\n{login}\n\n\
          Next step: approve this worker in the studio\n\
          \u{2022} open {base}/graphics and find this machine in the workers list\n\
          \u{2022} it appears as: {machine_name}\n\
@@ -54,13 +65,14 @@ pub fn setup_summary(machine_name: &str, api_base_url: &str, discovery_path: &st
 pub fn setup_with<O: SetupOps>(ops: &O, config_path: Option<&str>) -> Result<()> {
     let (cfg, path) = crate::config::load(config_path)?;
     let exe = ops.exe()?;
-    if let Err(e) = ops.ensure_login_entry(&exe) {
-        // The tray UI installs it again at every start; say so and carry on.
+    if let Err(e) = ops.sync_login_entry(&exe, cfg.auto_start) {
+        // The tray UI syncs it again at every start; say so and carry on.
         warn!(
             target: TRACE_TARGET,
             op = "setup",
+            auto_start = cfg.auto_start,
             error = %e,
-            "could not install the tray UI's login entry; the tray UI retries when it starts"
+            "could not update the tray UI's login entry; the tray UI retries when it starts"
         );
     }
     let log = crate::daemon_link::ui_log_path(&path);
@@ -81,7 +93,12 @@ pub fn setup_with<O: SetupOps>(ops: &O, config_path: Option<&str>) -> Result<()>
         .unwrap_or_else(|| "<config dir>/local-api.json".to_string());
     print!(
         "{}",
-        setup_summary(&crate::sys::machine_name(), &cfg.api_base_url, &discovery)
+        setup_summary(
+            &crate::sys::machine_name(),
+            &cfg.api_base_url,
+            &discovery,
+            cfg.auto_start,
+        )
     );
     Ok(())
 }
@@ -111,8 +128,8 @@ impl SetupOps for RealOps {
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn ensure_login_entry(&self, exe: &Path) -> Result<()> {
-        crate::autostart::ensure(exe)
+    fn sync_login_entry(&self, exe: &Path, enabled: bool) -> Result<()> {
+        crate::autostart::sync(exe, enabled)
     }
 
     // Starts a real, detached tray UI; exercised by the installer runs, not unit tests.
@@ -157,7 +174,7 @@ mod tests {
     struct FakeOps {
         login_entry_fails: bool,
         start_fails: bool,
-        login_entries: Mutex<Vec<PathBuf>>,
+        login_entries: Mutex<Vec<(PathBuf, bool)>>,
         started: Mutex<Vec<(PathBuf, Vec<OsString>, PathBuf)>>,
     }
 
@@ -165,8 +182,11 @@ mod tests {
         fn exe(&self) -> Result<PathBuf> {
             Ok(PathBuf::from("/opt/sw/studio-worker"))
         }
-        fn ensure_login_entry(&self, exe: &Path) -> Result<()> {
-            self.login_entries.lock().unwrap().push(exe.to_path_buf());
+        fn sync_login_entry(&self, exe: &Path, enabled: bool) -> Result<()> {
+            self.login_entries
+                .lock()
+                .unwrap()
+                .push((exe.to_path_buf(), enabled));
             if self.login_entry_fails {
                 anyhow::bail!("no autostart dir");
             }
@@ -209,7 +229,7 @@ mod tests {
         let logs = capture(move || setup_with(&*in_capture, Some(&config)).unwrap());
         assert_eq!(
             *ops.login_entries.lock().unwrap(),
-            [PathBuf::from("/opt/sw/studio-worker")]
+            [(PathBuf::from("/opt/sw/studio-worker"), true)]
         );
         let started = ops.started.lock().unwrap();
         assert_eq!(started.len(), 1);
@@ -261,6 +281,7 @@ mod tests {
             "alices-rig",
             "https://studio.minis.gg/",
             "/home/alice/.config/minis-studio-worker/local-api.json",
+            true,
         );
         assert!(s.contains("alices-rig"), "must name the machine: {s}");
         assert!(s.contains("https://studio.minis.gg/graphics"), "got: {s}");
@@ -274,6 +295,27 @@ mod tests {
         );
         assert!(s.contains("tray UI is starting"), "got: {s}");
         assert!(s.contains("download on demand"), "got: {s}");
+        assert!(s.contains("every login"), "got: {s}");
+        let off = setup_summary("alices-rig", "https://studio.minis.gg/", "x", false);
+        assert!(off.contains("does not start at login"), "got: {off}");
+    }
+
+    #[test]
+    fn setup_removes_the_login_entry_when_auto_start_is_off() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = crate::config::Config {
+            auto_start: false,
+            ..crate::config::Config::default()
+        };
+        crate::config::save(&cfg, &path).unwrap();
+        let ops = FakeOps::default();
+        setup_with(&ops, Some(&path.to_string_lossy())).unwrap();
+        assert_eq!(
+            *ops.login_entries.lock().unwrap(),
+            [(PathBuf::from("/opt/sw/studio-worker"), false)]
+        );
+        assert_eq!(ops.started.lock().unwrap().len(), 1);
     }
 
     #[cfg(not(feature = "ui"))]

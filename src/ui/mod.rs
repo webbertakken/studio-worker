@@ -97,7 +97,8 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         UiLockOutcome::Held(lock) => lock,
         UiLockOutcome::HandedOver => return Ok(()),
     };
-    ensure_autostart();
+    let peeked = config::peek(&path);
+    sync_login_entry(&launch, peeked.auto_start);
     // Installed, the worker runs as the tray UI only: a legacy headless service goes.
     std::thread::spawn(crate::legacy_service::remove);
     crate::log_trim::spawn(crate::daemon_link::ui_log_path(&path));
@@ -146,7 +147,11 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     let actions = actions::ActionRunner::new(path.clone(), replica.clone());
     let deps = app::AppDeps {
         replica: replica.clone(),
-        start_minimised: config::peek(&path).start_minimised,
+        start_minimised: peeked.start_minimised,
+        login_entry: {
+            let launch = launch.clone();
+            Arc::new(move |enabled| sync_login_entry(&launch, enabled))
+        },
         actions: actions.clone(),
         config_path: path,
         tokio: tokio::runtime::Handle::current(),
@@ -353,26 +358,18 @@ fn spawn_exe_watch(launch: std::path::PathBuf, baseline: Option<crate::exe_watch
     }
 }
 
-/// Keep the tray UI's login entry installed and pointing at this
-/// executable.  Best-effort: a failure is logged, never fatal.
-fn ensure_autostart() {
-    match std::env::current_exe() {
-        Ok(exe) => {
-            if let Err(e) = crate::autostart::ensure(&exe) {
-                tracing::warn!(
-                    target: "studio_worker::ui",
-                    op = "autostart",
-                    error = %e,
-                    "could not install the login entry for the tray UI"
-                );
-            }
-        }
-        Err(e) => tracing::warn!(
-            target: "studio_worker::ui",
+/// Make the tray UI's login entry match `auto_start`: installed and pointing
+/// at `launch` while enabled, removed otherwise.  Best-effort: a failure is
+/// logged, never fatal.
+fn sync_login_entry(launch: &std::path::Path, enabled: bool) {
+    if let Err(e) = crate::autostart::sync(launch, enabled) {
+        tracing::warn!(
+            target: TRACE_TARGET,
             op = "autostart",
+            enabled,
             error = %e,
-            "could not resolve the current executable for the login entry"
-        ),
+            "could not update the login entry for the tray UI"
+        );
     }
 }
 
