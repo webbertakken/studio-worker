@@ -213,6 +213,9 @@ pub struct WorkerObservers {
     /// Entries ever pushed into `recent_logs`; the newest entry's sequence
     /// number.  Written under the `recent_logs` lock.
     pub recent_logs_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the person is using this computer (the daemon's presence
+    /// monitor writes it); `None` while unknown.
+    pub user_presence: crate::presence::PresenceSlot,
 }
 
 /// Entries of `recent_logs` newer than sequence number `after`, and the
@@ -597,6 +600,8 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     let busy = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let observers = WorkerObservers::with_global_worker_log();
+    let presence_monitor =
+        crate::presence::spawn_monitor(observers.user_presence.clone(), control.stop.clone());
 
     let stop_clone = control.stop.clone();
     tokio::spawn(async move {
@@ -618,6 +623,7 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     if let Some(handle) = local_api {
         let _ = handle.join();
     }
+    presence_monitor.abort();
     outcome
 }
 
@@ -1342,17 +1348,19 @@ pub fn is_unsupported_kind(e: &anyhow::Error) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn build_capabilities(cfg: &Config, engine: &dyn Engine) -> WorkerCapabilities {
-    build_capabilities_with(cfg, engine, true)
+    build_capabilities_with(cfg, engine, true, None)
 }
 
 /// Same as [`build_capabilities`] but lets the caller drive
 /// `auto_enabled` from a runtime pause flag (the UI's Pause/Resume
 /// button).  The persisted [`Config`] no longer carries that bit —
-/// it's an in-process toggle.
+/// it's an in-process toggle.  `presence` is the latest
+/// [`crate::presence`] sample (`None` while unknown).
 pub fn build_capabilities_with(
     cfg: &Config,
     engine: &dyn Engine,
     auto_enabled: bool,
+    presence: Option<crate::presence::UserPresence>,
 ) -> WorkerCapabilities {
     let vram = sys::detect_vram_gb().unwrap_or(0.0);
     let caps = engine.capabilities();
@@ -1379,6 +1387,10 @@ pub fn build_capabilities_with(
         // The tray UI's login entry exists while `auto_start` is on; a build
         // without the UI has no login entry.
         auto_start: cfg!(feature = "ui") && cfg.auto_start,
+        auto_update: cfg.auto_update_enabled,
+        start_minimised: cfg.start_minimised,
+        only_when_idle: cfg.only_when_idle,
+        user_presence: presence,
         supported_models,
         task_kinds,
         supported_models_per_kind,
@@ -1403,11 +1415,13 @@ pub fn summarize_capabilities(caps: &WorkerCapabilities) -> String {
         .join(", ");
     format!(
         "advertising engine={}, vram={:.1}/{:.1}GB threshold, auto_enabled={}, \
-         kinds=[{}], {} model(s)=[{}]",
+         only_when_idle={}, user_presence={}, kinds=[{}], {} model(s)=[{}]",
         caps.engine,
         caps.vram_total_gb,
         caps.vram_threshold_gb,
         caps.auto_enabled,
+        caps.only_when_idle,
+        caps.user_presence.map_or("unknown", |p| p.as_str()),
         kinds,
         caps.supported_models.len(),
         caps.supported_models.join(", "),
@@ -1843,7 +1857,7 @@ mod tests {
     fn capabilities_with_paused_flag_drives_auto_enabled() {
         let cfg = Config::default();
         let engine = SyntheticEngine::new();
-        let paused_caps = build_capabilities_with(&cfg, &engine, false);
+        let paused_caps = build_capabilities_with(&cfg, &engine, false, None);
         assert!(!paused_caps.auto_enabled);
     }
 
@@ -1866,7 +1880,7 @@ mod tests {
             ..Config::default()
         };
         let engine = SyntheticEngine::new();
-        let caps = build_capabilities_with(&cfg, &engine, true);
+        let caps = build_capabilities_with(&cfg, &engine, true, None);
         let summary = summarize_capabilities(&caps);
         // Engine name + every advertised kind is present.
         assert!(summary.contains("engine=synthetic"), "got: {summary}");
@@ -1898,7 +1912,7 @@ mod tests {
     fn summarize_capabilities_reflects_paused_state() {
         let cfg = Config::default();
         let engine = SyntheticEngine::new();
-        let caps = build_capabilities_with(&cfg, &engine, false);
+        let caps = build_capabilities_with(&cfg, &engine, false, None);
         assert!(
             summarize_capabilities(&caps).contains("auto_enabled=false"),
             "paused worker must advertise auto_enabled=false"
@@ -1909,7 +1923,8 @@ mod tests {
     /// the threshold/total relationship is deterministic regardless of
     /// the host's real GPU (the probe is `0.0` on CI).
     fn caps_with_vram(total_gb: f32, threshold_gb: f32) -> WorkerCapabilities {
-        let mut caps = build_capabilities_with(&Config::default(), &SyntheticEngine::new(), true);
+        let mut caps =
+            build_capabilities_with(&Config::default(), &SyntheticEngine::new(), true, None);
         caps.vram_total_gb = total_gb;
         caps.vram_threshold_gb = threshold_gb;
         caps

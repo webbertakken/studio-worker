@@ -162,12 +162,19 @@ tray-icon = { version = "0.24", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", optional = true }
+# User presence (input idle time): the X11 ScreenSaver extension and the
+# Wayland compositors' D-Bus idle monitors.  Both pure Rust: no libX11,
+# no libdbus.  x11rb stays on the 0.13 line eframe already compiles.
+x11rb = { version = "0.13", default-features = false, features = ["screensaver"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # Real autostart-on-login on Windows is an HKCU \Run registry value.
 # winreg is a tiny pure-FFI wrapper over advapi32 (always present on
 # Windows), so it's a plain target dep — no feature gate, no system libs.
+# system-idle-time wraps `GetLastInputInfo` for user presence.
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
+system-idle-time = { version = "1.0.4", default-features = false }
 
 # In-process llama.cpp LLM — gated OFF Windows.  llama-cpp-2 0.1.x builds
 # llama.cpp via cmake (which links the dynamic MSVC CRT and ignores

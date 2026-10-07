@@ -5524,6 +5524,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "system-idle-time",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -5541,6 +5542,8 @@ dependencies = [
  "whoami",
  "winreg",
  "wiremock",
+ "x11rb",
+ "zbus",
  "zip 8.6.0",
 ]
 
@@ -5616,6 +5619,16 @@ dependencies = [
  "pkg-config",
  "toml",
  "version-compare",
+]
+
+[[package]]
+name = "system-idle-time"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76b62d1c49068469ff8b0cd0896d0de4601658f21d0abd70e16b0ce0ddc9fa5a"
+dependencies = [
+ "core-foundation 0.10.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

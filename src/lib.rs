@@ -43,6 +43,7 @@ pub mod local;
 pub mod local_api;
 pub mod log_trim;
 pub mod net;
+pub mod presence;
 pub mod residency;
 pub mod runtime;
 pub mod secrets;

@@ -25,6 +25,7 @@ pub struct EditableConfig {
     pub vram_threshold_gb: f32,
     pub auto_start: bool,
     pub start_minimised: bool,
+    pub only_when_idle: bool,
     pub auto_update_enabled: bool,
     pub auto_update_interval_secs: u64,
     pub auto_update_feed: String,
@@ -51,6 +52,7 @@ impl EditableConfig {
             vram_threshold_gb: cfg.vram_threshold_gb,
             auto_start: cfg.auto_start,
             start_minimised: cfg.start_minimised,
+            only_when_idle: cfg.only_when_idle,
             auto_update_enabled: cfg.auto_update_enabled,
             auto_update_interval_secs: cfg.auto_update_interval_secs,
             auto_update_feed: cfg.auto_update_feed.clone(),
@@ -65,6 +67,7 @@ impl EditableConfig {
         cfg.vram_threshold_gb = self.vram_threshold_gb;
         cfg.auto_start = self.auto_start;
         cfg.start_minimised = self.start_minimised;
+        cfg.only_when_idle = self.only_when_idle;
         cfg.auto_update_enabled = self.auto_update_enabled;
         cfg.auto_update_interval_secs = self.auto_update_interval_secs;
         cfg.auto_update_feed = self.auto_update_feed.clone();
@@ -305,9 +308,11 @@ mod tests {
         edit.vram_threshold_gb = 7.5;
         edit.models_root = PathBuf::from("/srv/models");
         edit.auto_start = false;
+        edit.only_when_idle = true;
         edit.apply_to(&mut cfg);
         assert_eq!(cfg.vram_threshold_gb, 7.5);
         assert!(!cfg.auto_start);
+        assert!(cfg.only_when_idle);
         assert_eq!(cfg.models_root, PathBuf::from("/srv/models"));
         assert_eq!(cfg.worker_id.as_deref(), Some("w-1"));
         assert_eq!(cfg.auth_token.as_deref(), Some("secret"));

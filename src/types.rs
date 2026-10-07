@@ -299,6 +299,21 @@ pub struct WorkerCapabilities {
     pub auto_enabled: bool,
     #[serde(rename = "autoStart")]
     pub auto_start: bool,
+    /// The operator's settings, shown per worker in the studio.
+    #[serde(rename = "autoUpdate", default)]
+    pub auto_update: bool,
+    #[serde(rename = "startMinimised", default)]
+    pub start_minimised: bool,
+    /// Experimental: take studio work only while the person is away.
+    #[serde(rename = "onlyWhenIdle", default)]
+    pub only_when_idle: bool,
+    /// Whether the person is using this computer; absent while unknown.
+    #[serde(
+        rename = "userPresence",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_presence: Option<crate::presence::UserPresence>,
     /// Flat list of models, kept for backward compat with the existing studio
     /// API that doesn't know about kinds yet.  Equivalent to
     /// `supported_models_per_kind[Image]`.

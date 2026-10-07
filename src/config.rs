@@ -15,7 +15,7 @@
 //! What lives here vs. what's stripped from the user-editable surface:
 //!
 //! * **Operator-facing**: `api_base_url`, `vram_threshold_gb`,
-//!   `auto_start`, `start_minimised`, `auto_update_*`, `models_root`.
+//!   `auto_start`, `start_minimised`, `only_when_idle`, `auto_update_*`, `models_root`.
 //!   These are exposed in the tray UI's Config page (through the daemon's
 //!   `PUT /daemon/config`).
 //! * **Internal state, persisted but not user-editable**: `worker_id`,
@@ -61,6 +61,10 @@ pub struct Config {
     /// window over the operator's session.
     #[serde(default = "default_start_minimised")]
     pub start_minimised: bool,
+    /// Experimental: take studio work only while the person is away from
+    /// this computer (see `presence.rs`).  Default `false`.
+    #[serde(default)]
+    pub only_when_idle: bool,
     /// Periodically check the release feed and auto-install newer
     /// versions when no job is running.
     #[serde(default = "default_auto_update_enabled")]
@@ -192,6 +196,7 @@ impl Default for Config {
             vram_threshold_gb: 12.0,
             auto_start: default_auto_start(),
             start_minimised: default_start_minimised(),
+            only_when_idle: false,
             auto_update_enabled: default_auto_update_enabled(),
             auto_update_interval_secs: default_auto_update_interval(),
             auto_update_feed: default_auto_update_feed(),
@@ -442,6 +447,9 @@ pub fn changed_fields(a: &Config, b: &Config) -> Vec<&'static str> {
     if a.start_minimised != b.start_minimised {
         fields.push("start_minimised");
     }
+    if a.only_when_idle != b.only_when_idle {
+        fields.push("only_when_idle");
+    }
     if a.auto_update_enabled != b.auto_update_enabled {
         fields.push("auto_update_enabled");
     }
@@ -485,6 +493,7 @@ mod tests {
         .unwrap();
         assert!(cfg.start_minimised);
         assert!(cfg.auto_start);
+        assert!(!cfg.only_when_idle);
         assert!(cfg.auto_update_enabled);
     }
 
@@ -494,6 +503,7 @@ mod tests {
         assert!(cfg.start_minimised);
         assert!(cfg.auto_start);
         assert!(cfg.auto_update_enabled);
+        assert!(!cfg.only_when_idle, "experimental, off by default");
     }
 
     #[test]
