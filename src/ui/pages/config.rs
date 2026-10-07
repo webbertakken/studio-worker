@@ -219,6 +219,16 @@ fn worker_sections(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
     section(ui, "START-UP", "", |ui| {
         labeled_bool(ui, "Start with my machine", &mut c.auto_start);
         labeled_bool(ui, "Start the window minimised", &mut c.start_minimised);
+        labeled_bool(
+            ui,
+            "Only utilise when I'm not using this computer",
+            &mut c.only_when_idle,
+        );
+        hint_row(
+            ui,
+            "Experimental.  Takes studio jobs only after 2 minutes without keyboard or mouse \
+             input; a job that is running carries on.",
+        );
     });
 }
 

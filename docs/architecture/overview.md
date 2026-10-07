@@ -315,7 +315,8 @@ Each `register-request` carries a full
 - `engine` (`multi` — the dispatcher wrapping every compiled-in backend)
 - `vramTotalGb` (probed from `/proc/driver/nvidia/gpus` on Linux; 0 elsewhere)
 - `vramThresholdGb` (operator-set max GB per claim)
-- `autoEnabled`, `autoStart` (operator toggles)
+- `autoEnabled`, `autoStart`, `autoUpdate`, `startMinimised`, `onlyWhenIdle` (operator toggles)
+- `userPresence` (`idle` / `active`, absent while unknown; see [user presence](../runtime/user-presence.md))
 - `supportedModels` (flat list across all task kinds)
 - `taskKinds` (image / llm / audio_stt / audio_tts / video)
 - `supportedModelsPerKind` (per-kind breakdown)
@@ -586,6 +587,7 @@ never reads them in-process.
 | `vram_threshold_gb` | `12.0` | Max VRAM per claim |
 | `auto_start` | `true` | Tray UI starts at login (Start with my machine) |
 | `start_minimised` | `true` | Tray UI window starts minimised |
+| `only_when_idle` | `false` | Experimental: take studio work only while the person is away |
 | `auto_update_enabled` | `true` | Check the GitHub release feed |
 | `auto_update_interval_secs` | `1800` | How often (default 30 min) |
 | `auto_update_feed` | release URL | GitHub feed to poll |
@@ -662,7 +664,7 @@ on Jobs.
 | **Models** | GPU memory held (one bar segment per loaded model), then models kept in memory (in-process loader) and models loaded per job, in catalogue order: state, name and id, kind, engine, estimate, resident pin, exclusive group, since, error; one action (Load / Unload / Retry). |
 | **Worker** | State with **Pause / Resume**; registration (worker id, or Initialising / Pending with request id + copy / Rejected with reason + **Reset registration**); studio connection, last heartbeat, API URL; GPU runtime, VRAM total / threshold, memory held; local API URL; tray UI and daemon versions, Sentry release, config path, manual "Check for updates". |
 | **Logs** | Everything the daemon logs at info and up (level filter, search, follow, copy), from the daemon's worker log ring. |
-| **Config** | The operator-editable subset of `Config` in cards (Connection / Worker / Auto-update / Models / Start-up: Start with my machine, Start the window minimised); Save sends it to the daemon (`PUT /daemon/config`), which validates, saves and applies it.  This window: theme (dark by default, light, follow system), reduce motion, notifications, stored at once in `<config dir>/ui.toml`. |
+| **Config** | The operator-editable subset of `Config` in cards (Connection / Worker / Auto-update / Models / Start-up: Start with my machine, Start the window minimised, Only utilise when I'm not using this computer); Save sends it to the daemon (`PUT /daemon/config`), which validates, saves and applies it.  This window: theme (dark by default, light, follow system), reduce motion, notifications, stored at once in `<config dir>/ui.toml`. |
 
 Both themes meet WCAG 2.2 AA contrast (tests in
 [`src/ui/theme.rs`](../../src/ui/theme.rs)); errors show where they

@@ -353,7 +353,8 @@ The worker's identity and health on one page (formerly Status and About):
 #### Config
 
 - One card per section: Connection, Worker, Auto-update, Models, Start-up (**Start with my
-  machine**, **Start the window minimised**; both on by default), sent to the daemon
+  machine**, **Start the window minimised**, both on by default; **Only utilise when I'm not using
+  this computer**, experimental and off by default, see [user presence](user-presence.md)), sent to the daemon
   with **Save** (it validates, saves and applies them); and This window (appearance, reduce motion,
   notifications), applied and stored at once.
 - A footer that never changes height: Save, Reset, and the save state (`Up to date`,
@@ -412,3 +413,4 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `legacy_service` | `studio_worker::legacy_service` | a legacy service step ran, failed, or none was found |
 | `update_restart` | `studio_worker::ui` | the launch path changed; the UI restarts on it, waits, or failed to |
 | `log_trim` | `studio_worker::log_trim` | `daemon.log` / `ui.log` trimmed, or the trim failed |
+| `presence` | `studio_worker::presence` | the user presence changed, or the idle time could not be read |

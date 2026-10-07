@@ -413,6 +413,7 @@ async fn run_one_session(
         &cfg.lock(),
         &*engine,
         !paused.load(Ordering::SeqCst),
+        *observers.user_presence.lock(),
     );
     // Record exactly what we're about to advertise so the worker's logs
     // (and the studio's shipped-log view) show the offered kinds /
@@ -508,6 +509,7 @@ async fn run_one_session(
         logs: logs.clone(),
         busy: busy.clone(),
         paused: paused.clone(),
+        cfg: cfg.clone(),
         observers: observers.clone(),
         api_base_url: api_base_url.clone(),
         worker_id: worker_id.clone(),
@@ -555,6 +557,7 @@ struct SessionContext {
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    cfg: SharedConfig,
     observers: WorkerObservers,
     api_base_url: String,
     worker_id: String,
@@ -675,6 +678,32 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
             ctx.observers.clone(),
             job_id,
             "worker paused by operator",
+            crate::ws::types::RejectCode::Paused,
+        );
+        return;
+    }
+    // Only when idle (experimental): the person is using this computer (or
+    // we cannot tell), so the studio's offer goes back for another worker.
+    let only_when_idle = ctx.cfg.lock().only_when_idle;
+    let presence = *ctx.observers.user_presence.lock();
+    if crate::presence::holds_back(only_when_idle, presence) {
+        push_log_with_observers(
+            &ctx.logs,
+            Some(&ctx.observers),
+            "info",
+            "ws",
+            &format!(
+                "rejecting offer {job_id}: only when idle, and the person is {}",
+                presence.map_or("unknown", |p| p.as_str())
+            ),
+            Some(job_id.clone()),
+        );
+        spawn_reject_offer(
+            ctx.sender.clone(),
+            ctx.logs.clone(),
+            ctx.observers.clone(),
+            job_id,
+            "only when idle: the person is using this computer",
             crate::ws::types::RejectCode::Paused,
         );
         return;
@@ -1097,7 +1126,13 @@ fn spawn_heartbeat_pump(
             // Rebuild the snapshot from the live config so operator
             // edits (VRAM threshold, auto-start) propagate on the
             // next tick instead of on the next reconnect.
-            let caps = crate::runtime::build_capabilities_with(&cfg.lock(), &*engine, !now_paused);
+            let presence = *observers.user_presence.lock();
+            let caps = crate::runtime::build_capabilities_with(
+                &cfg.lock(),
+                &*engine,
+                !now_paused,
+                presence,
+            );
             let current_job_id = heartbeat_current_job_id(&observers);
             if let Err(e) = sender
                 .send(&WorkerInbound::Heartbeat {

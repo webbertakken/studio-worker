@@ -18,6 +18,10 @@ fn capabilities() -> WorkerCapabilities {
         vram_threshold_gb: 12.0,
         auto_enabled: true,
         auto_start: false,
+        auto_update: true,
+        start_minimised: true,
+        only_when_idle: false,
+        user_presence: None,
         supported_models: vec!["synthetic".into(), "sdxl".into()],
         task_kinds: vec![],
         supported_models_per_kind: Default::default(),
@@ -105,6 +109,32 @@ fn inbound_heartbeat_with_current_job_id_round_trips() {
         }
         other => panic!("expected Heartbeat, got {other:?}"),
     }
+}
+
+#[test]
+fn heartbeat_carries_the_settings_and_the_user_presence() {
+    let mut caps = capabilities();
+    caps.only_when_idle = true;
+    caps.user_presence = Some(studio_worker::presence::UserPresence::Idle);
+    let frame = WorkerInbound::Heartbeat {
+        capabilities: caps,
+        current_job_id: None,
+    };
+    let json = serde_json::to_value(&frame).unwrap();
+    let c = &json["capabilities"];
+    assert_eq!(c["agentVersion"], "0.2.0");
+    assert_eq!(c["autoStart"], false);
+    assert_eq!(c["autoUpdate"], true);
+    assert_eq!(c["startMinimised"], true);
+    assert_eq!(c["onlyWhenIdle"], true);
+    assert_eq!(c["userPresence"], "idle");
+}
+
+#[test]
+fn an_unknown_user_presence_is_left_out() {
+    let json = serde_json::to_value(capabilities()).unwrap();
+    assert!(json.get("userPresence").is_none(), "{json}");
+    assert_eq!(json["onlyWhenIdle"], false);
 }
 
 #[test]

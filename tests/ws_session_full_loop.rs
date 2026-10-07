@@ -28,6 +28,7 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
 use studio_worker::config::{self, Config};
+use studio_worker::presence::UserPresence;
 use studio_worker::runtime::WorkerObservers;
 use studio_worker::types::LogEntry;
 use studio_worker::ws::session::{spawn_ws_session, SessionSchedule};
@@ -755,4 +756,118 @@ async fn ws_session_ships_pause_and_resume_transitions_to_operator_logs() {
 
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = tokio::time::timeout(Duration::from_secs(5), session_handle).await;
+}
+
+fn llm_offer(job_id: &str) -> Message {
+    Message::Text(
+        json!({
+            "type": "offer",
+            "claim": {
+                "jobId": job_id,
+                "gameId": "g",
+                "assetName": "g/dialogue/scribe",
+                "model": "synthetic",
+                "vramGbEstimate": 1.0,
+                "task": {
+                    "kind": "llm",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "maxTokens": 4,
+                    "temperature": 0.5
+                },
+                "modelSource": {
+                    "engine": "synthetic",
+                    "files": [],
+                    "cliDefaults": {"cfgScale": 1.0, "steps": 8, "width": 1024, "height": 1024}
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+/// The next heartbeat whose `userPresence` equals `presence`.
+async fn heartbeat_with_presence(
+    ws: &mut WebSocketStream<TcpStream>,
+    presence: &str,
+) -> Result<serde_json::Value> {
+    loop {
+        let frames = collect_frames(ws, &["heartbeat"]).await?;
+        let caps = frames["heartbeat"]["capabilities"].clone();
+        if caps["userPresence"] == presence {
+            return Ok(caps);
+        }
+    }
+}
+
+#[tokio::test]
+async fn ws_session_only_when_idle_turns_offers_down_while_the_person_is_active() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_addr = listener.local_addr().unwrap();
+    let observers = WorkerObservers::default();
+    *observers.user_presence.lock() = Some(UserPresence::Active);
+    let presence = observers.user_presence.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut ws = tokio_tungstenite::accept_hdr_async(stream, echo_subprotocol).await?;
+        let hello = collect_frames(&mut ws, &["hello"]).await?;
+        let caps = &hello["hello"]["capabilities"];
+        assert_eq!(caps["onlyWhenIdle"], true);
+        assert_eq!(caps["userPresence"], "active");
+        assert_eq!(caps["autoUpdate"], false);
+        assert_eq!(caps["startMinimised"], true);
+        ws.send(Message::Text(
+            json!({"type":"welcome","workerId":"w-test","serverTime":"now"})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+
+        // Active: the offer goes back, as a no-attempt `paused` reject.
+        ws.send(llm_offer("job-active")).await?;
+        let frames = collect_frames(&mut ws, &["reject"]).await?;
+        assert_eq!(frames["reject"]["jobId"], "job-active");
+        assert_eq!(frames["reject"]["code"], "paused");
+
+        // The person leaves: the next heartbeat says so, and work flows again.
+        *presence.lock() = Some(UserPresence::Idle);
+        heartbeat_with_presence(&mut ws, "idle").await?;
+        ws.send(llm_offer("job-idle")).await?;
+        let frames = collect_frames(&mut ws, &["accept", "completeJson"]).await?;
+        assert_eq!(frames["accept"]["jobId"], "job-idle");
+
+        ws.close(None).await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        only_when_idle: true,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let session = tokio::spawn(spawn_ws_session(
+        config::shared(cfg),
+        stop.clone(),
+        Arc::new(Mutex::new(Vec::<LogEntry>::new())),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        observers,
+        SessionSchedule::fast_for_tests(),
+    ));
+
+    tokio::time::timeout(TIMEOUT, server)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked")
+        .expect("server returned err");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("session loop timed out");
 }
