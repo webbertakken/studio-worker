@@ -23,6 +23,7 @@ use crate::types::{LogEntry, ModelEngine, TaskKind};
 pub struct EditableConfig {
     pub api_base_url: String,
     pub vram_threshold_gb: f32,
+    pub auto_start: bool,
     pub start_minimised: bool,
     pub auto_update_enabled: bool,
     pub auto_update_interval_secs: u64,
@@ -48,6 +49,7 @@ impl EditableConfig {
         Self {
             api_base_url: cfg.api_base_url.clone(),
             vram_threshold_gb: cfg.vram_threshold_gb,
+            auto_start: cfg.auto_start,
             start_minimised: cfg.start_minimised,
             auto_update_enabled: cfg.auto_update_enabled,
             auto_update_interval_secs: cfg.auto_update_interval_secs,
@@ -61,6 +63,7 @@ impl EditableConfig {
     pub fn apply_to(&self, cfg: &mut Config) {
         cfg.api_base_url = self.api_base_url.clone();
         cfg.vram_threshold_gb = self.vram_threshold_gb;
+        cfg.auto_start = self.auto_start;
         cfg.start_minimised = self.start_minimised;
         cfg.auto_update_enabled = self.auto_update_enabled;
         cfg.auto_update_interval_secs = self.auto_update_interval_secs;
@@ -301,8 +304,10 @@ mod tests {
         let mut edit = editable();
         edit.vram_threshold_gb = 7.5;
         edit.models_root = PathBuf::from("/srv/models");
+        edit.auto_start = false;
         edit.apply_to(&mut cfg);
         assert_eq!(cfg.vram_threshold_gb, 7.5);
+        assert!(!cfg.auto_start);
         assert_eq!(cfg.models_root, PathBuf::from("/srv/models"));
         assert_eq!(cfg.worker_id.as_deref(), Some("w-1"));
         assert_eq!(cfg.auth_token.as_deref(), Some("secret"));

@@ -110,6 +110,17 @@ pub fn ensure(exe: &Path) -> Result<()> {
     backend::ensure(exe)
 }
 
+/// Make the login entry match the operator's `auto_start`: installed and
+/// pointing at `exe` while `enabled`, absent otherwise.  Logs the outcome.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn sync(exe: &Path, enabled: bool) -> Result<()> {
+    if enabled {
+        ensure(exe)
+    } else {
+        disable()
+    }
+}
+
 /// Whether autostart-on-login is currently enabled.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub fn is_enabled() -> bool {

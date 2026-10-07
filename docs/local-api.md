@@ -94,7 +94,7 @@ carries a credential:
   "busy": false,                       // the one-job gate is taken
   "registered": true, "workerId": "w-…",
   "registration": { "state": "approved" },   // pristine | pending{requestId,since} | approved | rejected{reason}
-  "config": { "apiBaseUrl": "…", "vramThresholdGb": 12.0, "startMinimised": true,
+  "config": { "apiBaseUrl": "…", "vramThresholdGb": 12.0, "autoStart": true, "startMinimised": true,
               "autoUpdateEnabled": true, "autoUpdateIntervalSecs": 1800,
               "autoUpdateFeed": "…", "autoUpdatePrerelease": false, "modelsRoot": "…" },
   "session": { "state": "connected" },       // waiting_for_approval | connecting | connected | reconnecting{attempt} | auth_failed{reason} | fatal{reason} | stopped

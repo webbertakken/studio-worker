@@ -76,8 +76,8 @@ hosts the studio session, the local API, the model
 host and every job; the **tray UI** (`studio-worker ui`) is a native
 `egui`/`eframe` window and system-tray icon that shows what the daemon
 does and sends your actions back over the local API.  The UI starts the
-daemon when none is running, starts itself at every login (always; there
-is no setting to turn that off), and waits for the display when the
+daemon when none is running, starts itself at every login (**Start with my machine** in Config, on
+by default), and waits for the display when the
 graphical session is not ready yet.  Design:
 [`docs/runtime/daemon-and-tray.md`](docs/runtime/daemon-and-tray.md).
 
@@ -147,7 +147,7 @@ irm https://github.com/webbertakken/studio-worker/releases/latest/download/studi
 
 The installer finishes by running `studio-worker setup`: it starts the
 tray UI (look for its icon) and installs its login entry, so the worker
-runs now and at every login, then prints the machine name the studio
+runs now and at every login (turn that off with **Start with my machine**), then prints the machine name the studio
 admin approves, the studio URL, and where the local API's URL + token
 are written.  `setup` is idempotent; run it yourself after a
 `cargo install`.  A headless service from an older version is removed

@@ -217,6 +217,7 @@ fn worker_sections(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
         );
     });
     section(ui, "START-UP", "", |ui| {
+        labeled_bool(ui, "Start with my machine", &mut c.auto_start);
         labeled_bool(ui, "Start the window minimised", &mut c.start_minimised);
     });
 }

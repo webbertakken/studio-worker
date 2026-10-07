@@ -115,7 +115,7 @@ runtime.rs::run       (the daemon; `ui::run` is the tray UI client)
 ui::run (tray UI)
    |
    +--> single_instance::acquire     (one tray UI per config dir; a second hands over and exits 0)
-   +--> autostart::ensure            (login entry, always)
+   +--> autostart::sync              (login entry, per `auto_start`)
    +--> daemon_link::Poller          (1 s poll into a Replica; starts the daemon when absent)
    +--> eframe window + tray         (restarts itself in place while no display is usable)
 ```
@@ -181,7 +181,7 @@ src/
 ├── legacy_service.rs Removes the headless service older versions installed (tray UI start).
 ├── exe_watch.rs      Notices a replaced launch path so the tray UI restarts on the new binary.
 ├── log_trim.rs       Copy-truncate for daemon.log / ui.log (10 MiB + 3 copies).
-├── autostart.rs      Cross-OS tray-UI login entry, always installed by `ui::run` (logged).
+├── autostart.rs      Cross-OS tray-UI login entry, synced with `auto_start` by `ui::run` (logged).
 ├── update.rs         GitHub release feed poll + installer script download + re-exec on success;
 │                     keeps the build variant (CPU or CUDA).
 ├── variant.rs        The build variant (`cpu` or `cuda`) and the release target of this binary.
@@ -584,6 +584,7 @@ never reads them in-process.
 |---|---|---|
 | `api_base_url` | `https://studio.minis.gg/` | Studio API root |
 | `vram_threshold_gb` | `12.0` | Max VRAM per claim |
+| `auto_start` | `true` | Tray UI starts at login (Start with my machine) |
 | `start_minimised` | `true` | Tray UI window starts minimised |
 | `auto_update_enabled` | `true` | Check the GitHub release feed |
 | `auto_update_interval_secs` | `1800` | How often (default 30 min) |
@@ -661,7 +662,7 @@ on Jobs.
 | **Models** | GPU memory held (one bar segment per loaded model), then models kept in memory (in-process loader) and models loaded per job, in catalogue order: state, name and id, kind, engine, estimate, resident pin, exclusive group, since, error; one action (Load / Unload / Retry). |
 | **Worker** | State with **Pause / Resume**; registration (worker id, or Initialising / Pending with request id + copy / Rejected with reason + **Reset registration**); studio connection, last heartbeat, API URL; GPU runtime, VRAM total / threshold, memory held; local API URL; tray UI and daemon versions, Sentry release, config path, manual "Check for updates". |
 | **Logs** | Everything the daemon logs at info and up (level filter, search, follow, copy), from the daemon's worker log ring. |
-| **Config** | The operator-editable subset of `Config` in cards (Connection / Worker / Auto-update / Models / Start-up); Save sends it to the daemon (`PUT /daemon/config`), which validates, saves and applies it.  This window: theme (dark by default, light, follow system), reduce motion, notifications, stored at once in `<config dir>/ui.toml`. |
+| **Config** | The operator-editable subset of `Config` in cards (Connection / Worker / Auto-update / Models / Start-up: Start with my machine, Start the window minimised); Save sends it to the daemon (`PUT /daemon/config`), which validates, saves and applies it.  This window: theme (dark by default, light, follow system), reduce motion, notifications, stored at once in `<config dir>/ui.toml`. |
 
 Both themes meet WCAG 2.2 AA contrast (tests in
 [`src/ui/theme.rs`](../../src/ui/theme.rs)); errors show where they
@@ -792,7 +793,7 @@ Installed, the worker runs as the tray UI only; nothing installs the daemon on i
 
 ### `studio-worker setup` (the installers run it)
 
-[`src/setup.rs`](../../src/setup.rs).  Installs the tray UI's login entry, starts the
+[`src/setup.rs`](../../src/setup.rs).  Syncs the tray UI's login entry with `auto_start`, starts the
 tray UI detached (output to `<config dir>/ui.log`) and prints the approval guidance.
 
 ### Legacy headless services
@@ -801,11 +802,12 @@ tray UI detached (output to `<config dir>/ui.log`) and prints the approval guida
 user unit, a LaunchAgent or a scheduled task that ran `studio-worker run`.  The tray UI
 deregisters and deletes it at start, without stopping a running legacy daemon.
 
-### Tray UI login entry (always)
+### Tray UI login entry (`auto_start`)
 
-[`src/autostart.rs`](../../src/autostart.rs).  Every `ui::run` makes sure
-the tray UI starts at login from the current executable (rewriting a stale
-entry); there is no setting to turn it off.  Each write or no-op emits a
+[`src/autostart.rs`](../../src/autostart.rs).  While `auto_start` (**Start with my
+machine**, on by default) is on, every `ui::run` and every successful Config save make
+sure the tray UI starts at login from the current executable (rewriting a stale
+entry); while it is off they remove the entry.  Each write, removal or no-op emits a
 structured `tracing` event on target `studio_worker::autostart`.  Writes:
 
 - Linux: `~/.config/autostart/studio-worker-ui.desktop`
@@ -815,9 +817,8 @@ structured `tracing` event on target `studio_worker::autostart`.  Writes:
   The standard per-user autostart mechanism: no console flash, no admin
   rights, no COM.
 
-The two mechanisms coexist: the service runs the daemon before anyone
-logs in; the tray UI starts at login and starts the daemon itself when
-none runs.  The daemon lock keeps it to one daemon per config directory.
+The tray UI starts the daemon itself when none runs; the daemon lock keeps
+it to one daemon per config directory.
 
 ---
 
