@@ -197,7 +197,8 @@ encoding_rs = { version = "0.8", optional = true }
 # `--no-default-features` for the headless core. Conflicting engines
 # (whisper, image-candle) stay opt-in.
 default = ["ui", "llama", "video", "tts", "image-onnx", "stt-stream"]
-llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# `mtmd`: vision projectors (images on chat tasks); `common`: jsonSchema -> grammar.
+llama = ["dep:llama-cpp-2", "llama-cpp-2?/mtmd", "llama-cpp-2?/common", "dep:encoding_rs"]
 # In-process LLM on NVIDIA GPUs (all layers offloaded).  Needs the CUDA
 # toolkit (nvcc) at build time, so it is opt-in; releases ship it as a second
 # x86_64 Linux archive (scripts/release/cuda-variant.sh, docs/operations/release.md).

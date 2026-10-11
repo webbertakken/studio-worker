@@ -21,7 +21,11 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::mtmd::{
+    mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunks, MtmdInputText,
+};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -103,7 +107,9 @@ impl LlamaEngine {
             let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) == Some("gguf") {
                 if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    out.push((stem.to_string(), p));
+                    if !is_projector_name(stem) {
+                        out.push((stem.to_string(), p));
+                    }
                 }
             }
         }
@@ -215,7 +221,8 @@ fn template_vars(model: &LlamaModel) -> TemplateVars {
     }
 }
 
-/// Render the request with the model's own template and switches.
+/// Render the request with the model's own template and switches, with one media marker per
+/// image at the start of the last user message.
 fn render_request(
     model: &LlamaModel,
     defaults: &ModelCliDefaults,
@@ -228,12 +235,117 @@ fn render_request(
         defaults.chat_template_kwargs.as_ref(),
         params.chat_template_kwargs.as_ref(),
     );
+    let messages = crate::vision::with_markers(
+        chat_messages(params),
+        mtmd_default_marker(),
+        params.images.len(),
+    )?;
     Ok(render_chat(
         &template,
-        &chat_messages(params),
+        &messages,
         &kwargs,
         &template_vars(model),
     )?)
+}
+
+/// llama.cpp's grammar for a request's `jsonSchema`, so the answer is JSON of that shape.
+pub fn json_schema_grammar(schema: &serde_json::Value) -> Result<String> {
+    llama_cpp_2::json_schema_to_grammar(&schema.to_string())
+        .map_err(|e| anyhow!("jsonSchema cannot be turned into a llama.cpp grammar: {e}"))
+}
+
+/// The sampler for a request: constrained to its `jsonSchema` when it has one, then greedy at
+/// temperature 0, else top-p (when set), temperature and a seeded draw.
+fn sampler_for(model: &LlamaModel, params: &LlmParams) -> Result<LlamaSampler> {
+    let mut chain = Vec::new();
+    if let Some(schema) = &params.json_schema {
+        let grammar = json_schema_grammar(schema)?;
+        chain.push(
+            LlamaSampler::grammar(model, &grammar, "root")
+                .map_err(|e| anyhow!("loading the jsonSchema grammar: {e:?}"))?,
+        );
+    }
+    if params.temperature <= 0.0 {
+        chain.push(LlamaSampler::greedy());
+    } else {
+        if let Some(p) = params.top_p {
+            chain.push(LlamaSampler::top_p(p, 1));
+        }
+        chain.push(LlamaSampler::temp(params.temperature));
+        chain.push(LlamaSampler::dist(1234));
+    }
+    Ok(LlamaSampler::chain_simple(chain))
+}
+
+/// Load the vision projector (`mmproj`) at `path` for `model`.
+fn load_projector(model: &LlamaModel, id: &str, path: &Path) -> Result<MtmdContext> {
+    let started = Instant::now();
+    let params = MtmdContextParams {
+        use_gpu: gpu_layers() > 0,
+        print_timings: false,
+        ..MtmdContextParams::default()
+    };
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow!("projector path is not UTF-8: {}", path.display()))?;
+    let projector = MtmdContext::init_from_file(path_str, model, &params)
+        .map_err(|e| anyhow!("loading vision projector {} for {id}: {e}", path.display()))?;
+    if !projector.support_vision() {
+        bail!(
+            "{} is a projector without vision (audio only?) for {id}",
+            path.display()
+        );
+    }
+    info!(
+        target: TRACE_TARGET,
+        op = "load",
+        model = id,
+        projector = %path.display(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "vision projector loaded"
+    );
+    Ok(projector)
+}
+
+/// A rendered prompt, tokenised: plain tokens, or text and image chunks for the projector.
+enum Prompt {
+    Text(Vec<LlamaToken>),
+    Media(MtmdInputChunks),
+}
+
+impl Prompt {
+    fn n_tokens(&self) -> usize {
+        match self {
+            Prompt::Text(tokens) => tokens.len(),
+            Prompt::Media(chunks) => chunks.total_tokens(),
+        }
+    }
+}
+
+/// Tokenise `prompt` with the request's pictures: each media marker becomes one picture.
+fn tokenize_media(
+    projector: &MtmdContext,
+    prompt: String,
+    add_bos: bool,
+    images: &[String],
+) -> Result<MtmdInputChunks> {
+    let pictures = crate::vision::load_all(images)?;
+    let bitmaps = pictures
+        .iter()
+        .map(|p| MtmdBitmap::from_image_data(p.width, p.height, &p.pixels))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow!("preparing an input image: {e}"))?;
+    let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+    projector
+        .tokenize(
+            MtmdInputText {
+                text: prompt,
+                add_special: add_bos,
+                parse_special: true,
+            },
+            &refs,
+        )
+        .map_err(|e| anyhow!("tokenising the prompt with its images: {e}"))
 }
 
 fn model_adds_bos(model: &LlamaModel) -> bool {
@@ -245,8 +357,12 @@ fn model_adds_bos(model: &LlamaModel) -> bool {
 
 /// Run one chat completion on a loaded model.  Shared by the resident
 /// lane and the transient (per-job) path, so both behave the same.
+/// `projector` is the model's vision projector, required when the
+/// request carries images.
+#[allow(clippy::too_many_arguments)]
 pub fn complete(
     model: &LlamaModel,
+    projector: Option<&Mutex<MtmdContext>>,
     backend: &LlamaBackend,
     id: &str,
     defaults: &ModelCliDefaults,
@@ -255,62 +371,94 @@ pub fn complete(
     on_piece: &mut dyn FnMut(&str),
 ) -> Result<serde_json::Value> {
     let started = Instant::now();
+    let images = params.images.len();
+    let projector = match (images, projector) {
+        (0, _) => None,
+        (_, Some(projector)) => Some(projector.lock()),
+        (_, None) => {
+            return Err(crate::vision::ImageRefusal::Unsupported {
+                model: id.to_string(),
+            }
+            .into())
+        }
+    };
     let prompt = render_request(model, defaults, &params)?;
     let bos = template_vars(model).bos_token;
-    let add_bos = if should_add_bos(model_adds_bos(model), &prompt, &bos) {
-        AddBos::Always
-    } else {
-        AddBos::Never
+    let add_bos = should_add_bos(model_adds_bos(model), &prompt, &bos);
+    let tokenized = match &projector {
+        None => Prompt::Text(
+            model
+                .str_to_token(
+                    &prompt,
+                    if add_bos {
+                        AddBos::Always
+                    } else {
+                        AddBos::Never
+                    },
+                )
+                .map_err(|e| anyhow!("tokenize prompt: {e:?}"))?,
+        ),
+        Some(projector) => {
+            Prompt::Media(tokenize_media(projector, prompt, add_bos, &params.images)?)
+        }
     };
-    let tokens = model
-        .str_to_token(&prompt, add_bos)
-        .map_err(|e| anyhow!("tokenize prompt: {e:?}"))?;
+    let prompt_tokens = tokenized.n_tokens();
     let n_ctx = effective_context(defaults.context_size, model.n_ctx_train());
-    let budget = plan_budget(tokens.len(), params.max_tokens, n_ctx)?;
+    let budget = plan_budget(prompt_tokens, params.max_tokens, n_ctx)?;
     debug!(
         target: TRACE_TARGET,
         op = "generate",
         model = id,
-        prompt_tokens = tokens.len(),
+        prompt_tokens,
+        images,
         budget,
         n_ctx,
         "starting generation"
     );
-    let ctx_params = LlamaContextParams::default()
+    let mut ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(PROMPT_BATCH as u32);
+    if projector.is_some() {
+        // An image's tokens decode in one micro-batch (non-causal attention needs them together).
+        ctx_params = ctx_params.with_n_ubatch(PROMPT_BATCH as u32);
+    }
     let mut ctx = model
         .new_context(backend, ctx_params)
         .context("creating llama context")?;
 
     let mut batch = LlamaBatch::new(PROMPT_BATCH, 1);
-    let mut pos: i32 = 0;
-    let last = tokens.len() - 1;
-    for chunk in tokens.chunks(PROMPT_BATCH) {
-        if cancelled() {
-            bail!("cancelled: the model is unloading or the client left");
+    // Where the next token goes, and which logits to sample first (-1: the last computed).
+    let (mut pos, mut logits_at): (i32, i32) = (0, -1);
+    if cancelled() {
+        bail!("cancelled: the model is unloading or the client left");
+    }
+    match (tokenized, projector) {
+        (Prompt::Text(tokens), _) => {
+            let last = tokens.len() - 1;
+            for chunk in tokens.chunks(PROMPT_BATCH) {
+                if cancelled() {
+                    bail!("cancelled: the model is unloading or the client left");
+                }
+                batch.clear();
+                for token in chunk {
+                    batch
+                        .add(*token, pos, &[0], pos as usize == last)
+                        .map_err(|e| anyhow!("batch add: {e:?}"))?;
+                    pos += 1;
+                }
+                ctx.decode(&mut batch).context("decoding prompt")?;
+            }
+            logits_at = batch.n_tokens() - 1;
         }
-        batch.clear();
-        for token in chunk {
-            batch
-                .add(*token, pos, &[0], pos as usize == last)
-                .map_err(|e| anyhow!("batch add: {e:?}"))?;
-            pos += 1;
+        (Prompt::Media(chunks), Some(projector)) => {
+            pos = chunks
+                .eval_chunks(&projector, &ctx, 0, 0, PROMPT_BATCH as i32, true)
+                .map_err(|e| anyhow!("decoding the prompt with its images: {e}"))?;
         }
-        ctx.decode(&mut batch).context("decoding prompt")?;
+        (Prompt::Media(_), None) => bail!("a prompt with images needs the vision projector"),
     }
 
-    let mut sampler = if params.temperature <= 0.0 {
-        LlamaSampler::greedy()
-    } else {
-        let mut chain = Vec::new();
-        if let Some(p) = params.top_p {
-            chain.push(LlamaSampler::top_p(p, 1));
-        }
-        chain.push(LlamaSampler::temp(params.temperature));
-        chain.push(LlamaSampler::dist(1234));
-        LlamaSampler::chain_simple(chain)
-    };
+    let mut sampler = sampler_for(model, &params)?;
     let mut hold = StopHold::new(&params.stop.clone().unwrap_or_default());
     // One decoder for the whole completion: a character split across two
     // tokens decodes once both halves arrive.
@@ -321,8 +469,8 @@ pub fn complete(
         if cancelled() {
             bail!("cancelled: the model is unloading or the client left");
         }
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
+        // `sample` accepts the token itself; a second accept would advance a grammar twice.
+        let token = sampler.sample(&ctx, logits_at);
         if model.is_eog_token(token) {
             hit_end = true;
             break;
@@ -349,6 +497,7 @@ pub fn complete(
             .map_err(|e| anyhow!("batch add (token): {e:?}"))?;
         pos += 1;
         ctx.decode(&mut batch).context("decoding token")?;
+        logits_at = batch.n_tokens() - 1;
     }
     let rest = hold.finish();
     if !rest.is_empty() {
@@ -361,7 +510,8 @@ pub fn complete(
         target: TRACE_TARGET,
         op = "generate",
         model = id,
-        prompt_tokens = tokens.len(),
+        prompt_tokens,
+        images,
         completion_tokens = generated,
         finish = finish.as_str(),
         decode_failures,
@@ -371,7 +521,7 @@ pub fn complete(
     Ok(completion_json(
         id,
         &out,
-        tokens.len(),
+        prompt_tokens,
         generated,
         finish,
         elapsed_ms,
@@ -381,6 +531,9 @@ pub fn complete(
 /// A GGUF held in memory by the model host (a resident model).
 pub struct LoadedLlm {
     id: String,
+    /// The vision projector, when the model reads images.  Declared before `model` so it is
+    /// dropped first: it holds a pointer into the model.
+    projector: Option<Mutex<MtmdContext>>,
     model: LlamaModel,
     backend: Arc<LlamaBackend>,
     defaults: ModelCliDefaults,
@@ -405,6 +558,7 @@ impl ChatModel for LoadedLlm {
     ) -> Result<serde_json::Value> {
         complete(
             &self.model,
+            self.projector.as_ref(),
             &self.backend,
             &self.id,
             &self.defaults,
@@ -443,16 +597,21 @@ pub fn load_resident(models_root: &Path, model: &CatalogModel) -> Result<LoadedL
     })?;
     let started = Instant::now();
     let loaded = load_model(&backend, &model.id, &path)?;
+    let projector = crate::vision::projector(&files)
+        .map(|p| load_projector(&loaded, &model.id, p).map(Mutex::new))
+        .transpose()?;
     info!(
         target: TRACE_TARGET,
         op = "load",
         model = %model.id,
         gpu_layers = gpu_layers(),
+        reads_images = projector.is_some(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "resident model loaded"
     );
     Ok(LoadedLlm {
         id: model.id.clone(),
+        projector,
         model: loaded,
         backend,
         defaults: model.source.cli_defaults.clone(),
@@ -486,6 +645,11 @@ fn ensure_llm_files(
 /// demand.
 const LLAMA_MODEL_WILDCARD: &str = "llama-cpp:*";
 
+/// A vision projector's file name (`mmproj` by llama.cpp's convention): never a chat model.
+fn is_projector_name(stem: &str) -> bool {
+    stem.to_ascii_lowercase().contains("mmproj")
+}
+
 fn is_gguf(path: &Path) -> bool {
     path.extension()
         .and_then(|s| s.to_str())
@@ -494,13 +658,18 @@ fn is_gguf(path: &Path) -> bool {
 }
 
 /// Pick the GGUF to load from a set of downloaded model files: prefer
-/// the explicit `Model`-role file, else the first `.gguf`.  Pure so the
-/// selection contract is unit-tested without a download.
+/// the explicit `Model`-role file, else the first `.gguf` that is not the
+/// vision projector.  Pure so the selection contract is unit-tested
+/// without a download.
 fn pick_gguf(files: &[(ModelFileRole, PathBuf)]) -> Option<PathBuf> {
     files
         .iter()
         .find(|(role, path)| matches!(role, ModelFileRole::Model) && is_gguf(path))
-        .or_else(|| files.iter().find(|(_, path)| is_gguf(path)))
+        .or_else(|| {
+            files.iter().find(|(role, path)| {
+                !matches!(role, ModelFileRole::TextEncoderVision) && is_gguf(path)
+            })
+        })
         .map(|(_, path)| path.clone())
 }
 
@@ -530,12 +699,21 @@ impl LlamaEngine {
         &self,
         model: &str,
         path: &Path,
+        projector: Option<&Path>,
         defaults: &ModelCliDefaults,
         llm: LlmParams,
     ) -> Result<TaskResult> {
         let loaded = self.load_transient(model, path)?;
+        // Only a job with images pays for the projector.  Declared after `loaded`, so dropped first.
+        let projector = match projector {
+            Some(p) if !llm.images.is_empty() => {
+                Some(Mutex::new(load_projector(&loaded, model, p)?))
+            }
+            _ => None,
+        };
         let json = complete(
             &loaded,
+            projector.as_ref(),
             &self.backend,
             model,
             defaults,
@@ -592,7 +770,7 @@ impl Engine for LlamaEngine {
                 self.llm_dir().display()
             )
         })?;
-        self.run_llm(model, &path, &ModelCliDefaults::default(), llm)
+        self.run_llm(model, &path, None, &ModelCliDefaults::default(), llm)
     }
 
     fn dispatch_with_source(
@@ -604,20 +782,32 @@ impl Engine for LlamaEngine {
         let llm = as_llm(task, model)?;
         // Prefer the studio-provided files (download on demand); fall
         // back to a locally-present GGUF when the offer lists none.
-        let path = if source.files.is_empty() {
-            self.resolve_path(model).ok_or_else(|| {
+        let (path, projector) = if source.files.is_empty() {
+            let path = self.resolve_path(model).ok_or_else(|| {
                 anyhow!(
                     "model `{model}` not found in {} and the offer's modelSource \
                      listed no files to download",
                     self.llm_dir().display()
                 )
-            })?
+            })?;
+            (path, None)
         } else {
             let resolved = ensure_llm_files(&self.models_root, source)?;
-            pick_gguf(&resolved)
-                .ok_or_else(|| anyhow!("llama modelSource for `{model}` contained no .gguf file"))?
+            let path = pick_gguf(&resolved).ok_or_else(|| {
+                anyhow!("llama modelSource for `{model}` contained no .gguf file")
+            })?;
+            (
+                path,
+                crate::vision::projector(&resolved).map(Path::to_path_buf),
+            )
         };
-        self.run_llm(model, &path, &source.cli_defaults, llm)
+        self.run_llm(
+            model,
+            &path,
+            projector.as_deref(),
+            &source.cli_defaults,
+            llm,
+        )
     }
 }
 
@@ -727,6 +917,7 @@ mod tests {
         // Just touch a file; we never load it.
         std::fs::write(llm_dir.join("smollm-135m-q8.gguf"), b"not-real").unwrap();
         std::fs::write(llm_dir.join("ignored.txt"), b"x").unwrap();
+        std::fs::write(llm_dir.join("Qwen3.5-9B-mmproj-F16.gguf"), b"x").unwrap();
         let engine = LlamaEngine::new(tmp.path().to_path_buf()).expect("init backend");
         let caps = engine.capabilities();
         let models = &caps.supported_models_per_kind[&TaskKind::Llm];
@@ -765,6 +956,54 @@ mod tests {
         // Nothing gguf at all.
         let files = vec![(ModelFileRole::Vae, PathBuf::from("/m/vae.safetensors"))];
         assert_eq!(pick_gguf(&files), None);
+    }
+
+    #[test]
+    fn pick_gguf_never_takes_the_vision_projector_for_the_model() {
+        let files = vec![
+            (
+                ModelFileRole::TextEncoderVision,
+                PathBuf::from("/m/mmproj.gguf"),
+            ),
+            (ModelFileRole::TextEncoder, PathBuf::from("/m/weights.gguf")),
+        ];
+        assert_eq!(pick_gguf(&files), Some(PathBuf::from("/m/weights.gguf")));
+        assert_eq!(pick_gguf(&files[..1]), None);
+    }
+
+    /// The Glimpse pre-screen's schema (`Screening.request`): nested objects, required keys,
+    /// an array of strings.
+    #[test]
+    fn a_json_schema_becomes_a_grammar() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["familyFriendly", "guesses"],
+            "properties": {
+                "familyFriendly": {
+                    "type": "object",
+                    "required": ["pass", "failedItems", "reason"],
+                    "properties": {
+                        "pass": { "type": "boolean" },
+                        "failedItems": { "type": "array", "items": { "type": "string" } },
+                        "reason": { "type": "string" }
+                    }
+                },
+                "guesses": {
+                    "type": "object",
+                    "required": ["blur"],
+                    "properties": { "blur": { "type": "string" } }
+                }
+            }
+        });
+        let grammar = json_schema_grammar(&schema).unwrap();
+        assert!(grammar.contains("root ::="), "{grammar}");
+        assert!(grammar.contains("familyFriendly"), "{grammar}");
+    }
+
+    #[test]
+    fn a_schema_llama_cannot_express_is_refused_by_name() {
+        let err = json_schema_grammar(&serde_json::json!({ "$ref": "#/nowhere" })).unwrap_err();
+        assert!(err.to_string().contains("jsonSchema"), "{err}");
     }
 
     #[test]

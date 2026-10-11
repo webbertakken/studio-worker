@@ -58,13 +58,18 @@ worker-local (the studio does not send them today):
 
 `role` maps onto `sd-cli` / `llama-cpp` CLI flags:
 
-| Role | sd-cpp CLI flag |
-|---|---|
-| `diffusion-model` | `--diffusion-model` |
-| `text-encoder`    | `--llm`              |
-| `vae`             | `--vae`              |
-| `lora`            | `--lora-model-dir`   |
-| `model`           | `--model` (single-file packaging) |
+| Role | sd-cpp CLI flag | llama-cpp |
+|---|---|---|
+| `diffusion-model` | `--diffusion-model` | |
+| `text-encoder`    | `--llm`              | |
+| `text-encoder-vision` | `--llm_vision`   | the vision projector (`mmproj`): the model reads images ([vision](../engines/llama.md#vision)) |
+| `vae`             | `--vae`              | |
+| `lora`            | `--lora-model-dir`   | |
+| `model`           | `--model` (single-file packaging) | the weights |
+
+LLM files share `<models_root>/llm/`, so a projector's `filename` carries its model's name
+(`Qwen3.5-9B-mmproj-F16.gguf`, not upstream's bare `mmproj-F16.gguf`): two models' projectors
+would otherwise collide on one cached file.
 
 ## Studio side
 
