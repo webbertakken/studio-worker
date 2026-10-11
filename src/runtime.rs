@@ -1340,6 +1340,9 @@ pub fn is_unsupported_kind(e: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<crate::engine::UnsupportedTask>()
             .is_some()
+            || cause
+                .downcast_ref::<crate::vision::ImageRefusal>()
+                .is_some()
     }) || e.to_string().contains("cannot serve")
 }
 

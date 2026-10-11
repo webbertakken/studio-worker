@@ -59,6 +59,7 @@ pub mod types;
 pub mod ui;
 pub mod update;
 pub mod variant;
+pub mod vision;
 pub mod ws;
 
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");

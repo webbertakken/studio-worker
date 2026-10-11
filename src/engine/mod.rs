@@ -278,9 +278,22 @@ impl Engine for SyntheticEngine {
                     .map(|m| format!("{}: {}", m.role, m.content))
                     .collect::<Vec<_>>()
                     .join("\n");
-                Ok(TaskResult::Llm {
-                    json: synthetic_llm_response(&prompt),
-                })
+                let mut json = synthetic_llm_response(&prompt);
+                if !p.images.is_empty() {
+                    let sizes: Vec<String> = crate::vision::load_all(&p.images)?
+                        .iter()
+                        .map(|i| format!("{}x{}", i.width, i.height))
+                        .collect();
+                    let content = &mut json["choices"][0]["message"]["content"];
+                    *content = format!(
+                        "{} (read {} images: {})",
+                        content.as_str().unwrap_or_default(),
+                        sizes.len(),
+                        sizes.join(", ")
+                    )
+                    .into();
+                }
+                Ok(TaskResult::Llm { json })
             }
             Task::AudioStt(p) => Ok(TaskResult::AudioStt {
                 json: synthetic_stt_response(&p.input_url, p.language.as_deref()),
@@ -511,6 +524,50 @@ mod tests {
             .with_guessed_format()
             .unwrap();
         assert_eq!(reader.format().unwrap(), image::ImageFormat::Png);
+    }
+
+    fn png_data_url(width: u32, height: u32) -> String {
+        use base64::Engine as _;
+        let image = image::RgbImage::new(width, height);
+        let mut out = Cursor::new(Vec::new());
+        image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+        )
+    }
+
+    fn chat_with_images(images: Vec<String>) -> Task {
+        Task::Llm(LlmParams {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "what are these?".into(),
+            }],
+            images,
+            ..Default::default()
+        })
+    }
+
+    /// The synthetic engine is the GPU-free stand-in for a vision model: it reads every
+    /// picture and says what it saw, so a test can tell the pictures reached the model.
+    #[test]
+    fn synthetic_llm_reads_the_pictures_it_is_given() {
+        let task = chat_with_images(vec![png_data_url(2, 1), png_data_url(1, 3)]);
+        let TaskResult::Llm { json } = SyntheticEngine::new().dispatch("synthetic", task).unwrap()
+        else {
+            panic!("expected llm")
+        };
+        let content = json["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.ends_with("(read 2 images: 2x1, 1x3)"), "{content}");
+    }
+
+    #[test]
+    fn synthetic_llm_fails_on_a_picture_it_cannot_read() {
+        let task = chat_with_images(vec!["data:image/png;base64,AAAA".into()]);
+        let err = SyntheticEngine::new()
+            .dispatch("synthetic", task)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("input image 1 of 1"), "{err:#}");
     }
 
     #[test]
