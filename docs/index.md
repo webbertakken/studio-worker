@@ -40,6 +40,8 @@ top-level [`README.md`](../README.md).  For active plans, see
 - [sd-cpp engine](engines/sdcpp.md) — real image inference via
   `stable-diffusion.cpp` as a subprocess.  Auto-provisions `sd-cli`
   and downloads model weights on demand, cached in `cfg.models_root`.
+- [llama engine](engines/llama.md) — chat models in process (llama.cpp), structured output and
+  vision: the pictures a model reads with its messages.
 
 ## Operations
 
