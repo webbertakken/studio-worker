@@ -248,6 +248,37 @@ struct ChatBody {
     /// chat is dropped and a running one stopped (`504`).
     #[serde(default)]
     deadline_ms: Option<u64>,
+    /// Pictures the model reads with the last user message, as inline
+    /// `data:image/...;base64,` URLs (the studio's `images`).
+    #[serde(default)]
+    images: Vec<String>,
+    /// OpenAI's structured output: `{"type":"json_schema","json_schema":{"schema":…}}`
+    /// constrains the answer to the schema; `{"type":"text"}` leaves it free.
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
+}
+
+/// The JSON schema an OpenAI `response_format` asks for: `json_schema` gives its `schema`,
+/// `text` none; anything else is refused by name.
+fn schema_of(
+    response_format: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, LocalError> {
+    let Some(format) = response_format else {
+        return Ok(None);
+    };
+    match format["type"].as_str() {
+        Some("text") => Ok(None),
+        Some("json_schema") => match format["json_schema"].get("schema") {
+            Some(schema) if schema.is_object() => Ok(Some(schema.clone())),
+            _ => Err(LocalError::BadInput(
+                "response_format json_schema needs json_schema.schema, an object".into(),
+            )),
+        },
+        other => Err(LocalError::BadInput(format!(
+            "response_format type {} is not served; use json_schema or text",
+            other.map_or_else(|| "(missing)".to_string(), |t| format!("`{t}`"))
+        ))),
+    }
 }
 
 /// llama-server compatible `/tokenize` request.
@@ -618,9 +649,11 @@ impl LocalApi {
     /// engines already emit a `chat.completion`-shaped body).
     fn handle_chat(&self, mut request: Request) -> std::io::Result<()> {
         let received = std::time::Instant::now();
-        let body = match read_body(&mut request)? {
+        let body = match read_body_capped(&mut request, MAX_IMAGE_BODY_BYTES)? {
             BodyOutcome::Ok(body) => body,
-            BodyOutcome::TooLarge => return respond_too_large(request),
+            BodyOutcome::TooLarge => {
+                return respond_too_large_capped(request, MAX_IMAGE_BODY_BYTES)
+            }
         };
         let parsed: ChatBody = match serde_json::from_str(&body) {
             Ok(p) => p,
@@ -638,6 +671,14 @@ impl LocalApi {
             .last()
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        let catalog = self.catalog.lock().clone();
+        if let Err(err) = chat_images_readable(&catalog, parsed.model.as_deref(), &parsed.images) {
+            return respond_local_err(request, err);
+        }
+        let json_schema = match schema_of(parsed.response_format) {
+            Ok(schema) => schema,
+            Err(err) => return respond_local_err(request, err),
+        };
         let params = LlmParams {
             messages: parsed
                 .messages
@@ -652,12 +693,13 @@ impl LocalApi {
             top_p: parsed.top_p,
             stop: parsed.stop,
             chat_template_kwargs: parsed.chat_template_kwargs,
+            images: parsed.images,
+            json_schema,
             ..Default::default()
         };
         let deadline = parsed
             .deadline_ms
             .and_then(|ms| received.checked_add(std::time::Duration::from_millis(ms)));
-        let catalog = self.catalog.lock().clone();
         if parsed.stream {
             return self.stream_chat(
                 request,
@@ -963,6 +1005,12 @@ impl LocalApi {
             .iter()
             .map(|model| {
                 let mut value = serde_json::to_value(model).unwrap_or_default();
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "images".into(),
+                        crate::vision::reads_images(&model.source).into(),
+                    );
+                }
                 if let (Some(obj), Some(status)) = (
                     value.as_object_mut(),
                     statuses.iter().find(|s| s.id == model.id),
@@ -1396,6 +1444,30 @@ fn content_type_for(ext: &str) -> &'static str {
 /// Map a [`LocalError`] onto an HTTP response: catalog/contract errors
 /// (unknown or wrong-kind model, none configured) are the caller's
 /// fault → 400 with the message; an engine failure is 500.
+/// A chat's pictures are inline, and the model it resolves to reads images.  No pictures: `Ok`
+/// whatever the model.
+fn chat_images_readable(
+    catalog: &Catalog,
+    model_id: Option<&str>,
+    images: &[String],
+) -> Result<(), LocalError> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    if let Some(index) = images.iter().position(|u| !u.starts_with("data:image/")) {
+        return Err(LocalError::BadInput(format!(
+            "images[{index}] must be a data:image/...;base64, URL"
+        )));
+    }
+    let model = crate::local::resolve_llm(catalog, model_id)?;
+    let task = Task::Llm(LlmParams {
+        images: images.to_vec(),
+        ..Default::default()
+    });
+    crate::vision::check(&model.id, &task, Some(&model.source))
+        .map_err(|refusal| LocalError::BadInput(refusal.to_string()))
+}
+
 fn respond_local_err(request: Request, err: LocalError) -> std::io::Result<()> {
     let status = match err {
         LocalError::Engine(_) => 500,
@@ -2064,6 +2136,167 @@ mod tests {
             body["kwargs"],
             serde_json::json!({ "enable_thinking": false })
         );
+    }
+
+    /// A synthetic chat model with a vision projector: it reads images.
+    fn vision_catalog() -> Catalog {
+        let mut vision = synthetic_model_of("vision-llm", TaskKind::Llm);
+        vision.source.files.push(crate::types::ModelFile {
+            role: crate::types::ModelFileRole::TextEncoderVision,
+            url: "https://models.invalid/mmproj.gguf".into(),
+            filename: "mmproj.gguf".into(),
+            approx_bytes: None,
+            sha256: None,
+        });
+        Catalog {
+            models: vec![vision, synthetic_model_of("chat-llm", TaskKind::Llm)],
+            ..Default::default()
+        }
+    }
+
+    fn inline_png(width: u32, height: u32) -> String {
+        use base64::Engine as _;
+        let image = image::RgbImage::new(width, height);
+        let mut out = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+        )
+    }
+
+    fn chat_text(h: &Harness, body: serde_json::Value) -> (u16, String) {
+        let response = h.post("/v1/chat/completions").json(&body).send().unwrap();
+        (response.status().as_u16(), response.text().unwrap())
+    }
+
+    #[test]
+    fn a_vision_model_reads_inline_images_as_a_transient_job() {
+        let h = Harness::start(vision_catalog());
+        let (status, body) = chat(
+            &h,
+            serde_json::json!({
+                "model": "vision-llm",
+                "messages": [{ "role": "user", "content": "what is it?" }],
+                "images": [inline_png(2, 1)],
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.ends_with("(read 1 images: 2x1)"), "{content}");
+    }
+
+    #[test]
+    fn a_loaded_vision_model_gets_the_images_and_schema_on_its_lane() {
+        let h = Harness::start(vision_catalog());
+        h.post("/models/vision-llm/load").send().unwrap();
+        wait_state(&h, "vision-llm", "loaded");
+        let schema = serde_json::json!({ "type": "object" });
+        let (status, body) = chat(
+            &h,
+            serde_json::json!({
+                "model": "vision-llm",
+                "messages": [{ "role": "user", "content": "what is it?" }],
+                "images": [inline_png(1, 1), inline_png(1, 1)],
+                "response_format": { "type": "json_schema", "json_schema": { "name": "a", "schema": schema } },
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["images"], 2, "{body}");
+        assert_eq!(body["jsonSchema"], schema, "{body}");
+    }
+
+    #[test]
+    fn images_for_a_model_that_reads_none_are_refused() {
+        let h = Harness::start(vision_catalog());
+        let (status, body) = chat_text(
+            &h,
+            serde_json::json!({
+                "model": "chat-llm",
+                "messages": [{ "role": "user", "content": "what is it?" }],
+                "images": [inline_png(1, 1)],
+            }),
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("reads no images"), "{body}");
+        assert!(h.observers.local_jobs.lock().is_empty(), "nothing ran");
+    }
+
+    #[test]
+    fn images_must_travel_inline() {
+        let h = Harness::start(vision_catalog());
+        let (status, body) = chat_text(
+            &h,
+            serde_json::json!({
+                "model": "vision-llm",
+                "messages": [{ "role": "user", "content": "what is it?" }],
+                "images": ["https://example.invalid/a.png"],
+            }),
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("data:image"), "{body}");
+    }
+
+    #[test]
+    fn a_response_format_other_than_a_json_schema_or_text_is_refused() {
+        let h = Harness::start(llm_catalog());
+        let (status, body) = chat_text(
+            &h,
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "response_format": { "type": "json_object" },
+            }),
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("response_format"), "{body}");
+    }
+
+    #[test]
+    fn response_format_maps_to_the_schema_it_names() {
+        let schema = serde_json::json!({ "type": "object" });
+        let named = |v: serde_json::Value| schema_of(Some(v)).map_err(|e| e.to_string());
+        assert_eq!(schema_of(None).unwrap(), None);
+        assert_eq!(named(serde_json::json!({ "type": "text" })), Ok(None));
+        assert_eq!(
+            named(
+                serde_json::json!({ "type": "json_schema", "json_schema": { "schema": schema } })
+            ),
+            Ok(Some(schema))
+        );
+        let missing = named(serde_json::json!({ "type": "json_schema", "json_schema": {} }));
+        assert!(missing.unwrap_err().contains("json_schema.schema"));
+        let untyped = named(serde_json::json!({}));
+        assert!(untyped.unwrap_err().contains("(missing)"));
+    }
+
+    #[test]
+    fn a_chat_with_pictures_may_be_larger_than_a_plain_request() {
+        let h = Harness::start(llm_catalog());
+        let (status, body) = chat_text(
+            &h,
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "x".repeat(MAX_BODY_BYTES + 1) }],
+                "max_tokens": 1,
+            }),
+        );
+        assert_eq!(status, 200, "{}", &body[..body.len().min(200)]);
+    }
+
+    #[test]
+    fn the_model_list_says_which_models_read_images() {
+        let h = Harness::start(vision_catalog());
+        let (_, listed) = json(h.get("/models").send().unwrap());
+        let reads = |id: &str| {
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap()["images"]
+                .clone()
+        };
+        assert_eq!(reads("vision-llm"), true);
+        assert_eq!(reads("chat-llm"), false);
     }
 
     #[test]

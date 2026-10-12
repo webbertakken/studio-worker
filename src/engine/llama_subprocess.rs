@@ -259,6 +259,36 @@ impl LlamaSubprocessEngine {
     }
 }
 
+/// Refuse what llama-cli is not driven with here: pictures (the model would answer about pictures
+/// it never saw) and a JSON schema (the answer would be free text).  Permanent for this engine.
+#[cfg(any(target_os = "windows", test))]
+fn refuse_unsupported(model: &str, params: &LlmParams) -> Result<()> {
+    if params.json_schema.is_some() {
+        warn!(
+            target: TRACE_TARGET,
+            op = "schema",
+            model,
+            "a chat with a JSON schema refused: llama-subprocess honours no schema"
+        );
+        bail!("llama-subprocess honours no JSON schema: model `{model}` was asked for one");
+    }
+    if params.images.is_empty() {
+        return Ok(());
+    }
+    warn!(
+        target: TRACE_TARGET,
+        op = "images",
+        model,
+        count = params.images.len(),
+        "a chat with images refused: llama-subprocess reads no images"
+    );
+    bail!(
+        "llama-subprocess reads no images: model `{model}` was sent {} on a worker without the \
+         in-process llama engine",
+        params.images.len()
+    )
+}
+
 #[cfg(any(target_os = "windows", test))]
 impl super::Engine for LlamaSubprocessEngine {
     fn name(&self) -> &'static str {
@@ -287,7 +317,10 @@ impl super::Engine for LlamaSubprocessEngine {
         source: &ModelSource,
     ) -> Result<TaskResult> {
         match task {
-            Task::Llm(p) => self.run_chat(model, p, source),
+            Task::Llm(p) => {
+                refuse_unsupported(model, &p)?;
+                self.run_chat(model, p, source)
+            }
             other => Err(super::UnsupportedTask::new("llama-subprocess", other.kind()).into()),
         }
     }
@@ -297,6 +330,37 @@ impl super::Engine for LlamaSubprocessEngine {
 mod tests {
     use super::*;
     use crate::types::ChatMessage;
+
+    /// llama-cli takes no pictures here: a chat that carries them is refused, never answered unseen.
+    #[test]
+    fn a_chat_with_images_is_refused_before_anything_runs() {
+        let with_images = LlmParams {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "what is this?".into(),
+            }],
+            images: vec!["data:image/png;base64,AAAA".into()],
+            ..Default::default()
+        };
+        let err = refuse_unsupported("qwen3.5-9b-vision", &with_images).unwrap_err();
+        assert!(format!("{err:#}").contains("reads no images"), "{err:#}");
+
+        assert!(refuse_unsupported("qwen3.5-9b-vision", &LlmParams::default()).is_ok());
+    }
+
+    /// llama-cli is driven without a grammar here: a schema is refused, never answered freely.
+    #[test]
+    fn a_chat_with_a_json_schema_is_refused() {
+        let with_schema = LlmParams {
+            json_schema: Some(serde_json::json!({ "type": "object" })),
+            ..Default::default()
+        };
+        let err = refuse_unsupported("qwen3.5-2b", &with_schema).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("honours no JSON schema"),
+            "{err:#}"
+        );
+    }
 
     #[test]
     fn select_build_prefers_env_then_default() {

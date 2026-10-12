@@ -206,6 +206,8 @@ impl crate::host::ChatModel for TestLoaded {
             "model": self.id,
             "choices": [{ "index": 0, "message": { "role": "assistant", "content": format!("resident:{last}") }, "finish_reason": "stop" }],
             "kwargs": params.chat_template_kwargs,
+            "images": params.images.len(),
+            "jsonSchema": params.json_schema,
             "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 },
         }))
     }

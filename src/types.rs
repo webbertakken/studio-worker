@@ -145,6 +145,11 @@ pub struct LlmParams {
     /// `{"enable_thinking": false}`); overrides the model's own defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Pictures the model reads with the last user message, in order: absolute URLs (the
+    /// studio's job inputs) or `data:image/...;base64,` URLs.  Only a model with a vision
+    /// projector reads them; any other model refuses the task (see `crate::vision`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -607,6 +612,41 @@ mod tests {
             }
             other => panic!("expected llm, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn an_llm_task_carries_the_studios_images_in_order() {
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "kind": "llm",
+            "messages": [{"role": "user", "content": "what is this?"}],
+            "images": ["https://studio.invalid/a/0", "https://studio.invalid/a/1"],
+        }))
+        .unwrap();
+        let Task::Llm(p) = task else {
+            panic!("expected llm")
+        };
+        assert_eq!(
+            p.images,
+            vec![
+                "https://studio.invalid/a/0".to_string(),
+                "https://studio.invalid/a/1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_llm_task_without_images_reads_none_and_writes_none() {
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "kind": "llm",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        let Task::Llm(p) = &task else {
+            panic!("expected llm")
+        };
+        assert!(p.images.is_empty());
+        let wire = serde_json::to_value(&task).unwrap();
+        assert!(wire.get("images").is_none(), "{wire}");
     }
 
     #[test]

@@ -28,6 +28,22 @@ pub struct MultiEngine {
     engines: Vec<Box<dyn Engine>>,
 }
 
+/// A task carrying pictures its model cannot read is refused here, before any engine runs, so
+/// no backend answers about pictures it never saw.
+fn refuse_unreadable_images(model: &str, task: &Task, source: Option<&ModelSource>) -> Result<()> {
+    crate::vision::check(model, task, source).map_err(|refusal| {
+        warn!(
+            target: TRACE_TARGET,
+            op = "images",
+            model,
+            images = crate::vision::images_of(task).len(),
+            reason = %refusal,
+            "refusing a task whose images the model cannot read"
+        );
+        refusal.into()
+    })
+}
+
 impl MultiEngine {
     pub fn new(engines: Vec<Box<dyn Engine>>) -> Self {
         Self { engines }
@@ -87,6 +103,7 @@ impl Engine for MultiEngine {
     }
 
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult> {
+        refuse_unreadable_images(model, &task, None)?;
         let kind = task.kind();
         let Some(engine) = self.pick_for(kind, model) else {
             bail!(
@@ -105,6 +122,7 @@ impl Engine for MultiEngine {
         task: Task,
         source: &crate::types::ModelSource,
     ) -> Result<TaskResult> {
+        refuse_unreadable_images(model, &task, Some(source))?;
         let kind = task.kind();
         // The studio knows exactly which engine should serve this
         // job (source.engine); we route strictly to that backend.
@@ -430,5 +448,73 @@ mod tests {
             TaskResult::Llm { json } => assert_eq!(json["from"], "llama"),
             _ => panic!("expected the llm to route to the llama stub"),
         }
+    }
+
+    fn llm_with_images() -> Task {
+        Task::Llm(LlmParams {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "what is it?".into(),
+            }],
+            images: vec!["data:image/png;base64,AA==".into()],
+            ..Default::default()
+        })
+    }
+
+    fn llama_stub() -> MultiEngine {
+        MultiEngine::new(vec![Box::new(StubEngine {
+            name: "llama",
+            kinds: vec![TaskKind::Llm],
+            models: vec!["local-gguf".into()],
+        })])
+    }
+
+    /// A worker that cannot read the pictures refuses the task: no engine ever sees it.
+    #[test]
+    fn images_for_a_model_without_a_projector_are_refused_before_any_engine() {
+        let source = source_for(crate::types::ModelEngine::LlamaCpp);
+        let err = llama_stub()
+            .dispatch_with_source("text-only", llm_with_images(), &source)
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::vision::ImageRefusal>().is_some(),
+            "{err}"
+        );
+        assert!(crate::runtime::is_unsupported_kind(&err), "{err}");
+    }
+
+    #[test]
+    fn images_for_a_model_known_only_by_its_file_are_refused() {
+        let err = llama_stub()
+            .dispatch("local-gguf", llm_with_images())
+            .unwrap_err();
+        assert!(err.to_string().contains("reads no images"), "{err}");
+    }
+
+    #[test]
+    fn images_for_a_model_with_a_projector_reach_its_engine() {
+        let mut source = source_for(crate::types::ModelEngine::LlamaCpp);
+        source.files.push(crate::types::ModelFile {
+            role: crate::types::ModelFileRole::TextEncoderVision,
+            url: "https://models.invalid/p.gguf".into(),
+            filename: "p.gguf".into(),
+            approx_bytes: None,
+            sha256: None,
+        });
+        let result = llama_stub()
+            .dispatch_with_source("vl", llm_with_images(), &source)
+            .unwrap();
+        assert!(matches!(result, TaskResult::Llm { .. }));
+    }
+
+    #[test]
+    fn a_refusal_leaves_a_warning_naming_the_model() {
+        let logs = crate::test_support::capture(|| {
+            let source = source_for(crate::types::ModelEngine::LlamaCpp);
+            let _ = llama_stub().dispatch_with_source("text-only", llm_with_images(), &source);
+        });
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("op=\"images\""), "{logs}");
+        assert!(logs.contains("text-only"), "{logs}");
     }
 }

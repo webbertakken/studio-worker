@@ -21,8 +21,8 @@ itself a client of this API (see [daemon control](#daemon-control)).
   preferred port is taken the worker falls back to an ephemeral port and logs
   the chosen URL (also shown on the tray UI's Worker page and under the Jobs page's
   Local filter, and published in the discovery file).
-- Request bodies are capped at 1 MiB (`413` beyond that); `POST /image` at 64 MiB, room for
-  inline input images.
+- Request bodies are capped at 1 MiB (`413` beyond that); `POST /image` and
+  `POST /v1/chat/completions` at 64 MiB, room for inline input images.
 - Synchronous: `POST /image` blocks until the engine finishes and returns the
   image bytes. Each job is recorded in the in-app **Local queue**.
 
@@ -31,12 +31,12 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | Method | Path            | Auth | Body / params                              | Returns |
 | ------ | --------------- | ---- | ------------------------------------------ | ------- |
 | POST   | `/image`        | yes  | JSON image request (below)                 | image bytes (`image/webp` etc.) |
-| POST   | `/v1/chat/completions` | yes | OpenAI-compatible chat body (`model?`, `messages`, `max_tokens?`, `temperature?`, `top_p?`, `stop?`, `chat_template_kwargs?`, `stream?`, `deadline_ms?`) | `chat.completion` JSON |
+| POST   | `/v1/chat/completions` | yes | OpenAI-compatible chat body (`model?`, `messages`, `max_tokens?`, `temperature?`, `top_p?`, `stop?`, `chat_template_kwargs?`, `stream?`, `deadline_ms?`, `images?`, `response_format?`) | `chat.completion` JSON |
 | POST   | `/tts`          | yes  | `{text, model?, voice?, speed?, language?, ext?}` | audio bytes (`audio/wav` etc.) |
 | POST   | `/stt`          | yes  | `{inputUrl, model?, language?}`            | transcript JSON |
 | POST   | `/video`        | yes  | `{prompt, model?, negativePrompt?, seconds?, width?, height?, ext?}` | video bytes (`video/mp4` etc.) |
 | POST   | `/tokenize`     | yes  | `{content, model?, add_special?}` (llama-server shape) | `{tokens: [...]}` from a loaded chat model |
-| GET    | `/models`       | yes  | —                                          | catalog as JSON array, each entry with `state`, `resident`, `since`, `loadable` (+ `error` when failed) |
+| GET    | `/models`       | yes  | —                                          | catalog as JSON array, each entry with `state`, `resident`, `since`, `loadable`, `images` (+ `error` when failed) |
 | GET    | `/models/:id/state` | yes | —                                        | `{id, state, resident, since, error?}` |
 | POST   | `/models/:id/load`  | yes | —                                        | `202` loading / `200` loaded; marks it resident |
 | POST   | `/models/:id/unload`| yes | —                                        | `202` unloading / `200` unloaded; clears residency |
@@ -270,6 +270,24 @@ deadline a chat still queued on the lane is dropped without running, and a
 running one stops at its next prompt batch or token. The answer is `504` (a
 stream ends on its error event), and the job is recorded as failed with
 `deadline passed`. Without it a chat runs to the end.
+
+**Images.** `images` is a list of inline `data:image/<type>;base64,` pictures (PNG, JPEG, WebP),
+read in order with the last user message, as a studio job's `images` are. Only a model whose
+source carries a vision projector (a `text-encoder-vision` file; `images: true` on `GET /models`)
+reads them; any other model answers `400 … reads no images` and nothing runs. Any other address is
+refused (`400`): the local API never makes the worker fetch a URL a caller names. At most 16
+pictures, 25 MiB each. See [vision](engines/llama.md#vision).
+
+**Structured output.** `response_format: {"type": "json_schema", "json_schema": {"schema": {…}}}`
+constrains the answer to the schema (a llama.cpp grammar; a studio job's `jsonSchema` does the
+same); `{"type": "text"}` leaves it free; any other type is refused (`400`).
+
+```bash
+curl -s "$(jq -r .url $DISCOVERY)/v1/chat/completions" \
+  -H "authorization: Bearer $(jq -r .token $DISCOVERY)" -H 'content-type: application/json' \
+  -d "{\"model\":\"qwen3.5-9b-vision\",\"messages\":[{\"role\":\"user\",\"content\":\"What is this?\"}],
+       \"images\":[\"data:image/webp;base64,$(base64 -w0 picture.webp)\"]}"
+```
 
 **Token counts.** `POST /tokenize` returns the loaded model's token ids for
 `content` (`404 unknown_model`, `409 model_not_loaded`), so a client can size
