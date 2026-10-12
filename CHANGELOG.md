@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.17](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.16...studio-worker-v0.4.17) (2026-10-12)
+
+
+### Features
+
+* chat models read images ([#157](https://github.com/webbertakken/studio-worker/issues/157)) ([672c6b3](https://github.com/webbertakken/studio-worker/commit/672c6b3d924fe9435464dad5689de50bd2d3db9b))
+
 ## [0.4.16](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.15...studio-worker-v0.4.16) (2026-10-07)
 
 
