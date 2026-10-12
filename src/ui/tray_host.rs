@@ -189,6 +189,23 @@ impl ksni::Tray for KsniTray {
     }
 }
 
+/// The wait before re-registering the tray icon after its service ended for the `attempt`th time
+/// in a row: 2 s, doubling, at most five minutes.
+#[cfg(target_os = "linux")]
+pub fn ksni_respawn_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(2)
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
+        .min(std::time::Duration::from_secs(300))
+}
+
+/// A tray service that stayed up this long starts the backoff over when it ends.
+#[cfg(target_os = "linux")]
+const KSNI_STABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the tray checks that its service still runs.
+#[cfg(target_os = "linux")]
+const KSNI_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Spawn the ksni tray on the tokio runtime and return a handle that
 /// forwards variant updates to it.  The service is set up
 /// asynchronously; variant updates sent before it is ready are buffered
@@ -207,34 +224,79 @@ pub fn install(
     use ksni::TrayMethods;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TrayVariant>();
     tokio.spawn(async move {
-        let tray = KsniTray {
-            variant: TrayVariant::Disconnected,
-            paused,
-            set_paused,
-            quit,
-            ctx,
-        };
-        let handle = match tray.spawn().await {
-            Ok(h) => {
-                tracing::info!(target: TRACE_TARGET, "linux tray (ksni) started");
-                h
+        let mut variant = TrayVariant::Disconnected;
+        // Ends of the tray service in a row; 0 until the first start.
+        let mut losses: u32 = 0;
+        loop {
+            let tray = KsniTray {
+                variant,
+                paused: paused.clone(),
+                set_paused: set_paused.clone(),
+                quit: quit.clone(),
+                ctx: ctx.clone(),
+            };
+            let handle = match tray.spawn().await {
+                Ok(h) => {
+                    tracing::info!(target: TRACE_TARGET, op = "tray", losses, "linux tray (ksni) started");
+                    h
+                }
+                Err(e) if losses == 0 => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        op = "tray",
+                        error = %e,
+                        "linux tray (ksni) failed to start; running without a tray"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    losses += 1;
+                    let wait = ksni_respawn_delay(losses);
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        op = "tray",
+                        losses,
+                        retry_in_secs = wait.as_secs(),
+                        error = %e,
+                        "linux tray (ksni) could not re-register; retrying"
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+            let started = std::time::Instant::now();
+            loop {
+                tokio::select! {
+                    next = rx.recv() => match next {
+                        Some(next) => {
+                            variant = next;
+                            handle.update(move |t: &mut KsniTray| t.variant = next).await;
+                        }
+                        None => {
+                            // All senders dropped (window closed): tear the tray down.
+                            handle.shutdown().await;
+                            return;
+                        }
+                    },
+                    _ = tokio::time::sleep(KSNI_CHECK_EVERY) => {
+                        if handle.is_closed() {
+                            break;
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    error = %e,
-                    "linux tray (ksni) failed to start; running without a tray"
-                );
-                return;
-            }
-        };
-        while let Some(variant) = rx.recv().await {
-            handle
-                .update(move |t: &mut KsniTray| t.variant = variant)
-                .await;
+            losses = if started.elapsed() >= KSNI_STABLE_AFTER { 1 } else { losses + 1 };
+            let wait = ksni_respawn_delay(losses);
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "tray",
+                losses,
+                up_secs = started.elapsed().as_secs(),
+                retry_in_secs = wait.as_secs(),
+                "linux tray (ksni) service ended (its D-Bus connection was lost); re-registering the icon"
+            );
+            tokio::time::sleep(wait).await;
         }
-        // All senders dropped (window closed) — tear the tray down.
-        handle.shutdown().await;
     });
     Some(TrayHandle {
         inner: Inner { tx, warned: false },
@@ -378,6 +440,17 @@ pub fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lost_tray_service_re_registers_after_a_doubling_capped_wait() {
+        use std::time::Duration;
+        assert_eq!(ksni_respawn_delay(1), Duration::from_secs(2));
+        assert_eq!(ksni_respawn_delay(2), Duration::from_secs(4));
+        assert_eq!(ksni_respawn_delay(5), Duration::from_secs(32));
+        assert_eq!(ksni_respawn_delay(9), Duration::from_secs(300));
+        assert_eq!(ksni_respawn_delay(u32::MAX), Duration::from_secs(300));
+    }
 
     // The mac/win tray builds an icon image from a static RGBA buffer in
     // two places (`install` at startup, `set_variant` on every health

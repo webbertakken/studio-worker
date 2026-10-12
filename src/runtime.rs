@@ -602,6 +602,9 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     let observers = WorkerObservers::with_global_worker_log();
     let presence_monitor =
         crate::presence::spawn_monitor(observers.user_presence.clone(), control.stop.clone());
+    // A tray UI that vanished (crashed, killed, lost with its session bus) comes back.
+    #[cfg(feature = "ui")]
+    crate::tray_watchdog::spawn(control.clone());
 
     let stop_clone = control.stop.clone();
     tokio::spawn(async move {

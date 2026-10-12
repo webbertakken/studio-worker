@@ -12,6 +12,7 @@
 pub mod actions;
 pub mod app;
 pub mod chrome;
+pub mod exit_log;
 pub mod format;
 pub mod icons;
 pub mod log_view;
@@ -95,8 +96,15 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     );
     let _ui_lock = match take_ui_lock(&path, attempt > 0 || restarted.is_some()) {
         UiLockOutcome::Held(lock) => lock,
-        UiLockOutcome::HandedOver => return Ok(()),
+        UiLockOutcome::HandedOver => {
+            exit_log::log_exit("another tray UI runs for this config; it was asked to show itself");
+            return Ok(());
+        }
     };
+    exit_log::install_panic_log();
+    #[cfg(unix)]
+    exit_log::spawn_signal_log(&tokio::runtime::Handle::current());
+    exit_log::clear_quit_marker(&path);
     let peeked = config::peek(&path);
     sync_login_entry(&launch, peeked.auto_start);
     // Installed, the worker runs as the tray UI only: a legacy headless service goes.
@@ -212,6 +220,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     match outcome {
         Ok(()) => {
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            exit_log::log_exit("the window's event loop ended (Quit, or the window was closed)");
             Ok(())
         }
         Err(err) => {

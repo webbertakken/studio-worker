@@ -17,7 +17,7 @@ pub trait SetupOps {
     fn exe(&self) -> Result<PathBuf>;
     /// Install (or refresh) the tray UI's login entry when `enabled`, remove it otherwise.
     fn sync_login_entry(&self, exe: &Path, enabled: bool) -> Result<()>;
-    /// Start `exe args` detached, output appended to `log`; its pid.
+    /// Start `exe args` detached, its stderr appended to `log`; its pid.
     fn start_ui(&self, exe: &Path, args: &[OsString], log: &Path) -> std::io::Result<u32>;
 }
 
@@ -141,9 +141,11 @@ impl SetupOps for RealOps {
             .append(true)
             .open(log)?;
         let mut cmd = Command::new(exe);
+        // The UI writes its own log to `log` (`ui_log`); stderr keeps what bypasses tracing (a
+        // panic message).
         cmd.args(args)
             .stdin(Stdio::null())
-            .stdout(out.try_clone()?)
+            .stdout(Stdio::null())
             .stderr(out);
         // Its own process group / no console, so it outlives the installer.
         #[cfg(unix)]

@@ -54,9 +54,11 @@ pub mod telemetry;
 #[doc(hidden)]
 pub mod test_support;
 pub mod thumbnail;
+pub mod tray_watchdog;
 pub mod types;
 #[cfg(feature = "ui")]
 pub mod ui;
+pub mod ui_log;
 pub mod update;
 pub mod variant;
 pub mod vision;
@@ -89,9 +91,34 @@ fn log_cli_startup(command: &cli::Command) {
     );
 }
 
+/// The file the tray UI logs to: `<config dir>/ui.log` for `ui`, nothing for the other commands
+/// (and nothing when the config path cannot be resolved; the UI then reports that itself).
+pub fn ui_log_target(
+    command: &cli::Command,
+    config_path: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    match command {
+        cli::Command::Ui => config::resolve_path(config_path)
+            .ok()
+            .map(|path| daemon_link::ui_log_path(&path)),
+        _ => None,
+    }
+}
+
 /// Dispatch table for the CLI subcommands.  Lives in the library so we
 /// can drive it from tests without invoking the binary.
 pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {
+    if let Some(log) = ui_log_target(&args.command, args.config.as_deref()) {
+        if let Err(e) = ui_log::open(&log) {
+            tracing::warn!(
+                target: CLI_TRACE_TARGET,
+                op = "startup",
+                log = %log.display(),
+                error = %e,
+                "could not open the tray UI log; logging to stdout only"
+            );
+        }
+    }
     log_cli_startup(&args.command);
     match args.command {
         cli::Command::Run => runtime::run(args.config.as_deref()).await,
@@ -136,6 +163,22 @@ async fn run_ui(_config_path: Option<&str>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::capture;
+
+    #[test]
+    fn only_the_tray_ui_logs_to_ui_log_beside_its_config() {
+        assert_eq!(
+            ui_log_target(&cli::Command::Ui, Some("/home/a/.config/sw/config.toml")),
+            Some(std::path::PathBuf::from("/home/a/.config/sw/ui.log"))
+        );
+        assert_eq!(
+            ui_log_target(&cli::Command::Run, Some("/home/a/.config/sw/config.toml")),
+            None
+        );
+        assert_eq!(
+            ui_log_target(&cli::Command::Setup, Some("/home/a/.config/sw/config.toml")),
+            None
+        );
+    }
 
     #[test]
     fn the_default_log_filter_keeps_llama_cpp_info_and_drops_its_debug() {
