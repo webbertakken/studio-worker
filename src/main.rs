@@ -20,6 +20,7 @@ fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(studio_worker::ui_log::layer())
         .with(telemetry::tracing_layer())
         .with(studio_worker::job_log::JobLogLayer::global())
         .with(studio_worker::job_log::WorkerLogLayer::global())

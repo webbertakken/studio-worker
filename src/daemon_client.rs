@@ -41,6 +41,11 @@ struct Discovery {
     token: String,
 }
 
+/// The header a daemon client names itself with.
+pub const CLIENT_HEADER: &str = "x-studio-worker-client";
+/// The tray UI's name in [`CLIENT_HEADER`].
+pub const TRAY_CLIENT: &str = "tray";
+
 /// A client bound to one daemon's URL and token.
 #[derive(Clone)]
 pub struct DaemonClient {
@@ -124,8 +129,13 @@ impl DaemonClient {
         self.http.post(format!("{}{path}", self.url))
     }
 
+    /// The daemon's status. The tray UI's once-a-second poll marks itself, so the daemon knows a
+    /// tray is alive (`tray_watchdog`).
     pub fn status(&self) -> Result<DaemonStatus, ClientError> {
-        self.json(self.get("/daemon/status"))
+        self.json(
+            self.get("/daemon/status")
+                .header(CLIENT_HEADER, TRAY_CLIENT),
+        )
     }
 
     pub fn logs(&self, after: u64) -> Result<LogsPage, ClientError> {

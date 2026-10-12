@@ -1252,6 +1252,13 @@ impl LocalApi {
         let path = url.split('?').next().unwrap_or("/");
         match (method, path) {
             (Method::Get, "/daemon/status") => {
+                let from_tray = request.headers().iter().any(|h| {
+                    h.field.equiv(crate::daemon_client::CLIENT_HEADER)
+                        && h.value.as_str() == crate::daemon_client::TRAY_CLIENT
+                });
+                if from_tray {
+                    control.note_tray_poll(crate::tray_watchdog::now_ms());
+                }
                 let status = control.status(&self.observers, self.gate.is_busy());
                 respond_serialised(request, 200, &status)
             }
@@ -2673,6 +2680,28 @@ mod tests {
             .send()
             .unwrap();
         assert_eq!(resp.status(), 401);
+    }
+
+    #[test]
+    fn a_status_poll_marked_as_the_tray_s_is_noted_for_the_watchdog() {
+        let daemon = crate::test_support::DaemonHarness::start();
+        let client = reqwest::blocking::Client::new();
+        let poll = |marked: bool| {
+            let mut request = client
+                .get(format!("{}/daemon/status", daemon.url))
+                .bearer_auth(crate::test_support::HARNESS_TOKEN);
+            if marked {
+                request = request.header(
+                    crate::daemon_client::CLIENT_HEADER,
+                    crate::daemon_client::TRAY_CLIENT,
+                );
+            }
+            assert_eq!(request.send().unwrap().status(), 200);
+        };
+        poll(false);
+        assert_eq!(daemon.control.tray_last_seen(), None);
+        poll(true);
+        assert!(daemon.control.tray_last_seen().is_some());
     }
 
     #[test]

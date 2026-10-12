@@ -5,7 +5,7 @@
 //! without a socket.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::auto_register::{RegistrationState, SharedRegistration};
@@ -30,6 +30,9 @@ pub struct DaemonControl {
     pub reset_requested: Arc<AtomicBool>,
     /// Total device memory, probed once at start.
     pub vram_total_gb: f32,
+    /// When the tray UI last polled, in milliseconds since the Unix epoch; 0 until it first does
+    /// (`tray_watchdog`).
+    pub tray_last_seen_ms: Arc<AtomicU64>,
 }
 
 /// Why a control action was refused.
@@ -54,6 +57,20 @@ impl DaemonControl {
             registration: crate::auto_register::shared_initial(),
             reset_requested: Arc::new(AtomicBool::new(false)),
             vram_total_gb,
+            tray_last_seen_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Note that the tray UI polled at `now_ms` (milliseconds since the Unix epoch).
+    pub fn note_tray_poll(&self, now_ms: u64) {
+        self.tray_last_seen_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// When the tray UI last polled, or `None` when no tray ever did.
+    pub fn tray_last_seen(&self) -> Option<u64> {
+        match self.tray_last_seen_ms.load(Ordering::Relaxed) {
+            0 => None,
+            seen => Some(seen),
         }
     }
 
@@ -210,6 +227,15 @@ mod tests {
             ..Config::default()
         };
         DaemonControl::new(crate::config::shared(cfg), dir.join("config.toml"), 24.0)
+    }
+
+    #[test]
+    fn remembers_when_the_tray_last_polled() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = control_in(dir.path());
+        assert_eq!(control.tray_last_seen(), None);
+        control.note_tray_poll(1_700_000_000_000);
+        assert_eq!(control.tray_last_seen(), Some(1_700_000_000_000));
     }
 
     #[test]

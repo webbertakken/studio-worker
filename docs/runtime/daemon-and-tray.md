@@ -129,7 +129,8 @@ Every install method ends with the tray UI running:
 1. installs (or refreshes) the tray UI's login entry, pointing at this executable, or removes it
    when `auto_start` is off;
 2. starts the tray UI (`<exe> [--config <path>] ui`) detached: its own process group, no
-   console, stdin closed, output appended to `<config dir>/ui.log`. When a tray UI already runs
+   console, stdin closed, stdout discarded, stderr appended to `<config dir>/ui.log` (the UI writes
+   its log there itself, see [log files](#log-files)). When a tray UI already runs
    for this config, the new one hands over and the running window comes forward;
 3. prints what to do next (the machine name the studio admin approves, the studio URL, where
    the local API's URL and token are written) and logs `op="setup"`.
@@ -165,12 +166,14 @@ service present nothing happens.
    ([restart after an update](#restart-after-an-update)).
 3. Take the UI lock (see [one tray UI per config directory](#one-tray-ui-per-config-directory)),
    or hand over to the tray UI that holds it and exit.
-4. Sync the tray UI's login entry with `auto_start` (read from the config, like
+4. Install the [exit log](#exit-and-relaunch) (panic hook, signal listener) and clear
+   `<config dir>/ui.quit`.
+5. Sync the tray UI's login entry with `auto_start` (read from the config, like
    `start_minimised`): installed while on, removed while off.
-5. Remove any [legacy service](#legacy-services).
-6. Start the poller (below), the launch-path watch, and the `ui.log` trim
+6. Remove any [legacy service](#legacy-services).
+7. Start the poller (below), the launch-path watch, and the `ui.log` trim
    ([log files](#log-files)).
-7. Open the window. When there is no usable display (e.g. started at login before the
+8. Open the window. When there is no usable display (e.g. started at login before the
    graphical session accepts clients), the UI logs `op="display_wait"` with the attempt and
    the error, waits (2 s doubling to 60 s) and starts itself again in place. It never exits
    for want of a display.
@@ -200,8 +203,11 @@ A daemon the UI started outlives the UI.
 
 ### Log files
 
-A daemon the UI starts writes to `<config dir>/daemon.log`, and a tray UI that `setup` starts
-writes to `<config dir>/ui.log`. Both are kept small by copy-truncate, so the live file keeps
+A daemon the UI starts writes to `<config dir>/daemon.log`. The tray UI writes to
+`<config dir>/ui.log` however it was started (login entry, `setup`, the daemon's relaunch, a
+restart in place): `ui` opens the file before its first line (`ui_log`), in addition to stdout.
+Launchers that redirect its output discard stdout and append stderr to the same file, so no
+line is written twice and a panic message still lands there. Both are kept small by copy-truncate, so the live file keeps
 its name (tools tail `daemon.log` by that exact path) and the processes writing to it keep their
 handles:
 
@@ -253,6 +259,39 @@ reinstall):
 
 The daemon restarts itself after its own update (`update::restart_self`); the two restarts are
 independent, and the UI shows `Daemon starting` in between.
+
+### Exit and relaunch
+
+Every way the tray UI ends logs `op="exit"` with a `reason`: the window's event loop ended
+(Quit), a hand-over to the tray UI already running, `SIGTERM` / `SIGHUP` / `SIGINT` (it then
+exits with 128 + the signal number), or a panic (error, with location and message, before
+the previous panic hook runs).
+
+The housekeeping that keeps the tray alive runs in `App::logic`, which eframe calls on every
+frame, the window shown or not; `App::ui` only draws. eframe skips `ui` while the window is
+hidden or minimised, so a close request (`op="hide_to_tray"`) or a tray Quit reaching a hidden
+window is still handled: the close is cancelled and the window hides, rather than the event
+loop ending.
+
+When the tray UI vanishes anyway (crashed, killed), the daemon starts it again
+(`tray_watchdog`):
+
+- The poller marks its `GET /daemon/status` with `x-studio-worker-client: tray`; the daemon
+  records when it last saw that poll.
+- Every 5 s the daemon checks. A tray it has seen that has been silent for 30 s
+  (`ABSENT_AFTER`) has vanished: the daemon logs `op="tray_relaunch"` (warn) with the attempt
+  and the silence, and starts `<exe> --config <path> ui` as `setup` does, logging the pid
+  (info) or the failure (error).
+- Attempts that bring no tray back wait 30 s, doubling to 15 minutes. A poll starts it over.
+- A daemon that never saw a tray (a headless `run`) never starts one.
+- Quit leaves `<config dir>/ui.quit` before stopping the daemon; while it exists the daemon logs
+  once that the user quit and never relaunches. The tray UI removes it when it starts.
+- Should the tray already be back (started at login), the new one hands over to it.
+
+The Linux tray icon is a D-Bus service (ksni). When it ends, its D-Bus connection lost, the tray
+UI keeps running, logs `op="tray"` (warn) and registers the icon again after 2 s, doubling to
+5 minutes; a service that stayed up for a minute starts the backoff over. A first start that
+fails (no StatusNotifier host) is logged once and the UI runs without an icon.
 
 ### One tray UI per config directory
 
@@ -378,8 +417,9 @@ selects a job once it shows up, for screenshots and headless inspection.
 - The Studio card's last heartbeat is the last one the studio acked, or the last send that
   failed (`record_heartbeat`).
 - Menu: Open window, Pause/Resume (sent to the daemon), Quit.
-- Quit stops the daemon (`POST /daemon/shutdown`) and closes the UI. Closing the window only
-  hides it.
+- Quit leaves the quit marker ([exit and relaunch](#exit-and-relaunch)), stops the daemon
+  (`POST /daemon/shutdown`) and closes the UI. Closing the window only hides it, shown or
+  hidden, minimised or not.
 
 ## Autostart
 
@@ -412,5 +452,8 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `setup` | `studio_worker::setup` | `setup` installed the login entry and started the tray UI, or failed to |
 | `legacy_service` | `studio_worker::legacy_service` | a legacy service step ran, failed, or none was found |
 | `update_restart` | `studio_worker::ui` | the launch path changed; the UI restarts on it, waits, or failed to |
+| `exit` | `studio_worker::ui` | the tray UI exits, and why (event loop ended, hand-over, signal, panic) |
+| `tray_relaunch` | `studio_worker::tray_watchdog` | the daemon relaunches a vanished tray UI, failed to, or the user quit it |
+| `tray` | `studio_worker::ui::tray` | the Linux tray icon service started, ended, or re-registered |
 | `log_trim` | `studio_worker::log_trim` | `daemon.log` / `ui.log` trimmed, or the trim failed |
 | `presence` | `studio_worker::presence` | the user presence changed, or the idle time could not be read |

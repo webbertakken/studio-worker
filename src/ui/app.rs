@@ -366,8 +366,9 @@ impl App {
         }
     }
 
-    /// Shared housekeeping invoked before every frame's render.
-    fn pre_render(&mut self, ctx: &egui::Context) {
+    /// Housekeeping for every frame, the window shown or not: eframe skips `App::ui` while the
+    /// window is hidden or minimised, so a close request or a tray Quit is handled here.
+    fn housekeeping(&mut self, ctx: &egui::Context) {
         if self.start_minimised_pending {
             self.start_minimised_pending = false;
             tracing::info!(
@@ -402,6 +403,17 @@ impl App {
                 op = "quit",
                 "quit requested; stopping the daemon and closing the tray UI"
             );
+            // The daemon relaunches a vanished tray unless the user quit it.
+            let marker = crate::tray_watchdog::quit_marker_path(&self.deps.config_path);
+            if let Err(e) = std::fs::write(&marker, b"") {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    op = "quit",
+                    marker = %marker.display(),
+                    error = %e,
+                    "could not leave the quit marker; a daemon still running may relaunch the tray UI"
+                );
+            }
             self.deps.actions.run_and_wait(Action::Shutdown);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -581,9 +593,11 @@ fn reading_column(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) 
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.housekeeping(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.pre_render(&ctx);
         self.render(ui);
     }
 }
@@ -624,6 +638,53 @@ mod tests {
             url: "http://127.0.0.1:4787".into(),
             version: crate::AGENT_VERSION.into(),
         };
+    }
+
+    /// Run one hidden-window frame: eframe calls only `App::logic` while the window is
+    /// invisible or minimised. The root viewport's commands come back.
+    fn hidden_frame(app: &mut App, close_requested: bool) -> Vec<egui::ViewportCommand> {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        if close_requested {
+            raw.viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        let mut frame = eframe::Frame::_new_kittest();
+        let out = ctx.run_ui(raw, |ui| eframe::App::logic(app, ui.ctx(), &mut frame));
+        out.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .clone()
+    }
+
+    #[test]
+    fn a_close_request_while_hidden_hides_to_tray_instead_of_exiting() {
+        let mut app = App::new(mock_deps());
+        let commands = hidden_frame(&mut app, true);
+        assert!(
+            commands.contains(&egui::ViewportCommand::CancelClose),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn a_tray_quit_while_hidden_leaves_the_quit_marker_and_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deps = mock_deps();
+        deps.config_path = dir.path().join("config.toml");
+        deps.actions = ActionRunner::new(deps.config_path.clone(), deps.replica.clone());
+        let mut app = App::new(deps);
+        app.quit_requested_handle().store(true, Ordering::SeqCst);
+
+        let commands = hidden_frame(&mut app, false);
+
+        assert!(
+            commands.contains(&egui::ViewportCommand::Close),
+            "{commands:?}"
+        );
+        assert!(dir.path().join("ui.quit").exists());
     }
 
     #[test]
