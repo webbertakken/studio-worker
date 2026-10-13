@@ -477,6 +477,10 @@ pub struct ModelCliDefaults {
     /// the card with other tenants (pairs with `offload_to_cpu`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vram_gib: Option<f32>,
+    /// Blend weight for the model's LoRA files, appended to each
+    /// `<lora:name:weight>` prompt tag; defaults to 1.0 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lora_weight: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

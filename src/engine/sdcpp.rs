@@ -7,7 +7,10 @@
 //! URL + filename), and CLI defaults (cfg-scale, steps, dimensions).
 //! The worker has zero hardcoded model knowledge — it caches
 //! whatever the studio asks for under `cfg.models_root` and invokes
-//! `sd-cli` with the files arranged by role.
+//! `sd-cli` with the files arranged by role.  LoRA files in the source are
+//! passed through to sd-cli with `--lora-model-dir` plus one
+//! `<lora:name:weight>` prompt tag per file, so a registry model that ships
+//! a LoRA actually applies it.
 //!
 //! Layout under `cfg.models_root` (default `~/models`):
 //! ```text
@@ -248,6 +251,13 @@ impl SdCppEngine {
         let vae = file_for_role(&files, ModelFileRole::Vae);
         let text_encoder = file_for_role(&files, ModelFileRole::TextEncoder);
         let text_encoder_vision = file_for_role(&files, ModelFileRole::TextEncoderVision);
+        // LoRA files are applied through sd-cli's `--lora-model-dir` + prompt tags, not as
+        // standalone model paths; collect them in source order for the arg builder.
+        let loras: Vec<&Path> = files
+            .iter()
+            .filter(|(role, _)| *role == ModelFileRole::Lora)
+            .map(|(_, path)| path.as_path())
+            .collect();
 
         let out_dir = std::env::temp_dir().join("studio-worker-sdcpp");
         std::fs::create_dir_all(&out_dir)
@@ -345,6 +355,7 @@ impl SdCppEngine {
             mask_path.as_deref(),
             ref_img_path.as_deref(),
             full_checkpoint,
+            &loras,
         );
         let mut cmd = Command::new(&sd_cli);
         cmd.args(&args);
@@ -481,6 +492,17 @@ fn file_for_role(files: &[(ModelFileRole, PathBuf)], role: ModelFileRole) -> Opt
         .map(|(_, p)| p.as_path())
 }
 
+/// The LoRA prompt-tag stem for a resolved file: its file name without the
+/// `.safetensors` / `.ckpt` / `.gguf` extension.  `None` for a name sd-cli
+/// cannot address as a LoRA.
+fn lora_stem(path: &Path) -> Option<&str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(ext.as_str(), "safetensors" | "ckpt" | "gguf") {
+        return None;
+    }
+    path.file_stem()?.to_str().filter(|stem| !stem.is_empty())
+}
+
 /// Resolve final per-job width / height / steps / cfg / sampler /
 /// negative-prompt by layering `params` over `source.cli_defaults`
 /// with the agreed precedence (per-job override beats model default
@@ -558,6 +580,7 @@ fn build_sdcli_args(
     mask_path: Option<&Path>,
     ref_img_path: Option<&Path>,
     full_checkpoint: bool,
+    loras: &[&Path],
 ) -> Vec<OsString> {
     let resolved = resolve_image_args(params, source);
     let mut args: Vec<OsString> = Vec::with_capacity(32);
@@ -585,8 +608,32 @@ fn build_sdcli_args(
         args.push("--llm_vision".into());
         args.push(p.into());
     }
+    // LoRA pass-through: every LoRA of a model shares its cache directory, so
+    // one `--lora-model-dir` suffices; each file is named by a
+    // `<lora:stem:weight>` prompt tag appended to the positive prompt.  A file
+    // whose name has no recognised extension is skipped.
+    let lora_weight = source.cli_defaults.lora_weight.unwrap_or(1.0);
+    let mut lora_tags: Vec<String> = Vec::new();
+    let mut lora_dir: Option<&Path> = None;
+    for lora in loras {
+        let Some(stem) = lora_stem(lora) else {
+            continue;
+        };
+        if lora_dir.is_none() {
+            lora_dir = lora.parent();
+        }
+        lora_tags.push(format!("<lora:{stem}:{lora_weight}>"));
+    }
+    if let Some(dir) = lora_dir {
+        args.push("--lora-model-dir".into());
+        args.push(dir.into());
+    }
     args.push("-p".into());
-    args.push((&params.prompt as &str).into());
+    if lora_tags.is_empty() {
+        args.push((&params.prompt as &str).into());
+    } else {
+        args.push(format!("{} {}", params.prompt, lora_tags.join(" ")).into());
+    }
     if let Some(neg) = params.negative_prompt.as_deref() {
         if !neg.is_empty() {
             args.push("--negative-prompt".into());
@@ -872,6 +919,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--diffusion-model").unwrap()], "/d.gguf");
@@ -912,6 +960,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert_eq!(
@@ -940,6 +989,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert!(!s.contains(&"--negative-prompt".to_string()));
@@ -965,6 +1015,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--init-img").unwrap()], "/tmp/init.webp");
@@ -993,6 +1044,7 @@ mod tests {
             Some(Path::new("/tmp/mask.png")),
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--init-img").unwrap()], "/tmp/init.webp");
@@ -1019,6 +1071,7 @@ mod tests {
             None,
             None,
             true,
+            &[],
         );
         let s = args_to_strings(&args);
         // A full checkpoint loads via -m/--model, not --diffusion-model.
@@ -1049,6 +1102,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--strength").unwrap()], "0.75");
@@ -1074,6 +1128,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--cfg-scale").unwrap()], "7.5");
@@ -1099,6 +1154,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--sampling-method").unwrap()], "dpm++2m");
@@ -1124,6 +1180,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--steps").unwrap()], "30");
@@ -1149,6 +1206,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert_eq!(s[idx_after(&s, "--seed").unwrap()], "42");
@@ -1193,6 +1251,7 @@ mod tests {
             Some(Path::new("/tmp/mask.png")),
             Some(Path::new("/tmp/ref.webp")),
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         // Reference mode: `-r` set, a `--mask` constrains the edit region, and the img2img-only
@@ -1234,6 +1293,7 @@ mod tests {
             None,
             Some(Path::new("/tmp/ref.webp")),
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert!(s.contains(&"--mmap".to_string()));
@@ -1262,6 +1322,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         let s = args_to_strings(&args);
         assert!(!s.contains(&"--flow-shift".to_string()));
@@ -1272,6 +1333,166 @@ mod tests {
         assert!(!s.contains(&"--max-vram".to_string()));
         assert!(!s.contains(&"--llm_vision".to_string()));
         assert!(!s.contains(&"-r".to_string()));
+    }
+
+    #[test]
+    fn build_sdcli_args_adds_lora_model_dir_and_prompt_tag() {
+        let params = ImageParams {
+            prompt: "a cat".into(),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let loras = [Path::new("/models/marblesh.safetensors")];
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            None,
+            false,
+            &loras,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--lora-model-dir").unwrap()], "/models");
+        assert_eq!(s[idx_after(&s, "-p").unwrap()], "a cat <lora:marblesh:1>");
+    }
+
+    #[test]
+    fn build_sdcli_args_appends_lora_tags_in_source_order() {
+        let params = ImageParams {
+            prompt: "a cat".into(),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let loras = [
+            Path::new("/models/lightning.safetensors"),
+            Path::new("/models/detail.ckpt"),
+        ];
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            None,
+            false,
+            &loras,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "--lora-model-dir").unwrap()], "/models");
+        assert_eq!(
+            s[idx_after(&s, "-p").unwrap()],
+            "a cat <lora:lightning:1> <lora:detail:1>"
+        );
+    }
+
+    #[test]
+    fn build_sdcli_args_honours_explicit_lora_weight() {
+        let params = ImageParams {
+            prompt: "a cat".into(),
+            ..Default::default()
+        };
+        let mut source = fake_source(vec![]);
+        source.cli_defaults.lora_weight = Some(0.65);
+        let loras = [Path::new("/models/qwen_edit_lightning.safetensors")];
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            None,
+            false,
+            &loras,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(
+            s[idx_after(&s, "-p").unwrap()],
+            "a cat <lora:qwen_edit_lightning:0.65>"
+        );
+    }
+
+    #[test]
+    fn build_sdcli_args_omits_lora_flags_without_lora_files() {
+        let params = ImageParams {
+            prompt: "a cat".into(),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            None,
+            false,
+            &[],
+        );
+        let s = args_to_strings(&args);
+        assert!(!s.contains(&"--lora-model-dir".to_string()));
+        assert_eq!(s[idx_after(&s, "-p").unwrap()], "a cat");
+    }
+
+    #[test]
+    fn build_sdcli_args_skips_loras_without_a_known_stem() {
+        let params = ImageParams {
+            prompt: "a cat".into(),
+            ..Default::default()
+        };
+        let source = fake_source(vec![]);
+        // `.bin` and no-extension names can't be addressed as `<lora:stem:…>`; `.gguf` can.
+        let loras = [
+            Path::new("/models/opaque.bin"),
+            Path::new("/models/noext"),
+            Path::new("/models/turbo.gguf"),
+        ];
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/d.gguf"),
+            None,
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            None,
+            false,
+            &loras,
+        );
+        let s = args_to_strings(&args);
+        assert_eq!(s[idx_after(&s, "-p").unwrap()], "a cat <lora:turbo:1>");
+    }
+
+    #[test]
+    fn model_cli_defaults_parses_camel_case_lora_weight() {
+        let defaults: ModelCliDefaults = serde_json::from_value(serde_json::json!({
+            "cfgScale": 1.0,
+            "steps": 8,
+            "width": 1024,
+            "height": 1024,
+            "loraWeight": 0.75,
+        }))
+        .unwrap();
+        assert_eq!(defaults.lora_weight, Some(0.75));
     }
 
     #[test]
