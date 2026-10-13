@@ -50,6 +50,10 @@ so CI can test the headless core; it is not shipped.
   (`op="registration"`), keeps serving locally, and waits until either it is stopped or the
   UI asks for a reset (`POST /daemon/registration/reset`). A reset clears the local
   registration state exactly like `register --reset` and starts a fresh request.
+- An operator *deleting* the worker is the same: the next `/connect` gets `404 worker not
+  found` (or a live socket closes `4004 worker_deleted`), the daemon clears its stale
+  credentials and posts a fresh register-request, so it waits for approval again instead of
+  reconnecting forever.
 
 ## Local API additions
 
@@ -436,7 +440,7 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `op` | Target | When |
 | --- | --- | --- |
 | `daemon_lock` | `studio_worker::daemon` | lock taken, or another daemon holds it |
-| `registration` | `studio_worker::runtime` | rejection wait, reset |
+| `registration` | `studio_worker::runtime` | rejection wait, reset, revocation re-register |
 | `control` | `studio_worker::local_api` | pause, resume, config save, reset, shutdown via the API |
 | `job` | `studio_worker::job` | job started / finished |
 | `thumbnail` | `studio_worker::job` | thumbnail could not be made |

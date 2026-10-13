@@ -280,6 +280,84 @@ async fn a_rejection_waits_for_a_reset_then_asks_the_studio_again() {
 }
 
 #[tokio::test]
+async fn a_revoked_registration_re_registers_instead_of_reconnecting() {
+    // The operator deleted this worker while it held stale credentials,
+    // so the studio answers its `/connect` upgrade with `404 worker not
+    // found`.  That is terminal for the session but not for the daemon:
+    // it must clear the stale credentials and land in the approval queue
+    // again instead of reconnecting forever against a row that is gone.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/graphics/api/workers/w-revoked/connect"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": "worker not found",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphics/api/workers/register-request"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "rr-fresh",
+            "status": "pending",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/graphics/api/workers/register-requests/rr-fresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "pending",
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let mut cfg = polling_cfg(&server.uri());
+    cfg.worker_id = Some("w-revoked".into());
+    cfg.auth_token = Some("tok-stale".into());
+    cfg.registration_request_id = None;
+    cfg.registration_secret = None;
+    let path = write_cfg(&dir, &cfg);
+    let control = control_for(cfg, path);
+    let serving = tokio::spawn({
+        let control = control.clone();
+        async move {
+            runtime::serve_studio(
+                &control,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(AtomicBool::new(false)),
+                runtime::WorkerObservers::default(),
+                runtime::LoopSchedule::fast_for_tests(),
+            )
+            .await
+        }
+    });
+
+    wait_until("a fresh request after revocation", || {
+        control.cfg.lock().registration_request_id.as_deref() == Some("rr-fresh")
+    })
+    .await;
+    {
+        let snap = control.cfg.lock();
+        assert!(
+            snap.worker_id.is_none(),
+            "the stale worker id must be cleared"
+        );
+        assert!(snap.auth_token.is_none(), "the stale token must be cleared");
+    }
+    assert!(
+        !serving.is_finished(),
+        "a revoked registration must re-register, not end the daemon"
+    );
+
+    control.shutdown();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("stops promptly")
+        .unwrap();
+    assert!(outcome.is_ok());
+}
+
+#[tokio::test]
 async fn a_stop_during_the_rejection_wait_ends_cleanly() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

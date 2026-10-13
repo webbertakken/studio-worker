@@ -288,6 +288,11 @@ The worker doesn't ship a shared secret.  On first launch:
    normal heartbeat / claim loops take over.
 5. On Reject: worker stops trying.  `studio-worker register --reset`
    clears state and the next launch submits a fresh request.
+6. On Revoke: if the operator deletes the worker from the studio, its
+   next `/connect` gets `404 worker not found` (or a live socket closes
+   `4004`).  The worker clears its local credentials and submits a fresh
+   register-request, so it reappears in the Pending Workers panel.
+   Reject that request to keep the worker out for good.
 
 See [`docs/architecture/overview.md`](docs/architecture/overview.md#registration-auto-register-with-approval)
 for the full state machine + per-install identity details.
@@ -296,11 +301,12 @@ for the full state machine + per-install identity details.
 
 - **Worker exits with `ws auth failed: ...`** — the studio API rejected
   the auth token on the upgrade (HTTP 401) or via a close-code 4001
-  after a successful upgrade.  The token was either revoked, the
-  worker was deleted from the studio admin UI, or `config.toml`
-  carries a stale token.  Clear local state and let the next launch
-  auto-register again: `studio-worker register --reset`, then quit
-  the tray UI and start it again (`studio-worker ui`).
+  after a successful upgrade.  `config.toml` carries a stale or revoked
+  token.  Clear local state and let the next launch auto-register again:
+  `studio-worker register --reset`, then quit the tray UI and start it
+  again (`studio-worker ui`).  A worker whose row was *deleted* from the
+  studio admin UI needs none of that: it re-registers by itself and
+  reappears as a pending request.
 - **Worker exits with `ws reconnect cap reached`** — every reconnect
   attempt failed (DNS, TLS, or the API is down).  The tray UI starts
   a new daemon; if it keeps happening, check the API is reachable from

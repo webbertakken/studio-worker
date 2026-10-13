@@ -180,6 +180,31 @@ async fn maps_401_upgrade_to_auth_failed_error() {
     let _ = server.await;
 }
 
+/// 404 on the upgrade (`worker not found`) surfaces as
+/// `RegistrationRevoked`: the studio deleted this worker.
+#[tokio::test]
+async fn maps_404_upgrade_to_registration_revoked() {
+    let (addr, server) = spawn_server(
+        |_req, _resp| {
+            let mut response = tokio_tungstenite::tungstenite::http::Response::new(Some(
+                "{\"error\":\"worker not found\"}".to_owned(),
+            ));
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            Err(response)
+        },
+        |_ws| async move {},
+    )
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let err = connect(&base, "w-1", "t").await.unwrap_err();
+    let WsClientError::RegistrationRevoked { reason } = err else {
+        panic!("a 404 upgrade must map to RegistrationRevoked, got {err:?}");
+    };
+    assert!(reason.contains("worker not found"), "got {reason}");
+    let _ = server.await;
+}
+
 /// Server-side close with code 4001 → typed `AuthFailed` from `recv()`.
 #[tokio::test]
 async fn surfaces_4001_close_as_typed_auth_failed() {
@@ -212,6 +237,42 @@ async fn surfaces_4001_close_as_typed_auth_failed() {
     let err = error.expect("expected a typed close-driven error");
     assert!(
         matches!(err, WsClientError::AuthFailed { .. }),
+        "got {err:?}"
+    );
+    server.await.unwrap();
+}
+
+/// Server-side close with code 4004 (`worker_deleted`) → typed
+/// `RegistrationRevoked` from `recv()`.
+#[tokio::test]
+async fn surfaces_4004_close_as_registration_revoked() {
+    let (addr, server) = spawn_server(echo_subprotocol, |mut ws| async move {
+        let _ = ws
+            .close(Some(CloseFrame {
+                code: CloseCode::Library(4004),
+                reason: "worker_deleted".into(),
+            }))
+            .await;
+    })
+    .await;
+
+    let base = format!("http://{addr}/graphics/api");
+    let mut client = connect(&base, "w-1", "t").await.unwrap();
+    let mut error = None;
+    for _ in 0..5 {
+        match tokio::time::timeout(TIMEOUT, client.recv()).await {
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(_))) => continue,
+            Ok(Err(e)) => {
+                error = Some(e);
+                break;
+            }
+            Err(_) => panic!("recv timed out"),
+        }
+    }
+    let err = error.expect("expected a typed close-driven error");
+    assert!(
+        matches!(err, WsClientError::RegistrationRevoked { .. }),
         "got {err:?}"
     );
     server.await.unwrap();
