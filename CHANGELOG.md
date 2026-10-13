@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.19](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.18...studio-worker-v0.4.19) (2026-10-13)
+
+
+### Features
+
+* **sdcpp:** apply model LoRA files ([#162](https://github.com/webbertakken/studio-worker/issues/162)) ([c1a4afb](https://github.com/webbertakken/studio-worker/commit/c1a4afba024b7b0996c40f88e5d2c1b653a47278))
+
 ## [0.4.18](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.17...studio-worker-v0.4.18) (2026-10-13)
 
 
