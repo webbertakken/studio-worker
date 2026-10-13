@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.18](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.17...studio-worker-v0.4.18) (2026-10-13)
+
+
+### Bug Fixes
+
+* **ui:** keep the tray alive and bring it back ([#159](https://github.com/webbertakken/studio-worker/issues/159)) ([95bce93](https://github.com/webbertakken/studio-worker/commit/95bce93c1aa7f3027e2e4d797bd86fa0f258a44e))
+* **ws:** re-register when the studio revokes us ([#161](https://github.com/webbertakken/studio-worker/issues/161)) ([cc60779](https://github.com/webbertakken/studio-worker/commit/cc607795b68cea178ddd6328cf5c1e820c9263f4))
+
 ## [0.4.17](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.16...studio-worker-v0.4.17) (2026-10-12)
 
 
