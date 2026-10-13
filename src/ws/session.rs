@@ -8,7 +8,10 @@
 //! Reconnect policy: on a transport error or non-auth close, back off
 //! `BASE_BACKOFF_MS * 2^attempt` and try again, up to
 //! `cfg.ws_reconnect_attempts`.  Out of retries → return `Err`; the daemon
-//! exits and the tray UI starts a new one.
+//! exits and the tray UI starts a new one.  A revoked registration (the
+//! operator deleted the worker: `404` on `/connect` or close `4004`) is not
+//! a reconnect: it returns [`StudioExit::RegistrationRevoked`] so the daemon
+//! clears its stale credentials and asks the studio for approval again.
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -75,8 +78,25 @@ pub enum SessionOutcome {
     Disconnected,
     /// Server rejected auth; do not reconnect.
     AuthFailed(String),
+    /// The studio revoked this registration (the operator deleted the
+    /// worker while we held stale credentials); do not reconnect, ask
+    /// for approval again instead.
+    RegistrationRevoked(String),
     /// Server sent a fatal error frame; do not reconnect.
     Fatal(String),
+}
+
+/// How the top-level session loop ended, for the daemon's outer control
+/// flow.  `spawn_ws_session` returns it so `runtime::serve_studio` can
+/// tell a clean stop (shut the daemon down) from a revoked registration
+/// (clear credentials and re-register).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StudioExit {
+    /// A stop signal ended the session; the daemon shuts down.
+    Stopped,
+    /// The studio revoked this worker's registration; the daemon must
+    /// clear the local credentials and register afresh.
+    RegistrationRevoked,
 }
 
 /// Tunables for the session loop — dialed down in tests.
@@ -122,6 +142,12 @@ impl SessionSchedule {
 /// Top-level driver: connect, run a session, reconnect on disconnect,
 /// give up after `cfg.ws_reconnect_attempts` failures.
 ///
+/// Returns [`StudioExit::Stopped`] when a stop signal ends the session
+/// and [`StudioExit::RegistrationRevoked`] when the studio no longer
+/// recognises this worker, so the caller can re-register.  A genuine
+/// auth failure or a fatal frame still returns `Err`, which ends the
+/// daemon.
+///
 /// `paused` is a runtime-only flag (not persisted to `Config`).  When
 /// true, the heartbeat reports `autoEnabled = false` and incoming
 /// offers are rejected, so the studio stops sending new jobs.  In-
@@ -135,7 +161,7 @@ pub async fn spawn_ws_session(
     paused: Arc<AtomicBool>,
     observers: WorkerObservers,
     schedule: SessionSchedule,
-) -> Result<()> {
+) -> Result<StudioExit> {
     let max_attempts = {
         let guard = cfg.lock();
         guard
@@ -147,7 +173,7 @@ pub async fn spawn_ws_session(
     let mut waiting_for_creds_logged = false;
     loop {
         if stop.load(Ordering::SeqCst) {
-            return Ok(());
+            return Ok(StudioExit::Stopped);
         }
         // Credentials may not exist yet (first launch — the
         // auto-register loop is racing to populate them).  Poll the
@@ -181,7 +207,26 @@ pub async fn spawn_ws_session(
         {
             Ok(SessionOutcome::Stopped) => {
                 set_session_state(&observers, SessionState::Stopped);
-                return Ok(());
+                return Ok(StudioExit::Stopped);
+            }
+            Ok(SessionOutcome::RegistrationRevoked(reason)) => {
+                // Terminal for this session, but not for the daemon: the
+                // operator deleted this worker, so hand control back to
+                // `serve_studio` to clear the stale credentials and ask
+                // the studio for approval again.
+                set_session_state(&observers, SessionState::WaitingForApproval);
+                push_log_with_observers(
+                    &logs,
+                    Some(&observers),
+                    "warn",
+                    "ws",
+                    &format!(
+                        "studio revoked this worker's registration ({reason}); \
+                         asking for approval again"
+                    ),
+                    None,
+                );
+                return Ok(StudioExit::RegistrationRevoked);
             }
             Ok(SessionOutcome::AuthFailed(reason)) => {
                 set_session_state(
@@ -265,6 +310,7 @@ pub async fn spawn_ws_session(
 enum WelcomeOutcome {
     Welcomed,
     AuthFailed(String),
+    RegistrationRevoked(String),
     Fatal(String),
     Disconnected,
 }
@@ -309,6 +355,9 @@ async fn wait_for_welcome(
                     crate::ws::types::WorkerErrorCode::AuthFailed => {
                         WelcomeOutcome::AuthFailed(message)
                     }
+                    crate::ws::types::WorkerErrorCode::WorkerDeleted => {
+                        WelcomeOutcome::RegistrationRevoked(message)
+                    }
                     _ => WelcomeOutcome::Fatal(message),
                 };
             }
@@ -325,6 +374,9 @@ async fn wait_for_welcome(
             }
             SessionEvent::Disconnected(WsClientError::AuthFailed { reason }) => {
                 return WelcomeOutcome::AuthFailed(reason);
+            }
+            SessionEvent::Disconnected(WsClientError::RegistrationRevoked { reason }) => {
+                return WelcomeOutcome::RegistrationRevoked(reason);
             }
             SessionEvent::Disconnected(_) => return WelcomeOutcome::Disconnected,
             SessionEvent::Stopped => return WelcomeOutcome::Disconnected,
@@ -392,6 +444,9 @@ async fn run_one_session(
         Ok(c) => c,
         Err(WsClientError::AuthFailed { reason }) => {
             return Ok(SessionOutcome::AuthFailed(reason));
+        }
+        Err(WsClientError::RegistrationRevoked { reason }) => {
+            return Ok(SessionOutcome::RegistrationRevoked(reason));
         }
         Err(e) => {
             push_log_with_observers(
@@ -466,6 +521,11 @@ async fn run_one_session(
             let _ = sender.close(1000, "auth failed").await;
             let _ = reader.await;
             return Ok(SessionOutcome::AuthFailed(reason));
+        }
+        WelcomeOutcome::RegistrationRevoked(reason) => {
+            let _ = sender.close(1000, "registration revoked").await;
+            let _ = reader.await;
+            return Ok(SessionOutcome::RegistrationRevoked(reason));
         }
         WelcomeOutcome::Fatal(reason) => {
             let _ = sender.close(1000, "protocol violation").await;
@@ -574,6 +634,9 @@ async fn run_dispatch_loop(
             SessionEvent::Disconnected(WsClientError::AuthFailed { reason }) => {
                 return SessionOutcome::AuthFailed(reason);
             }
+            SessionEvent::Disconnected(WsClientError::RegistrationRevoked { reason }) => {
+                return SessionOutcome::RegistrationRevoked(reason);
+            }
             SessionEvent::Disconnected(_) => return SessionOutcome::Disconnected,
             SessionEvent::Stopped => return SessionOutcome::Stopped,
             SessionEvent::Frame(frame) => match frame {
@@ -605,6 +668,9 @@ async fn run_dispatch_loop(
                     return match code {
                         crate::ws::types::WorkerErrorCode::AuthFailed => {
                             SessionOutcome::AuthFailed(message)
+                        }
+                        crate::ws::types::WorkerErrorCode::WorkerDeleted => {
+                            SessionOutcome::RegistrationRevoked(message)
                         }
                         _ => SessionOutcome::Fatal(message),
                     };

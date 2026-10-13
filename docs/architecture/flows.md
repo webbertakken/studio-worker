@@ -76,7 +76,10 @@ to the WS session; `Rejected` stops the loop until
 a reset (`studio-worker register --reset`, or Reset registration in the
 tray UI via `POST /daemon/registration/reset`, which needs no restart);
 the daemon keeps serving locally meanwhile.  A `404` on poll drops the
-stale request and recreates next tick.
+stale request and recreates next tick.  A registration the studio later
+revokes (the operator deletes the worker) re-enters this flow: the WS
+session returns `StudioExit::RegistrationRevoked`, `serve_studio`
+clears the credentials, and the gate posts a fresh register-request.
 
 ## 2. WebSocket session lifecycle
 
@@ -115,13 +118,19 @@ spawn_ws_session loop:
 ```
 
 Reconnect policy: `Disconnected` backs off `1s × 2^attempt` capped
-at 30s, up to `ws_reconnect_attempts` (default 5); a session that
-reached Welcome resets the counter, so only consecutive
-connect-failures accumulate.  No reconnect on close codes `4001
-auth_failed` (operator must `register --reset`), `4003
-duplicate_worker`, `4004 worker_deleted`; `4002` is
-`protocol_violation`.  Mapping is 1:1 between
-`WsCloseCode::from_error_code` (Rust) and `closeCodeForError`
+at 30s, up to `ws_reconnect_attempts` (`None` retries forever, the
+default); a session that reached Welcome resets the counter, so only
+consecutive connect-failures accumulate.  A `4001 auth_failed` close
+ends the session (`register --reset` is the operator's fix), as does
+`4002 protocol_violation`; every other close — including `4003
+duplicate_worker` — is a transient drop the loop retries.  A `404
+worker not found` on the `/connect` upgrade, a `4004 worker_deleted`
+close, or a `workerDeleted` error frame is a terminal **revocation**:
+`spawn_ws_session` returns `StudioExit::RegistrationRevoked`,
+`serve_studio` clears the local credentials and registers again, so
+the worker reappears in the studio's approval queue instead of
+reconnecting forever against a row that is gone.  Mapping is 1:1
+between `WsCloseCode::from_error_code` (Rust) and `closeCodeForError`
 (`workerWs.ts`).  Studio side sweeps stale sessions via a DO alarm
 every 10s (heartbeat older than 30s → close + release the claim);
 the DO survives hibernation by rebuilding its session map from

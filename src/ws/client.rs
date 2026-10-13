@@ -66,6 +66,15 @@ pub enum WsClientError {
     #[error("auth failed: {reason}")]
     AuthFailed { reason: String },
 
+    /// Upgrade returned 404 (`worker not found`) or the server closed
+    /// with 4004: the studio no longer recognises this worker's
+    /// registration (the operator deleted it).  The runtime clears the
+    /// local credentials and asks for approval again — it must not
+    /// reconnect, which would loop forever against a row that no longer
+    /// exists.
+    #[error("registration revoked: {reason}")]
+    RegistrationRevoked { reason: String },
+
     /// Server closed for a reason other than auth failure.  The runtime
     /// treats this as a transient drop and tries to reconnect.
     #[error("connection closed by server")]
@@ -86,6 +95,17 @@ impl From<TError> for WsClientError {
             TError::Http(response) if response.status() == StatusCode::UNAUTHORIZED => {
                 WsClientError::AuthFailed {
                     reason: "401 on websocket upgrade".to_string(),
+                }
+            }
+            // A deleted worker's `/connect` fails the token middleware
+            // with `404 worker not found`.  That is a terminal
+            // revocation, not a transient fault: surfacing it as
+            // `RegistrationRevoked` lets the runtime clear its stale
+            // credentials and re-register instead of reconnecting
+            // forever.
+            TError::Http(response) if response.status() == StatusCode::NOT_FOUND => {
+                WsClientError::RegistrationRevoked {
+                    reason: http_upgrade_error_message(&response),
                 }
             }
             // Any other upgrade status (500/502/503/429 …) is a
@@ -335,7 +355,8 @@ pub struct WsReceiver {
 impl WsReceiver {
     /// Read the next outbound frame.  Same semantics as
     /// `WsClient::recv` — silent close → `Ok(None)`, close frame with
-    /// 4001 → `AuthFailed`, other closes → `ConnectionClosed`.
+    /// 4001 → `AuthFailed`, 4004 → `RegistrationRevoked`, other closes
+    /// → `ConnectionClosed`.
     pub async fn recv(&mut self) -> WsResult<Option<WorkerOutbound>> {
         recv_next(&mut self.source, &mut self.closed).await
     }
@@ -519,6 +540,12 @@ fn classify_incoming(item: Result<Message, TError>) -> RecvStep {
                     reason = %reason,
                     "server closed connection: auth failed"
                 ),
+                WsClientError::RegistrationRevoked { reason } => warn!(
+                    target: TRACE_TARGET,
+                    op = "recv",
+                    reason = %reason,
+                    "server closed connection: registration revoked"
+                ),
                 _ => debug!(
                     target: TRACE_TARGET,
                     op = "recv",
@@ -558,6 +585,14 @@ fn close_frame_to_error(frame: Option<CloseFrame>) -> WsClientError {
         if code == 4001 {
             return WsClientError::AuthFailed {
                 reason: format!("server closed 4001: {}", frame.reason),
+            };
+        }
+        // 4004 `worker_deleted`: the operator deleted this worker while
+        // its socket was live.  Reconnecting is futile (the row is
+        // gone); the runtime re-registers instead.
+        if code == 4004 {
+            return WsClientError::RegistrationRevoked {
+                reason: format!("server closed 4004: {}", frame.reason),
             };
         }
     }
@@ -615,6 +650,23 @@ mod tests {
         };
         let err = close_frame_to_error(Some(frame));
         assert!(matches!(err, WsClientError::AuthFailed { .. }));
+    }
+
+    #[test]
+    fn close_frame_4004_maps_to_registration_revoked() {
+        let frame = CloseFrame {
+            code: CloseCode::Library(4004),
+            reason: "worker_deleted".into(),
+        };
+        let err = close_frame_to_error(Some(frame));
+        let WsClientError::RegistrationRevoked { reason } = err else {
+            panic!("4004 must map to RegistrationRevoked, got {err:?}");
+        };
+        assert!(reason.contains("4004"), "code must be present: {reason}");
+        assert!(
+            reason.contains("worker_deleted"),
+            "reason must be present: {reason}"
+        );
     }
 
     #[test]
@@ -690,6 +742,26 @@ mod tests {
         });
         assert!(logs.contains("WARN"), "expected WARN, got: {logs}");
         assert!(logs.contains("auth failed"), "expected reason: {logs}");
+    }
+
+    #[test]
+    fn classify_warns_on_4004_close_frame() {
+        let logs = capture(|| {
+            let frame = CloseFrame {
+                code: CloseCode::Library(4004),
+                reason: "worker_deleted".into(),
+            };
+            let step = classify_incoming(Ok(Message::Close(Some(frame))));
+            assert!(matches!(
+                step,
+                RecvStep::Closed(WsClientError::RegistrationRevoked { .. })
+            ));
+        });
+        assert!(logs.contains("WARN"), "expected WARN, got: {logs}");
+        assert!(
+            logs.contains("registration revoked"),
+            "expected reason: {logs}"
+        );
     }
 
     #[test]
@@ -964,6 +1036,19 @@ mod tests {
         assert!(
             matches!(err, WsClientError::AuthFailed { .. }),
             "401 must stay AuthFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn http_404_upgrade_maps_to_registration_revoked() {
+        let err = WsClientError::from(http_error(404, Some(b"{\"error\":\"worker not found\"}")));
+        let WsClientError::RegistrationRevoked { reason } = err else {
+            panic!("a 404 on the upgrade must map to RegistrationRevoked, got {err:?}");
+        };
+        assert!(reason.contains("404"), "status must be present: {reason}");
+        assert!(
+            reason.contains("worker not found"),
+            "the studio's body must survive: {reason}"
         );
     }
 

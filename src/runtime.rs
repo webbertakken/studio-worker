@@ -661,16 +661,33 @@ pub async fn serve_studio(
                 return Ok(());
             }
             Ok(RegistrationGate::Ready) => {
-                return run_loops(
+                match run_loops(
                     control.cfg.clone(),
                     control.stop.clone(),
-                    logs,
-                    busy,
+                    logs.clone(),
+                    busy.clone(),
                     control.paused.clone(),
-                    observers,
+                    observers.clone(),
                     schedule,
                 )
-                .await;
+                .await
+                {
+                    Ok(crate::ws::session::StudioExit::Stopped) => return Ok(()),
+                    Ok(crate::ws::session::StudioExit::RegistrationRevoked) => {
+                        // The operator deleted this worker while it held
+                        // stale credentials.  Clear them locally and fall
+                        // back through `ensure_registered` so it lands in
+                        // the studio's approval queue again rather than
+                        // reconnecting against a row that is gone.
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            op = "registration",
+                            "studio revoked this worker's registration; asking for approval again"
+                        );
+                        reset_registration(control)?;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             Err(err) => {
                 tracing::error!(
@@ -869,7 +886,7 @@ pub async fn run_loops(
     paused: Arc<AtomicBool>,
     observers: WorkerObservers,
     schedule: LoopSchedule,
-) -> Result<()> {
+) -> Result<crate::ws::session::StudioExit> {
     let session = crate::ws::session::spawn_ws_session(
         cfg.clone(),
         stop.clone(),
@@ -886,7 +903,11 @@ pub async fn run_loops(
         busy.clone(),
         schedule,
     );
-    let (session_result, _) = tokio::join!(session, auto_updater);
+    // The session owns the daemon's reason to run: once it ends (stop,
+    // auth failure, or a revoked registration) the auto-updater must not
+    // keep the join — and with it `serve_studio` — alive past it.
+    let session_result = session.await;
+    auto_updater.abort();
     session_result
 }
 
