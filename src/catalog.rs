@@ -522,6 +522,7 @@ fn zimage_turbo() -> CatalogModel {
                 chat_template_kwargs: None,
                 mmap: None,
                 max_vram_gib: None,
+                lora_weight: None,
             },
         },
         enabled: true,
