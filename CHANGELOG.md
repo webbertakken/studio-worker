@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.20](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.19...studio-worker-v0.4.20) (2026-10-14)
+
+
+### Bug Fixes
+
+* child processes open no console window ([#164](https://github.com/webbertakken/studio-worker/issues/164)) ([8ed2725](https://github.com/webbertakken/studio-worker/commit/8ed27251f918551bad3ca4ebab41339f1a112ed4))
+
 ## [0.4.19](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.18...studio-worker-v0.4.19) (2026-10-13)
 
 
