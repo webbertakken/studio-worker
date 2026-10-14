@@ -236,7 +236,7 @@ impl LlamaSubprocessEngine {
         let model_path = self.ensure_model(model, source)?;
         let prompt = prompt_from_params(&params);
         let argv = build_argv(&model_path, &prompt, &params);
-        let output = std::process::Command::new(&binary)
+        let output = crate::process::command(&binary)
             .args(&argv)
             .output()
             .with_context(|| format!("spawning {}", binary.display()))?;

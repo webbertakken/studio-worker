@@ -357,7 +357,7 @@ impl SdCppEngine {
             full_checkpoint,
             &loras,
         );
-        let mut cmd = Command::new(&sd_cli);
+        let mut cmd = crate::process::command(&sd_cli);
         cmd.args(&args);
         apply_library_path(&mut cmd, &sd_cli);
 

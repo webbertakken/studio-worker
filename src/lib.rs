@@ -44,6 +44,7 @@ pub mod local_api;
 pub mod log_trim;
 pub mod net;
 pub mod presence;
+pub mod process;
 pub mod residency;
 pub mod runtime;
 pub mod secrets;

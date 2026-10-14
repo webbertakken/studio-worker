@@ -122,7 +122,7 @@ impl MemoryProbe for SystemProbe {
     // unit-tested above.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn free_gib(&self) -> Option<f32> {
-        let smi = std::process::Command::new("nvidia-smi")
+        let smi = crate::process::command("nvidia-smi")
             .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
             .output()
             .ok()
