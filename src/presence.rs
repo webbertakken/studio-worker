@@ -273,7 +273,7 @@ mod platform {
 
     pub async fn idle_time() -> Result<Duration, ProbeError> {
         tokio::task::spawn_blocking(|| {
-            let out = std::process::Command::new("ioreg")
+            let out = crate::process::command("ioreg")
                 .args(["-c", "IOHIDSystem", "-r", "-d", "1", "-k", "HIDIdleTime"])
                 .output()
                 .map_err(|e| ProbeError::failed("ioreg", e))?;

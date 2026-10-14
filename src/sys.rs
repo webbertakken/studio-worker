@@ -209,7 +209,7 @@ pub fn parse_wmic_adapter_ram(stdout: &str) -> Option<f32> {
 /// unit-tested directly.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn detect_vram_gb_via_nvidia_smi() -> Option<f32> {
-    let output = std::process::Command::new("nvidia-smi")
+    let output = crate::process::command("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output();
     match output {
@@ -243,7 +243,7 @@ fn detect_vram_gb_via_nvidia_smi() -> Option<f32> {
 #[cfg(target_os = "macos")]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn detect_vram_gb_via_sysctl() -> Option<f32> {
-    let output = std::process::Command::new("sysctl")
+    let output = crate::process::command("sysctl")
         .args(["-n", "hw.memsize"])
         .output()
         .ok()?;
@@ -261,7 +261,7 @@ fn detect_vram_gb_via_sysctl() -> Option<f32> {
 #[cfg(target_os = "windows")]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn detect_vram_gb_via_wmic() -> Option<f32> {
-    let output = std::process::Command::new("powershell")
+    let output = crate::process::command("powershell")
         .args([
             "-NoProfile",
             "-Command",

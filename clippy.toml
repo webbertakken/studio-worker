@@ -1,0 +1,5 @@
+# A console child of the windowless daemon or tray opens a console window on Windows: every child
+# process is built by `crate::process` (CREATE_NO_WINDOW).
+disallowed-methods = [
+  { path = "std::process::Command::new", reason = "use crate::process::command or crate::process::detached, which never open a console window on Windows" },
+]

@@ -222,7 +222,7 @@ fn detect_flavour() -> Result<OrtFlavour> {
         return Ok(pinned);
     }
     let detected = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        std::process::Command::new("ldconfig")
+        crate::process::command("ldconfig")
             .arg("-p")
             .output()
             .ok()

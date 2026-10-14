@@ -94,7 +94,7 @@ pub fn pinned_commit() -> Option<String> {
 /// from coverage: spawns a host binary.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub fn probe_commit(sd_cli: &Path) -> Option<String> {
-    let mut command = std::process::Command::new(sd_cli);
+    let mut command = crate::process::command(sd_cli);
     command.arg("--version");
     if let Some((var, dir)) = library_path_env(sd_cli) {
         command.env(var, dir);

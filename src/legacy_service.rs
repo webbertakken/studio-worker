@@ -222,7 +222,7 @@ impl LegacyOps for RealOps {
     fn registered(&self) -> bool {
         #[cfg(target_os = "windows")]
         {
-            Command::new("schtasks")
+            crate::process::command("schtasks")
                 .args(["/Query", "/TN", TASK_NAME])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -239,13 +239,13 @@ impl LegacyOps for RealOps {
     fn deregister(&self) -> StepOutcome {
         #[cfg(target_os = "linux")]
         {
-            let mut disable = Command::new("systemctl");
+            let mut disable = crate::process::command("systemctl");
             disable.args(["--user", "disable", UNIT_NAME]);
             run_step(OP, "systemctl-disable", disable)
         }
         #[cfg(target_os = "windows")]
         {
-            let mut delete = Command::new("schtasks");
+            let mut delete = crate::process::command("schtasks");
             delete.args(["/Delete", "/TN", TASK_NAME, "/F"]);
             run_step(OP, "schtasks-delete", delete)
         }
@@ -260,7 +260,7 @@ impl LegacyOps for RealOps {
     fn reload(&self) -> StepOutcome {
         #[cfg(target_os = "linux")]
         {
-            let mut reload = Command::new("systemctl");
+            let mut reload = crate::process::command("systemctl");
             reload.args(["--user", "daemon-reload"]);
             run_step(OP, "systemctl-daemon-reload", reload)
         }
@@ -424,7 +424,7 @@ mod tests {
     fn classify_status_recognises_zero_exit_as_succeeded() {
         // Spawn the running test binary with `--list` (the cargo test
         // harness accepts it and exits 0).
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = crate::process::command(std::env::current_exe().unwrap())
             .arg("--list")
             .stdout(std::process::Stdio::null())
             .status();
@@ -435,7 +435,7 @@ mod tests {
     fn classify_status_recognises_non_zero_exit_as_failed() {
         // The cargo test harness rejects an unknown long flag with a
         // non-zero exit.
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = crate::process::command(std::env::current_exe().unwrap())
             .arg("--definitely-not-a-real-flag-zzzqx")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn classify_status_recognises_spawn_failure() {
         let status =
-            std::process::Command::new("definitely-not-on-path-zzzqxq-studio-worker").status();
+            crate::process::command("definitely-not-on-path-zzzqxq-studio-worker").status();
         assert_eq!(classify_status(status), StepOutcome::SpawnFailed);
     }
 
@@ -459,7 +459,7 @@ mod tests {
         // error, a broken interpreter, etc.  The warn must carry the real
         // OS error so an operator isn't misled by the generic "missing on
         // PATH?" hint when the true cause is something else.
-        let cmd = std::process::Command::new("definitely-not-on-path-zzzqxq-studio-worker");
+        let cmd = crate::process::command("definitely-not-on-path-zzzqxq-studio-worker");
         let logs = capture(move || {
             assert_eq!(run_step("activate", "smoke", cmd), StepOutcome::SpawnFailed);
         });

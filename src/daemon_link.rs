@@ -272,32 +272,19 @@ impl DaemonStarter for ProcessStarter {
     // run, not by unit tests (which substitute a fake starter).
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn start(&self) -> std::io::Result<u32> {
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(daemon_log_path(&self.config_path))?;
-        let mut cmd = Command::new(&self.exe);
+        // Its own process group, no console, so it outlives the UI.
+        let mut cmd = crate::process::detached(&self.exe);
         cmd.arg("--config")
             .arg(&self.config_path)
             .arg("run")
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        // Its own process group / no console, so it outlives the UI.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            cmd.process_group(0);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        }
         let mut child = cmd.spawn()?;
         let pid = child.id();
         // Reap it when it exits, and say so.

@@ -135,32 +135,19 @@ impl SetupOps for RealOps {
     // Starts a real, detached tray UI; exercised by the installer runs, not unit tests.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn start_ui(&self, exe: &Path, args: &[OsString], log: &Path) -> std::io::Result<u32> {
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         let out = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log)?;
-        let mut cmd = Command::new(exe);
+        // Its own process group, no console, so it outlives the installer.
+        let mut cmd = crate::process::detached(exe);
         // The UI writes its own log to `log` (`ui_log`); stderr keeps what bypasses tracing (a
         // panic message).
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(out);
-        // Its own process group / no console, so it outlives the installer.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            cmd.process_group(0);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-        }
         Ok(cmd.spawn()?.id())
     }
 }

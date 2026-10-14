@@ -374,7 +374,7 @@ impl UpdateRunner for RealRunner {
 
     fn run_installer(&self, installer_path: &Path, variant: Variant) -> Result<()> {
         if cfg!(target_os = "windows") {
-            let status = std::process::Command::new("powershell")
+            let status = crate::process::command("powershell")
                 .env(variant::INSTALLER_ENV, variant.as_str())
                 .env(INSTALLER_UPDATE_ENV, "1")
                 .args([
@@ -391,7 +391,7 @@ impl UpdateRunner for RealRunner {
                 bail!("installer exited with {status}");
             }
         } else {
-            let status = std::process::Command::new("sh")
+            let status = crate::process::command("sh")
                 .env(variant::INSTALLER_ENV, variant.as_str())
                 .env(INSTALLER_UPDATE_ENV, "1")
                 .arg(installer_path)
@@ -754,7 +754,7 @@ pub fn restart_self() -> ! {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(&bin).args(&args).exec();
+        let err = crate::process::command(&bin).args(&args).exec();
         tracing::error!(
             target: TRACE_TARGET,
             bin = %bin.display(),
@@ -766,7 +766,7 @@ pub fn restart_self() -> ! {
     }
     #[cfg(not(unix))]
     {
-        match std::process::Command::new(&bin).args(&args).spawn() {
+        match crate::process::detached(&bin).args(&args).spawn() {
             Ok(_) => std::process::exit(0),
             Err(err) => {
                 tracing::error!(

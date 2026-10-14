@@ -294,7 +294,12 @@ enum Restart {
 /// display retry needs a fresh process; a replaced binary needs one to run the new code.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn restart_in_place(launch: &std::path::Path, reason: Restart) -> Result<()> {
-    let mut cmd = std::process::Command::new(launch);
+    // Unix replaces this process in place; elsewhere the new UI outlives this one.
+    let mut cmd = if cfg!(unix) {
+        crate::process::command(launch)
+    } else {
+        crate::process::detached(launch)
+    };
     cmd.args(std::env::args_os().skip(1));
     match reason {
         Restart::Display(attempt) => cmd.env(DISPLAY_ATTEMPT_ENV, attempt.to_string()),
