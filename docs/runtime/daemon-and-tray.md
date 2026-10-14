@@ -43,6 +43,22 @@ so CI can test the headless core; it is not shipped.
 - The lock is advisory and per config directory: two workers with different `--config`
   directories run side by side.
 
+## Child processes never show a window
+
+The daemon and the tray run without a console on Windows (the daemon is started detached, the
+tray from the login entry). A console program started from a process without a console opens a
+console window of its own, so every child process is built by `crate::process`:
+
+- `command(program)`: a helper the worker runs and reads (`nvidia-smi`, `powershell`, `sd-cli`,
+  the llama binary, `schtasks`, `systemctl`, the installer): `CREATE_NO_WINDOW` on Windows, in the
+  worker's process group.
+- `detached(program)`: a process that outlives the worker (the daemon, the tray, a restart into an
+  updated binary): `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW` on Windows, its
+  own process group (`process_group(0)`) on Unix. A Unix restart in place `exec`s instead, so it
+  uses `command`.
+- `clippy.toml` disallows `std::process::Command::new` everywhere else; `cargo clippy` fails on a
+  new raw spawn.
+
 ## Registration never stops local serving
 
 - The local API, model host and stream listener start before the registration gate.
