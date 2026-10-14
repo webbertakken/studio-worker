@@ -5,6 +5,7 @@
 //! or `schtasks`, then opens a console window of its own in front of the player. Every child is
 //! therefore built here: [`command`] for a helper the worker waits on, [`detached`] for a process
 //! that outlives the worker. `clippy.toml` refuses `std::process::Command::new` anywhere else.
+//! Rule: docs/runtime/daemon-and-tray.md, "Child processes never show a window".
 
 use std::ffi::OsStr;
 use std::process::Command;
@@ -80,6 +81,13 @@ mod tests {
         assert_eq!(flags & CREATE_NO_WINDOW, CREATE_NO_WINDOW);
         assert_eq!(flags & DETACHED_PROCESS, DETACHED_PROCESS);
         assert_eq!(flags & CREATE_NEW_PROCESS_GROUP, CREATE_NEW_PROCESS_GROUP);
+    }
+
+    #[test]
+    fn clippy_refuses_a_raw_spawn_anywhere_else() {
+        let config = include_str!("../clippy.toml");
+        assert!(config.contains("disallowed-methods"));
+        assert!(config.contains("path = \"std::process::Command::new\""));
     }
 
     #[test]
