@@ -247,7 +247,11 @@ request with no model of that kind in the catalog returns `400`.  The
 an OpenAI-style client can point straight at
 `http://127.0.0.1:4787/v1/chat/completions` with the bearer token.
 
-Chat renders the model's own chat template.  `chat_template_kwargs` (as in
+Chat renders the model's own chat template, with llama.cpp's template helpers:
+`raise_exception(message)` fails the render with the template's message, and
+`strftime_now(format)` is the local time in a strftime format (Mistral Small 3.2
+dates its system prompt with it); a format it cannot read is a named error.
+`chat_template_kwargs` (as in
 llama-server) overrides the model's `chatTemplateKwargs`, e.g.
 `{"enable_thinking": false}` for a hybrid-reasoning model; a `<think>` block
 in the answer is returned as `reasoning_content`.  `usage` carries real token

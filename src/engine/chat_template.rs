@@ -40,6 +40,23 @@ pub fn render_chat(
             ))
         },
     );
+    // llama.cpp's template helpers: `raise_exception` (above) and `strftime_now`, the local time
+    // in a strftime format (Mistral Small 3.2 dates its system prompt with it).
+    env.add_function(
+        "strftime_now",
+        |format: String| -> Result<String, minijinja::Error> {
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            // An unknown specifier is an error, never a panic in the worker.
+            write!(out, "{}", chrono::Local::now().format(&format)).map_err(|_| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("strftime_now: unsupported format {format:?}"),
+                )
+            })?;
+            Ok(out)
+        },
+    );
     let err = |e: minijinja::Error| {
         // Keep the template's own message (e.g. `raise_exception`) visible.
         let detail = e
@@ -165,6 +182,45 @@ mod tests {
             err.to_string().contains("System role not supported"),
             "{err}"
         );
+    }
+
+    /// llama.cpp gives templates `strftime_now`; Mistral Small 3.2's template dates its system prompt
+    /// with it (`strftime_now("%Y-%m-%d")`).
+    #[test]
+    fn strftime_now_formats_the_local_date_like_llama_cpp() {
+        let out = render_chat(
+            "{%- set today = strftime_now(\"%Y-%m-%d\") %}Today is {{ today }}.",
+            &msgs(),
+            &Default::default(),
+            &vars(),
+        )
+        .unwrap();
+        let expected = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(out, format!("Today is {expected}."));
+    }
+
+    #[test]
+    fn strftime_now_takes_any_strftime_format() {
+        let out = render_chat(
+            "{{ strftime_now('%d %b %Y') }}",
+            &msgs(),
+            &Default::default(),
+            &vars(),
+        )
+        .unwrap();
+        assert_eq!(out, chrono::Local::now().format("%d %b %Y").to_string());
+    }
+
+    #[test]
+    fn strftime_now_names_a_format_it_cannot_read_instead_of_panicking() {
+        let err = render_chat(
+            "{{ strftime_now('%Q') }}",
+            &msgs(),
+            &Default::default(),
+            &vars(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unsupported format"), "{err}");
     }
 
     #[test]
