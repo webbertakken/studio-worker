@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.24](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.23...studio-worker-v0.4.24) (2026-10-15)
+
+
+### Bug Fixes
+
+* the auto-updater checks while a job runs ([#173](https://github.com/webbertakken/studio-worker/issues/173)) ([f8f64d6](https://github.com/webbertakken/studio-worker/commit/f8f64d6e2c765360d73fb844f0aad5c2037fbfa6))
+
 ## [0.4.23](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.22...studio-worker-v0.4.23) (2026-10-15)
 
 
