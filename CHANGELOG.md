@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.22](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.21...studio-worker-v0.4.22) (2026-10-15)
+
+
+### Bug Fixes
+
+* Windows updates install in process ([#169](https://github.com/webbertakken/studio-worker/issues/169)) ([737ce27](https://github.com/webbertakken/studio-worker/commit/737ce272497946f61141742ab7ba292fbb12a5d1))
+
 ## [0.4.21](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.20...studio-worker-v0.4.21) (2026-10-15)
 
 
