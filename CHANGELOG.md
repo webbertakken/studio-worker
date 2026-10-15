@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.23](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.22...studio-worker-v0.4.23) (2026-10-15)
+
+
+### Bug Fixes
+
+* admit transient jobs next to loaded models ([#171](https://github.com/webbertakken/studio-worker/issues/171)) ([a5d8072](https://github.com/webbertakken/studio-worker/commit/a5d80726791b89f95113b77825d151b9512acc3a))
+
 ## [0.4.22](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.21...studio-worker-v0.4.22) (2026-10-15)
 
 
