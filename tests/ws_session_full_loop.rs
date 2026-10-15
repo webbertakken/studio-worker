@@ -982,3 +982,70 @@ async fn ws_session_rejects_an_offer_that_does_not_fit_next_to_the_resident_mode
         .await
         .expect("session loop timed out");
 }
+
+/// An update waiting for the running job to end turns new offers away as `busy` (requeued, no
+/// attempt counted), so the job slot frees and the update installs.
+#[tokio::test]
+async fn ws_session_turns_offers_away_while_an_update_waits() {
+    let observers = WorkerObservers::default();
+    observers
+        .update_pending
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let pending = observers.update_pending.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut ws = tokio_tungstenite::accept_hdr_async(stream, echo_subprotocol).await?;
+        collect_frames(&mut ws, &["hello"]).await?;
+        ws.send(Message::Text(
+            json!({"type":"welcome","workerId":"w-test","serverTime":"now"})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+        ws.send(llm_offer("job-during-update")).await?;
+        let frames = collect_frames(&mut ws, &["reject"]).await?;
+        assert_eq!(frames["reject"]["jobId"], "job-during-update");
+        assert_eq!(frames["reject"]["code"], "busy");
+        let reason = frames["reject"]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("update"), "{reason}");
+
+        // The update gave up (or failed): offers run again.
+        pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        ws.send(llm_offer("job-after")).await?;
+        let frames = collect_frames(&mut ws, &["accept", "completeJson"]).await?;
+        assert_eq!(frames["accept"]["jobId"], "job-after");
+        ws.close(None).await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let session = tokio::spawn(spawn_ws_session(
+        config::shared(cfg),
+        stop.clone(),
+        Arc::new(Mutex::new(Vec::<LogEntry>::new())),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        observers,
+        SessionSchedule::fast_for_tests(),
+    ));
+    tokio::time::timeout(TIMEOUT, server)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked")
+        .expect("server returned err");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("session loop timed out");
+}

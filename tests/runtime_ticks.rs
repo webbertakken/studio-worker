@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use studio_worker::config::Config;
 use studio_worker::job_gate::JobGate;
 use studio_worker::runtime::{
-    auto_update_tick, spawn_auto_updater, AutoUpdateDecision, LoopSchedule,
+    auto_update_tick, spawn_auto_updater, AutoUpdateDecision, LoopSchedule, UpdateDrain,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -45,7 +45,13 @@ async fn auto_update_tick_reports_up_to_date() {
     cfg.auto_update_enabled = true;
     cfg.auto_update_feed = format!("{}/releases", feed.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let decision = auto_update_tick(&cfg, &JobGate::new(), &logs).await;
+    let decision = auto_update_tick(
+        &cfg,
+        &JobGate::new(),
+        &UpdateDrain::new(Arc::new(AtomicBool::new(false))),
+        &logs,
+    )
+    .await;
     assert_eq!(decision, AutoUpdateDecision::UpToDate);
 }
 
@@ -61,7 +67,13 @@ async fn auto_update_tick_reports_check_error_on_bad_feed() {
     cfg.auto_update_enabled = true;
     cfg.auto_update_feed = format!("{}/releases", feed.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let decision = auto_update_tick(&cfg, &JobGate::new(), &logs).await;
+    let decision = auto_update_tick(
+        &cfg,
+        &JobGate::new(),
+        &UpdateDrain::new(Arc::new(AtomicBool::new(false))),
+        &logs,
+    )
+    .await;
     assert!(matches!(decision, AutoUpdateDecision::CheckError(_)));
 }
 
@@ -85,7 +97,13 @@ async fn auto_update_tick_reports_update_error_when_apply_fails() {
     cfg.auto_update_enabled = true;
     cfg.auto_update_feed = format!("{}/releases", feed.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let decision = auto_update_tick(&cfg, &JobGate::new(), &logs).await;
+    let decision = auto_update_tick(
+        &cfg,
+        &JobGate::new(),
+        &UpdateDrain::new(Arc::new(AtomicBool::new(false))),
+        &logs,
+    )
+    .await;
     assert!(matches!(decision, AutoUpdateDecision::UpdateError(_)));
     let entries = logs.lock();
     assert!(entries
@@ -93,18 +111,124 @@ async fn auto_update_tick_reports_update_error_when_apply_fails() {
         .any(|e| e.level == "error" && e.message.contains("update failed")));
 }
 
+/// A feed whose newest release is `v9999.0.0` with no assets: an install of it fails at once, so
+/// reaching `UpdateError` proves the tick got past the drain without installing anything.
+async fn newer_feed() -> (MockServer, String) {
+    let feed = MockServer::start().await;
+    let body = serde_json::json!([{
+        "tag_name": "v9999.0.0", "prerelease": false, "draft": false, "assets": [],
+    }]);
+    Mock::given(method("GET"))
+        .and(path("/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&feed)
+        .await;
+    let url = format!("{}/releases", feed.uri());
+    (feed, url)
+}
+
+fn drain_for_tests(pending: &Arc<AtomicBool>, limit: Duration) -> UpdateDrain {
+    UpdateDrain::new(pending.clone()).with_timing(Duration::from_millis(10), limit)
+}
+
+/// PCWebber stayed on 0.4.21 all day: every tick found a job running and skipped the check.  A busy
+/// worker still checks; it only waits to install.
 #[tokio::test]
-async fn auto_update_tick_skips_when_busy() {
+async fn auto_update_tick_checks_while_a_job_runs() {
+    let feed = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&feed)
+        .await;
     let mut cfg = registered_cfg("http://api.invalid");
     cfg.auto_update_enabled = true;
+    cfg.auto_update_feed = format!("{}/releases", feed.uri());
     let logs = Arc::new(Mutex::new(Vec::new()));
-    // A held reservation on the shared gate models an in-flight job.
     let gate = JobGate::new();
     let _held = gate.try_reserve().expect("hold the slot");
-    let decision = auto_update_tick(&cfg, &gate, &logs).await;
-    assert_eq!(decision, AutoUpdateDecision::SkippedBusy);
+    let pending = Arc::new(AtomicBool::new(false));
+    let decision = auto_update_tick(
+        &cfg,
+        &gate,
+        &drain_for_tests(&pending, Duration::from_secs(5)),
+        &logs,
+    )
+    .await;
+    assert_eq!(decision, AutoUpdateDecision::UpToDate);
+    assert!(logs.lock().iter().any(|e| e.message.contains("up to date")));
+}
+
+/// A newer version found mid-job: new offers are turned away until the job ends, then it installs.
+#[tokio::test]
+async fn auto_update_tick_waits_for_the_running_job_then_installs() {
+    let (_feed, url) = newer_feed().await;
+    let mut cfg = registered_cfg("http://api.invalid");
+    cfg.auto_update_enabled = true;
+    cfg.auto_update_feed = url;
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let gate = JobGate::new();
+    let held = gate.try_reserve().expect("hold the slot");
+    let pending = Arc::new(AtomicBool::new(false));
+    let watched = pending.clone();
+    let job = std::thread::spawn(move || {
+        // The job runs on while the update waits; it ends once offers are being turned away.
+        let started = std::time::Instant::now();
+        while !watched.load(Ordering::SeqCst) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the update never waited"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(held);
+    });
+    let decision = auto_update_tick(
+        &cfg,
+        &gate,
+        &drain_for_tests(&pending, Duration::from_secs(5)),
+        &logs,
+    )
+    .await;
+    job.join().unwrap();
+    assert!(
+        matches!(decision, AutoUpdateDecision::UpdateError(_)),
+        "{decision:?}"
+    );
+    assert!(
+        !pending.load(Ordering::SeqCst),
+        "offers flow again after a failed install"
+    );
     let entries = logs.lock();
-    assert!(entries.iter().any(|e| e.message.contains("worker is busy")));
+    assert!(entries
+        .iter()
+        .any(|e| e.message.contains("waits for the running job to end")));
+}
+
+/// A job that outlasts the wait: the update gives up until the next check, and offers flow again.
+#[tokio::test]
+async fn auto_update_tick_gives_up_waiting_for_a_long_job() {
+    let (_feed, url) = newer_feed().await;
+    let mut cfg = registered_cfg("http://api.invalid");
+    cfg.auto_update_enabled = true;
+    cfg.auto_update_feed = url;
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let gate = JobGate::new();
+    let _held = gate.try_reserve().expect("hold the slot");
+    let pending = Arc::new(AtomicBool::new(false));
+    let decision = auto_update_tick(
+        &cfg,
+        &gate,
+        &drain_for_tests(&pending, Duration::from_millis(50)),
+        &logs,
+    )
+    .await;
+    assert_eq!(decision, AutoUpdateDecision::SkippedBusy);
+    assert!(!pending.load(Ordering::SeqCst));
+    assert!(logs
+        .lock()
+        .iter()
+        .any(|e| e.level == "warn" && e.message.contains("gave up waiting")));
 }
 
 #[tokio::test]
@@ -112,7 +236,13 @@ async fn auto_update_tick_returns_disabled_when_turned_off() {
     let mut cfg = registered_cfg("http://api.invalid");
     cfg.auto_update_enabled = false;
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let decision = auto_update_tick(&cfg, &JobGate::new(), &logs).await;
+    let decision = auto_update_tick(
+        &cfg,
+        &JobGate::new(),
+        &UpdateDrain::new(Arc::new(AtomicBool::new(false))),
+        &logs,
+    )
+    .await;
     assert_eq!(decision, AutoUpdateDecision::Disabled);
 }
 
@@ -155,7 +285,14 @@ async fn spawn_auto_updater_throttles_then_checks_until_stopped() {
         ..LoopSchedule::fast_for_tests()
     };
 
-    let handle = spawn_auto_updater(shared, stop.clone(), logs, busy, schedule);
+    let handle = spawn_auto_updater(
+        shared,
+        stop.clone(),
+        logs,
+        busy,
+        Arc::new(AtomicBool::new(false)),
+        schedule,
+    );
 
     // Poll until the feed is hit (proving a check fired), then stop.
     let mut fired = false;

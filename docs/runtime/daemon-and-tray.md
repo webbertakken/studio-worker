@@ -152,6 +152,18 @@ Every install method ends with the tray UI running:
   `step` `download`, `verify`, `extract` or `swap`. A failure the operating system caused (access
   denied, the file in use, flagged by the antivirus, blocked by policy) reaches the worker's log,
   and so the studio, as "update blocked by the OS: <reason>"; any other reads "update failed: …".
+- **When the auto-updater checks.** Every `auto_update_interval_secs` (30 min), whether or not a job
+  runs; each check logs under `auto-update`: "up to date at <v>", "update available <a> -> <b>;
+  applying", "check failed: …", or the waiting lines below. It used to skip the whole check while a
+  job ran, and a worker busy all day (PCWebber) never updated.
+  - A newer version found while a job runs waits for it ("update <a> -> <b> waits for the running
+    job to end"). Meanwhile the WS session turns new offers away as `busy` ("worker is installing
+    an update"), which the studio requeues with no attempt counted, so the running job is the last
+    (`UpdateDrain`, `observers.update_pending`).
+  - The job slot is tried every 5 s (`UPDATE_DRAIN_POLL`); once free, the updater holds it and
+    installs.
+  - A job still running after 30 min (`UPDATE_DRAIN_LIMIT`) is left alone: "gave up waiting"
+    (warn), offers flow again, and the next check tries again.
 - **From source** (`cargo install studio-worker`): run `studio-worker setup` once.
 
 `studio-worker setup`:

@@ -748,6 +748,27 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         );
         return;
     }
+    // An update waits for the running job to end: the offer goes back for another worker, with no
+    // attempt counted, so this worker's slot frees for the install.
+    if ctx.observers.update_pending.load(Ordering::SeqCst) {
+        push_log_with_observers(
+            &ctx.logs,
+            Some(&ctx.observers),
+            "info",
+            "ws",
+            &format!("rejecting offer {job_id}: an update is waiting to install"),
+            Some(job_id.clone()),
+        );
+        spawn_reject_offer(
+            ctx.sender.clone(),
+            ctx.logs.clone(),
+            ctx.observers.clone(),
+            job_id,
+            "worker is installing an update",
+            crate::ws::types::RejectCode::Busy,
+        );
+        return;
+    }
     // Only when idle (experimental): the person is using this computer (or
     // we cannot tell), so the studio's offer goes back for another worker.
     let only_when_idle = ctx.cfg.lock().only_when_idle;

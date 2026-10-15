@@ -219,6 +219,9 @@ pub struct WorkerObservers {
     /// The model host, once `spawn_local_api` starts it: the WS session admits a studio offer
     /// against the models it holds loaded (docs/runtime/model-lifecycle.md).
     pub model_host: Arc<Mutex<Option<crate::host::ModelHost>>>,
+    /// An update waits for the running job to end: the WS session turns new offers away as
+    /// `busy` until it is cleared (`UpdateDrain`).
+    pub update_pending: Arc<AtomicBool>,
 }
 
 /// Entries of `recent_logs` newer than sequence number `after`, and the
@@ -904,6 +907,7 @@ pub async fn run_loops(
         stop.clone(),
         logs.clone(),
         busy.clone(),
+        observers.update_pending.clone(),
         schedule,
     );
     // The session owns the daemon's reason to run: once it ends (stop,
@@ -1165,7 +1169,8 @@ pub fn spawn_local_api(
 pub enum AutoUpdateDecision {
     /// Auto-update is turned off — do nothing.
     Disabled,
-    /// Worker is currently running a job — skip.
+    /// A newer version waited for the running job longer than the drain limit; the next check
+    /// tries again.
     SkippedBusy,
     /// Local version is already the latest.
     UpToDate,
@@ -1177,27 +1182,75 @@ pub enum AutoUpdateDecision {
     UpdateError(String),
 }
 
+/// How an update found while a job runs waits for it (docs/runtime/daemon-and-tray.md, "Auto-update").
+/// While `pending` is set, the WS session turns new offers away as `busy`, so the running job is the
+/// last before the install.
+#[derive(Clone)]
+pub struct UpdateDrain {
+    pub pending: Arc<AtomicBool>,
+    /// How often the free job slot is tried while waiting.
+    pub poll: Duration,
+    /// How long to wait for the running job before giving up until the next check.
+    pub limit: Duration,
+}
+
+/// A job slot tried every 5 s.  Safe range 1..=30 s.
+pub const UPDATE_DRAIN_POLL: Duration = Duration::from_secs(5);
+/// Longer than a studio job takes (image jobs end within minutes; a clue batch within 20); past it
+/// the update gives up until the next check.  Safe range 10..=60 min.
+pub const UPDATE_DRAIN_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+impl UpdateDrain {
+    pub fn new(pending: Arc<AtomicBool>) -> Self {
+        Self {
+            pending,
+            poll: UPDATE_DRAIN_POLL,
+            limit: UPDATE_DRAIN_LIMIT,
+        }
+    }
+
+    pub fn with_timing(self, poll: Duration, limit: Duration) -> Self {
+        Self {
+            poll,
+            limit,
+            ..self
+        }
+    }
+
+    /// The job slot once the running job ends, turning offers away meanwhile; `None` past the limit.
+    fn wait_for_slot(
+        &self,
+        gate: &crate::job_gate::JobGate,
+    ) -> Option<crate::job_gate::JobReservation> {
+        self.pending.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let slot = loop {
+            if let Some(slot) = gate.try_reserve() {
+                break Some(slot);
+            }
+            if started.elapsed() >= self.limit {
+                break None;
+            }
+            std::thread::sleep(self.poll);
+        };
+        // Holding the slot keeps offers away from here on; without it they flow again.
+        self.pending.store(false, Ordering::SeqCst);
+        slot
+    }
+}
+
 pub async fn auto_update_tick(
     cfg: &Config,
     gate: &crate::job_gate::JobGate,
+    drain: &UpdateDrain,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
 ) -> AutoUpdateDecision {
     if !cfg.auto_update_enabled {
         return AutoUpdateDecision::Disabled;
     }
-    // A job in flight: skip the whole check.  The network probe is
-    // cheap but restarting mid-job is not, and we'd only reject the
-    // apply below anyway.
-    if gate.is_busy() {
-        push_log(
-            logs,
-            "info",
-            "auto-update",
-            "skipping check: worker is busy on a job",
-            None,
-        );
-        return AutoUpdateDecision::SkippedBusy;
-    }
+    // A running job never skips the check (PCWebber, busy all day, stayed on an old version): only
+    // the install waits for the job to end.
+    let drain = drain.clone();
     let feed = cfg.auto_update_feed.clone();
     let prerelease = cfg.auto_update_prerelease;
     let logs_for_task = logs.clone();
@@ -1217,18 +1270,37 @@ pub async fn auto_update_tick(
                 Ok(AutoUpdateDecision::UpToDate)
             }
             Ok(update::CheckOutcome::NewerAvailable { current, latest }) => {
-                // Reserve the one-job slot *before* touching the
-                // installer, so an offer arriving mid-install is
-                // rejected as busy (the WS session shares this gate)
-                // and `restart_self` can never kill an in-flight job.
-                // A job that started between the is_busy() check and
-                // here loses the race here and we defer to next tick.
-                let Some(_reservation) = gate.try_reserve() else {
+                // Reserve the one-job slot *before* touching the installer, so an offer arriving
+                // mid-install is rejected as busy (the WS session shares this gate) and
+                // `restart_self` can never kill an in-flight job.  A running job is waited for, with
+                // new offers turned away meanwhile.
+                let reservation = match gate.try_reserve() {
+                    Some(slot) => Some(slot),
+                    None => {
+                        push_log(
+                            &logs_for_task,
+                            "info",
+                            "auto-update",
+                            &format!(
+                                "update {current} -> {latest} waits for the running job to end; \
+                                 new offers are turned away until then (at most {} min)",
+                                drain.limit.as_secs() / 60
+                            ),
+                            None,
+                        );
+                        drain.wait_for_slot(&gate)
+                    }
+                };
+                let Some(_reservation) = reservation else {
                     push_log(
                         &logs_for_task,
-                        "info",
+                        "warn",
                         "auto-update",
-                        "update available but a job started; deferring install",
+                        &format!(
+                            "update {current} -> {latest} gave up waiting for the running job after \
+                             {} min; offers flow again, and the next check tries again",
+                            drain.limit.as_secs() / 60
+                        ),
                         None,
                     );
                     return Ok(AutoUpdateDecision::SkippedBusy);
@@ -1315,6 +1387,7 @@ pub fn spawn_auto_updater(
     stop: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     busy: Arc<AtomicBool>,
+    update_pending: Arc<AtomicBool>,
     schedule: LoopSchedule,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1335,7 +1408,8 @@ pub fn spawn_auto_updater(
             }
             elapsed = Duration::from_secs(0);
             let gate = crate::job_gate::JobGate::from_shared(busy.clone());
-            let decision = auto_update_tick(&snapshot, &gate, &logs).await;
+            let drain = UpdateDrain::new(update_pending.clone());
+            let decision = auto_update_tick(&snapshot, &gate, &drain, &logs).await;
             if matches!(decision, AutoUpdateDecision::Updated) {
                 stop.store(true, Ordering::SeqCst);
                 update::restart_self();
@@ -2274,24 +2348,14 @@ mod tests {
             ..Config::default()
         };
         let logs = Arc::new(Mutex::new(Vec::new()));
-        let decision = auto_update_tick(&cfg, &crate::job_gate::JobGate::new(), &logs).await;
+        let decision = auto_update_tick(
+            &cfg,
+            &crate::job_gate::JobGate::new(),
+            &UpdateDrain::new(Arc::new(AtomicBool::new(false))),
+            &logs,
+        )
+        .await;
         assert_eq!(decision, AutoUpdateDecision::Disabled);
-    }
-
-    #[tokio::test]
-    async fn auto_update_tick_skipped_when_busy() {
-        let cfg = Config {
-            auto_update_enabled: true,
-            ..Config::default()
-        };
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        // A held reservation on the shared gate = an in-flight job.
-        let gate = crate::job_gate::JobGate::new();
-        let _held = gate.try_reserve().expect("hold the slot");
-        let decision = auto_update_tick(&cfg, &gate, &logs).await;
-        assert_eq!(decision, AutoUpdateDecision::SkippedBusy);
-        let entries = logs.lock();
-        assert!(entries.iter().any(|e| e.message.contains("busy on a job")));
     }
 
     #[tokio::test]
@@ -2324,7 +2388,14 @@ mod tests {
             auto_update_tick: Duration::from_secs(3600),
             shutdown_tick: Duration::from_millis(1),
         };
-        let handle = spawn_auto_updater(cfg, stop.clone(), logs, busy, schedule);
+        let handle = spawn_auto_updater(
+            cfg,
+            stop.clone(),
+            logs,
+            busy,
+            Arc::new(AtomicBool::new(false)),
+            schedule,
+        );
         // Let the loop reach its idle wait, then request shutdown.
         tokio::time::sleep(Duration::from_millis(10)).await;
         stop.store(true, Ordering::SeqCst);
