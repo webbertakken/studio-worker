@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.21](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.20...studio-worker-v0.4.21) (2026-10-15)
+
+
+### Bug Fixes
+
+* chat templates get strftime_now ([#167](https://github.com/webbertakken/studio-worker/issues/167)) ([6b5175e](https://github.com/webbertakken/studio-worker/commit/6b5175e5e13674a68492f3565fc20a2b5e5ed384))
+
 ## [0.4.20](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.19...studio-worker-v0.4.20) (2026-10-14)
 
 
