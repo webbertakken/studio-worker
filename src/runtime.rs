@@ -1252,7 +1252,8 @@ pub async fn auto_update_tick(
                             &logs_for_task,
                             "error",
                             "auto-update",
-                            &format!("update failed: {e}"),
+                            // "update blocked by the OS: …" when the OS refused the swap.
+                            &crate::self_install::describe_failure(&e),
                             None,
                         );
                         Ok(AutoUpdateDecision::UpdateError(e.to_string()))

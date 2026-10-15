@@ -138,10 +138,20 @@ Every install method ends with the tray UI running:
 - **Shell installer** (Linux, macOS) and **PowerShell installer** (Windows): after installing the
   binary they run `<install dir>/studio-worker setup`, and say so. When `setup` fails they warn
   with the command to run by hand; the binary stays installed.
-- **The auto-updater** runs the same installer with `STUDIO_WORKER_UPDATE=1`: the installer skips
-  `setup`, because the running tray UI restarts itself on the new binary
-  ([restart after an update](#restart-after-an-update)) and a second launch would pop its window
-  up.
+- **The auto-updater** on Linux and macOS runs the same shell installer with
+  `STUDIO_WORKER_UPDATE=1`: the installer skips `setup`, because the running tray UI restarts itself
+  on the new binary ([restart after an update](#restart-after-an-update)) and a second launch would
+  pop its window up.
+- **The auto-updater on Windows installs in its own process** (`self_install.rs`), never through
+  PowerShell or cmd. A managed machine's Attack Surface Reduction rules ("Use advanced protection
+  against ransomware") block a script host from changing an executable, and stranded a worker on
+  the old version. It downloads the release's `studio-worker-<target>.zip` and refuses one whose
+  `.sha256` sidecar is missing or does not match. It takes `studio-worker.exe` out of the archive,
+  parks the running binary as `studio-worker.exe.old` (removed at the next start) and copies the new
+  one into place, putting the old one back on any failure. Each step logs `op="self_install"` with
+  `step` `download`, `verify`, `extract` or `swap`. A failure the operating system caused (access
+  denied, the file in use, flagged by the antivirus, blocked by policy) reaches the worker's log,
+  and so the studio, as "update blocked by the OS: <reason>"; any other reads "update failed: …".
 - **From source** (`cargo install studio-worker`): run `studio-worker setup` once.
 
 `studio-worker setup`:

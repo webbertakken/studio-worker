@@ -587,6 +587,16 @@ pub struct UpdateHost<'a> {
     pub target: Option<&'a str>,
     /// The NVIDIA driver (`libcuda.so.1`) loads on this machine.
     pub nvidia_driver: bool,
+    /// Install in this process into this executable instead of running the installer script
+    /// (Windows: a managed machine's Attack Surface Reduction blocks a script host from changing
+    /// the executable; `crate::self_install`).
+    pub self_install_exe: Option<&'a Path>,
+}
+
+/// This process's executable, resolved once, for a host that lives for the whole process.
+fn current_exe_static() -> Option<&'static Path> {
+    static EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| std::env::current_exe().ok()).as_deref()
 }
 
 impl UpdateHost<'static> {
@@ -596,6 +606,11 @@ impl UpdateHost<'static> {
             running: Variant::current(),
             target: variant::release_target(),
             nvidia_driver: variant::nvidia_driver_present(),
+            self_install_exe: if cfg!(windows) {
+                current_exe_static()
+            } else {
+                None
+            },
         }
     }
 }
@@ -619,6 +634,14 @@ pub fn apply_variant_with<R: UpdateRunner>(
         .find(|r| parse_tag(&r.tag_name).as_ref() == Some(latest))
         .ok_or_else(|| anyhow!("release {latest} not present in feed"))?;
 
+    if let Some(exe) = host.self_install_exe {
+        let target = host
+            .target
+            .ok_or_else(|| anyhow!("this build names no release target to update from"))?;
+        crate::self_install::self_install(release, target, exe, &SelfInstallVia(runner))?;
+        info!(target: TRACE_TARGET, latest = %latest, "update installed in process; binary replaced");
+        return Ok(());
+    }
     let url = resolve_installer_url(release).ok_or_else(|| {
         anyhow!(
             "release {} is missing installer asset {}",
@@ -724,6 +747,18 @@ pub fn apply_variant_with<R: UpdateRunner>(
         "installer completed; binary replaced"
     );
     Ok(())
+}
+
+/// The update runner's download and checksum read, for a self-install.
+struct SelfInstallVia<'a, R: UpdateRunner>(&'a R);
+
+impl<R: UpdateRunner> crate::self_install::SelfInstallIo for SelfInstallVia<'_, R> {
+    fn download(&self, url: &str, dest: &Path) -> Result<()> {
+        self.0.download(url, dest)
+    }
+    fn fetch_checksum(&self, url: &str) -> Result<Option<String>> {
+        self.0.fetch_checksum(url)
+    }
 }
 
 /// Compute the (binary, args) tuple we'd re-exec ourselves with.  Pure
