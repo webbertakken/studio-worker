@@ -216,6 +216,9 @@ pub struct WorkerObservers {
     /// Whether the person is using this computer (the daemon's presence
     /// monitor writes it); `None` while unknown.
     pub user_presence: crate::presence::PresenceSlot,
+    /// The model host, once `spawn_local_api` starts it: the WS session admits a studio offer
+    /// against the models it holds loaded (docs/runtime/model-lifecycle.md).
+    pub model_host: Arc<Mutex<Option<crate::host::ModelHost>>>,
 }
 
 /// Entries of `recent_logs` newer than sequence number `after`, and the
@@ -1075,6 +1078,7 @@ pub fn spawn_local_api(
             config_path,
         )),
     );
+    *observers.model_host.lock() = Some(host.clone());
     let services = crate::local_api::ModelServices::new(host.clone());
     spawn_stream_listener(&cfg, &services, &observers, stop.clone());
     let api = crate::local_api::LocalApi::bind(

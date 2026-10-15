@@ -84,6 +84,19 @@ Every catalogue model has exactly one state. Only the worker changes it.
   see. Keeping a model warm is what residency is for.
 - A transient job is admitted only if its model fits next to the loaded models; otherwise it is
   refused (`insufficient_memory`) and, for a studio offer, rejected so another worker takes it.
+  - A studio offer is admitted against its `vramGbEstimate` before the job slot is reserved
+    (`ModelHost::admit_transient`). A refusal is a `reject` with code `insufficient_memory` and the
+    refusal as its reason; the studio requeues the job with no attempt counted.
+  - A local API request for a model that is not loaded is admitted against the catalogue
+    estimate; a refusal answers `409` with the refusal.
+  - When device memory cannot be measured at all (no probe and no total, or no model host), the
+    job is admitted unmeasured, with a warning: a worker without a readable device runs jobs as it
+    did before admission.
+  - Each decision logs `op="admit"`: "transient job admitted" (info) or "transient job refused"
+    (warn).
+  - PCWebber found the gap: two residents held 5.7 GB, and a Qwen3 32B clue job (21 GiB with its 8K
+    context) loaded 16.1 GiB of weights into the 16.4 GiB left. Creating its llama context then
+    failed, three attempts each.
 
 ## Admission
 

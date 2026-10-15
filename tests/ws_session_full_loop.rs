@@ -871,3 +871,114 @@ async fn ws_session_only_when_idle_turns_offers_down_while_the_person_is_active(
         .await
         .expect("session loop timed out");
 }
+
+/// An LLM offer for a model the studio estimates at `vram_gb_estimate`.
+fn llm_offer_needing(job_id: &str, vram_gb_estimate: f32) -> Message {
+    let Message::Text(text) = llm_offer(job_id) else {
+        unreachable!()
+    };
+    let mut offer: serde_json::Value = serde_json::from_str(&text).unwrap();
+    offer["claim"]["vramGbEstimate"] = json!(vram_gb_estimate);
+    Message::Text(offer.to_string().into())
+}
+
+/// docs/runtime/model-lifecycle.md: a transient job is admitted only if it fits next to the loaded
+/// models; a studio offer that does not is rejected `insufficient_memory`, so another worker takes
+/// it with no attempt counted.  PCWebber: two residents (5.7 GB) left 16,785 MiB free, and a Qwen3
+/// 32B clue job (21 GiB with its context) failed three times creating its llama context.
+#[tokio::test]
+async fn ws_session_rejects_an_offer_that_does_not_fit_next_to_the_resident_models() {
+    use studio_worker::catalog::{Catalog, CatalogModel};
+    use studio_worker::types::{ModelEngine, ModelSource, TaskKind};
+
+    let resident = |id: &str, gib: f32| CatalogModel {
+        id: id.into(),
+        display_name: id.into(),
+        kind: TaskKind::Llm,
+        vram_gb_estimate: gib,
+        description: None,
+        source: ModelSource {
+            engine: ModelEngine::Synthetic,
+            files: vec![],
+            cli_defaults: Default::default(),
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let host = studio_worker::host::ModelHost::new(
+        Arc::new(Mutex::new(Catalog {
+            models: vec![resident("a", 3.0), resident("b", 2.7)],
+            ..Default::default()
+        })),
+        Arc::new(studio_worker::test_support::InstantRuntime),
+        Arc::new(studio_worker::test_support::FixedProbe(16_785.0 / 1024.0)),
+        studio_worker::residency::Residency::load_for_serving(Some(dir.path().join("r.json"))),
+    );
+    host.load("a").unwrap();
+    host.load("b").unwrap();
+    let observers = WorkerObservers::default();
+    *observers.model_host.lock() = Some(host);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut ws = tokio_tungstenite::accept_hdr_async(stream, echo_subprotocol).await?;
+        collect_frames(&mut ws, &["hello"]).await?;
+        ws.send(Message::Text(
+            json!({"type":"welcome","workerId":"w-test","serverTime":"now"})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+
+        ws.send(llm_offer_needing("job-32b", 21.0)).await?;
+        let frames = collect_frames(&mut ws, &["reject"]).await?;
+        assert_eq!(frames["reject"]["jobId"], "job-32b");
+        assert_eq!(frames["reject"]["code"], "insufficient_memory");
+        let reason = frames["reject"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("needs 21.00 GiB, 16.39 GiB free"),
+            "{reason}"
+        );
+
+        // A job that fits next to the residents still runs.
+        ws.send(llm_offer_needing("job-small", 1.0)).await?;
+        let frames = collect_frames(&mut ws, &["accept", "completeJson"]).await?;
+        assert_eq!(frames["accept"]["jobId"], "job-small");
+
+        ws.close(None).await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let cfg = Config {
+        api_base_url: format!("http://{ws_addr}"),
+        worker_id: Some("w-test".into()),
+        auth_token: Some("tok-test".into()),
+        auto_update_enabled: false,
+        ws_reconnect_attempts: Some(1),
+        ..Config::default()
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let session = tokio::spawn(spawn_ws_session(
+        config::shared(cfg),
+        stop.clone(),
+        Arc::new(Mutex::new(Vec::<LogEntry>::new())),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        observers,
+        SessionSchedule::fast_for_tests(),
+    ));
+
+    tokio::time::timeout(TIMEOUT, server)
+        .await
+        .expect("server timed out")
+        .expect("server task panicked")
+        .expect("server returned err");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("session loop timed out");
+}

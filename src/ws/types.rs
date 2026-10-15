@@ -31,6 +31,8 @@ pub enum RejectCode {
     Busy,
     /// Operator paused the worker.
     Paused,
+    /// The job does not fit in device memory next to the models the worker holds loaded.
+    InsufficientMemory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

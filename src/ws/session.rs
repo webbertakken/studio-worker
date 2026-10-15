@@ -774,6 +774,27 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
         );
         return;
     }
+    // A transient job runs only if it fits next to the loaded models; otherwise the studio gives it
+    // to a worker with room, with no attempt counted (docs/runtime/model-lifecycle.md).
+    if let Err(refused) = admit_offer(&ctx.observers, &claim.model, claim.vram_gb_estimate) {
+        push_log_with_observers(
+            &ctx.logs,
+            Some(&ctx.observers),
+            "warn",
+            "ws",
+            &format!("rejecting offer {job_id}: {refused}"),
+            Some(job_id.clone()),
+        );
+        spawn_reject_offer(
+            ctx.sender.clone(),
+            ctx.logs.clone(),
+            ctx.observers.clone(),
+            job_id,
+            refused.to_string(),
+            crate::ws::types::RejectCode::InsufficientMemory,
+        );
+        return;
+    }
     let reservation = match crate::job_gate::JobGate::from_shared(ctx.busy.clone()).try_reserve() {
         Some(reservation) => reservation,
         None => {
@@ -860,19 +881,42 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     });
 }
 
+/// Admit a studio offer through the model host, which counts the models it holds loaded.  Without a
+/// host (the local API failed to start) no model is loaded, and the job runs as it always has.
+fn admit_offer(
+    observers: &WorkerObservers,
+    model: &str,
+    needed_gib: f32,
+) -> Result<(), crate::admission::Refused> {
+    let host = observers.model_host.lock().clone();
+    match host {
+        Some(host) => host.admit_transient(model, needed_gib),
+        None => {
+            warn!(
+                target: "studio_worker::lifecycle",
+                op = "admit",
+                model,
+                "no model host: admitting the transient job unmeasured"
+            );
+            Ok(())
+        }
+    }
+}
+
 fn spawn_reject_offer(
     sender: WsSender,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     observers: WorkerObservers,
     job_id: String,
-    reason: &'static str,
+    reason: impl Into<String>,
     code: crate::ws::types::RejectCode,
 ) {
+    let reason = reason.into();
     tokio::spawn(async move {
         let result = sender
             .send(&WorkerInbound::Reject {
                 job_id: job_id.clone(),
-                reason: reason.to_string(),
+                reason,
                 code: Some(code),
             })
             .await;
