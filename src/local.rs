@@ -80,6 +80,9 @@ pub enum LocalError {
     BadInput(String),
     #[error("deadline passed: the caller stopped waiting")]
     DeadlineExceeded,
+    /// The job does not fit next to the loaded models (docs/runtime/model-lifecycle.md).
+    #[error("{0}")]
+    InsufficientMemory(crate::admission::Refused),
 }
 
 /// Why a job is refused or stopped once its caller's deadline has passed.
@@ -380,6 +383,12 @@ fn dispatch_and_record(
     prompt_preview: &str,
     task: Task,
 ) -> Result<TaskResult, LocalError> {
+    // A transient job: admitted only next to the loaded models, as a studio offer is.
+    let host = observers.model_host.lock().clone();
+    if let Some(host) = host {
+        host.admit_transient(&model.id, model.vram_gb_estimate)
+            .map_err(LocalError::InsufficientMemory)?;
+    }
     let run = JobRun::begin(
         observers,
         CurrentJob {
@@ -591,6 +600,42 @@ mod tests {
         assert_eq!(job.source, JobSource::Lane);
         assert_eq!(job.outcome, JobOutcome::Completed);
         assert!(observers.active_jobs.lock().is_empty());
+    }
+
+    /// docs/runtime/model-lifecycle.md: a local request for a model that is not loaded is a
+    /// transient job, admitted only if it fits next to the loaded models.
+    #[test]
+    fn a_transient_local_job_that_does_not_fit_next_to_the_residents_is_refused() {
+        let engine = SyntheticEngine::new();
+        let mut big = synthetic_model("big-chat", TaskKind::Llm);
+        big.vram_gb_estimate = 21.0;
+        let mut resident = synthetic_model("resident", TaskKind::Llm);
+        resident.vram_gb_estimate = 5.7;
+        let catalog = catalog_with(vec![big, resident]);
+        let host = crate::host::ModelHost::new(
+            std::sync::Arc::new(parking_lot::Mutex::new(catalog.clone())),
+            std::sync::Arc::new(crate::test_support::InstantRuntime),
+            std::sync::Arc::new(crate::test_support::FixedProbe(16.39)),
+            crate::residency::Residency::load_for_serving(None),
+        );
+        host.load("resident").unwrap();
+        let observers = WorkerObservers::default();
+        *observers.model_host.lock() = Some(host);
+
+        let err = run_kind(
+            &engine,
+            &catalog,
+            &observers,
+            TaskKind::Llm,
+            Some("big-chat"),
+            "hi",
+            Task::Llm(Default::default()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, LocalError::InsufficientMemory(_)), "{err}");
+        assert!(err.to_string().contains("needs 21.00 GiB"), "{err}");
+        assert!(observers.local_jobs.lock().is_empty(), "nothing ran");
     }
 
     #[test]

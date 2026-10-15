@@ -1479,6 +1479,7 @@ fn respond_local_err(request: Request, err: LocalError) -> std::io::Result<()> {
     let status = match err {
         LocalError::Engine(_) => 500,
         LocalError::DeadlineExceeded => 504,
+        LocalError::InsufficientMemory(_) => 409,
         _ => 400,
     };
     respond(request, status, "text/plain", err.to_string().as_bytes())

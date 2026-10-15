@@ -219,6 +219,47 @@ impl ModelHost {
         loaded_gib(&catalog, &entries)
     }
 
+    /// Admit a transient job for `model` needing `needed_gib`: only if it fits next to the models
+    /// loaded now (docs/runtime/model-lifecycle.md).  A transient job never swaps a resident out.
+    /// Memory that cannot be measured (no probe, no total) admits it, as before admission: a
+    /// worker without a readable device must not turn every job away.
+    pub fn admit_transient(&self, model: &str, needed_gib: f32) -> Result<(), admission::Refused> {
+        let free = admission::free_now(self.inner.probe.as_ref(), self.loaded_gib());
+        if free == admission::FreeMemory::Unknown {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "admit",
+                model,
+                needed_gib,
+                "device memory unknown: admitting the transient job unmeasured"
+            );
+            return Ok(());
+        }
+        match admission::admit(needed_gib, &free) {
+            Ok(()) => {
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    op = "admit",
+                    model,
+                    needed_gib,
+                    free_gib = free.gib(),
+                    "transient job admitted"
+                );
+                Ok(())
+            }
+            Err(refused) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    op = "admit",
+                    model,
+                    error = %refused,
+                    "transient job refused"
+                );
+                Err(refused)
+            }
+        }
+    }
+
     /// Load `id` and mark it resident.  Answers the state after the
     /// request: `loading`, or `loaded` when it already was.
     pub fn load(&self, id: &str) -> Result<ModelStatus, HostError> {
@@ -1059,6 +1100,91 @@ mod tests {
             logs.contains("from=\"unloaded\"") || logs.contains("from=unloaded"),
             "{logs}"
         );
+    }
+
+    /// docs/runtime/model-lifecycle.md: a transient job is admitted only if it fits next to the
+    /// loaded models.  PCWebber (RTX 4090): two residents hold 5.7 GB, 16,785 MiB is free, and a
+    /// Qwen3 32B clue job needs 21 GiB with its 8K context.
+    #[test]
+    fn a_transient_job_that_does_not_fit_next_to_the_residents_is_refused() {
+        let f = fixture(
+            vec![model("a", 3.0, None), model("b", 2.7, None)],
+            16_785.0 / 1024.0,
+            FakeRuntime::open(),
+        );
+        f.host.load("a").unwrap();
+        f.host.load("b").unwrap();
+        f.host.wait_for("a", ModelState::serves, WAIT).unwrap();
+        f.host.wait_for("b", ModelState::serves, WAIT).unwrap();
+        let refused = f.host.admit_transient("qwen3-32b", 21.0).unwrap_err();
+        assert_eq!(refused.needed_gib, 21.0);
+        assert!((refused.free_gib - 16.39).abs() < 0.01, "{refused:?}");
+        assert_eq!(state_of(&f.host, "a"), ModelState::Loaded, "residents stay");
+    }
+
+    #[test]
+    fn a_transient_job_that_fits_next_to_the_residents_is_admitted() {
+        let f = fixture(vec![model("a", 3.0, None)], 16.4, FakeRuntime::open());
+        f.host.load("a").unwrap();
+        f.host.wait_for("a", ModelState::serves, WAIT).unwrap();
+        f.host.admit_transient("mistral-small", 14.0).unwrap();
+    }
+
+    #[test]
+    fn a_transient_job_is_admitted_against_the_residents_when_memory_cannot_be_probed() {
+        let catalog = Arc::new(Mutex::new(Catalog {
+            models: vec![model("a", 5.7, None)],
+            ..Default::default()
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let host = ModelHost::new(
+            catalog,
+            FakeRuntime::open(),
+            Arc::new(TotalOnlyProbe(24.0)),
+            Residency::load_for_serving(Some(dir.path().join("residency.json"))),
+        );
+        host.load("a").unwrap();
+        host.wait_for("a", ModelState::serves, WAIT).unwrap();
+        // 24 - 5.7 = 18.3 GiB, less the reserve: 21 does not fit, 16 does.
+        assert!(host.admit_transient("big", 21.0).is_err());
+        host.admit_transient("smaller", 16.0).unwrap();
+    }
+
+    #[test]
+    fn a_transient_job_is_admitted_when_device_memory_is_unknown() {
+        let catalog = Arc::new(Mutex::new(Catalog::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let host = ModelHost::new(
+            catalog,
+            FakeRuntime::open(),
+            Arc::new(NoProbe),
+            Residency::load_for_serving(Some(dir.path().join("residency.json"))),
+        );
+        host.admit_transient("any", 4.0).unwrap();
+    }
+
+    /// A device whose memory cannot be read at all (a CPU-only worker).
+    struct NoProbe;
+
+    impl crate::admission::MemoryProbe for NoProbe {
+        fn free_gib(&self) -> Option<f32> {
+            None
+        }
+        fn total_gib(&self) -> Option<f32> {
+            None
+        }
+    }
+
+    /// A device whose free memory cannot be read, only its total.
+    struct TotalOnlyProbe(f32);
+
+    impl crate::admission::MemoryProbe for TotalOnlyProbe {
+        fn free_gib(&self) -> Option<f32> {
+            None
+        }
+        fn total_gib(&self) -> Option<f32> {
+            Some(self.0)
+        }
     }
 
     #[test]

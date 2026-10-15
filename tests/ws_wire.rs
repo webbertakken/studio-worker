@@ -616,3 +616,19 @@ fn _example_helpers_compile() {
 fn _unused_helper_touch(c: &JobClaim) -> &str {
     &c.asset_name
 }
+
+#[test]
+fn inbound_reject_carries_the_insufficient_memory_code() {
+    let json = json!({
+        "type": "reject", "jobId": "j", "reason": "insufficient memory", "code": "insufficient_memory",
+    });
+    let parsed: WorkerInbound = serde_json::from_value(json.clone()).unwrap();
+    match parsed {
+        WorkerInbound::Reject { code, .. } => assert_eq!(
+            code,
+            Some(studio_worker::ws::types::RejectCode::InsufficientMemory)
+        ),
+        ref other => panic!("expected Reject, got {other:?}"),
+    }
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+}
