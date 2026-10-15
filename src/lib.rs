@@ -48,6 +48,7 @@ pub mod process;
 pub mod residency;
 pub mod runtime;
 pub mod secrets;
+pub mod self_install;
 pub mod setup;
 pub mod stt_stream;
 pub mod sys;

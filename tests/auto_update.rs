@@ -10,6 +10,20 @@ use studio_worker::update;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// An update through the installer script, the path these tests cover, on every platform: on
+/// Windows the real host installs in process instead (`mod self_install` below).
+fn apply_with_installer<R: update::UpdateRunner>(
+    feed: &str,
+    latest: &Version,
+    runner: &R,
+) -> anyhow::Result<()> {
+    let host = update::UpdateHost {
+        self_install_exe: None,
+        ..update::UpdateHost::current()
+    };
+    update::apply_variant_with(feed, latest, host, runner)
+}
+
 fn release(tag: &str, prerelease: bool, draft: bool) -> serde_json::Value {
     let installer = if cfg!(target_os = "windows") {
         "studio-worker-installer.ps1"
@@ -267,7 +281,7 @@ async fn apply_with_fake_runner_runs_full_flow() {
         installs: Mutex::new(Vec::new()),
     });
     let runner_clone = runner.clone();
-    let result = std::thread::spawn(move || update::apply_with(&feed, &target, &*runner_clone))
+    let result = std::thread::spawn(move || apply_with_installer(&feed, &target, &*runner_clone))
         .join()
         .unwrap();
     result.unwrap();
@@ -305,7 +319,7 @@ async fn apply_with_errors_when_release_missing() {
         .await;
     let feed = format!("{}/releases", server.uri());
     let missing = Version::new(9, 9, 9);
-    let err = std::thread::spawn(move || update::apply_with(&feed, &missing, &Noop))
+    let err = std::thread::spawn(move || apply_with_installer(&feed, &missing, &Noop))
         .join()
         .unwrap()
         .unwrap_err();
@@ -341,7 +355,7 @@ async fn apply_with_propagates_download_errors() {
         .await;
     let feed = format!("{}/releases", server.uri());
     let target = Version::new(0, 2, 0);
-    let err = std::thread::spawn(move || update::apply_with(&feed, &target, &DownloadFails))
+    let err = std::thread::spawn(move || apply_with_installer(&feed, &target, &DownloadFails))
         .join()
         .unwrap()
         .unwrap_err();
@@ -379,7 +393,7 @@ async fn apply_with_propagates_run_installer_errors() {
         .await;
     let feed = format!("{}/releases", server.uri());
     let target = Version::new(0, 2, 0);
-    let err = std::thread::spawn(move || update::apply_with(&feed, &target, &InstallFails))
+    let err = std::thread::spawn(move || apply_with_installer(&feed, &target, &InstallFails))
         .join()
         .unwrap()
         .unwrap_err();
@@ -573,7 +587,7 @@ async fn apply_with_emits_info_events_for_every_state_transition() {
         let runner = FakeRunner {
             installs: Mutex::new(Vec::new()),
         };
-        update::apply_with(&feed, &Version::new(0, 2, 0), &runner).unwrap();
+        apply_with_installer(&feed, &Version::new(0, 2, 0), &runner).unwrap();
     });
 
     assert!(logs.contains("INFO"), "expected INFO event, got: {logs}");
@@ -636,7 +650,7 @@ async fn apply_with_errors_when_installer_asset_missing() {
         .await;
     let feed = format!("{}/releases", server.uri());
     let target = Version::new(0, 5, 0);
-    let err = std::thread::spawn(move || update::apply_with(&feed, &target, &Noop))
+    let err = std::thread::spawn(move || apply_with_installer(&feed, &target, &Noop))
         .join()
         .unwrap()
         .unwrap_err();
@@ -700,7 +714,7 @@ async fn apply_runs_the_installer_when_the_sidecar_matches() {
         installs: std::sync::Mutex::new(Vec::new()),
     });
     let runner_clone = runner.clone();
-    std::thread::spawn(move || update::apply_with(&feed, &Version::new(0, 2, 0), &*runner_clone))
+    std::thread::spawn(move || apply_with_installer(&feed, &Version::new(0, 2, 0), &*runner_clone))
         .join()
         .unwrap()
         .unwrap();
@@ -716,7 +730,7 @@ async fn apply_refuses_to_run_an_installer_with_a_wrong_checksum() {
     });
     let runner_clone = runner.clone();
     let err = std::thread::spawn(move || {
-        update::apply_with(&feed, &Version::new(0, 2, 0), &*runner_clone)
+        apply_with_installer(&feed, &Version::new(0, 2, 0), &*runner_clone)
     })
     .join()
     .unwrap()
@@ -738,7 +752,7 @@ async fn apply_refuses_an_unparseable_sidecar() {
     });
     let runner_clone = runner.clone();
     let err = std::thread::spawn(move || {
-        update::apply_with(&feed, &Version::new(0, 2, 0), &*runner_clone)
+        apply_with_installer(&feed, &Version::new(0, 2, 0), &*runner_clone)
     })
     .join()
     .unwrap()
@@ -762,7 +776,7 @@ async fn apply_warns_but_proceeds_when_no_sidecar_is_published() {
     let feed_clone = feed.clone();
     let logs = std::thread::spawn(move || {
         captured_logs_for(move || {
-            update::apply_with(&feed_clone, &Version::new(0, 2, 0), &*runner_clone).unwrap();
+            apply_with_installer(&feed_clone, &Version::new(0, 2, 0), &*runner_clone).unwrap();
         })
     })
     .join()
@@ -900,6 +914,7 @@ mod variant {
                 running,
                 target: Some(LINUX_X64),
                 nvidia_driver,
+                self_install_exe: None,
             };
             let result =
                 update::apply_variant_with(&feed, &Version::new(0, 2, 0), host, &*in_thread);
@@ -986,5 +1001,117 @@ mod variant {
             .to_string()
             .contains("STUDIO_WORKER_VARIANT"));
         assert!(installs.is_empty(), "the installer must not run");
+    }
+}
+
+/// docs/runtime/updates.md, "Self-install": a Windows update never runs a script host; it swaps the
+/// verified binary in this process.
+mod self_install {
+    use super::*;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use studio_worker::self_install::binary_name;
+    use studio_worker::update::UpdateRunner;
+    use studio_worker::variant::Variant;
+
+    const WINDOWS: &str = "x86_64-pc-windows-msvc";
+
+    struct ArchiveRunner {
+        archive: PathBuf,
+        checksum: String,
+        installers_run: Mutex<u32>,
+    }
+
+    impl UpdateRunner for ArchiveRunner {
+        fn download(&self, _u: &str, dest: &Path) -> anyhow::Result<()> {
+            std::fs::copy(&self.archive, dest)?;
+            Ok(())
+        }
+        fn fetch_checksum(&self, _u: &str) -> anyhow::Result<Option<String>> {
+            Ok(Some(format!(
+                "{}  studio-worker-{WINDOWS}.zip\n",
+                self.checksum
+            )))
+        }
+        fn run_installer(&self, _p: &Path, _v: Variant) -> anyhow::Result<()> {
+            *self.installers_run.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    async fn windows_feed() -> (MockServer, String) {
+        let body = serde_json::json!([{
+            "tag_name": "studio-worker-v0.2.0",
+            "prerelease": false,
+            "draft": false,
+            "assets": [
+                { "name": update::installer_asset_name(), "browser_download_url": "https://github.com/o/r/releases/download/v0.2.0/i" },
+                { "name": format!("studio-worker-{WINDOWS}.zip"), "browser_download_url": "https://github.com/o/r/releases/download/v0.2.0/zip" },
+            ],
+        }]);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let feed = format!("{}/releases", server.uri());
+        (server, feed)
+    }
+
+    #[tokio::test]
+    async fn a_windows_update_swaps_the_verified_binary_and_runs_no_installer() {
+        let (_server, feed) = windows_feed().await;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("release.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        zip.start_file(binary_name(), zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"new").unwrap();
+        zip.finish().unwrap();
+        let checksum = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(std::fs::read(&archive).unwrap())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let exe = dir.path().join(binary_name());
+        std::fs::write(&exe, b"old").unwrap();
+        let runner = Arc::new(ArchiveRunner {
+            archive,
+            checksum,
+            installers_run: Mutex::new(0),
+        });
+        let in_thread = runner.clone();
+        let exe_in_thread = exe.clone();
+        let slot = Arc::new(Mutex::new(None));
+        let result_slot = slot.clone();
+        let logs = captured_logs_for(move || {
+            let host = update::UpdateHost {
+                running: Variant::Cpu,
+                target: Some(WINDOWS),
+                nvidia_driver: false,
+                self_install_exe: Some(&exe_in_thread),
+            };
+            let result =
+                update::apply_variant_with(&feed, &Version::new(0, 2, 0), host, &*in_thread);
+            *result_slot.lock().unwrap() = Some(result);
+        });
+        slot.lock().unwrap().take().unwrap().unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        assert_eq!(
+            *runner.installers_run.lock().unwrap(),
+            0,
+            "no installer script ran"
+        );
+        for step in ["download", "verify", "extract", "swap"] {
+            assert!(
+                logs.contains(&format!("step=\"{step}\""))
+                    || logs.contains(&format!("step={step}")),
+                "logs the {step} step: {logs}"
+            );
+        }
     }
 }
