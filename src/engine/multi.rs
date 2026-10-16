@@ -134,6 +134,7 @@ impl Engine for MultiEngine {
             crate::types::ModelEngine::LlamaCpp => "llama",
             crate::types::ModelEngine::Onnx => "onnx",
             crate::types::ModelEngine::Parakeet => "parakeet",
+            crate::types::ModelEngine::OnnxVision => "onnx-vision",
             crate::types::ModelEngine::Synthetic => "synthetic",
         };
         for e in &self.engines {

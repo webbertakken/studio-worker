@@ -26,6 +26,15 @@ pub const THUMBNAILS_CAP: usize = 2 * crate::runtime::RECENT_JOBS_CAP;
 /// size.
 pub fn make_thumbnail(encoded: &[u8]) -> anyhow::Result<Vec<u8>> {
     let image = image::load_from_memory(encoded).context("decoding the job's image")?;
+    thumbnail_of(image)
+}
+
+/// [`make_thumbnail`] of a picture already decoded (the picture a vision job looked at).
+pub fn thumbnail_of_picture(picture: &image::RgbImage) -> anyhow::Result<Vec<u8>> {
+    thumbnail_of(image::DynamicImage::ImageRgb8(picture.clone()))
+}
+
+fn thumbnail_of(image: image::DynamicImage) -> anyhow::Result<Vec<u8>> {
     let image = if image.width() > THUMBNAIL_MAX_SIDE || image.height() > THUMBNAIL_MAX_SIDE {
         image.thumbnail(THUMBNAIL_MAX_SIDE, THUMBNAIL_MAX_SIDE)
     } else {
@@ -138,6 +147,12 @@ mod tests {
     fn bytes_that_are_not_an_image_are_refused() {
         let err = make_thumbnail(b"not an image").unwrap_err();
         assert!(err.to_string().contains("decoding"), "got {err:#}");
+    }
+
+    #[test]
+    fn a_decoded_picture_is_scaled_to_fit() {
+        let png = thumbnail_of_picture(&image::RgbImage::new(768, 192)).unwrap();
+        assert_eq!(dimensions(&png), (384, 96));
     }
 
     #[test]

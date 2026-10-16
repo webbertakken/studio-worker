@@ -137,7 +137,7 @@ fn capabilities_flat_models_returns_all_kinds_flattened() {
 fn capabilities_kinds_lists_each_advertised_kind() {
     let engine = synth_engine();
     let kinds = engine.capabilities().kinds();
-    assert_eq!(kinds.len(), TaskKind::ALL.len());
+    assert_eq!(kinds.len(), TaskKind::STUDIO.len());
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn build_returns_a_multi_engine_named_multi() {
 fn capabilities_advertise_every_kind() {
     let engine = synth_engine();
     let caps = engine.capabilities();
-    for kind in TaskKind::ALL {
+    for kind in TaskKind::STUDIO {
         assert!(
             caps.supported_models_per_kind.contains_key(&kind),
             "{} advertised",

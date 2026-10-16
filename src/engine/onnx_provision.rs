@@ -221,24 +221,69 @@ fn detect_flavour() -> Result<OrtFlavour> {
         tracing::info!(target: TRACE_TARGET, op = "flavour", flavour = pinned.name(), source = "override", "onnx runtime flavour pinned");
         return Ok(pinned);
     }
-    let detected = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        crate::process::command("ldconfig")
-            .arg("-p")
-            .output()
-            .ok()
-            .and_then(|o| cuda_flavour_from_ldconfig(&String::from_utf8_lossy(&o.stdout)))
+    let (detected, source) = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        match linker_cache(run_ldconfig) {
+            Ok(listing) => {
+                let detected = cuda_flavour_from_ldconfig(&listing);
+                let source = if detected.is_some() {
+                    "cuda_runtime_detected"
+                } else {
+                    "no_complete_cuda_runtime"
+                };
+                (detected, source)
+            }
+            Err(failures) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    op = "flavour",
+                    error = %failures,
+                    "ldconfig could not run, so a CUDA runtime cannot be detected; \
+                     set {FLAVOUR_ENV} to pin the flavour"
+                );
+                (None, "ldconfig_unavailable")
+            }
+        }
     } else {
-        None
+        (None, "no_cuda_build_for_this_platform")
     };
     let flavour = detected.unwrap_or(OrtFlavour::Cpu);
     tracing::info!(
         target: TRACE_TARGET,
         op = "flavour",
         flavour = flavour.name(),
-        source = if detected.is_some() { "cuda_runtime_detected" } else { "no_complete_cuda_runtime" },
+        source,
         "onnx runtime flavour chosen"
     );
     Ok(flavour)
+}
+
+/// Where `ldconfig` may be: on the `PATH`, else the system directories a short `PATH` (a
+/// desktop launcher's, a service manager's) leaves out.
+const LDCONFIG: [&str; 3] = ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"];
+
+/// The dynamic linker's cache listing from the first [`LDCONFIG`] that runs, else every
+/// candidate's failure.
+fn linker_cache(run: impl Fn(&str) -> std::io::Result<String>) -> Result<String, String> {
+    let mut failures = Vec::new();
+    for candidate in LDCONFIG {
+        match run(candidate) {
+            Ok(listing) => return Ok(listing),
+            Err(err) => failures.push(format!("{candidate}: {err}")),
+        }
+    }
+    Err(failures.join("; "))
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn run_ldconfig(program: &str) -> std::io::Result<String> {
+    let output = crate::process::command(program).arg("-p").output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "exited with {}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// The process-wide ONNX Runtime: chosen, provisioned and pointed at once.
@@ -466,6 +511,24 @@ mod tests {
 \tlibcublas.so.13 (libc6,x86-64) => /usr/local/cuda/lib64/libcublas.so.13
 \tlibcudart.so.12 (libc6,x86-64) => /opt/old/libcudart.so.12
 ";
+
+    #[test]
+    fn ldconfig_is_found_outside_a_short_path() {
+        let listing = linker_cache(|program| match program {
+            "/sbin/ldconfig" => Ok("libcudart.so.13".into()),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        });
+        assert_eq!(listing.as_deref(), Ok("libcudart.so.13"));
+    }
+
+    #[test]
+    fn every_ldconfig_failure_is_reported() {
+        let failures = linker_cache(|_| Err(std::io::Error::other("nope"))).unwrap_err();
+        assert_eq!(
+            failures,
+            "ldconfig: nope; /sbin/ldconfig: nope; /usr/sbin/ldconfig: nope"
+        );
+    }
 
     #[test]
     fn detects_the_newest_complete_cuda_runtime() {

@@ -196,7 +196,7 @@ encoding_rs = { version = "0.8", optional = true }
 # llama.cpp; bare boxes can use the prebuilt installer script, or
 # `--no-default-features` for the headless core. Conflicting engines
 # (whisper, image-candle) stay opt-in.
-default = ["ui", "llama", "video", "tts", "image-onnx", "stt-stream"]
+default = ["ui", "llama", "video", "tts", "image-onnx", "stt-stream", "vision"]
 # `mtmd`: vision projectors (images on chat tasks); `common`: jsonSchema -> grammar.
 llama = ["dep:llama-cpp-2", "llama-cpp-2?/mtmd", "llama-cpp-2?/common", "dep:encoding_rs"]
 # In-process LLM on NVIDIA GPUs (all layers offloaded).  Needs the CUDA
@@ -220,6 +220,10 @@ image-onnx = ["dep:ort", "dep:flate2", "dep:tar"]
 # on the shared, runtime-provisioned ONNX Runtime; CUDA when the host has a
 # complete CUDA runtime (see engine/onnx_provision.rs), CPU otherwise.
 stt-stream = ["dep:parakeet-rs", "dep:ort", "ort/cuda", "dep:flate2", "dep:tar"]
+# Vision inference (animal detection, species classification) on the shared,
+# runtime-provisioned ONNX Runtime; CUDA when the host has a complete CUDA runtime,
+# CPU otherwise.  See docs/engines/vision.md.
+vision = ["dep:ort", "ort/cuda", "dep:flate2", "dep:tar"]
 video = ["dep:gif"]
 tts = []
 # Desktop UI — brings in egui / eframe / tray-icon / notify-rust.  Installed, the
@@ -242,7 +246,7 @@ all-engines-stt = ["whisper", "image-candle", "video", "tts"]
 # binary (llama in-process + candle image + media).  whisper is excluded
 # — it static-links a second ggml that clashes with llama's.  This is the
 # feature set the cargo-dist release binaries are built with.
-all = ["ui", "llama", "image-candle", "image-onnx", "stt-stream", "video", "tts"]
+all = ["ui", "llama", "image-candle", "image-onnx", "stt-stream", "vision", "video", "tts"]
 
 [dev-dependencies]
 wiremock = "0.6"

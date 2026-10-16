@@ -111,7 +111,7 @@ pub mod llama_subprocess;
 pub mod multi;
 #[cfg(feature = "image-onnx")]
 pub mod onnx;
-#[cfg(any(feature = "image-onnx", feature = "stt-stream"))]
+#[cfg(any(feature = "image-onnx", feature = "stt-stream", feature = "vision"))]
 pub mod onnx_provision;
 #[cfg(feature = "stt-stream")]
 pub mod parakeet;
@@ -121,6 +121,7 @@ pub mod sdcpp;
 pub mod tts;
 #[cfg(feature = "video")]
 pub mod video;
+pub mod vision;
 #[cfg(feature = "whisper")]
 pub mod whisper;
 
@@ -665,7 +666,7 @@ mod tests {
     fn synthetic_engine_advertises_all_kinds() {
         let engine = SyntheticEngine::new();
         let caps = engine.capabilities();
-        for k in TaskKind::ALL {
+        for k in TaskKind::STUDIO {
             assert!(
                 caps.supported_models_per_kind.contains_key(&k),
                 "{} should be advertised",
@@ -690,7 +691,7 @@ mod tests {
         let eng = build(&cfg).unwrap();
         assert_eq!(eng.name(), "multi");
         let caps = eng.capabilities();
-        for k in TaskKind::ALL {
+        for k in TaskKind::STUDIO {
             assert!(caps.supported_models_per_kind.contains_key(&k));
         }
         assert!(caps.supports(TaskKind::Image, "synthetic"));

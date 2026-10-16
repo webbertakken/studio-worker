@@ -133,7 +133,16 @@ impl ThumbnailKeeper {
         let TaskResult::Image { bytes, .. } = result else {
             return;
         };
-        match crate::thumbnail::make_thumbnail(bytes) {
+        self.store(crate::thumbnail::make_thumbnail(bytes));
+    }
+
+    /// Keep a thumbnail of the picture the job looked at (a vision job's input).
+    pub fn keep_picture(&self, picture: &image::RgbImage) {
+        self.store(crate::thumbnail::thumbnail_of_picture(picture));
+    }
+
+    fn store(&self, thumbnail: anyhow::Result<Vec<u8>>) {
+        match thumbnail {
             Ok(png) => self.thumbnails.insert(&self.job_id, png),
             Err(err) => self.span.in_scope(|| {
                 tracing::warn!(

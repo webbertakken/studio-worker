@@ -339,6 +339,10 @@ incoming job to the first backend that supports its `(kind, model)` pair
   ships in its own bundle (`all-engines-stt`); the all-backends release
   pairs `llama` (in-process) with `sd-cli` (subprocess) to sidestep the
   clash.
+- **`onnx-vision`** (feature `vision`, on by default): animal detection
+  (MegaDetector) and species classification (525 birds) on ONNX Runtime,
+  CUDA when present.  Local only: served on `/vision/*` of the local API,
+  never offered by the studio.  See [`docs/engines/vision.md`](docs/engines/vision.md).
 
 When the studio offers a model whose engine isn't compiled into the
 worker, the job fails loudly with an actionable message (install the
