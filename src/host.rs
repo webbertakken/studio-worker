@@ -45,6 +45,11 @@ pub trait LoadedModel: Send + Sync {
     fn as_stream(&self) -> Option<&dyn StreamingModel> {
         None
     }
+
+    /// The vision interface, for loaded detectors and classifiers.
+    fn as_vision(&self) -> Option<&dyn crate::engine::vision::VisionModel> {
+        None
+    }
 }
 
 /// A loaded streaming speech model.  Each `open` is an independent
@@ -258,6 +263,29 @@ impl ModelHost {
                 Err(refused)
             }
         }
+    }
+
+    /// Load `model` for one transient job, outside the lifecycle: the caller admits it first and
+    /// drops the result when the job ends, which frees it.
+    pub fn load_transient(&self, model: &CatalogModel) -> anyhow::Result<Arc<dyn LoadedModel>> {
+        let started = Instant::now();
+        let loaded = self.inner.runtime.load(model).inspect_err(|err| {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                op = "transient",
+                model = %model.id,
+                error = %format!("{err:#}"),
+                "transient load failed"
+            );
+        })?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            op = "transient",
+            model = %model.id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "loaded for one job; freed when it ends"
+        );
+        Ok(loaded)
     }
 
     /// Load `id` and mark it resident.  Answers the state after the

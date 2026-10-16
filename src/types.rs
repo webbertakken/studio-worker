@@ -14,10 +14,23 @@ pub enum TaskKind {
     AudioStt,
     AudioTts,
     Video,
+    /// Detection and classification on a picture (see `docs/engines/vision.md`).  Local only:
+    /// served by the local API, never offered by the studio.
+    Vision,
 }
 
 impl TaskKind {
-    pub const ALL: [TaskKind; 5] = [
+    pub const ALL: [TaskKind; 6] = [
+        TaskKind::Image,
+        TaskKind::Llm,
+        TaskKind::AudioStt,
+        TaskKind::AudioTts,
+        TaskKind::Video,
+        TaskKind::Vision,
+    ];
+
+    /// The kinds the studio offers as jobs: every kind but the local-only ones.
+    pub const STUDIO: [TaskKind; 5] = [
         TaskKind::Image,
         TaskKind::Llm,
         TaskKind::AudioStt,
@@ -32,6 +45,7 @@ impl TaskKind {
             TaskKind::AudioStt => "audio_stt",
             TaskKind::AudioTts => "audio_tts",
             TaskKind::Video => "video",
+            TaskKind::Vision => "vision",
         }
     }
 }
@@ -412,6 +426,8 @@ pub enum ModelFileRole {
     Vae,
     Lora,
     Model,
+    /// The class names of a vision model, by output index (see `engine::vision::labels`).
+    Labels,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,6 +441,8 @@ pub enum ModelEngine {
     /// Streaming speech-to-text (parakeet-rs).  Local-only: served by a
     /// loaded model over the LAN streaming listener, never by a job.
     Parakeet,
+    /// Detection and classification on ONNX Runtime (`engine::vision`).  Local only.
+    OnnxVision,
     Synthetic,
 }
 
@@ -481,6 +499,69 @@ pub struct ModelCliDefaults {
     /// `<lora:name:weight>` prompt tag; defaults to 1.0 when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lora_weight: Option<f32>,
+    /// What a vision model does and how its input and output are shaped; its input size is
+    /// `width` x `height`.  Required for a vision model, absent for every other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<VisionDefaults>,
+}
+
+/// What a vision model computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionTask {
+    /// Boxes with a class and a confidence (YOLO-style output).
+    Detect,
+    /// One confidence per class for the whole picture.
+    Classify,
+}
+
+impl VisionTask {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VisionTask::Detect => "detect",
+            VisionTask::Classify => "classify",
+        }
+    }
+}
+
+/// The per-model knobs of a vision model (`cliDefaults.vision`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisionDefaults {
+    pub task: VisionTask,
+    /// Class names by output index.  Empty: they come from the model's `labels` file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// Detector classes that are animals, for `animalPresent`.  Absent: every class is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animal_labels: Option<Vec<String>>,
+    /// Per-channel RGB mean subtracted after scaling to 0..1 (classifiers).  Absent: 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean: Option<[f32; 3]>,
+    /// Per-channel RGB standard deviation divided by after the mean.  Absent: 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub std: Option<[f32; 3]>,
+    /// The classifier's output is already probabilities; absent or false: logits, softmaxed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probabilities: Option<bool>,
+    /// Lowest confidence answered unless the request says otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_confidence: Option<f32>,
+    /// Overlap above which a detector's weaker box of the same class is dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iou: Option<f32>,
+    /// Classes a classifier answers unless the request says otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
+    /// The network takes `1 x height x width x 3` (NHWC, Keras-style) instead of
+    /// `1 x 3 x height x width`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels_last: Option<bool>,
+    /// How much of its surroundings an animal's crop keeps for this classifier, as a fraction of
+    /// the box per side, 0..=1.  Absent: 0.1.  SpeciesNet's always-crop model is trained on the
+    /// detector's exact boxes: 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop_margin: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

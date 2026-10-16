@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 const TRACE_TARGET: &str = "studio_worker::catalog";
 
 use crate::types::{
-    ModelCliDefaults, ModelEngine, ModelFile, ModelFileRole, ModelSource, TaskKind,
+    ModelCliDefaults, ModelEngine, ModelFile, ModelFileRole, ModelSource, TaskKind, VisionDefaults,
+    VisionTask,
 };
 
 /// One catalog entry: a model id plus everything needed to run it. Mirrors the
@@ -83,6 +84,9 @@ impl Catalog {
                 qwen35_2b(),
                 nemotron_stream(),
                 parakeet_eou(),
+                megadetector_v5a(),
+                speciesnet_v4a(),
+                bird_species(),
             ],
             dismissed_seeds: Vec::new(),
         }
@@ -286,6 +290,165 @@ fn hf_file(repo: &str, revision: &str, path: &str, bytes: u64, sha256: &str) -> 
         filename: path.rsplit('/').next().unwrap_or(path).to_string(),
         approx_bytes: Some(bytes),
         sha256: Some(sha256.into()),
+    }
+}
+
+/// MegaDetector v5a (Microsoft CameraTraps, MIT): finds animals, people and vehicles in camera
+/// trap pictures, so blanks can be filtered out.  YOLOv5 at 1280x1280; its authors' own
+/// threshold for keeping a box is 0.2.
+fn megadetector_v5a() -> CatalogModel {
+    CatalogModel {
+        id: "megadetector-v5a".into(),
+        display_name: "MegaDetector v5a (camera trap animals)".into(),
+        kind: TaskKind::Vision,
+        vram_gb_estimate: 2.0,
+        description: Some("Finds animals, people and vehicles; filters blank pictures".into()),
+        source: ModelSource {
+            engine: ModelEngine::OnnxVision,
+            files: vec![hf_file(
+                "malyvsen/megadetector-v5a-onnx",
+                "f042c11430241afaf986a1f856f0d2552811628f",
+                "md_v5a.0.0.onnx",
+                561_711_905,
+                "6b81668c931a15a0117cb43f810ee06ee1009896d71831d060ba3fb8d286cfa0",
+            )],
+            cli_defaults: ModelCliDefaults {
+                width: 1280,
+                height: 1280,
+                vision: Some(VisionDefaults {
+                    task: VisionTask::Detect,
+                    labels: vec!["animal".into(), "person".into(), "vehicle".into()],
+                    animal_labels: Some(vec!["animal".into()]),
+                    mean: None,
+                    std: None,
+                    probabilities: None,
+                    min_confidence: Some(0.2),
+                    iou: Some(0.45),
+                    top_k: None,
+                    channels_last: None,
+                    crop_margin: None,
+                }),
+                ..Default::default()
+            },
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: None,
+    }
+}
+
+/// SpeciesNet v4.0.1a (Google cameratrapai, Apache-2.0), the always-crop model: ranks an
+/// animal's crop (a detector's exact box) over 2 498 classes of camera trap wildlife, each with
+/// its taxonomy.  EfficientNetV2-M at 480x480, channels last, 0..1 input, softmaxed logits, as
+/// SpeciesNet's own `classifier.py` feeds it.  ONNX export by daslearning; labels from the
+/// 4.0.1a release.
+fn speciesnet_v4a() -> CatalogModel {
+    let mut labels = hf_file(
+        "earthtoolsmaker/speciesnet",
+        "8fb0eeea863afe62e442305bf41112316bf59709",
+        "4.0.1a/always_crop_99710272_22x8_v12_epoch_00148.labels.txt",
+        256_138,
+        "b6b7f5c9e3bff6730c0c526ed717df5e5a251c2062070458387cb7de84017052",
+    );
+    labels.role = ModelFileRole::Labels;
+    CatalogModel {
+        id: "speciesnet-v4a".into(),
+        display_name: "SpeciesNet v4.0.1a (camera trap species, crops)".into(),
+        kind: TaskKind::Vision,
+        vram_gb_estimate: 1.5,
+        description: Some("Names an animal's crop over 2 498 species, with taxonomy".into()),
+        source: ModelSource {
+            engine: ModelEngine::OnnxVision,
+            files: vec![
+                hf_file(
+                    "daslearning/Google-SpeciesNet-ONNX",
+                    "9022b5f81b49ee090dd8f384581178d1c7432ff3",
+                    "onnx/spicesNet_v401a.onnx",
+                    223_998_606,
+                    "3241441fc5783d1a909ae5c2af432b97ff8210abe336d03f62b24373a61bc1fa",
+                ),
+                labels,
+            ],
+            cli_defaults: ModelCliDefaults {
+                width: 480,
+                height: 480,
+                vision: Some(VisionDefaults {
+                    task: VisionTask::Classify,
+                    labels: vec![],
+                    animal_labels: None,
+                    mean: None,
+                    std: None,
+                    probabilities: None,
+                    min_confidence: None,
+                    iou: None,
+                    top_k: Some(5),
+                    channels_last: Some(true),
+                    crop_margin: Some(0.0),
+                }),
+                ..Default::default()
+            },
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: None,
+    }
+}
+
+/// Bird species classifier (chriamue, MIT): EfficientNet-B2 over 525 species, 96.8 % on its
+/// validation split.  The `onnx/` export is of those final weights (the root `model.onnx`
+/// predates the last training run and takes 224² input).  Its labels are the Hugging Face
+/// `config.json` `id2label`; its preprocessing that repository's `preprocessor_config.json`.
+fn bird_species() -> CatalogModel {
+    const REPO: &str = "chriamue/bird-species-classifier";
+    const REVISION: &str = "c8b211833491b1032250462c2b7e53e02f4de336";
+    let mut labels = hf_file(
+        REPO,
+        REVISION,
+        "config.json",
+        32_307,
+        "c0e5dcd2132ca2bb1e25c2b6d5bddee5201418307fda9d7cfe063600729afeb4",
+    );
+    labels.role = ModelFileRole::Labels;
+    CatalogModel {
+        id: "bird-species-efficientnet-b2".into(),
+        display_name: "Bird species (EfficientNet-B2, 525 species)".into(),
+        kind: TaskKind::Vision,
+        vram_gb_estimate: 0.5,
+        description: Some("Ranks 525 bird species with confidences".into()),
+        source: ModelSource {
+            engine: ModelEngine::OnnxVision,
+            files: vec![
+                hf_file(
+                    REPO,
+                    REVISION,
+                    "onnx/model.onnx",
+                    33_741_738,
+                    "09b950b371030de9003824baa66457f2e8fc4f96fe87a34cc4c3b242b2864d8b",
+                ),
+                labels,
+            ],
+            cli_defaults: ModelCliDefaults {
+                width: 260,
+                height: 260,
+                vision: Some(VisionDefaults {
+                    task: VisionTask::Classify,
+                    labels: vec![],
+                    animal_labels: None,
+                    mean: Some([0.485, 0.456, 0.406]),
+                    std: Some([0.478_539_44, 0.473_286_4, 0.474_341_63]),
+                    probabilities: None,
+                    min_confidence: None,
+                    iou: None,
+                    top_k: Some(5),
+                    channels_last: None,
+                    crop_margin: None,
+                }),
+                ..Default::default()
+            },
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: None,
     }
 }
 
@@ -523,6 +686,7 @@ fn zimage_turbo() -> CatalogModel {
                 mmap: None,
                 max_vram_gib: None,
                 lora_weight: None,
+                vision: None,
             },
         },
         enabled: true,
@@ -540,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn the_seed_carries_image_llm_and_both_streaming_speech_models() {
+    fn the_seed_carries_image_llm_streaming_speech_and_vision_models() {
         assert_eq!(
             ids(&Catalog::seed()),
             [
@@ -548,8 +712,57 @@ mod tests {
                 "qwen3.5-0.8b",
                 "qwen3.5-2b",
                 "nemotron-3.5-stream",
-                "parakeet-eou-120m"
+                "parakeet-eou-120m",
+                "megadetector-v5a",
+                "speciesnet-v4a",
+                "bird-species-efficientnet-b2",
             ]
+        );
+    }
+
+    #[test]
+    fn the_vision_seeds_detect_animals_and_classify_birds() {
+        use crate::engine::vision::VisionSpec;
+        let seed = Catalog::seed();
+        let detector = seed.get("megadetector-v5a").unwrap();
+        assert_eq!(detector.kind, TaskKind::Vision);
+        assert_eq!(detector.source.engine, ModelEngine::OnnxVision);
+        let spec = VisionSpec::from_model(detector, None).unwrap();
+        assert_eq!(spec.task, VisionTask::Detect);
+        assert_eq!((spec.width, spec.height), (1280, 1280));
+        assert_eq!(spec.animal, vec![true, false, false]);
+
+        let classifier = seed.get("bird-species-efficientnet-b2").unwrap();
+        let labels = classifier
+            .source
+            .files
+            .iter()
+            .find(|f| f.role == ModelFileRole::Labels)
+            .expect("labels file");
+        assert_eq!(labels.filename, "config.json");
+        let spec = VisionSpec::from_model(
+            classifier,
+            Some(r#"{"id2label": {"0": "ABBOTTS BABBLER", "1": "ABBOTTS BOOBY"}}"#),
+        )
+        .unwrap();
+        assert_eq!(spec.task, VisionTask::Classify);
+        assert_eq!((spec.width, spec.height), (260, 260));
+        assert_eq!(spec.labels[1].name, "ABBOTTS BOOBY");
+
+        let speciesnet = seed.get("speciesnet-v4a").unwrap();
+        let spec = VisionSpec::from_model(
+            speciesnet,
+            Some("u;aves;passeriformes;turdidae;turdus;merula;common blackbird"),
+        )
+        .unwrap();
+        assert_eq!(spec.input_shape(), [1, 480, 480, 3]);
+        assert_eq!(spec.crop_margin, 0.0);
+        assert_eq!(
+            spec.labels[0]
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.scientific_name.as_deref()),
+            Some("Turdus merula")
         );
     }
 

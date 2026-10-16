@@ -36,6 +36,9 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | POST   | `/stt`          | yes  | `{inputUrl, model?, language?}`            | transcript JSON |
 | POST   | `/video`        | yes  | `{prompt, model?, negativePrompt?, seconds?, width?, height?, ext?}` | video bytes (`video/mp4` etc.) |
 | POST   | `/tokenize`     | yes  | `{content, model?, add_special?}` (llama-server shape) | `{tokens: [...]}` from a loaded chat model |
+| POST   | `/vision/detect` | yes | a picture (raw, multipart or JSON) + `model?`, `minConfidence?`, `iou?` | animals, people, vehicles: boxes and `animalPresent` ([vision](#vision)) |
+| POST   | `/vision/classify` | yes | a picture + `model?`, `minConfidence?`, `topK?` | ranked classes with confidence and taxonomy |
+| POST   | `/vision/species` | yes | a picture + `detector?`, `classifier?`, `minConfidence?`, `iou?`, `topK?` | each detection; each animal with its ranked species |
 | GET    | `/models`       | yes  | —                                          | catalog as JSON array, each entry with `state`, `resident`, `since`, `loadable`, `images` (+ `error` when failed) |
 | GET    | `/models/:id/state` | yes | —                                        | `{id, state, resident, since, error?}` |
 | POST   | `/models/:id/load`  | yes | —                                        | `202` loading / `200` loaded; marks it resident |
@@ -309,6 +312,68 @@ installer picks when the NVIDIA driver is present
 ([release: CUDA variant](operations/release.md#cuda-variant)).  Other builds run
 LLMs on the CPU.
 
+### Vision
+
+Animal detection and species classification; models, pipeline and GPU use in
+[vision](engines/vision.md).  Each route takes one picture (PNG, JPEG or WebP, at most 25 MiB)
+in any of three ways:
+
+- the raw body, `Content-Type: image/*` or `application/octet-stream`, options in the query;
+- `multipart/form-data` with the picture as the `image` file and options as fields;
+- JSON, `{"image": "data:image/jpeg;base64,…" | "<base64>", …options}`.
+
+Options in the body override the query.  An option the route does not read is refused by name
+(`400`), as is a threshold outside 0..1 or a `topK` outside 1..100.  Without `model` (or
+`detector` / `classifier`) the first enabled model doing that task answers.
+
+```bash
+D=~/.config/minis-studio-worker/local-api.json
+URL=$(jq -r .url $D); AUTH="authorization: Bearer $(jq -r .token $D)"
+
+# Is anything there?  The raw picture, options in the query.
+curl -s "$URL/vision/detect?minConfidence=0.3" -H "$AUTH" \
+  -H 'content-type: image/jpeg' --data-binary @trap.jpg
+# {"model":"megadetector-v5a","device":"cuda","picture":{"width":1920,"height":1080},
+#  "animalPresent":true,"detections":[{"label":"animal","classId":0,"confidence":0.94,
+#  "animal":true,"box":{"x":812.4,"y":430.1,"width":220.7,"height":180.2},
+#  "boxNormalised":{"x":0.42,"y":0.40,"width":0.11,"height":0.17}}],"elapsedMs":180}
+
+# Which bird?  A form.
+curl -s "$URL/vision/classify" -H "$AUTH" -F image=@robin.jpg -F topK=3
+# {"model":"bird-species-efficientnet-b2","device":"cuda","picture":{…},
+#  "predictions":[{"label":"EUROPEAN ROBIN","classId":…,"confidence":0.97},…],"elapsedMs":25}
+
+# Both: every animal found, each classified on its own crop.
+curl -s "$URL/vision/species" -H "$AUTH" -H 'content-type: application/json' \
+  -d "{\"image\":\"$(base64 -w0 trap.jpg)\",\"topK\":3}"
+# {"detector":"megadetector-v5a","classifier":"bird-species-efficientnet-b2",
+#  "animalPresent":true,"detections":[{"label":"animal",…,"species":[{"label":…}]}],…}
+```
+
+`animalPresent: false` means the picture is blank (no animal class at or above the threshold);
+`/vision/species` then never runs the classifier.  Each `species` entry ranks one animal's crop;
+a person or vehicle has none, nor an animal past the 20 strongest.  On `species`,
+`minConfidence` is the detector's threshold and `topK` the classifier's.  A `taxonomy`
+(`class`, `order`, `family`, `genus`, `species`, `scientificName`) comes with a prediction
+when the classifier's labels carry one.
+
+Errors are JSON `{error, message}`:
+
+| Status | `error` | When |
+| --- | --- | --- |
+| 400 | `bad_request` | no picture, an undecodable one, a bad or unknown option |
+| 400 | `wrong_model`, `model_disabled` | the model does not do this task, or is disabled |
+| 404 | `unknown_model`, `no_model` | the model is not in the catalogue, or none does the task |
+| 409 | `insufficient_memory` | a transient job does not fit next to the loaded models |
+| 413 | `picture_too_large` | the picture is over 25 MiB (a body over 64 MiB is refused before it is read) |
+| 415 | `unsupported_media_type` | a `Content-Type` other than the three above |
+| 500 | `inference_failed` | the model failed to download, load or run; the message says why |
+| 501 | `not_served` | the model is no vision model in this build (no `vision` feature) |
+| 503 | `busy` | a transient job while another job holds the gate (`Retry-After: 2`) |
+
+A loaded vision model answers on its lane without the gate; keep the detector loaded for a
+batch of camera trap pictures.
+
 ## Local model catalog
 
 Models live in a local catalog at `<config dir>/models.json`
@@ -317,7 +382,8 @@ model registry: each entry carries the same `ModelSource` (engine + files +
 `cliDefaults`) the studio would send on a job. The catalog is **seeded** with
 Z-Image-Turbo (image), Qwen3.5 0.8B and 2B (LLMs, reasoning off, 32K context; the 2B
 needs about 3 GB of VRAM at 32K),
-Nemotron 3.5 streaming and Parakeet EOU (streaming speech, one loaded at a time)
+Nemotron 3.5 streaming and Parakeet EOU (streaming speech, one loaded at a time),
+MegaDetector v5a, SpeciesNet v4.0.1a and a 525-species bird classifier ([vision](engines/vision.md))
 — seeds a catalogue lacks are added at startup, except ones the operator deleted
 (`dismissedSeeds`) — and the files are downloaded on demand into
 `models_root` (`~/models`) the first time a model is used — exactly as a

@@ -51,13 +51,15 @@ downloads the `.onnx` (role `model`) on demand like any other.
 ### Flavour: CPU or CUDA
 
 A process loads one ONNX Runtime library, shared by every ONNX engine (LaMa
-image removal, streaming speech-to-text).  `ensure_runtime` picks the flavour
+image removal, streaming speech-to-text, [vision](vision.md)).  `ensure_runtime` picks the flavour
 once:
 
 1. `STUDIO_WORKER_ORT_FLAVOUR=cpu|cuda12|cuda13` pins it;
 2. else, on x64 Linux, a complete CUDA runtime in `ldconfig -p` (cudart,
    cuBLAS, cuBLASLt of one major, cuRAND 10, cuDNN 9) selects the matching GPU
-   build, preferring CUDA 13;
+   build, preferring CUDA 13.  `ldconfig` is looked for on the `PATH`, then in
+   `/sbin` and `/usr/sbin` (a launcher's short `PATH` leaves them out); when none
+   runs, a warning says so and the CPU build is chosen (`source="ldconfig_unavailable"`);
 3. else the CPU build.
 
 GPU builds (`onnxruntime-{linux,win}-x64-gpu[_cuda13]-<ver>`) are cached under

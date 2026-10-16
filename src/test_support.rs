@@ -387,6 +387,145 @@ impl Drop for DaemonHarness {
     }
 }
 
+/// A vision catalogue model of `width` x `width` input with `vision` defaults.
+pub fn vision_model(
+    id: &str,
+    width: u32,
+    vision: crate::types::VisionDefaults,
+) -> crate::catalog::CatalogModel {
+    crate::catalog::CatalogModel {
+        id: id.into(),
+        display_name: id.into(),
+        kind: crate::types::TaskKind::Vision,
+        vram_gb_estimate: 0.5,
+        description: None,
+        source: crate::types::ModelSource {
+            engine: crate::types::ModelEngine::OnnxVision,
+            files: vec![],
+            cli_defaults: crate::types::ModelCliDefaults {
+                width,
+                height: width,
+                vision: Some(vision),
+                ..Default::default()
+            },
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: None,
+    }
+}
+
+/// Vision defaults doing `task` over inline `labels`, everything else unset.
+pub fn vision_defaults(
+    task: crate::types::VisionTask,
+    labels: &[&str],
+) -> crate::types::VisionDefaults {
+    crate::types::VisionDefaults {
+        task,
+        labels: labels.iter().map(|l| l.to_string()).collect(),
+        animal_labels: None,
+        mean: None,
+        std: None,
+        probabilities: None,
+        min_confidence: None,
+        iou: None,
+        top_k: None,
+        channels_last: None,
+        crop_margin: None,
+    }
+}
+
+/// A vision network that answers a fixed output and keeps the input it was given.
+pub struct CannedVision {
+    pub spec: crate::engine::vision::VisionSpec,
+    pub output: crate::engine::vision::postprocess::RawTensor,
+    pub seen: parking_lot::Mutex<Option<Vec<f32>>>,
+}
+
+impl CannedVision {
+    pub fn new(spec: crate::engine::vision::VisionSpec, shape: &[i64], data: Vec<f32>) -> Self {
+        Self {
+            spec,
+            output: crate::engine::vision::postprocess::RawTensor {
+                shape: shape.to_vec(),
+                data,
+            },
+            seen: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+impl crate::engine::vision::VisionModel for CannedVision {
+    fn spec(&self) -> &crate::engine::vision::VisionSpec {
+        &self.spec
+    }
+    fn device(&self) -> &'static str {
+        "cpu"
+    }
+    fn run(
+        &self,
+        input: Vec<f32>,
+    ) -> anyhow::Result<crate::engine::vision::postprocess::RawTensor> {
+        *self.seen.lock() = Some(input);
+        Ok(self.output.clone())
+    }
+}
+
+impl crate::host::LoadedModel for CannedVision {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_vision(&self) -> Option<&dyn crate::engine::vision::VisionModel> {
+        Some(self)
+    }
+}
+
+/// Loads [`vision_catalog`]'s models as canned networks: the detector finds an animal at
+/// (15..25, 15..25) and a person at (45..55, 45..55) of a 64 x 64 input; the classifier
+/// answers `robin`.
+pub struct FakeVisionRuntime;
+
+impl crate::host::ModelRuntime for FakeVisionRuntime {
+    fn load(
+        &self,
+        model: &crate::catalog::CatalogModel,
+    ) -> anyhow::Result<std::sync::Arc<dyn crate::host::LoadedModel>> {
+        let spec = crate::engine::vision::VisionSpec::from_model(model, None)?;
+        Ok(std::sync::Arc::new(match spec.task {
+            crate::types::VisionTask::Detect => CannedVision::new(
+                spec,
+                &[1, 2, 7],
+                vec![
+                    20.0, 20.0, 10.0, 10.0, 0.9, 1.0, 0.0, // an animal
+                    50.0, 50.0, 10.0, 10.0, 0.8, 0.0, 1.0, // a person
+                ],
+            ),
+            crate::types::VisionTask::Classify => {
+                CannedVision::new(spec, &[1, 3], vec![0.0, 4.0, 1.0])
+            }
+        }))
+    }
+}
+
+/// A detector `md` (animal, person; 64 x 64) and a classifier `birds` (blackbird, robin, wren),
+/// for [`FakeVisionRuntime`].
+pub fn vision_catalog() -> crate::catalog::Catalog {
+    use crate::types::VisionTask;
+    let mut detector = vision_defaults(VisionTask::Detect, &["animal", "person"]);
+    detector.animal_labels = Some(vec!["animal".into()]);
+    crate::catalog::Catalog {
+        models: vec![
+            vision_model("md", 64, detector),
+            vision_model(
+                "birds",
+                8,
+                vision_defaults(VisionTask::Classify, &["blackbird", "robin", "wren"]),
+            ),
+        ],
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

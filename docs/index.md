@@ -42,6 +42,8 @@ top-level [`README.md`](../README.md).  For active plans, see
   and downloads model weights on demand, cached in `cfg.models_root`.
 - [llama engine](engines/llama.md) — chat models in process (llama.cpp), structured output and
   vision: the pictures a model reads with its messages.
+- [vision engine](engines/vision.md): animal detection (MegaDetector, YOLO) and species
+  classification on ONNX Runtime, CUDA when present; `/vision/*` on the local API.
 
 ## Operations
 

@@ -19,11 +19,12 @@ pub enum Icon {
     Microphone,
     Speaker,
     Film,
+    Eye,
     Pin,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 11] = [
+    pub const ALL: [Icon; 12] = [
         Icon::Jobs,
         Icon::Models,
         Icon::Worker,
@@ -34,6 +35,7 @@ impl Icon {
         Icon::Microphone,
         Icon::Speaker,
         Icon::Film,
+        Icon::Eye,
         Icon::Pin,
     ];
 
@@ -45,6 +47,7 @@ impl Icon {
             TaskKind::AudioStt => Icon::Microphone,
             TaskKind::AudioTts => Icon::Speaker,
             TaskKind::Video => Icon::Film,
+            TaskKind::Vision => Icon::Eye,
         }
     }
 }
@@ -165,6 +168,25 @@ pub fn shapes(icon: Icon, rect: Rect, colour: Color32) -> Vec<Shape> {
         Icon::Film => vec![
             rounded(p(2.5, 4.5), p(21.5, 19.5), 2.0),
             closed(vec![p(10.0, 8.5), p(16.0, 12.0), p(10.0, 15.5)]),
+        ],
+        Icon::Eye => vec![
+            path(vec![
+                p(2.5, 12.0),
+                p(5.5, 8.0),
+                p(9.0, 6.0),
+                p(12.0, 5.5),
+                p(15.0, 6.0),
+                p(18.5, 8.0),
+                p(21.5, 12.0),
+                p(18.5, 16.0),
+                p(15.0, 18.0),
+                p(12.0, 18.5),
+                p(9.0, 18.0),
+                p(5.5, 16.0),
+                p(2.5, 12.0),
+            ]),
+            circle(p(12.0, 12.0), 3.5),
+            dot(p(12.0, 12.0), 1.4),
         ],
         Icon::Pin => vec![
             circle(p(12.0, 8.5), 5.0),

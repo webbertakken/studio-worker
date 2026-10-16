@@ -49,6 +49,8 @@ use crate::types::{
     AudioSttParams, AudioTtsParams, ChatMessage, LlmParams, Task, TaskKind, TaskResult, VideoParams,
 };
 
+mod vision;
+
 const TRACE_TARGET: &str = "studio_worker::local_api";
 const POLL: Duration = Duration::from_millis(200);
 
@@ -527,6 +529,10 @@ impl LocalApi {
             (Method::Post, "/models") => self.handle_add_model(request),
             (Method::Get, "/jobs") => self.handle_jobs(request),
             (Method::Post, "/stream-tokens") => self.handle_stream_token(request),
+            (Method::Post, p) if vision::Route::of(p).is_some() => {
+                let route = vision::Route::of(p).expect("matched just above");
+                self.handle_vision(request, route)
+            }
             (_, p) if p.starts_with("/daemon/") => self.handle_daemon(request, &method, &url),
             (Method::Get, p) if job_route(p, "/log").is_some() => {
                 let id = job_route(p, "/log").unwrap_or_default().to_string();
@@ -1363,6 +1369,20 @@ fn read_body_capped(request: &mut Request, cap: usize) -> std::io::Result<BodyOu
         return Ok(BodyOutcome::TooLarge);
     }
     Ok(BodyOutcome::Ok(body))
+}
+
+/// The raw request body, or `None` past `cap` bytes.
+fn read_bytes_capped(request: &mut Request, cap: usize) -> std::io::Result<Option<Vec<u8>>> {
+    if matches!(request.body_length(), Some(len) if len > cap) {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    use std::io::Read as _;
+    request
+        .as_reader()
+        .take(cap as u64 + 1)
+        .read_to_end(&mut body)?;
+    Ok((body.len() <= cap).then_some(body))
 }
 
 fn respond_too_large(request: Request) -> std::io::Result<()> {

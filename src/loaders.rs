@@ -26,6 +26,8 @@ impl ModelRuntime for Loaders {
             crate::types::ModelEngine::LlamaCpp => true,
             #[cfg(feature = "stt-stream")]
             crate::types::ModelEngine::Parakeet => true,
+            #[cfg(feature = "vision")]
+            crate::types::ModelEngine::OnnxVision => true,
             _ => false,
         }
     }
@@ -39,6 +41,10 @@ impl ModelRuntime for Loaders {
             #[cfg(feature = "stt-stream")]
             crate::types::ModelEngine::Parakeet => Ok(Arc::new(
                 crate::engine::parakeet::load_resident(&self.models_root, model)?,
+            )),
+            #[cfg(feature = "vision")]
+            crate::types::ModelEngine::OnnxVision => Ok(Arc::new(
+                crate::engine::vision::onnx::load(&self.models_root, model)?,
             )),
             engine => {
                 let _ = &self.models_root;

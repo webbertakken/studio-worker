@@ -1952,9 +1952,9 @@ mod tests {
         let engine = SyntheticEngine::new();
         let cap = build_capabilities(&cfg, &engine);
         assert_eq!(cap.engine, "synthetic");
-        assert_eq!(cap.task_kinds.len(), TaskKind::ALL.len());
+        assert_eq!(cap.task_kinds.len(), TaskKind::STUDIO.len());
         assert!(cap.auto_enabled, "default capability snapshot is unpaused");
-        for kind in TaskKind::ALL {
+        for kind in TaskKind::STUDIO {
             assert!(cap.supported_models_per_kind.contains_key(&kind));
         }
     }
