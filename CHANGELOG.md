@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.25](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.24...studio-worker-v0.4.25) (2026-10-16)
+
+
+### Features
+
+* vision detection and species classification ([#175](https://github.com/webbertakken/studio-worker/issues/175)) ([6820d10](https://github.com/webbertakken/studio-worker/commit/6820d105bd0f0802c378fa8d00c080100b421c64))
+
 ## [0.4.24](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.23...studio-worker-v0.4.24) (2026-10-15)
 
 
