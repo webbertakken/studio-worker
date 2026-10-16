@@ -95,7 +95,7 @@ CI.
 - `src/engine/` — pluggable inference engines (`SyntheticEngine` +
   `MultiEngine` dispatcher, `SdCppEngine`, plus feature-gated `llama`
   / `whisper` / `image-candle` / `image-onnx` (LaMa removal) / `video`
-  / `tts` backends). Shared
+  / `tts` backends; `vision` models are served by the model host). Shared
   on-demand model provisioning lives in `src/engine/download.rs`
   (cache + Content-Length verify + path-traversal guard).
   `src/engine/sd_provision.rs` auto-provisions the `sd-cli` binary +
@@ -121,6 +121,11 @@ CI.
   memory), `src/loaders.rs` (in-process loaders per engine).
 - `src/catalog.rs` — the local model catalogue (`models.json`);
   `src/local.rs` — local jobs without the studio (transient or on a lane).
+- `src/engine/vision/` (feature `vision`): detection and classification on
+  ONNX Runtime: `labels`, `preprocess`, `postprocess` (pure), `onnx` (sessions);
+  `src/local_vision.rs` serves them (lane or transient, jobs, `/vision/species`);
+  `src/local_api/vision.rs` the `/vision/*` routes; `src/multipart.rs` form
+  bodies.  See [`docs/engines/vision.md`](docs/engines/vision.md).
 - `src/job_run.rs`, `src/job_log.rs`, `src/thumbnail.rs`, `src/job_gate.rs` —
   one job's bookkeeping (running list, `job` span, rings), per-job logs and
   the worker log ring, image thumbnails, the one-transient-job gate.
@@ -208,6 +213,8 @@ Engines + multi-modal:
 - `tests/sd_provision.rs` — the `sd-cli` auto-provisioner against a
   wiremock release zip (download + extract, cache reuse, missing-binary
   error).
+- `tests/local_api_vision.rs`: `/vision/*` over HTTP with canned networks
+  (raw, multipart and JSON pictures; refusals; lanes and the job gate).
 
 Telemetry + host-probe tracing:
 
@@ -223,6 +230,8 @@ weights, run with the matching feature):
 - `tests/real_candle_image.rs` — `image-candle` SD v1.5 image gen.
 - `tests/real_llama.rs` — `llama` GGUF chat-completion.
 - `tests/real_whisper.rs` — `whisper` whisper-tiny.en STT.
+- `tests/real_vision.rs`: `vision` MegaDetector + bird classifier on
+  pictures named by env.
 
 ## CI
 
