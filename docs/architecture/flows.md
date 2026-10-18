@@ -140,7 +140,7 @@ the DO survives hibernation by rebuilding its session map from
 
 The core flow.  Studio: `orchestrator.ts` (offer pipeline),
 `candidateSelection.ts` (`pickWorkerForJob` — autoEnabled, idle,
-kind match via `taskKinds`, `vramThresholdGb >=
+kind match via `taskKinds`, engine match via `modelEngines`, `vramThresholdGb >=
 job.vramGbEstimate`, earliest-connected wins),
 `repository.ts` (D1 CAS).  Worker: `handle_offer` +
 `run_offered_job` in [`src/ws/session.rs`](../../src/ws/session.rs),

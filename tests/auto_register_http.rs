@@ -30,6 +30,7 @@ fn caps() -> WorkerCapabilities {
         supported_models: vec!["synthetic".into()],
         task_kinds: vec![TaskKind::Image],
         supported_models_per_kind: models_per_kind,
+        model_engines: vec![],
     }
 }
 

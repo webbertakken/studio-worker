@@ -1500,6 +1500,7 @@ pub fn build_capabilities_with(
         supported_models,
         task_kinds,
         supported_models_per_kind,
+        model_engines: engine.model_engines(),
     }
 }
 
@@ -1519,9 +1520,17 @@ pub fn summarize_capabilities(caps: &WorkerCapabilities) -> String {
         .map(|k| k.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    // The studio's spelling (`sd-cpp`), as the handshake carries it.
+    let model_engines = caps
+        .model_engines
+        .iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "advertising engine={}, vram={:.1}/{:.1}GB threshold, auto_enabled={}, \
-         only_when_idle={}, user_presence={}, kinds=[{}], {} model(s)=[{}]",
+         only_when_idle={}, user_presence={}, kinds=[{}], model_engines=[{}], {} model(s)=[{}]",
         caps.engine,
         caps.vram_total_gb,
         caps.vram_threshold_gb,
@@ -1529,6 +1538,7 @@ pub fn summarize_capabilities(caps: &WorkerCapabilities) -> String {
         caps.only_when_idle,
         caps.user_presence.map_or("unknown", |p| p.as_str()),
         kinds,
+        model_engines,
         caps.supported_models.len(),
         caps.supported_models.join(", "),
     )
@@ -1943,6 +1953,22 @@ mod tests {
         assert!(
             out.contains("GPU runtime missing") && out.contains("WARN"),
             "a missing runtime must warn with the remedy: {out}"
+        );
+    }
+
+    #[test]
+    fn capabilities_name_the_model_engines_the_worker_routes_to() {
+        let cfg = Config::default();
+        let engine = SyntheticEngine::new();
+        let cap = build_capabilities(&cfg, &engine);
+        assert_eq!(
+            cap.model_engines,
+            vec![crate::types::ModelEngine::Synthetic]
+        );
+        assert!(
+            summarize_capabilities(&cap).contains("model_engines=[synthetic]"),
+            "the handshake log names the engines: {}",
+            summarize_capabilities(&cap)
         );
     }
 

@@ -27,6 +27,7 @@ fn caps() -> WorkerCapabilities {
         supported_models: vec![],
         task_kinds: vec![],
         supported_models_per_kind: Default::default(),
+        model_engines: vec![],
     }
 }
 
