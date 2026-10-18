@@ -56,6 +56,8 @@ top-level [`README.md`](../README.md).  For active plans, see
   flavours of dev process and when to use each.
 - [Job-state recovery](operations/recovery.md) — D1 reset SQL for
   zombie / synthetic-bad / failed rows.
+- [Provider keys](operations/provider-keys.md) — where the hosted providers' keys live (the
+  studio Worker, never this worker) and how to prove a rotation.
 
 ## Screenshots
 
