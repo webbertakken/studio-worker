@@ -127,6 +127,14 @@ pub mod whisper;
 
 pub trait Engine: Send + Sync {
     fn name(&self) -> &'static str;
+
+    /// The model-source engines whose offers route to this engine (`ModelEngine::backend`).
+    fn model_engines(&self) -> Vec<crate::types::ModelEngine> {
+        crate::types::ModelEngine::ALL
+            .into_iter()
+            .filter(|engine| engine.backend() == self.name())
+            .collect()
+    }
     fn capabilities(&self) -> EngineCapabilities;
     fn dispatch(&self, model: &str, task: Task) -> Result<TaskResult>;
 

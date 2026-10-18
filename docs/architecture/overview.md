@@ -320,6 +320,8 @@ Each `register-request` carries a full
 - `supportedModels` (flat list across all task kinds)
 - `taskKinds` (image / llm / audio_stt / audio_tts / video)
 - `supportedModelsPerKind` (per-kind breakdown)
+- `modelEngines` (the model-source engines an offer can route to, in the studio's spelling:
+  `sd-cpp`, `llama-cpp`, ...; `ModelEngine::backend` names the compiled-in backend each one needs)
 
 The operator sees all of this in the dashboard's Pending Workers row
 before deciding.
@@ -531,9 +533,12 @@ If engine returns Err:
 
 Rules worth pinning explicitly:
 
-- **Selection is kind-based, not model-name-based.**  The studio's
+- **Selection is by kind and engine, not model name.**  The studio's
   `pickWorkerForJob` and `findQueuedJobForWorker` filter on the
-  worker's `taskKinds`.  Model-name whitelisting on the worker is
+  worker's `taskKinds` and on `modelEngines`: an offer routes strictly
+  to its model source's engine, and the synthetic backend advertises
+  every kind, so kinds alone would hand vision checks to a worker
+  without the `llama` backend.  Model-name whitelisting on the worker is
   gone (a brief `'*'` wildcard sentinel shipped + got reverted in
   the same session as the model registry; the registry approach is
   cleaner because the studio already knows everything about the

@@ -48,6 +48,7 @@ fn capabilities() -> WorkerCapabilities {
         supported_models: vec!["synthetic".into()],
         task_kinds: vec![],
         supported_models_per_kind: Default::default(),
+        model_engines: vec![],
     }
 }
 

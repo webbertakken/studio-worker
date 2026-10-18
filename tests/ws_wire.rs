@@ -25,6 +25,7 @@ fn capabilities() -> WorkerCapabilities {
         supported_models: vec!["synthetic".into(), "sdxl".into()],
         task_kinds: vec![],
         supported_models_per_kind: Default::default(),
+        model_engines: vec![],
     }
 }
 
@@ -631,4 +632,20 @@ fn inbound_reject_carries_the_insufficient_memory_code() {
         ref other => panic!("expected Reject, got {other:?}"),
     }
     assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+}
+
+/// The studio offers a job only to a worker that names its model source's engine
+/// (worker-pool.md, "Dispatch"): the key is `modelEngines`, the values the TS `WorkerModelEngine`.
+#[test]
+fn hello_names_the_model_engines_in_the_studio_spelling() {
+    use studio_worker::types::ModelEngine;
+    let mut caps = capabilities();
+    caps.model_engines = vec![ModelEngine::SdCpp, ModelEngine::LlamaCpp];
+    let json = serde_json::to_value(&caps).unwrap();
+    assert_eq!(json["modelEngines"], json!(["sd-cpp", "llama-cpp"]));
+    let back: WorkerCapabilities = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        back.model_engines,
+        vec![ModelEngine::SdCpp, ModelEngine::LlamaCpp]
+    );
 }

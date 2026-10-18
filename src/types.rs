@@ -344,6 +344,10 @@ pub struct WorkerCapabilities {
     /// New: per-kind supported model ids.
     #[serde(rename = "supportedModelsPerKind", default)]
     pub supported_models_per_kind: BTreeMap<TaskKind, Vec<String>>,
+    /// The model-source engines an offer can route to on this worker.  The studio offers a job
+    /// only to a worker that names its `modelSource.engine` here.
+    #[serde(rename = "modelEngines", default)]
+    pub model_engines: Vec<ModelEngine>,
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +448,30 @@ pub enum ModelEngine {
     /// Detection and classification on ONNX Runtime (`engine::vision`).  Local only.
     OnnxVision,
     Synthetic,
+}
+
+impl ModelEngine {
+    pub const ALL: [ModelEngine; 6] = [
+        ModelEngine::SdCpp,
+        ModelEngine::LlamaCpp,
+        ModelEngine::Onnx,
+        ModelEngine::Parakeet,
+        ModelEngine::OnnxVision,
+        ModelEngine::Synthetic,
+    ];
+
+    /// The backend (its `Engine::name`) an offer naming this engine routes to, strictly: there is
+    /// no fallback to another backend.
+    pub fn backend(&self) -> &'static str {
+        match self {
+            ModelEngine::SdCpp => "sdcpp",
+            ModelEngine::LlamaCpp => "llama",
+            ModelEngine::Onnx => "onnx",
+            ModelEngine::Parakeet => "parakeet",
+            ModelEngine::OnnxVision => "onnx-vision",
+            ModelEngine::Synthetic => "synthetic",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

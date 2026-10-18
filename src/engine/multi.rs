@@ -85,6 +85,14 @@ impl Engine for MultiEngine {
         "multi"
     }
 
+    /// Every engine an offer can route to: one whose backend is among this worker's engines.
+    fn model_engines(&self) -> Vec<ModelEngine> {
+        ModelEngine::ALL
+            .into_iter()
+            .filter(|engine| self.engines.iter().any(|e| e.name() == engine.backend()))
+            .collect()
+    }
+
     fn capabilities(&self) -> EngineCapabilities {
         let mut map: BTreeMap<TaskKind, Vec<String>> = BTreeMap::new();
         for e in &self.engines {
@@ -129,14 +137,7 @@ impl Engine for MultiEngine {
         // No silent fallback to synthetic for real-model offers —
         // see DECISIONS.md "Synthetic fallback removed for real
         // models".
-        let wanted = match source.engine {
-            crate::types::ModelEngine::SdCpp => "sdcpp",
-            crate::types::ModelEngine::LlamaCpp => "llama",
-            crate::types::ModelEngine::Onnx => "onnx",
-            crate::types::ModelEngine::Parakeet => "parakeet",
-            crate::types::ModelEngine::OnnxVision => "onnx-vision",
-            crate::types::ModelEngine::Synthetic => "synthetic",
-        };
+        let wanted = source.engine.backend();
         for e in &self.engines {
             if e.name() == wanted {
                 debug!(
@@ -313,6 +314,49 @@ mod tests {
         let image = &caps.supported_models_per_kind[&TaskKind::Image];
         assert!(image.contains(&"synthetic".to_string()));
         assert!(image.contains(&"extra-image-model".to_string()));
+    }
+
+    fn stub(name: &'static str) -> Box<dyn Engine> {
+        Box::new(StubEngine {
+            name,
+            kinds: vec![TaskKind::Image, TaskKind::Llm],
+            models: vec![],
+        })
+    }
+
+    /// An offer routes strictly to the backend its model source names, so the worker advertises
+    /// exactly those engines (and not llama-cpp because the synthetic engine claims every kind).
+    #[test]
+    fn model_engines_name_only_the_backends_an_offer_can_route_to() {
+        let multi = MultiEngine::new(vec![stub("sdcpp"), Box::new(SyntheticEngine::new())]);
+        assert_eq!(
+            multi.model_engines(),
+            vec![ModelEngine::SdCpp, ModelEngine::Synthetic]
+        );
+    }
+
+    #[test]
+    fn model_engines_include_llama_cpp_with_the_in_process_llama_backend() {
+        let multi = MultiEngine::new(vec![stub("llama"), stub("sdcpp")]);
+        assert_eq!(
+            multi.model_engines(),
+            vec![ModelEngine::SdCpp, ModelEngine::LlamaCpp]
+        );
+    }
+
+    /// The Windows subprocess backend is not where a llama-cpp offer routes, so it claims none.
+    #[test]
+    fn model_engines_leave_out_llama_cpp_for_the_subprocess_backend() {
+        let multi = MultiEngine::new(vec![stub("llama-subprocess"), stub("sdcpp")]);
+        assert_eq!(multi.model_engines(), vec![ModelEngine::SdCpp]);
+    }
+
+    #[test]
+    fn every_advertised_engine_routes_to_its_backend() {
+        for engine in ModelEngine::ALL {
+            let multi = MultiEngine::new(vec![stub(engine.backend())]);
+            assert_eq!(multi.model_engines(), vec![engine.clone()]);
+        }
     }
 
     #[test]
