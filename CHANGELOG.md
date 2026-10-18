@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.26](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.25...studio-worker-v0.4.26) (2026-10-18)
+
+
+### Bug Fixes
+
+* advertise the model engines offers route to ([#178](https://github.com/webbertakken/studio-worker/issues/178)) ([a26a7ba](https://github.com/webbertakken/studio-worker/commit/a26a7bad528193c9ab7497f8ed16ce29d26aac46))
+
 ## [0.4.25](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.24...studio-worker-v0.4.25) (2026-10-16)
 
 
