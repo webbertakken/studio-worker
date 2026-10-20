@@ -311,12 +311,13 @@ pub const HUNYUAN3D: Recipe = Recipe {
             },
         },
     ],
+    // Not `realesrgan`: its basicsr imports a torchvision module 0.20 dropped, which the pipeline
+    // restores (Hunyuan's `torchvision_fix`) before importing it.
     imports: &[
         "torch",
         "custom_rasterizer",
         "pymeshlab",
         "xatlas",
-        "realesrgan",
         "rembg",
         "huggingface_hub",
     ],

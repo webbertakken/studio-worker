@@ -48,8 +48,8 @@ Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
 - [x] Record the licences in `DECISIONS.md`: Pixal3D (EU flag, chosen anyway), TRELLIS.2 (MIT),
       Hunyuan3D 2.1 (Territory, personal use only, off every public and commercial path), DINOv3
       mirror, BiRefNet in place of RMBG-2.0.
-- [ ] Record the pins in `DECISIONS.md`, each with the latest version checked and why it is not
-      taken where it is not (with phase 3, when the recipes are written).
+- [x] Record the pins in `DECISIONS.md`, each with the latest version checked and why it is not
+      taken where it is not.
 
 ## Phase 1: spec
 
@@ -75,49 +75,54 @@ Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
 
 ## Phase 3: provisioning
 
-- [ ] `uv`: pinned release, sha256-checked, into `<models_root>/bin/`; `$STUDIO_WORKER_UV` overrides.
-- [ ] CUDA toolkit: NVIDIA redist manifest at a pinned version, every archive sha256-checked,
-      merged with the cuBLAS, cuSPARSE, cuSOLVER and cuRAND headers of the environment's torch
-      wheels, into `<models_root>/torch/cuda-<version>/`.
-- [ ] Environments as data: Python version, torch index, pinned packages, sources at pinned
+- [x] `uv`: pinned release, sha256-checked, into `<models_root>/bin/`; `$STUDIO_WORKER_UV` overrides.
+- [x] CUDA toolkit: NVIDIA redist manifest (its own sha256 pinned), every archive sha256-checked,
+      merged with the cuBLAS, cuSPARSE, cuSOLVER, cuRAND, cuFFT and nvJitLink files of the
+      environment's torch wheels, into each environment's `cuda/` (archives cached once).
+- [x] Environments as data: Python version, torch index, pinned packages, sources at pinned
       commits, extensions with their build flags; a recipe hash in a marker, a changed recipe
       rebuilds; builds for the GPU's compute capability (`nvidia-smi --query-gpu=compute_cap`).
-- [ ] Environment `trellis` (Pixal3D and TRELLIS.2) and environment `hunyuan3d` (Hunyuan3D 2.1).
-- [ ] Sources: git checkouts at pinned commits under `<models_root>/torch/src/`; `git` preflight
-      with the remedy when missing.
-- [ ] Weights: `hf download` at pinned revisions with `HF_HOME=<models_root>/hf-cache` and
-      `TORCH_HOME=<models_root>/torch-hub`; nothing else is written outside `models_root`.
-- [ ] Model folders that swap gated parts: `pipeline.json` naming `ZhengPeng7/BiRefNet` (and the
+- [x] Environment `trellis` (Pixal3D and TRELLIS.2, plus flash-attn for TRELLIS.2) and environment
+      `hunyuan3d` (Hunyuan3D 2.1).
+- [x] Sources: git checkouts at pinned commits (submodules when asked) under
+      `<models_root>/torch/src/`; NAF into `TORCH_HOME/hub`; `git`, `tar` and `c++` preflight with
+      the remedy when missing.
+- [x] Weights: each pipeline's `prepare` fetches its snapshots at pinned revisions
+      (`snapshot_download`, `HF_HOME=<models_root>/hf-cache`, `TORCH_HOME=<models_root>/torch-hub`),
+      then runs offline; local paths everywhere, so nothing resolves a moving `main`.
+- [x] Model folders that swap gated parts: `pipeline.json` naming `ZhengPeng7/BiRefNet` (and the
       DINOv3 mirror for TRELLIS.2), `ckpts` linked to the snapshot.
-- [ ] One provisioning at a time (a lock file); a failed step leaves no marker and says which step
+- [x] One provisioning at a time (a lock file); a failed step leaves no marker and says which step
       failed, with the last lines of its output.
-- [ ] Unit tests for every argv and recipe builder, the marker logic and the manifest parser;
-      wiremock tests for the uv and redist downloads.
+- [x] Unit tests for the builders, the marker logic and the manifest parser; `tests/torch_provision.rs`
+      builds a fake environment end to end (wiremock uv and redist, a fake uv, a local git source).
 
 ## Phase 4: runner
 
-- [ ] `python/runner.py` (embedded with `include_str!`, written beside the environment): reads a
+- [x] `python/runner.py` (embedded with `include_str!`, written beside the environment): reads a
       request JSON, sets the VRAM cap (`torch.cuda.set_per_process_memory_fraction`), runs one
       pipeline, writes the GLB, prints progress as JSON lines on stdout, logs on stderr, exits
       0 (done), 2 (out of memory), 3 (bad input), 1 (anything else).
-- [ ] Pipelines `pixal3d.py`, `trellis2.py`, `hunyuan3d.py`: preprocess, generate, export GLB at
+- [x] Pipelines `pixal3d.py`, `trellis2.py`, `hunyuan3d.py`: preprocess, generate, export GLB at
       the source's decimation target and texture size.
-- [ ] Rust side: spawn through `crate::process::command`, stream both pipes into tracing (the job
-      log), parse progress, map exit codes to typed errors, kill the process group on a timeout or
-      when the worker stops.
-- [ ] Tests: protocol parsing, exit-code mapping, a fake runner script for the spawn path.
+- [x] Rust side: spawn through `crate::process::command`, stream both pipes into tracing (the job
+      log, progress-bar frames dropped), map exit codes to typed errors, kill the child on a
+      timeout; the runner dies with the worker (`PR_SET_PDEATHSIG`, a parent watch).
+- [x] Tests: protocol parsing, exit-code mapping, a fake runner script for the spawn path.
 
 ## Phase 5: engine
 
-- [ ] `TorchEngine` behind feature `torch` (in `default`, no native dependencies).
-- [ ] Capabilities: `mesh` only on Linux x86_64 with an NVIDIA GPU of compute capability 8.0 or
+- [x] `TorchEngine`, registered on every build (no feature: it adds no dependency); the platform
+      decides what it advertises.
+- [x] Capabilities: `mesh` only on Linux x86_64 with an NVIDIA GPU of compute capability 8.0 or
       more; logged either way.
-- [ ] The budget: `maxVramGib` required, passed to the runner as its allocator cap; admission is
+- [x] The budget: `maxVramGib` required, passed to the runner as its allocator cap; admission is
       the host's, as for every transient job; never unloads a model.
-- [ ] Dispatch: fetch the picture (`vision::fetch`, studio URL or `data:` URL), provision, run,
+- [x] Dispatch: fetch the picture (`vision::fetch`, studio URL or `data:` URL), provision, run,
       check the GLB magic, return `TaskResult::Mesh`.
-- [ ] Every decision point logs with `op` under `studio_worker::engine::torch`.
-- [ ] Tests: capabilities gating, a missing budget or pipeline, dispatch with a fake runtime.
+- [x] Every decision point logs with `op` under `studio_worker::engine::torch`.
+- [x] Tests: capabilities gating, a missing budget or pipeline, an unreadable picture, the runner
+      with a fake runtime.
 
 ## Phase 6: local API
 
@@ -128,13 +133,14 @@ Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
 
 ## Phase 7: real-model verification (4090)
 
-- [ ] Provision `trellis` from nothing; record the time per step.
-- [ ] Pixal3D through `POST /mesh` on `assets/images/0_img.png` and `9_img.png`: time, VRAM peak,
-      GLB size; look at the result.
-- [ ] TRELLIS.2 the same.
+- [x] Provision `trellis` from nothing: 13.5 min (NATTEN 10.7 min, o-voxel 2 min, CuMesh 2 min).
+- [x] Pixal3D on `0_img.png` and `9_img.png` (`tests/real_torch_mesh.rs`): 107 to 178 s, 14.2 GiB
+      peak, 2.1 MB, 39 k triangles; looked at.
+- [x] TRELLIS.2 the same: at 1024 the crab runs out of memory at 17 GiB; at 512, 100 s, 4.0 GiB,
+      2.2 MB; looked at.
 - [ ] Provision `hunyuan3d`; Hunyuan3D 2.1 the same.
 - [ ] A studio job end to end through a local studio (minigames plan 0245).
-- [ ] `tests/real_torch_mesh.rs` (ignored, `torch` feature) reproduces the above.
+- [x] `tests/real_torch_mesh.rs` (skipped unless `RUN_REAL_ENGINE_TESTS=1`) reproduces the above.
 
 ## Phase 8: ship
 
