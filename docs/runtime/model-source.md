@@ -21,7 +21,7 @@ JSON-serialised on the WS Offer, mirrored on both sides:
 
 ```jsonc
 {
-  "engine": "sd-cpp",          // | "llama-cpp" | "onnx" | "synthetic"
+  "engine": "sd-cpp",          // | "llama-cpp" | "onnx" | "torch" | "synthetic"
   "files": [
     {
       "role": "diffusion-model",  // | "text-encoder" | "vae" | "lora" | "model"
@@ -42,6 +42,10 @@ JSON-serialised on the WS Offer, mirrored on both sides:
   }
 }
 ```
+
+Mesh models (`engine: "torch"`) read the fields of [the torch engine](../engines/torch.md#model-source):
+`pipeline` and `maxVramGib` (both required), `resolution`, `lowVram`, `decimationTarget` and
+`textureSize`; they carry no `files`, their pipeline fetches its own weights.
 
 LLM models (`engine: "llama-cpp"`) read two more `cliDefaults`, both optional and
 worker-local (the studio does not send them today):

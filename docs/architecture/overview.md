@@ -205,7 +205,9 @@ src/
 │   ├── whisper.rs    (feature `whisper`) whisper-rs wrapper for STT.
 │   ├── candle_image.rs (feature `image-candle`) candle-transformers SD pipeline.
 │   ├── video.rs      (feature `video`) animated-GIF video stand-in (no ffmpeg).
-│   └── tts.rs        (feature `tts`) pure-Rust formant-synth TTS stand-in.
+│   ├── tts.rs        (feature `tts`) pure-Rust formant-synth TTS stand-in.
+│   └── torch/        PyTorch models in a child process per job (mesh: image to 3D);
+│                     provisions uv, CUDA, environments and weights under models_root.
 │
 ├── ws/               Replaces the four old polling loops with one WS session.
 │   ├── mod.rs        Re-exports.
@@ -318,7 +320,7 @@ Each `register-request` carries a full
 - `autoEnabled`, `autoStart`, `autoUpdate`, `startMinimised`, `onlyWhenIdle` (operator toggles)
 - `userPresence` (`idle` / `active`, absent while unknown; see [user presence](../runtime/user-presence.md))
 - `supportedModels` (flat list across all task kinds)
-- `taskKinds` (image / llm / audio_stt / audio_tts / video)
+- `taskKinds` (image / llm / audio_stt / audio_tts / video / mesh)
 - `supportedModelsPerKind` (per-kind breakdown)
 - `modelEngines` (the model-source engines an offer can route to, in the studio's spelling:
   `sd-cpp`, `llama-cpp`, ...; `ModelEngine::backend` names the compiled-in backend each one needs)
@@ -436,6 +438,7 @@ pub trait Engine: Send + Sync {
 - `AudioStt { json }` (whisper-shape segments)
 - `AudioTts { bytes, ext }` (wav)
 - `Video { bytes, ext }` (animated webp from synthetic, gif from the `video` feature)
+- `Mesh { bytes, ext }` (glb: a cube from synthetic, a model from the `torch` engine)
 
 Engines are no longer config-selectable.  `engine::build()` always
 returns a `MultiEngine` populated with every backend compiled into
@@ -458,6 +461,10 @@ Built-in:
   the right `--diffusion-model` / `--llm` / `--vae` flags + CLI
   defaults from the source.  Image kind only today.  Deep dive in
   [`docs/engines/sdcpp.md`](../engines/sdcpp.md).
+- **`torch`** — PyTorch models with custom CUDA extensions, one child process per job:
+  image to 3D (`mesh`) with Pixal3D, TRELLIS.2 and Hunyuan3D 2.1.  Advertised on Linux x86_64
+  with an NVIDIA GPU of compute capability 8.0 or more.  Deep dive in
+  [`docs/engines/torch.md`](../engines/torch.md).
 
 The legacy `gradio` engine is gone (operators run a Gradio app via
 an external service if they need it).  Feature-gated heavyweights

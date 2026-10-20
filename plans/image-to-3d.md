@@ -35,31 +35,30 @@ Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
   models pin 2.6.0 and 2.5.1), Hunyuan3D-2.1 `82920d6`, TRELLIS.2 `75fbf01`, Pixal3D `f7cf384`,
   CuMesh `12289e1`, FlexGEMM `6dd94a8`, MoGe `74fbce0` (Pixal3D needs `925b8ed`).
 
-## Forks (open, asked)
+## Decisions (Webber, 2026-10-20; `DECISIONS.md`)
 
-1. Process: a child process per job, or a long-lived sidecar kept by the model host.
-2. Engine split: one `torch` engine with a pipeline per model, or an engine per model.
-3. GLB size: decimate to the studio's 25 MiB upload cap, or raise the cap for `glb`.
-4. Hunyuan3D 2.1 texture (21 GB) next to the shared models (about 6 GB): offload, shape only, or
-   refuse while the card is shared.
+- A child process per job; one `torch` engine, a pipeline per model; environments `trellis`
+  (Pixal3D, TRELLIS.2) and `hunyuan3d` (its pins clash); web-sized GLB, 40 000 triangles and
+  1024 px textures; Hunyuan3D 2.1 textured within 16 GB (CPU offload, 512 px views); provisioned
+  on the first job; Hunyuan's adapter in this repo.
 
 ## Phase 0: decisions
 
-- [ ] Record Webber's answers to the forks in `DECISIONS.md`.
-- [ ] Record the licences in `DECISIONS.md`: Pixal3D (EU flag, chosen anyway), TRELLIS.2 (MIT),
+- [x] Record Webber's answers to the forks in `DECISIONS.md`.
+- [x] Record the licences in `DECISIONS.md`: Pixal3D (EU flag, chosen anyway), TRELLIS.2 (MIT),
       Hunyuan3D 2.1 (Territory, personal use only, off every public and commercial path), DINOv3
       mirror, BiRefNet in place of RMBG-2.0.
 - [ ] Record the pins in `DECISIONS.md`, each with the latest version checked and why it is not
-      taken where it is not.
+      taken where it is not (with phase 3, when the recipes are written).
 
 ## Phase 1: spec
 
-- [ ] `docs/engines/torch.md`: what the engine is, the runtime layout under `models_root`,
+- [x] `docs/engines/torch.md`: what the engine is, the runtime layout under `models_root`,
       provisioning, environments, pipelines, the runner protocol, admission and the VRAM cap,
       failure modes, observability (`op` table), privacy (inputs in a per-job temp dir).
-- [ ] `docs/runtime/model-source.md`: the `torch` engine and its `cliDefaults` fields.
-- [ ] `docs/architecture/overview.md` and `flows.md`: the `mesh` kind and the torch engine.
-- [ ] `docs/index.md`: link the new page.
+- [x] `docs/runtime/model-source.md`: the `torch` engine and its `cliDefaults` fields.
+- [x] `docs/architecture/overview.md`: the `mesh` kind and the torch engine (`flows.md` at fold-back).
+- [x] `docs/index.md`: link the new page.
 
 ## Phase 2: wire contract
 
