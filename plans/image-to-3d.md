@@ -11,9 +11,9 @@ Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
 ## Findings
 
 - Verified (read): every engine is native (llama.cpp, sd.cpp, ONNX, parakeet); none runs Python.
-- Verified (read): `admission::admit` runs only for model-host loads (`host.rs`), never for a studio
-  offer or a transient local job, although `docs/runtime/model-lifecycle.md` says transient jobs
-  are admitted. The torch engine admits itself; the doc is reconciled in phase 9.
+- Verified (read, origin/main): transient jobs are admitted (`ModelHost::admit_transient`); a
+  studio offer that does not fit is rejected `insufficient_memory`. A mesh job rides on it; the
+  engine adds the cap on the child's allocator.
 - Verified (read): an offer stays claimed while the worker heartbeats; there is no job time limit
   on the studio side, so a first job that provisions for half an hour is not reclaimed.
 - Verified (run, `assets/images/0_img.png`, `--low_vram`, 1024 cascade, 4090 with 5.6 GB already
@@ -62,15 +62,16 @@ Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
 
 ## Phase 2: wire contract
 
-- [ ] `TaskKind::Mesh` (`mesh`), `MeshParams { imageUrl, seed, ext }`, `TaskResult::Mesh { bytes, ext }`.
-- [ ] `ModelEngine::Torch` (`torch`); `ModelCliDefaults` gains `pipeline`, `resolution`,
+- [x] `TaskKind::Mesh` (`mesh`), `MeshParams { imageUrl, seed, ext }`, `TaskResult::Mesh { bytes, ext }`.
+- [x] `ModelEngine::Torch` (`torch`); `ModelCliDefaults` gains `pipeline`, `resolution`,
       `textureSize`, `decimationTarget`, `lowVram`, `texture` (all optional).
-- [ ] `mime_for_ext("glb")` is `model/gltf-binary`; multipart `/complete` sends it.
-- [ ] Synthetic engine: `synthetic-mesh` answers a valid GLB (one textured cube), so CI runs a mesh
+- [x] `mime_for_ext("glb")` is `model/gltf-binary`; multipart `/complete` sends it (one table now,
+      shared with the local API).
+- [x] Synthetic engine: `synthetic-mesh` answers a valid GLB (one textured cube), so CI runs a mesh
       job end to end without a GPU.
-- [ ] Session: a mesh result uploads through multipart `/complete` like image, audio and video.
-- [ ] Tray UI: the `mesh` kind has a glyph, a label and filters; no thumbnail.
-- [ ] Tests: `ws_wire` round trip, `multi_modal` round trip, types tests, `mime_for_ext`.
+- [x] Session: a mesh result uploads through multipart `/complete` like image, audio and video.
+- [x] Tray UI: the `mesh` kind has a glyph (a cube); no thumbnail.
+- [x] Tests: `multi_modal` wire round trip, synthetic mesh, `glb`, `mime_for_ext`.
 
 ## Phase 3: provisioning
 
@@ -111,18 +112,19 @@ Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
 - [ ] `TorchEngine` behind feature `torch` (in `default`, no native dependencies).
 - [ ] Capabilities: `mesh` only on Linux x86_64 with an NVIDIA GPU of compute capability 8.0 or
       more; logged either way.
-- [ ] Admission: free device memory now against `maxVramGib`; a refusal fails the job with the
-      numbers (retryable, so another worker may take it); never unloads a model it did not load.
+- [ ] The budget: `maxVramGib` required, passed to the runner as its allocator cap; admission is
+      the host's, as for every transient job; never unloads a model.
 - [ ] Dispatch: fetch the picture (`vision::fetch`, studio URL or `data:` URL), provision, run,
       check the GLB magic, return `TaskResult::Mesh`.
 - [ ] Every decision point logs with `op` under `studio_worker::engine::torch`.
-- [ ] Tests: capabilities gating, admission refusal, dispatch with a fake runtime.
+- [ ] Tests: capabilities gating, a missing budget or pipeline, dispatch with a fake runtime.
 
 ## Phase 6: local API
 
-- [ ] `POST /mesh { image: data URL, model?, seed? }` answers `model/gltf-binary`.
-- [ ] `docs/local-api.md`: the route.
-- [ ] Tests: happy path on the synthetic mesh model, bad picture, unknown model.
+- [x] `POST /mesh` (a picture raw, multipart or JSON; `model?`, `seed?`) answers `model/gltf-binary`;
+      the picture parsing is shared with the vision routes (`local_api/picture.rs`).
+- [x] `docs/local-api.md`: the route.
+- [x] Tests: happy path on the synthetic mesh model, bad picture, unknown model, busy gate.
 
 ## Phase 7: real-model verification (4090)
 
@@ -142,5 +144,5 @@ Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
 
 ## Phase 9: fold-back
 
-- [ ] Docs match what shipped: `torch.md`, model source, lifecycle (admission of transient jobs),
+- [ ] Docs match what shipped: `torch.md`, model source, lifecycle,
       local API, overview, flows, `AGENTS.md` project layout; every symbol and link checked.

@@ -14,28 +14,32 @@ pub enum TaskKind {
     AudioStt,
     AudioTts,
     Video,
+    /// A 3D model made from a picture: a GLB (see `docs/engines/torch.md`).
+    Mesh,
     /// Detection and classification on a picture (see `docs/engines/vision.md`).  Local only:
     /// served by the local API, never offered by the studio.
     Vision,
 }
 
 impl TaskKind {
-    pub const ALL: [TaskKind; 6] = [
+    pub const ALL: [TaskKind; 7] = [
         TaskKind::Image,
         TaskKind::Llm,
         TaskKind::AudioStt,
         TaskKind::AudioTts,
         TaskKind::Video,
+        TaskKind::Mesh,
         TaskKind::Vision,
     ];
 
     /// The kinds the studio offers as jobs: every kind but the local-only ones.
-    pub const STUDIO: [TaskKind; 5] = [
+    pub const STUDIO: [TaskKind; 6] = [
         TaskKind::Image,
         TaskKind::Llm,
         TaskKind::AudioStt,
         TaskKind::AudioTts,
         TaskKind::Video,
+        TaskKind::Mesh,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -45,6 +49,7 @@ impl TaskKind {
             TaskKind::AudioStt => "audio_stt",
             TaskKind::AudioTts => "audio_tts",
             TaskKind::Video => "video",
+            TaskKind::Mesh => "mesh",
             TaskKind::Vision => "vision",
         }
     }
@@ -246,6 +251,24 @@ fn default_video_ext() -> String {
     "mp4".into()
 }
 
+/// A picture in, a 3D model out (`docs/engines/torch.md`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshParams {
+    /// The picture: the studio's job-input URL, or a `data:image/...;base64,` URL from the local
+    /// API.  Wire-format key: `imageUrl`.
+    pub image_url: String,
+    /// Seed for every sampling stage; the pipeline picks one when absent.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default = "default_mesh_ext")]
+    pub ext: String,
+}
+
+fn default_mesh_ext() -> String {
+    "glb".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Task {
@@ -254,6 +277,7 @@ pub enum Task {
     AudioStt(AudioSttParams),
     AudioTts(AudioTtsParams),
     Video(VideoParams),
+    Mesh(MeshParams),
 }
 
 impl Task {
@@ -264,6 +288,7 @@ impl Task {
             Task::AudioStt(_) => TaskKind::AudioStt,
             Task::AudioTts(_) => TaskKind::AudioTts,
             Task::Video(_) => TaskKind::Video,
+            Task::Mesh(_) => TaskKind::Mesh,
         }
     }
 }
@@ -284,6 +309,8 @@ pub enum TaskResult {
     AudioTts { bytes: Vec<u8>, ext: String },
     /// Binary video (mp4/webm/...) with the chosen extension.
     Video { bytes: Vec<u8>, ext: String },
+    /// Binary 3D model (glb).
+    Mesh { bytes: Vec<u8>, ext: String },
 }
 
 impl TaskResult {
@@ -294,6 +321,7 @@ impl TaskResult {
             TaskResult::AudioStt { .. } => TaskKind::AudioStt,
             TaskResult::AudioTts { .. } => TaskKind::AudioTts,
             TaskResult::Video { .. } => TaskKind::Video,
+            TaskResult::Mesh { .. } => TaskKind::Mesh,
         }
     }
 }
@@ -447,16 +475,19 @@ pub enum ModelEngine {
     Parakeet,
     /// Detection and classification on ONNX Runtime (`engine::vision`).  Local only.
     OnnxVision,
+    /// PyTorch models in a child process per job (`engine::torch`): image to 3D.
+    Torch,
     Synthetic,
 }
 
 impl ModelEngine {
-    pub const ALL: [ModelEngine; 6] = [
+    pub const ALL: [ModelEngine; 7] = [
         ModelEngine::SdCpp,
         ModelEngine::LlamaCpp,
         ModelEngine::Onnx,
         ModelEngine::Parakeet,
         ModelEngine::OnnxVision,
+        ModelEngine::Torch,
         ModelEngine::Synthetic,
     ];
 
@@ -469,6 +500,7 @@ impl ModelEngine {
             ModelEngine::Onnx => "onnx",
             ModelEngine::Parakeet => "parakeet",
             ModelEngine::OnnxVision => "onnx-vision",
+            ModelEngine::Torch => "torch",
             ModelEngine::Synthetic => "synthetic",
         }
     }
@@ -531,6 +563,21 @@ pub struct ModelCliDefaults {
     /// `width` x `height`.  Required for a vision model, absent for every other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<VisionDefaults>,
+    /// The torch engine's pipeline (`pixal3d`, `trellis2`, `hunyuan3d`).  Required for a torch model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// Pipeline resolution (Pixal3D and TRELLIS.2: the cascade's 512, 1024 or 1536).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<u32>,
+    /// Keep a pipeline's stages on the CPU until each runs (lower peak device memory, slower).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_vram: Option<bool>,
+    /// Triangles in a mesh model's GLB; `engine::torch::WEB_GLB_TRIANGLES` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimation_target: Option<u32>,
+    /// Texture pixels (each side) in a mesh model's GLB; `engine::torch::WEB_GLB_TEXTURE_PX` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texture_size: Option<u32>,
 }
 
 /// What a vision model computes.

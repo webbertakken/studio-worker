@@ -21,7 +21,7 @@ Decisions and licences: `DECISIONS.md`, "Image to 3D".
 | recipe | the data an environment is built from: Python, torch, packages, sources, extensions |
 | provisioning | building what a job needs that is not there yet: `uv`, an environment, weights |
 | runner | `python/runner.py`: runs one pipeline for one job in a child process |
-| budget | the device memory a job may use (`maxVramGib`): admitted against, and enforced |
+| budget | the device memory a job may use (`maxVramGib`), enforced on the child's CUDA allocator |
 
 ## The mesh kind
 
@@ -134,9 +134,11 @@ environment (numpy 2, transformers 4.57, diffusers 0.37) cannot hold, hence two 
 1. **Platform**: no `mesh` support here fails with `UnsupportedTask` (never retried).
 2. **Picture**: fetched (`vision::fetch`: the studio URL or a `data:` URL, 25 MiB at most),
    decoded to check it is a picture, written to the job's temporary directory as PNG.
-3. **Admission**: free device memory now (`admission::free_now`) against the budget plus the
-   reserve; a refusal fails with the numbers and is retried by the studio (another worker may
-   have room). The engine never unloads a model; it only uses what is free.
+3. **Admission** happened before the job started, as for every transient job
+   ([model lifecycle](../runtime/model-lifecycle.md#concurrency)): the offer's `vramGbEstimate`
+   (or the catalogue's) next to the loaded models; a studio offer that does not fit is rejected
+   `insufficient_memory`. The estimate covers the budget plus the CUDA context (about 0.5 GiB).
+   The engine never unloads a model; it only uses what is free.
 4. **Provisioning** as above.
 5. **Run**: `python runner.py <request.json>` in the environment, as a child process
    (`crate::process::command`): `request.json` names the pipeline, the picture, the GLB path,
@@ -169,7 +171,6 @@ environment (numpy 2, transformers 4.57, diffusers 0.37) cannot hold, hence two 
 | Error | When | Retried by the studio |
 | --- | --- | --- |
 | `UnsupportedTask` | no mesh support on this machine | no |
-| `TorchError::Refused` | the budget does not fit in free device memory | yes |
 | `TorchError::Provision` | a provisioning step failed | yes |
 | `TorchError::BadInput` | the picture cannot be read, or the pipeline refuses it | no |
 | `TorchError::OutOfMemory` | the run passed its budget | no |
@@ -192,7 +193,6 @@ All under target `studio_worker::engine::torch`.
 | `op` | When |
 | --- | --- |
 | `platform` | at start: mesh advertised or not, and why |
-| `admit` | a job admitted or refused, with budget and free memory |
 | `provision` | each provisioning step: started, done (seconds), failed (tail) |
 | `runner` | each line the runner prints (stderr at info, events parsed) |
 | `run` | the run started, finished (seconds, triangles, bytes, peak memory) or failed |

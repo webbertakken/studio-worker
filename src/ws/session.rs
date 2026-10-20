@@ -1061,7 +1061,8 @@ async fn deliver_result(
     match result {
         TaskResult::Image { bytes, ext }
         | TaskResult::AudioTts { bytes, ext }
-        | TaskResult::Video { bytes, ext } => {
+        | TaskResult::Video { bytes, ext }
+        | TaskResult::Mesh { bytes, ext } => {
             let upload_result = tokio::task::spawn_blocking({
                 let api_base_url = ctx.api_base_url.clone();
                 let job_id = job_id.to_string();

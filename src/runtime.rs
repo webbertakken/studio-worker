@@ -1432,6 +1432,9 @@ pub fn prompt_for(task: &Task) -> String {
         Task::AudioStt(p) => p.input_url.clone(),
         Task::AudioTts(p) => p.text.clone(),
         Task::Video(p) => p.prompt.clone(),
+        // A mesh job has no words: its picture is the input, and its URL (a capability, or a
+        // data URL of megabytes) is never a prompt.
+        Task::Mesh(_) => String::new(),
     }
 }
 

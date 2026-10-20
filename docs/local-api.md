@@ -36,6 +36,7 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | POST   | `/stt`          | yes  | `{inputUrl, model?, language?}`            | transcript JSON |
 | POST   | `/video`        | yes  | `{prompt, model?, negativePrompt?, seconds?, width?, height?, ext?}` | video bytes (`video/mp4` etc.) |
 | POST   | `/tokenize`     | yes  | `{content, model?, add_special?}` (llama-server shape) | `{tokens: [...]}` from a loaded chat model |
+| POST   | `/mesh`         | yes  | a picture (raw, multipart or JSON) + `model?`, `seed?` | a 3D model, `model/gltf-binary` ([mesh](#mesh)) |
 | POST   | `/vision/detect` | yes | a picture (raw, multipart or JSON) + `model?`, `minConfidence?`, `iou?` | animals, people, vehicles: boxes and `animalPresent` ([vision](#vision)) |
 | POST   | `/vision/classify` | yes | a picture + `model?`, `minConfidence?`, `topK?` | ranked classes with confidence and taxonomy |
 | POST   | `/vision/species` | yes | a picture + `detector?`, `classifier?`, `minConfidence?`, `iou?`, `topK?` | each detection; each animal with its ranked species |
@@ -373,6 +374,22 @@ Errors are JSON `{error, message}`:
 
 A loaded vision model answers on its lane without the gate; keep the detector loaded for a
 batch of camera trap pictures.
+
+### Mesh
+
+A picture in, a 3D model out, made by the [torch engine](engines/torch.md) (Pixal3D, TRELLIS.2,
+Hunyuan3D 2.1) or, for `synthetic-mesh`, a textured cube in the picture's average colour.  The
+picture arrives in any of the three ways [vision](#vision) reads; the options are `model` and
+`seed`.  It runs as a transient job (one at a time, admitted next to the loaded models): a real
+model takes minutes, and its first job provisions its environment and weights (about 15 minutes
+once), so give the client a long timeout.
+
+```bash
+D=~/.config/minis-studio-worker/local-api.json
+curl -s --max-time 3300 "$(jq -r .url $D)/mesh?model=pixal3d&seed=42" \
+  -H "authorization: Bearer $(jq -r .token $D)" -H 'content-type: image/png' \
+  --data-binary @turtle.png -o turtle.glb
+```
 
 ## Local model catalog
 
