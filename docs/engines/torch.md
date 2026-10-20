@@ -42,7 +42,7 @@ Decisions and licences: `DECISIONS.md`, "Image to 3D".
   "files": [],                    // weights are the pipeline's own (below)
   "cliDefaults": {
     "pipeline": "pixal3d",        // pixal3d | trellis2 | hunyuan3d
-    "maxVramGib": 16.5,           // the budget; required
+    "maxVramGib": 15.5,           // the budget; required
     "steps": 12,                  // flow sampling steps per stage
     "cfgScale": 7.5,              // guidance of the shape stage
     "width": 1024, "height": 1024, // unused by mesh pipelines (the type requires them)
@@ -114,7 +114,7 @@ A job provisions what its pipeline lacks, in this order, logging each step (`op=
 
 | Environment | Python | torch | CUDA | Extensions | Sources |
 | --- | --- | --- | --- | --- | --- |
-| `trellis` | 3.10 | 2.6.0 + cu124 | 12.4.1 | nvdiffrast, CuMesh, FlexGEMM, o-voxel, NATTEN | TRELLIS.2, Pixal3D, MoGe |
+| `trellis` | 3.10 | 2.6.0 + cu124 | 12.4.1 | nvdiffrast, CuMesh, FlexGEMM, o-voxel, NATTEN; flash-attn (wheel) | TRELLIS.2, Pixal3D, NAF |
 | `hunyuan3d` | 3.10 | 2.5.1 + cu124 | 12.4.1 | custom_rasterizer, mesh_inpaint_processor | Hunyuan3D-2.1 |
 
 Hunyuan3D 2.1 pins numpy 1.24, transformers 4.46 and diffusers 0.30, which the `trellis`
@@ -182,9 +182,18 @@ environment (numpy 2, transformers 4.57, diffusers 0.37) cannot hold, hence two 
 
 | Pipeline | Budget | Settings | Measured |
 | --- | --- | --- | --- |
-| `pixal3d` | 16.5 GiB | `lowVram`, 1024 cascade | 187 s; 16.7 GB peak with Pixal3D's own 1 M-face export |
-| `trellis2` | measured in the plan's phase 7 | | |
+| `pixal3d` | 15.5 GiB (estimate 16.5) | `lowVram`, 1024 cascade | 107 to 178 s a run; 14.2 GiB peak on both test pictures; about 2.1 MB |
+| `trellis2` | 8 GiB (estimate 9) | `lowVram`, 512 | 100 s a run; 4.0 GiB peak; about 2.2 MB |
 | `hunyuan3d` | 16 GiB | CPU offload, 6 views of 512 px | measured in the plan's phase 7 |
+
+- A run's first job also loads its weights from disk (about 50 to 90 s) and, for Pixal3D, autotunes
+  FlexGEMM once (cached in `<torch>/cache`).
+- TRELLIS.2 runs at 512: at 1024 its shape decoder needs more than 17 GiB on a detailed picture
+  (the crab sample ran out of memory at 8, 12 and 17 GiB), which does not fit next to the shared
+  models on a 24 GB card; at 512 it peaks at 4 GiB and, decimated to 40 000 triangles, keeps its
+  detail. The registry can set `resolution: 1024` on a card with room.
+- The estimate is the budget plus about 1 GiB for the CUDA context; admission keeps another 1 GiB
+  in reserve, so a run fits when `estimate + 1` GiB is free.
 
 ## Observability
 

@@ -6,7 +6,9 @@
 //!
 //! - `MESH_PICTURE`: a picture of an object (not of a person);
 //! - `MESH_PIPELINES`: the pipelines to run, comma-separated (default `pixal3d`);
-//! - `MESH_OUT`: a directory the GLBs are copied to (optional).
+//! - `MESH_OUT`: a directory the GLBs are copied to (optional);
+//! - `MESH_BUDGET_GIB`: a device-memory budget for every pipeline, to measure one (optional);
+//! - `MESH_RESOLUTION`: a pipeline resolution for every pipeline (optional).
 //!
 //! Run it through PM2: the first run builds an environment for about 15 minutes.
 
@@ -20,10 +22,10 @@ use studio_worker::types::{
 
 /// A pipeline's registry row as the studio holds it (budgets measured on an RTX 4090).
 fn source(pipeline: &str) -> ModelSource {
-    let (budget, steps, guidance, low_vram) = match pipeline {
-        "pixal3d" => (15.0, 12, 7.5, true),
-        "trellis2" => (8.0, 12, 7.5, true),
-        "hunyuan3d" => (16.0, 30, 5.0, false),
+    let (budget, steps, guidance, low_vram, resolution) = match pipeline {
+        "pixal3d" => (15.5, 12, 7.5, true, Some(1024)),
+        "trellis2" => (8.0, 12, 7.5, true, Some(512)),
+        "hunyuan3d" => (16.0, 30, 5.0, false, None),
         other => panic!("unknown pipeline {other}"),
     };
     ModelSource {
@@ -35,8 +37,17 @@ fn source(pipeline: &str) -> ModelSource {
             width: 1024,
             height: 1024,
             pipeline: Some(pipeline.into()),
-            max_vram_gib: Some(budget),
+            max_vram_gib: Some(
+                std::env::var("MESH_BUDGET_GIB")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(budget),
+            ),
             low_vram: Some(low_vram),
+            resolution: std::env::var("MESH_RESOLUTION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(resolution),
             decimation_target: Some(WEB_GLB_TRIANGLES),
             texture_size: Some(WEB_GLB_TEXTURE_PX),
             ..Default::default()

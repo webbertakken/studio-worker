@@ -32,7 +32,7 @@ fn leak(text: String) -> &'static str {
 }
 
 fn run(dir: &Path, program: &str, args: &[&str]) {
-    let status = std::process::Command::new(program)
+    let status = studio_worker::process::command(program)
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "t")
@@ -164,7 +164,7 @@ fn fixture() -> Fixture {
     run(&repo, "git", &["add", "."]);
     run(&repo, "git", &["commit", "--quiet", "-m", "one"]);
     let rev = String::from_utf8(
-        std::process::Command::new("git")
+        studio_worker::process::command("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&repo)
             .output()

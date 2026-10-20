@@ -22,6 +22,11 @@ MAX_FACES_BEFORE_EXPORT = 16777216
 _paths = {}
 
 
+def pipeline_type(resolution):
+    """TRELLIS.2's pipeline for a resolution: 512 samples once; 1024 and 1536 cascade from 512."""
+    return "512" if resolution <= 512 else f"{resolution}_cascade"
+
+
 def prepare(request):
     trellis = common.snapshot(*TRELLIS2, allow_patterns=["pipeline.json", "ckpts/*"])
     large = common.snapshot(
@@ -67,7 +72,7 @@ def run(request, stage):
         shape_slat_sampler_params={"steps": steps, "guidance_strength": float(request["guidance"])},
         tex_slat_sampler_params={"steps": steps},
         preprocess_image=False,
-        pipeline_type=f"{resolution}_cascade",
+        pipeline_type=pipeline_type(resolution),
         max_num_tokens=MAX_NUM_TOKENS,
     )
     mesh = meshes[0]
