@@ -89,7 +89,11 @@ impl Engine for MultiEngine {
     fn model_engines(&self) -> Vec<ModelEngine> {
         ModelEngine::ALL
             .into_iter()
-            .filter(|engine| self.engines.iter().any(|e| e.name() == engine.backend()))
+            .filter(|engine| {
+                self.engines
+                    .iter()
+                    .any(|e| e.model_engines().contains(engine))
+            })
             .collect()
     }
 
@@ -525,7 +529,7 @@ mod tests {
             err.downcast_ref::<crate::vision::ImageRefusal>().is_some(),
             "{err}"
         );
-        assert!(crate::runtime::is_unsupported_kind(&err), "{err}");
+        assert!(crate::runtime::is_permanent_failure(&err), "{err}");
     }
 
     #[test]

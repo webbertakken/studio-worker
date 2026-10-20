@@ -48,7 +48,7 @@ fn log_engine_roster(engines: &[Box<dyn Engine>]) {
 /// Engines return this (instead of an ad-hoc string) when a task of a
 /// kind they don't implement reaches their dispatch, so the session
 /// classifies the failure as non-retryable via a downcast
-/// (`runtime::is_unsupported_kind`) instead of sniffing message text.
+/// (`runtime::is_permanent_failure`) instead of sniffing message text.
 /// The rendered message keeps the legacy `<engine> engine cannot
 /// serve <kind> tasks` shape operators already grep for.
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +117,7 @@ pub mod onnx_provision;
 pub mod parakeet;
 pub mod sd_provision;
 pub mod sdcpp;
+pub mod torch;
 #[cfg(feature = "tts")]
 pub mod tts;
 #[cfg(feature = "video")]
@@ -203,6 +204,9 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
         // already resolvable, so a fresh worker serves real image jobs
         // out of the box.
         v.push(Box::new(sdcpp::SdCppEngine::new(&cfg.models_root)));
+        // PyTorch models in a child process per job (image to 3D).  Registers everywhere; it
+        // advertises the mesh kind only on Linux x86_64 with a recent NVIDIA GPU.
+        v.push(Box::new(torch::TorchEngine::new(&cfg.models_root)));
         v.push(Box::new(SyntheticEngine::new()));
         v
     };

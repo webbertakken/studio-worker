@@ -28,7 +28,7 @@ use crate::engine::Engine;
 use crate::http::ApiClient;
 use crate::job_run::JobRun;
 use crate::runtime::{
-    is_unsupported_kind, prompt_for, push_log_with_observers, set_session_state, truncate_prompt,
+    is_permanent_failure, prompt_for, push_log_with_observers, set_session_state, truncate_prompt,
     wait_with_stop, CurrentJob, HeartbeatOutcome, HeartbeatStatus, JobOutcome, JobSource,
     SessionState, WorkerObservers,
 };
@@ -1009,7 +1009,7 @@ async fn run_offered_job(
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
                     error: e.to_string(),
-                    retryable: !is_unsupported_kind(&e),
+                    retryable: !is_permanent_failure(&e),
                 })
                 .await;
             record_fail_send(&fail_result, &job_id, &ctx.logs, &ctx.observers);
