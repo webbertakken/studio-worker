@@ -5,7 +5,7 @@
 [![Coverage](https://github.com/webbertakken/studio-worker/actions/workflows/coverage.yml/badge.svg)](https://github.com/webbertakken/studio-worker/actions/workflows/coverage.yml)
 
 A single self-contained Rust binary that pulls **image**, **LLM**,
-**audio (STT/TTS)**, and **video** jobs from the minis.gg studio API,
+**audio (STT/TTS)**, **video** and **3D model** jobs from the minis.gg studio API,
 runs them locally, and posts the results back.
 
 Install the worker on any PC, register once, and it will hold a
@@ -13,7 +13,7 @@ hibernatable **WebSocket session** to the studio API's
 `WorkerConnections` Durable Object.  The studio pushes job offers over
 the socket as soon as they're queued; the worker accepts, runs the
 engine, and posts the result back the same way (or via a single HTTP
-multipart route for image / audio / video bytes).  The worker also
+multipart route for image / audio / video / GLB bytes).  The worker also
 **auto-updates itself** between jobs.
 
 ```
@@ -37,6 +37,7 @@ worker HTTP routes (`heartbeat`, `claim`, `complete-json`, `fail`,
 | Audio STT   | `audio_stt`   | Whisper-shape JSON                           | `whisper` (whisper.cpp)   |
 | Audio TTS   | `audio_tts`   | real WAV (sine wave keyed by hash(text))     | `tts-piper`               |
 | Video       | `video`       | real WebP image (single-frame stand-in)      | `video-ffmpeg`            |
+| 3D model    | `mesh`        | real GLB (a textured cube in the picture's colour) | `torch` (Pixal3D, TRELLIS.2, Hunyuan3D 2.1) |
 
 The synthetic engine is the default and exercises the full pipeline
 end-to-end with no GPU, no model downloads, and ~0 ms per task — exactly
@@ -339,6 +340,11 @@ incoming job to the first backend that supports its `(kind, model)` pair
   ships in its own bundle (`all-engines-stt`); the all-backends release
   pairs `llama` (in-process) with `sd-cli` (subprocess) to sidestep the
   clash.
+- **`torch`** — PyTorch models with custom CUDA extensions, a child process per job: a picture
+  to a web-sized GLB with Pixal3D, TRELLIS.2 or Hunyuan3D 2.1.  Advertised on Linux x86_64 with an
+  NVIDIA GPU of compute capability 8.0 or more; provisions its own Python, CUDA toolkit, extensions
+  and weights under `models_root` on the first job (about 15 minutes once).  See
+  [`docs/engines/torch.md`](docs/engines/torch.md).
 - **`onnx-vision`** (feature `vision`, on by default): animal detection
   (MegaDetector) and species classification (525 birds) on ONNX Runtime,
   CUDA when present.  Local only: served on `/vision/*` of the local API,
