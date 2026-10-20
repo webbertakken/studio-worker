@@ -482,7 +482,11 @@ impl Provisioner {
                 return Ok(());
             }
             if self.head(&dest).as_deref() == Some(source.rev) {
-                return Ok(());
+                return if source.submodules {
+                    self.submodules(&step_name, &dest)
+                } else {
+                    Ok(())
+                };
             }
             std::fs::remove_dir_all(&dest).map_err(io_error(&step_name))?;
         }
@@ -537,6 +541,19 @@ impl Provisioner {
             }
         }
         std::fs::rename(&partial, &dest).map_err(io_error(&step_name))
+    }
+
+    /// Check a checkout's submodules out (a no-op when they are).
+    fn submodules(&self, step_name: &str, dir: &Path) -> Result<(), TorchError> {
+        let mut submodules = crate::process::command("git");
+        submodules.arg("-C").arg(dir).args([
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--quiet",
+        ]);
+        run_command(step_name, submodules)
     }
 
     /// The commit a checkout is at.

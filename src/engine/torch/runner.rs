@@ -104,6 +104,12 @@ pub struct Report {
     pub seconds: f32,
 }
 
+/// Whether a line is a progress bar's intermediate frame (`Sampling:  42%|████ | 5/12 [..., 3.6it/s]`):
+/// only a bar's last frame reaches the log, so a sampler's dozens of frames do not crowd it out.
+pub fn is_progress_frame(line: &str) -> bool {
+    line.contains("%|") && !line.contains("100%|")
+}
+
 /// Write the runner's files into `dir`, rewriting only what differs.
 pub fn install(dir: &Path) -> std::io::Result<()> {
     for (name, content) in FILES {
@@ -244,6 +250,7 @@ pub fn run(
             (Pipe::Stdout, Ok(Event::Failed { class, message })) => {
                 failure = Some((class, message))
             }
+            _ if is_progress_frame(line) => {}
             _ => tracing::info!(target: TRACE_TARGET, op = "runner", "{line}"),
         }
     })
@@ -358,6 +365,17 @@ mod tests {
             outcome(Ended::TimedOut { tail: String::new() }, None, None, 16.0, t),
             Err(TorchError::Timeout(d)) if d == t
         ));
+    }
+
+    #[test]
+    fn only_the_last_frame_of_a_progress_bar_is_logged() {
+        assert!(is_progress_frame(
+            "Sampling shape SLat (proj):  42%|████▏     | 5/12 [00:01<00:01,  4.03it/s]"
+        ));
+        assert!(!is_progress_frame(
+            "Sampling shape SLat (proj): 100%|██████████| 12/12 [00:02<00:00,  4.38it/s]"
+        ));
+        assert!(!is_progress_frame("[Pipeline] Low-VRAM mode enabled."));
     }
 
     #[test]

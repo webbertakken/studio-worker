@@ -7,8 +7,11 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Lines kept for an error message.  Safe range 10..=200.
+/// Last lines kept for an error message.  Safe range 10..=200.
 pub const TAIL_LINES: usize = 40;
+/// First lines naming an error kept for an error message: a compiler names the cause long before
+/// the build tool's traceback ends.  Safe range 1..=50.
+pub const FIRST_ERROR_LINES: usize = 12;
 /// How long the pipes may stay open after the child exits (a grandchild holding them).
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// How often the child is checked while it prints nothing.
@@ -28,20 +31,44 @@ pub enum Ended {
     TimedOut { tail: String },
 }
 
-/// The last [`TAIL_LINES`] lines of both pipes, in the order they arrived.
+/// The first [`FIRST_ERROR_LINES`] lines that name an error, and the last [`TAIL_LINES`] lines of
+/// both pipes, in the order they arrived.
 #[derive(Debug, Default)]
-struct Tail(VecDeque<String>);
+struct Tail {
+    first_errors: Vec<String>,
+    last: VecDeque<String>,
+}
+
+/// Whether a line names an error (`fatal error:`, `error:`, `Error compiling`), not a traceback's
+/// frame.
+fn names_an_error(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error") && !lower.trim_start().starts_with("file ")
+}
 
 impl Tail {
     fn push(&mut self, line: &str) {
-        if self.0.len() == TAIL_LINES {
-            self.0.pop_front();
+        if self.first_errors.len() < FIRST_ERROR_LINES && names_an_error(line) {
+            self.first_errors.push(line.to_string());
         }
-        self.0.push_back(line.to_string());
+        if self.last.len() == TAIL_LINES {
+            self.last.pop_front();
+        }
+        self.last.push_back(line.to_string());
     }
 
     fn text(&self) -> String {
-        self.0.iter().cloned().collect::<Vec<_>>().join("\n")
+        let last = self.last.iter().cloned().collect::<Vec<_>>().join("\n");
+        let earlier: Vec<&String> = self
+            .first_errors
+            .iter()
+            .filter(|line| !self.last.contains(line))
+            .collect();
+        if earlier.is_empty() {
+            return last;
+        }
+        let earlier: Vec<&str> = earlier.iter().map(|s| s.as_str()).collect();
+        format!("{}\n...\n{last}", earlier.join("\n"))
     }
 }
 
@@ -198,6 +225,29 @@ mod tests {
         assert_eq!(lines.len(), TAIL_LINES);
         assert_eq!(lines.last(), Some(&"line99"));
         assert_eq!(lines.first(), Some(&"line60"));
+    }
+
+    #[test]
+    fn the_first_errors_are_kept_before_the_tail() {
+        let ended = run(
+            sh(r#"echo 'x.cpp:1: fatal error: Eigen/Dense: No such file'; i=0; while [ $i -lt 60 ]; do echo '  File "build.py", in run'; i=$((i+1)); done; echo 'RuntimeError: Error compiling objects'"#),
+            Duration::from_secs(10),
+            |_, _| {},
+        )
+        .unwrap();
+        let Ended::Exited { tail, .. } = ended else {
+            panic!("expected an exit")
+        };
+        assert!(
+            tail.starts_with("x.cpp:1: fatal error: Eigen/Dense"),
+            "{tail}"
+        );
+        assert!(tail.contains("\n...\n"), "{tail}");
+        assert!(
+            tail.ends_with("RuntimeError: Error compiling objects"),
+            "{tail}"
+        );
+        assert!(!tail.starts_with("  File"));
     }
 
     #[test]

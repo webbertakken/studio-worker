@@ -170,7 +170,7 @@ pub const TRELLIS: Recipe = Recipe {
             name: "TRELLIS.2",
             repo: "https://github.com/microsoft/TRELLIS.2.git",
             rev: "75fbf0183001ed9876c8dbb35de6b68552ee08bd",
-            submodules: false,
+            submodules: true, // o-voxel builds against its Eigen submodule
             home: SourceHome::Sources,
         },
         Source {

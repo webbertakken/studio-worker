@@ -58,11 +58,11 @@ def prepare(request):
 def run(request, stage):
     common.source(request, "Pixal3D")
     import torch
+    # FlexGEMM reads its autotune cache path once, on import: import it before Pixal3D's
+    # `inference.py`, which points that path into its own checkout.
+    import flex_gemm  # noqa: F401
     import inference as pixal  # Pixal3D's own helpers: model loading and camera estimation
 
-    os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(
-        os.path.dirname(request["pipelinesDir"]), "cache", "flex-gemm-autotune.json"
-    )
     for config in pixal.IMAGE_COND_CONFIGS.values():
         config["model_name"] = _paths["dinov3"]
 
