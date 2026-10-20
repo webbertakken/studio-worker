@@ -72,9 +72,15 @@ pub fn classify(linux_x86_64: bool, nvidia_smi: Option<&str>) -> Platform {
     Platform::Supported(capability)
 }
 
-/// Probe this machine, and log what was found.
-#[cfg_attr(coverage_nightly, coverage(off))]
+/// This machine, probed once per process (the engine roster is built more than once), and logged
+/// when it is.
 pub fn probe() -> Platform {
+    static PROBED: std::sync::OnceLock<Platform> = std::sync::OnceLock::new();
+    PROBED.get_or_init(probe_now).clone()
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn probe_now() -> Platform {
     let linux_x86_64 = cfg!(all(target_os = "linux", target_arch = "x86_64"));
     let nvidia_smi = linux_x86_64
         .then(|| {

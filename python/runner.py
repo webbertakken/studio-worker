@@ -103,8 +103,9 @@ def main(argv):
         return EXIT_BAD_INPUT
     except torch.cuda.OutOfMemoryError as error:
         traceback.print_exc()
-        first_line = str(error).splitlines()[0] if str(error) else "CUDA out of memory"
-        emit("failed", **{"class": "out_of_memory", "message": first_line})
+        # torch's message runs on for lines about allocator settings: its first two sentences say it.
+        text = str(error).splitlines()[0] if str(error) else "CUDA out of memory"
+        emit("failed", **{"class": "out_of_memory", "message": ". ".join(text.split(". ")[:2])})
         return EXIT_OUT_OF_MEMORY
     except Exception as error:
         traceback.print_exc()
