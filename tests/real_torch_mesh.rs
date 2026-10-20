@@ -8,7 +8,8 @@
 //! - `MESH_PIPELINES`: the pipelines to run, comma-separated (default `pixal3d`);
 //! - `MESH_OUT`: a directory the GLBs are copied to (optional);
 //! - `MESH_BUDGET_GIB`: a device-memory budget for every pipeline, to measure one (optional);
-//! - `MESH_RESOLUTION`: a pipeline resolution for every pipeline (optional).
+//! - `MESH_RESOLUTION`: a pipeline resolution for every pipeline (optional);
+//! - `MESH_LOW_VRAM`: `1` or `0`, low-VRAM mode for every pipeline (optional).
 //!
 //! Run it through PM2: the first run builds an environment for about 15 minutes.
 
@@ -43,7 +44,11 @@ fn source(pipeline: &str) -> ModelSource {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(budget),
             ),
-            low_vram: Some(low_vram),
+            low_vram: Some(
+                std::env::var("MESH_LOW_VRAM")
+                    .map(|v| v == "1")
+                    .unwrap_or(low_vram),
+            ),
             resolution: std::env::var("MESH_RESOLUTION")
                 .ok()
                 .and_then(|v| v.parse().ok())

@@ -6,9 +6,10 @@ the weights, and the operator accepts Tencent's terms by pulling them. Webber us
 use only, off every public and commercial path (DECISIONS.md, "Image to 3D").
 
 Shape: the flow-matching DiT, then floaters, degenerate faces and the face count trimmed.
-Texture: the PBR paint pipeline with 6 views of 512 px and its diffusion model offloaded to the
-CPU, so the paint pass fits a 16 GiB budget (Webber, 2026-10-20). The GLB is written here, from the
-painted OBJ and its maps: Hunyuan's own conversion needs Blender (`bpy`), which is not installed.
+Texture: the PBR paint pipeline with 6 views of 512 px, so the paint pass fits a 16 GiB budget
+(Webber, 2026-10-20; 13.0 GiB at its peak, without CPU offload: see `_paint`). The GLB is written
+here, from the painted OBJ and its maps: Hunyuan's own conversion needs Blender (`bpy`), which is
+not installed.
 """
 
 import os
@@ -39,7 +40,7 @@ def prepare(request):
     _paths["hunyuan"] = common.snapshot(
         *HUNYUAN3D, allow_patterns=[f"{SHAPE_DIR}/*", "hunyuan3d-paintpbr-v2-1/*"]
     )
-    _paths["dinov2"] = common.snapshot(*DINOV2_GIANT)
+    _paths["dinov2"] = common.snapshot(*DINOV2_GIANT, allow_patterns=["*.json", "model.safetensors"])
     _paths["realesrgan"] = common.download(
         *REALESRGAN, os.path.join(request["pipelinesDir"], "hunyuan3d", "RealESRGAN_x4plus.pth")
     )
@@ -90,7 +91,7 @@ def _shape(request, torch, picture):
     return FaceReducer()(mesh, max_facenum=int(request["decimationTarget"]))
 
 
-def _paint(request, root, torch, shape_path, picture):
+def _paint(request, root, shape_path, picture):
     from textureGenPipeline import Hunyuan3DPaintConfig, Hunyuan3DPaintPipeline
     from utils import multiview_utils
 
@@ -103,9 +104,10 @@ def _paint(request, root, torch, shape_path, picture):
     config.texture_size = 2 * int(request["textureSize"])
     # The paint model is read from the pinned snapshot, never from the hub.
     multiview_utils.huggingface_hub.snapshot_download = lambda **_: _paths["hunyuan"]
+    # No CPU offload: its custom diffusion pipeline breaks under both of diffusers' offloads (the
+    # whole-model one leaves the VAE on the CPU, the layer-by-layer one hands the sampler a meta
+    # device; verified), and without it the paint pass peaks at 13.0 GiB, inside its 16 GiB budget.
     paint = Hunyuan3DPaintPipeline(config)
-    paint.models["multiview_model"].pipeline.enable_model_cpu_offload()
-    torch.cuda.empty_cache()
     painted = os.path.join(request["workDir"], "painted", "textured_mesh.obj")
     os.makedirs(os.path.dirname(painted), exist_ok=True)
     paint(mesh_path=shape_path, image_path=picture, output_mesh_path=painted, use_remesh=False,
@@ -151,7 +153,7 @@ def run(request, stage):
     common.log(f"shape: {len(shape.faces)} faces")
 
     stage("paint")
-    painted = _paint(request, root, torch, shape_path, picture)
+    painted = _paint(request, root, shape_path, picture)
 
     stage("export")
     return _glb(request, painted)
