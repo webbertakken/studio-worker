@@ -5,6 +5,8 @@ RMBG-2.0, the ungated DINOv3 mirror in place of `facebook/dinov3-vitl16-pretrain
 every weight at a pinned revision.
 """
 
+import os
+
 from . import common
 
 TRELLIS2 = ("microsoft/TRELLIS.2-4B", "af44b45f2e35a493886929c6d786e563ec68364d")
@@ -40,6 +42,8 @@ def prepare(request):
 
 
 def run(request, stage):
+    # TRELLIS.2's sparse attention runs on flash-attn (it has no SDPA backend); set before import.
+    os.environ["ATTN_BACKEND"] = "flash_attn"
     common.source(request, "TRELLIS.2")
     import torch
     from trellis2.pipelines import Trellis2ImageTo3DPipeline

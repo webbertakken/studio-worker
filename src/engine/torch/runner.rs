@@ -396,6 +396,99 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn fake_run(script_body: &str, timeout: Duration) -> Result<Report, TorchError> {
+        use crate::engine::torch::layout::Layout;
+        use crate::engine::torch::platform::ComputeCapability;
+        use crate::engine::torch::provision::{CudaSource, UvSource};
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let python = dir.path().join("python");
+        std::fs::write(&python, format!("#!/bin/sh\n{script_body}\n")).unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let provisioner = Provisioner {
+            layout: Layout::new(dir.path().join("models")),
+            capability: ComputeCapability { major: 8, minor: 9 },
+            uv: UvSource::Binary("/nonexistent/uv".into()),
+            cuda: CudaSource::default(),
+        };
+        let environment = Environment {
+            dir: dir.path().join("env"),
+            python,
+            cuda_home: dir.path().join("env/cuda"),
+            sources: vec![],
+        };
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let request = RunRequest {
+            pipeline: "fake".into(),
+            image: work.join("input.png"),
+            output: work.join("model.glb"),
+            work_dir: work.clone(),
+            seed: 1,
+            steps: 1,
+            guidance: 1.0,
+            resolution: None,
+            low_vram: true,
+            decimation_target: 40_000,
+            texture_size: 1024,
+            budget_gib: 8.0,
+            sources: BTreeMap::new(),
+            pipelines_dir: dir.path().join("models/torch/models"),
+        };
+        let result = run(&provisioner, &environment, &request, timeout);
+        assert!(provisioner.layout.runner().join("runner.py").exists());
+        assert!(work.join("request.json").exists());
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_reports_what_the_runner_says() {
+        let done = fake_run(
+            r#"echo '{"event":"stage","name":"generate"}'
+echo 'Sampling:  50%|█████     | 6/12 [00:01<00:01,  3.6it/s]' >&2
+echo '{"event":"done","triangles":40000,"bytes":3000000,"vramPeakGib":12.5,"seconds":95.5}'"#,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(done.triangles, 40_000);
+        assert_eq!(done.seconds, 95.5);
+        let bad = fake_run(
+            r#"echo '{"event":"failed","class":"bad_input","message":"the picture is 10x10"}'
+exit 3"#,
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(matches!(bad, TorchError::BadInput(ref m) if m == "the picture is 10x10"));
+        let crashed = fake_run(
+            "echo 'Segmentation fault' >&2; exit 139",
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(crashed, TorchError::Runner { ref tail, .. } if tail.contains("Segmentation fault"))
+        );
+        let slow = fake_run("sleep 30", Duration::from_millis(300)).unwrap_err();
+        assert!(matches!(slow, TorchError::Timeout(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_run_log_keeps_messages_and_drops_progress_frames() {
+        let logs = crate::test_support::capture(|| {
+            let _ = fake_run(
+                r#"echo '[Pipeline] Loading weights' >&2
+echo 'Sampling:  50%|█████     | 6/12 [00:01<00:01,  3.6it/s]' >&2
+echo '{"event":"stage","name":"export"}'"#,
+                Duration::from_secs(10),
+            );
+        });
+        assert!(logs.contains("[Pipeline] Loading weights"), "{logs}");
+        assert!(logs.contains("stage=export"), "{logs}");
+        assert!(!logs.contains("6/12"), "{logs}");
+    }
+
     #[test]
     fn a_request_is_camel_case_json() {
         let request = RunRequest {

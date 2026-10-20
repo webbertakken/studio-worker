@@ -143,6 +143,10 @@ pub const TRELLIS: Recipe = Recipe {
         // MoGe before its V3 bump, whose trimesh pin clashes with Pixal3D's.
         "moge @ git+https://github.com/microsoft/MoGe.git@925b8ed835a7a9cdb7578ba15c658a0afc969030",
         "utils3d @ https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl",
+        // TRELLIS.2's sparse attention has no SDPA backend: flash-attn, as a prebuilt wheel for
+        // torch 2.6 + CUDA 12.  2.7.4.post1, not the latest 2.8.3.post2: every 2.8.x wheel labelled
+        // `cxx11abiFALSE` for torch 2.6 is built with the C++11 ABI and does not load (verified).
+        "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl#sha256=ffe17686fa1a0f288de9eae7c32af209d32a27b037ef28614f042b377af5b15a",
     ],
     sources: &[
         Source {
@@ -232,6 +236,7 @@ pub const TRELLIS: Recipe = Recipe {
         "utils3d",
         "moge.model.v2",
         "natten",
+        "flash_attn",
         "huggingface_hub",
     ],
 };
