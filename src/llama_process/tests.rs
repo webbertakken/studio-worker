@@ -2,11 +2,15 @@
 //! protocol, one of which aborts itself the way ggml does on a CUDA out-of-memory.
 
 use super::*;
+#[cfg(unix)]
 use crate::types::{ChatMessage, LlmParams};
+#[cfg(unix)]
 use std::path::Path;
 
+#[cfg(unix)]
 const OOM_LOG: &str = r#"{"type":"log","level":"ERROR","target":"llama-cpp-2","message":"CUDA error: out of memory"}"#;
 
+#[cfg(unix)]
 fn loaded_line() -> String {
     format!(
         r#"{{"type":"loaded","version":"{}"}}"#,
@@ -14,8 +18,10 @@ fn loaded_line() -> String {
     )
 }
 
+/// Fakes are `sh` scripts: the llama process serves on Linux and macOS only (Windows runs `llama-cli`).
 /// A fake llama process: `/bin/sh` running `body` after it read the `load` line and answered
 /// `loaded`.  `$dir` is the script's directory.
+#[cfg(unix)]
 fn fake(dir: &Path, body: &str) -> ChildProgram {
     fake_raw(
         dir,
@@ -23,12 +29,14 @@ fn fake(dir: &Path, body: &str) -> ChildProgram {
     )
 }
 
+#[cfg(unix)]
 fn fake_raw(dir: &Path, script: &str) -> ChildProgram {
     let path = dir.join(format!("fake-{}.sh", rand_suffix()));
     std::fs::write(&path, format!("dir='{}'\n{script}\n", dir.display())).unwrap();
     ChildProgram::new("/bin/sh", vec![path.into_os_string()])
 }
 
+#[cfg(unix)]
 fn rand_suffix() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -44,6 +52,7 @@ fn spec() -> LoadSpec {
     }
 }
 
+#[cfg(unix)]
 fn params() -> LlmParams {
     LlmParams {
         messages: vec![ChatMessage {
@@ -62,14 +71,17 @@ fn quick() -> Timing {
     }
 }
 
+#[cfg(unix)]
 fn start(program: &ChildProgram) -> LlamaProcess {
     LlamaProcess::start_with(program, &spec(), quick()).expect("the fake loads")
 }
 
+#[cfg(unix)]
 fn chat(process: &mut LlamaProcess) -> Result<serde_json::Value, LlamaProcessError> {
     process.chat(params(), &|| false, &mut |_| {})
 }
 
+#[cfg(unix)]
 #[test]
 fn a_chat_streams_its_pieces_and_returns_the_completion() {
     let dir = tempfile::tempdir().unwrap();
@@ -91,6 +103,7 @@ done"#,
     assert!(chat(&mut process).is_ok());
 }
 
+#[cfg(unix)]
 #[test]
 fn an_abort_mid_request_fails_the_request_with_the_reason() {
     let dir = tempfile::tempdir().unwrap();
@@ -123,6 +136,7 @@ kill -ABRT $$"#
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn an_abort_is_logged_as_process_died() {
     let logs = crate::test_support::capture(|| {
@@ -136,6 +150,7 @@ fn an_abort_is_logged_as_process_died() {
     assert!(logs.contains("ERROR"), "{logs}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_handled_failure_carries_llamas_error_lines_and_the_process_keeps_serving() {
     let dir = tempfile::tempdir().unwrap();
@@ -169,6 +184,7 @@ fn a_failure_without_llama_lines_is_the_error_alone() {
     assert_eq!(err.to_string(), "tokenize prompt");
 }
 
+#[cfg(unix)]
 #[test]
 fn tokenize_answers_the_token_ids() {
     let dir = tempfile::tempdir().unwrap();
@@ -182,6 +198,7 @@ read -r rest"#,
     assert_eq!(process.tokenize("hi", true).unwrap(), vec![1, 2, 3]);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_load_failure_is_the_start_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -200,6 +217,7 @@ exit 1"#,
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_process_of_another_version_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -229,6 +247,7 @@ fn a_program_that_cannot_start_is_a_spawn_error() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_cancelled_request_sends_cancel() {
     let dir = tempfile::tempdir().unwrap();
@@ -244,6 +263,7 @@ read -r rest"#,
     assert_eq!(err.to_string(), "cancelled");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_process_that_ignores_cancel_is_killed() {
     let dir = tempfile::tempdir().unwrap();
@@ -256,6 +276,7 @@ fn a_process_that_ignores_cancel_is_killed() {
     assert!(process.has_ended());
 }
 
+#[cfg(unix)]
 #[test]
 fn dropping_closes_stdin_and_the_process_exits() {
     let dir = tempfile::tempdir().unwrap();
@@ -272,6 +293,7 @@ touch "$dir/exited""#,
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn dropping_kills_a_process_that_does_not_exit() {
     let dir = tempfile::tempdir().unwrap();
@@ -284,6 +306,7 @@ fn dropping_kills_a_process_that_does_not_exit() {
     assert!(logs.contains("killed"), "{logs}");
 }
 
+#[cfg(unix)]
 #[test]
 fn stray_output_and_process_logs_reach_the_callers_log() {
     let logs = crate::test_support::capture(|| {
@@ -334,6 +357,7 @@ fn reasons_keep_the_first_and_the_last_lines_shortened() {
 }
 
 /// A model load that runs out of memory logs the cause first, then what failed because of it.
+#[cfg(unix)]
 #[test]
 fn the_cause_stays_in_the_error_however_many_lines_follow() {
     let dir = tempfile::tempdir().unwrap();
@@ -385,6 +409,7 @@ fn the_daemons_own_executable_serves_with_backtraces_off() {
 // -- IsolatedLlm: a loaded model over its llama process ---------------------------------------
 
 /// Dies on the first chat (leaving a marker), serves every later one.
+#[cfg(unix)]
 fn dies_once(dir: &Path) -> ChildProgram {
     fake(
         dir,
@@ -395,6 +420,7 @@ done"#,
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn a_loaded_model_restarts_its_process_after_it_ended() {
     use crate::host::ChatModel as _;
@@ -409,6 +435,7 @@ fn a_loaded_model_restarts_its_process_after_it_ended() {
     assert!(logs.contains("op=\"restart\""), "{logs}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_loaded_model_tokenizes_through_its_process() {
     use crate::host::{ChatModel as _, LoadedModel as _};
@@ -423,6 +450,7 @@ fn a_loaded_model_tokenizes_through_its_process() {
     assert!(model.as_any().downcast_ref::<IsolatedLlm>().is_some());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_restart_that_fails_fails_the_request() {
     use crate::host::ChatModel as _;
