@@ -36,7 +36,7 @@ impl ModelRuntime for Loaders {
         match &model.source.engine {
             #[cfg(all(feature = "llama", not(target_os = "windows")))]
             crate::types::ModelEngine::LlamaCpp => Ok(Arc::new(
-                crate::engine::llama::load_resident(&self.models_root, model)?,
+                crate::engine::llama::load_isolated(&self.models_root, model)?,
             )),
             #[cfg(feature = "stt-stream")]
             crate::types::ModelEngine::Parakeet => Ok(Arc::new(

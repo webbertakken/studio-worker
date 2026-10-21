@@ -54,6 +54,11 @@ pub enum Command {
     CheckUpdate,
     /// Launch the desktop UI (requires the `ui` cargo feature).
     Ui,
+    /// A llama process: the daemon starts one per model it serves with llama.cpp, so a
+    /// llama.cpp abort ends one job, never the daemon (`docs/engines/llama.md`).  Hidden: it
+    /// speaks a protocol on stdin and stdout.
+    #[command(hide = true)]
+    LlamaServe,
 }
 
 impl Command {
@@ -71,6 +76,7 @@ impl Command {
             Command::Config => "config",
             Command::CheckUpdate => "check-update",
             Command::Ui => "ui",
+            Command::LlamaServe => "llama-serve",
         }
     }
 }
@@ -203,6 +209,19 @@ mod tests {
         assert_eq!(Command::Config.name(), "config");
         assert_eq!(Command::CheckUpdate.name(), "check-update");
         assert_eq!(Command::Ui.name(), "ui");
+        assert_eq!(
+            Command::LlamaServe.name(),
+            crate::llama_process::SERVE_COMMAND
+        );
+    }
+
+    #[test]
+    fn llama_serve_is_hidden() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("llama-serve"), "{help}");
+        let cli = Cli::parse_from(["studio-worker", "llama-serve"]);
+        assert_eq!(cli.command, Command::LlamaServe);
     }
 
     #[test]

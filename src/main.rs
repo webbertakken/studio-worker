@@ -9,6 +9,13 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 fn main() -> Result<()> {
+    let cli_args = cli::Cli::parse();
+    // A llama process speaks its protocol on stdout: it installs its own logging, which sends
+    // every event to the daemon instead (`docs/engines/llama.md`).
+    if cli_args.command == cli::Command::LlamaServe {
+        return studio_worker::llama_process::serve::run_stdio();
+    }
+
     // Install the tracing subscriber first so that the telemetry init
     // banner (and any warning about an invalid `SENTRY_DSN`) actually
     // surfaces.  The `sentry-tracing` layer is added now too; it uses
@@ -45,7 +52,6 @@ fn main() -> Result<()> {
     // remove the leftover now that we're the fresh binary.
     studio_worker::update::cleanup_parked_artifact_for_current_exe();
 
-    let cli_args = cli::Cli::parse();
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(run_cli(cli_args));
     if let Err(e) = &result {

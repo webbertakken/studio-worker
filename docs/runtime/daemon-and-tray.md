@@ -9,6 +9,8 @@ The worker is two processes built from one binary:
   actions back. It never runs a job and never talks to the studio.
 
 Closing or crashing the UI never stops a job. Stopping the daemon stops the worker.
+llama.cpp runs in a [llama process](../engines/llama.md#llama-process) per model, a child of the
+daemon, so a llama.cpp abort ends one job, never the daemon.
 
 Installed, the worker always runs as the tray UI: the installers start it, its login entry
 starts it at every login (unless **Start with my machine** is off), and it starts the daemon. Nothing installs the daemon on its own.
@@ -504,4 +506,5 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `tray` | `studio_worker::ui::tray` | the Linux tray icon service started, ended, or re-registered |
 | `log_trim` | `studio_worker::log_trim` | `daemon.log` / `ui.log` trimmed, or the trim failed |
 | `presence` | `studio_worker::presence` | the user presence changed, or the idle time could not be read |
+| `start` / `restart` / `process_died` / `stop` / `cancel` / `output` | `studio_worker::llama_process` | a [llama process](../engines/llama.md#llama-process) started, ended, or wrote outside its protocol |
 | `memory_ceiling` | `studio_worker::memory_ceiling` | the ceiling in effect at start, the scope's limits set, the launcher unusable |

@@ -4,8 +4,11 @@
 //! find under `<models_root>/llm/` and exposes the filename stem as a
 //! model id.  A job loads its model, runs the generation and frees it
 //! again (transient); models kept warm are the model host's resident
-//! models (`LoadedLlm`, see `docs/runtime/model-lifecycle.md`).  Both
-//! paths share `complete`, returning `chat.completion`-shaped JSON.
+//! models (see `docs/runtime/model-lifecycle.md`).
+//!
+//! llama.cpp runs in a llama process, never in the daemon (`crate::llama_process`): the daemon
+//! downloads the files ([`load_isolated`], [`LlamaEngine`]); the process loads them
+//! ([`load_local`]) and answers with `complete`, returning `chat.completion`-shaped JSON.
 use crate::catalog::CatalogModel;
 use crate::engine::chat_template::{merge_kwargs, render_chat, TemplateVars};
 use crate::engine::llm_core::{
@@ -13,7 +16,8 @@ use crate::engine::llm_core::{
     StopHold,
 };
 use crate::engine::{Engine, EngineCapabilities};
-use crate::host::{ChatModel, LoadedModel};
+use crate::host::ChatModel;
+use crate::llama_process::{ChildProgram, IsolatedLlm, LlamaProcess, LoadSpec};
 use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -39,7 +43,8 @@ use tracing::{debug, info, warn};
 const TRACE_TARGET: &str = "studio_worker::engine::llama";
 
 pub struct LlamaEngine {
-    backend: Arc<LlamaBackend>,
+    /// The llama process each job runs in.
+    program: ChildProgram,
     models_root: PathBuf,
 }
 
@@ -85,12 +90,19 @@ fn global_backend() -> Result<Arc<LlamaBackend>> {
 }
 
 impl LlamaEngine {
+    /// Jobs run in the daemon's own executable as a llama process.
     pub fn new(models_root: PathBuf) -> Result<Self> {
-        let backend = global_backend().context("initialising llama backend")?;
-        Ok(Self {
-            backend,
+        let program = ChildProgram::this_executable()
+            .context("locating the executable to run llama processes")?;
+        Ok(Self::with_program(models_root, program))
+    }
+
+    /// Jobs run in `program` (tests name the built binary).
+    pub fn with_program(models_root: PathBuf, program: ChildProgram) -> Self {
+        Self {
+            program,
             models_root,
-        })
+        }
     }
 
     fn llm_dir(&self) -> PathBuf {
@@ -121,39 +133,6 @@ impl LlamaEngine {
             .into_iter()
             .find(|(stem, _)| stem == model)
             .map(|(_, p)| p)
-    }
-
-    /// Load `path` for one transient job.  Dropped when the job ends, so a
-    /// transient job never leaves memory behind that the model host (and
-    /// its admission) cannot see; keeping a model warm is what residency is for.
-    fn load_transient(&self, model: &str, path: &Path) -> Result<LlamaModel> {
-        info!(
-            target: TRACE_TARGET,
-            op = "load",
-            model,
-            path = %path.display(),
-            "loading model for one job"
-        );
-        let started = Instant::now();
-        let loaded = load_model(&self.backend, model, path).inspect_err(|e| {
-            warn!(
-                target: TRACE_TARGET,
-                op = "load",
-                model,
-                path = %path.display(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                error = %e,
-                "failed to load model"
-            );
-        })?;
-        info!(
-            target: TRACE_TARGET,
-            op = "load",
-            model,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "model loaded"
-        );
-        Ok(loaded)
     }
 }
 
@@ -528,7 +507,7 @@ pub fn complete(
     ))
 }
 
-/// A GGUF held in memory by the model host (a resident model).
+/// A GGUF held in memory by a llama process.
 pub struct LoadedLlm {
     id: String,
     /// The vision projector, when the model reads images.  Declared before `model` so it is
@@ -537,16 +516,6 @@ pub struct LoadedLlm {
     model: LlamaModel,
     backend: Arc<LlamaBackend>,
     defaults: ModelCliDefaults,
-}
-
-impl LoadedModel for LoadedLlm {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_chat(&self) -> Option<&dyn ChatModel> {
-        Some(self)
-    }
 }
 
 impl ChatModel for LoadedLlm {
@@ -584,10 +553,10 @@ impl ChatModel for LoadedLlm {
     }
 }
 
-/// Download (if needed) and load `model` for the host to keep resident.
+/// Download (if needed) `model`'s files and start the llama process that keeps it loaded for the
+/// host.
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub fn load_resident(models_root: &Path, model: &CatalogModel) -> Result<LoadedLlm> {
-    let backend = global_backend().context("initialising llama backend")?;
+pub fn load_isolated(models_root: &Path, model: &CatalogModel) -> Result<IsolatedLlm> {
     let files = ensure_llm_files(models_root, &model.source)?;
     let path = pick_gguf(&files).ok_or_else(|| {
         anyhow!(
@@ -595,26 +564,53 @@ pub fn load_resident(models_root: &Path, model: &CatalogModel) -> Result<LoadedL
             model.id
         )
     })?;
+    let spec = LoadSpec {
+        model: model.id.clone(),
+        model_path: path,
+        projector_path: crate::vision::projector(&files).map(Path::to_path_buf),
+        defaults: model.source.cli_defaults.clone(),
+    };
+    let program = ChildProgram::this_executable()
+        .context("locating the executable to run llama processes")?;
+    Ok(IsolatedLlm::start(program, spec)?)
+}
+
+/// Load the files `spec` names, in the llama process.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn load_local(spec: &LoadSpec) -> Result<LoadedLlm> {
+    // llama-cpp-2 panics on a path that does not exist.
+    for path in std::iter::once(&spec.model_path).chain(&spec.projector_path) {
+        if !path.is_file() {
+            bail!(
+                "loading model {}: {} does not exist",
+                spec.model,
+                path.display()
+            );
+        }
+    }
+    let backend = global_backend().context("initialising llama backend")?;
     let started = Instant::now();
-    let loaded = load_model(&backend, &model.id, &path)?;
-    let projector = crate::vision::projector(&files)
-        .map(|p| load_projector(&loaded, &model.id, p).map(Mutex::new))
+    let loaded = load_model(&backend, &spec.model, &spec.model_path)?;
+    let projector = spec
+        .projector_path
+        .as_deref()
+        .map(|p| load_projector(&loaded, &spec.model, p).map(Mutex::new))
         .transpose()?;
     info!(
         target: TRACE_TARGET,
         op = "load",
-        model = %model.id,
+        model = %spec.model,
         gpu_layers = gpu_layers(),
         reads_images = projector.is_some(),
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "resident model loaded"
+        "model loaded"
     );
     Ok(LoadedLlm {
-        id: model.id.clone(),
+        id: spec.model.clone(),
         projector,
         model: loaded,
         backend,
-        defaults: model.source.cli_defaults.clone(),
+        defaults: spec.defaults.clone(),
     })
 }
 
@@ -692,9 +688,10 @@ fn as_llm(task: Task, model: &str) -> Result<LlmParams> {
 }
 
 impl LlamaEngine {
-    /// Load `path` (caching it) and run one chat completion with the
-    /// model's catalogue `defaults`.  Shared by `dispatch` (local model)
-    /// and `dispatch_with_source` (downloaded model).
+    /// Run one chat completion on `path` in a llama process of its own, with the model's
+    /// catalogue `defaults`; the process ends with the job, so a transient job never leaves
+    /// memory behind that the model host (and its admission) cannot see.  Shared by `dispatch`
+    /// (local model) and `dispatch_with_source` (downloaded model).
     fn run_llm(
         &self,
         model: &str,
@@ -703,34 +700,27 @@ impl LlamaEngine {
         defaults: &ModelCliDefaults,
         llm: LlmParams,
     ) -> Result<TaskResult> {
-        let loaded = self.load_transient(model, path)?;
-        // Only a job with images pays for the projector.  Declared after `loaded`, so dropped first.
-        let projector = match projector {
-            Some(p) if !llm.images.is_empty() => {
-                Some(Mutex::new(load_projector(&loaded, model, p)?))
-            }
-            _ => None,
+        let spec = LoadSpec {
+            model: model.to_string(),
+            model_path: path.to_path_buf(),
+            // Only a job with images pays for the projector.
+            projector_path: projector
+                .filter(|_| !llm.images.is_empty())
+                .map(Path::to_path_buf),
+            defaults: defaults.clone(),
         };
-        let json = complete(
-            &loaded,
-            projector.as_ref(),
-            &self.backend,
-            model,
-            defaults,
-            llm,
-            &|| false,
-            &mut |_| {},
-        )
-        .inspect_err(|e| {
-            warn!(
-                target: TRACE_TARGET,
-                op = "dispatch",
-                kind = "llm",
-                model,
-                error = %e,
-                "generation failed"
-            );
-        })?;
+        let json = LlamaProcess::start(&self.program, &spec)
+            .and_then(|mut process| process.chat(llm, &|| false, &mut |_| {}))
+            .inspect_err(|e| {
+                warn!(
+                    target: TRACE_TARGET,
+                    op = "dispatch",
+                    kind = "llm",
+                    model,
+                    error = %e,
+                    "generation failed"
+                );
+            })?;
         Ok(TaskResult::Llm { json })
     }
 }
