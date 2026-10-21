@@ -15,7 +15,8 @@
 //! What lives here vs. what's stripped from the user-editable surface:
 //!
 //! * **Operator-facing**: `api_base_url`, `vram_threshold_gb`,
-//!   `auto_start`, `start_minimised`, `only_when_idle`, `auto_update_*`, `models_root`.
+//!   `memory_max_gb`, `auto_start`, `start_minimised`, `only_when_idle`, `auto_update_*`,
+//!   `models_root`.
 //!   These are exposed in the tray UI's Config page (through the daemon's
 //!   `PUT /daemon/config`).
 //! * **Internal state, persisted but not user-editable**: `worker_id`,
@@ -51,6 +52,10 @@ pub struct Config {
     pub auth_token: Option<String>,
     /// VRAM threshold the worker reports as its max claim size, in GB.
     pub vram_threshold_gb: f32,
+    /// The memory ceiling, in GB: the most memory the worker's processes may hold together
+    /// (Linux, `studio-worker.scope`'s `MemoryMax`; see `docs/runtime/memory-ceiling.md`).
+    #[serde(default = "default_memory_max_gb")]
+    pub memory_max_gb: u32,
     /// Start the tray UI at login (its login entry is installed while
     /// true and removed while false).  Default `true`.
     #[serde(default = "default_auto_start")]
@@ -121,6 +126,9 @@ pub struct Config {
 
 fn default_auto_update_enabled() -> bool {
     true
+}
+fn default_memory_max_gb() -> u32 {
+    crate::memory_ceiling::DEFAULT_MEMORY_MAX_GB
 }
 fn default_auto_start() -> bool {
     true
@@ -194,6 +202,7 @@ impl Default for Config {
             worker_id: None,
             auth_token: None,
             vram_threshold_gb: 12.0,
+            memory_max_gb: default_memory_max_gb(),
             auto_start: default_auto_start(),
             start_minimised: default_start_minimised(),
             only_when_idle: false,
@@ -441,6 +450,9 @@ pub fn changed_fields(a: &Config, b: &Config) -> Vec<&'static str> {
     if (a.vram_threshold_gb - b.vram_threshold_gb).abs() >= f32::EPSILON {
         fields.push("vram_threshold_gb");
     }
+    if a.memory_max_gb != b.memory_max_gb {
+        fields.push("memory_max_gb");
+    }
     if a.auto_start != b.auto_start {
         fields.push("auto_start");
     }
@@ -495,6 +507,34 @@ mod tests {
         assert!(cfg.auto_start);
         assert!(!cfg.only_when_idle);
         assert!(cfg.auto_update_enabled);
+        assert_eq!(cfg.memory_max_gb, 32);
+    }
+
+    #[test]
+    fn the_memory_ceiling_defaults_to_32_gb_and_survives_a_load_and_save() {
+        assert_eq!(Config::default().memory_max_gb, 32);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "api_base_url = \"https://studio.minis.gg/\"\nvram_threshold_gb = 8.0\nmemory_max_gb = 24\n",
+        )
+        .unwrap();
+        let (cfg, _) = load(Some(&path.to_string_lossy())).unwrap();
+        assert_eq!(cfg.memory_max_gb, 24);
+        save(&cfg, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("memory_max_gb = 24"), "{text}");
+    }
+
+    #[test]
+    fn changed_fields_names_the_memory_ceiling() {
+        let a = Config::default();
+        let b = Config {
+            memory_max_gb: 48,
+            ..a.clone()
+        };
+        assert_eq!(changed_fields(&a, &b), ["memory_max_gb"]);
     }
 
     #[test]

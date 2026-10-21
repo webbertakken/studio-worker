@@ -169,8 +169,10 @@ Every install method ends with the tray UI running:
 `studio-worker setup`:
 
 1. installs (or refreshes) the tray UI's login entry, pointing at this executable, or removes it
-   when `auto_start` is off;
-2. starts the tray UI (`<exe> [--config <path>] ui`) detached: its own process group, no
+   when `auto_start` is off; on Linux with a systemd user manager the entry starts the tray UI
+   inside `studio-worker.scope` with the [memory ceiling](memory-ceiling.md);
+2. starts the tray UI (`<exe> [--config <path>] ui`, inside the capped scope as the login entry
+   does unless that scope is already active) detached: its own process group, no
    console, stdin closed, stdout discarded, stderr appended to `<config dir>/ui.log` (the UI writes
    its log there itself, see [log files](#log-files)). When a tray UI already runs
    for this config, the new one hands over and the running window comes forward;
@@ -433,7 +435,7 @@ The worker's identity and health on one page (formerly Status and About):
 
 #### Config
 
-- One card per section: Connection, Worker, Auto-update, Models, Start-up (**Start with my
+- One card per section: Connection, Worker (VRAM threshold, **Memory ceiling (GB)**), Auto-update, Models, Start-up (**Start with my
   machine**, **Start the window minimised**, both on by default; **Only utilise when I'm not using
   this computer**, experimental and off by default, see [user presence](user-presence.md)), sent to the daemon
   with **Save** (it validates, saves and applies them); and This window (appearance, reduce motion,
@@ -467,7 +469,8 @@ selects a job once it shows up, for screenshots and headless inspection.
 
 - **Start with my machine** (config `auto_start`, on by default) decides whether the tray UI's
   login entry exists (Linux `.desktop`, macOS LaunchAgent, Windows `HKCU\…\Run`). While on, it is
-  kept pointing at the current executable.
+  kept pointing at the current executable, and on Linux with a systemd user manager it starts the
+  tray UI inside `studio-worker.scope` with the configured [memory ceiling](memory-ceiling.md).
 - The tray UI syncs the entry at start, and after every successful Config save; `setup` syncs it
   too. A failed sync is a warning (`op="autostart"`); the UI carries on.
 - The daemon is started by the UI when absent, and only by the UI. There is no OS service for
@@ -499,3 +502,4 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `tray` | `studio_worker::ui::tray` | the Linux tray icon service started, ended, or re-registered |
 | `log_trim` | `studio_worker::log_trim` | `daemon.log` / `ui.log` trimmed, or the trim failed |
 | `presence` | `studio_worker::presence` | the user presence changed, or the idle time could not be read |
+| `memory_ceiling` | `studio_worker::memory_ceiling` | the ceiling in effect at start, the scope's limits set, the launcher unusable |

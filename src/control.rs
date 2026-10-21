@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::auto_register::{RegistrationState, SharedRegistration};
 use crate::config::SharedConfig;
 use crate::daemon_api::{ConfigRejection, DaemonStatus, EditableConfig, JobWire};
+use crate::memory_ceiling::MemoryCeiling;
 use crate::runtime::WorkerObservers;
 
 const TRACE_TARGET: &str = "studio_worker::local_api";
@@ -33,7 +34,12 @@ pub struct DaemonControl {
     /// When the tray UI last polled, in milliseconds since the Unix epoch; 0 until it first does
     /// (`tray_watchdog`).
     pub tray_last_seen_ms: Arc<AtomicU64>,
+    /// Makes a changed memory ceiling the scope's limits (`memory_ceiling::reconcile`).
+    pub apply_ceiling: CeilingApplier,
 }
+
+/// Applies a memory ceiling to the running worker.
+pub type CeilingApplier = Arc<dyn Fn(MemoryCeiling) + Send + Sync>;
 
 /// Why a control action was refused.
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +64,7 @@ impl DaemonControl {
             reset_requested: Arc::new(AtomicBool::new(false)),
             vram_total_gb,
             tray_last_seen_ms: Arc::new(AtomicU64::new(0)),
+            apply_ceiling: Arc::new(crate::memory_ceiling::reconcile),
         }
     }
 
@@ -164,8 +171,13 @@ impl DaemonControl {
             );
             return Err(ControlError::NotSaved(e.to_string()));
         }
-        let changed = crate::config::changed_fields(&current, &next).join(",");
+        let changed_fields = crate::config::changed_fields(&current, &next);
+        let changed = changed_fields.join(",");
+        let ceiling = MemoryCeiling::from_config(&next);
         *self.cfg.lock() = next;
+        if changed_fields.contains(&"memory_max_gb") {
+            (self.apply_ceiling)(ceiling);
+        }
         tracing::info!(
             target: TRACE_TARGET,
             op = "control",
@@ -297,6 +309,32 @@ mod tests {
         assert_eq!(saved.vram_threshold_gb, 6.0);
         assert_eq!(saved.auth_token.as_deref(), Some("secret-token"));
         assert!(logs.contains("changed=vram_threshold_gb"), "{logs}");
+    }
+
+    #[test]
+    fn a_changed_memory_ceiling_is_applied_to_the_scope_at_once_and_an_unchanged_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let applied: Arc<parking_lot::Mutex<Vec<u32>>> = Arc::default();
+        let control = DaemonControl {
+            apply_ceiling: {
+                let applied = applied.clone();
+                Arc::new(move |c| applied.lock().push(c.max_gb()))
+            },
+            ..control_in(dir.path())
+        };
+        let mut edit = control.editable_config();
+        edit.vram_threshold_gb = 6.0;
+        control.update_config(edit.clone()).unwrap();
+        assert!(applied.lock().is_empty());
+
+        edit.memory_max_gb = 24;
+        control.update_config(edit.clone()).unwrap();
+        assert_eq!(*applied.lock(), [24]);
+        assert_eq!(control.cfg.lock().memory_max_gb, 24);
+
+        edit.memory_max_gb = 2;
+        assert!(control.update_config(edit).is_err());
+        assert_eq!(*applied.lock(), [24]);
     }
 
     #[test]

@@ -102,6 +102,9 @@ Every catalogue model has exactly one state. Only the worker changes it.
 
 - Needed: the catalogue model's `vram_gb_estimate`.
 - Free: the device's free memory as probed now (`sys.rs`), minus a safety margin.
+- A transient job whose engine keeps its weights in host memory (`offloadToCpu` without `mmap`)
+  must also fit in the host memory available: see
+  [memory ceiling](memory-ceiling.md#admission-of-host-memory).
 - A load that is refused changes nothing and says why; there is no silent fallback to CPU.
 
 ## Local API

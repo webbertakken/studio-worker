@@ -106,7 +106,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
     exit_log::spawn_signal_log(&tokio::runtime::Handle::current());
     exit_log::clear_quit_marker(&path);
     let peeked = config::peek(&path);
-    sync_login_entry(&launch, peeked.auto_start);
+    sync_login_entry(&launch, peeked.auto_start, peeked.memory_max_gb);
     // Installed, the worker runs as the tray UI only: a legacy headless service goes.
     std::thread::spawn(crate::legacy_service::remove);
     crate::log_trim::spawn(crate::daemon_link::ui_log_path(&path));
@@ -158,7 +158,7 @@ pub fn run(config_path: Option<&str>) -> Result<()> {
         start_minimised: peeked.start_minimised,
         login_entry: {
             let launch = launch.clone();
-            Arc::new(move |enabled| sync_login_entry(&launch, enabled))
+            Arc::new(move |saved| sync_login_entry(&launch, saved.auto_start, saved.memory_max_gb))
         },
         actions: actions.clone(),
         config_path: path,
@@ -373,10 +373,18 @@ fn spawn_exe_watch(launch: std::path::PathBuf, baseline: Option<crate::exe_watch
 }
 
 /// Make the tray UI's login entry match `auto_start`: installed and pointing
-/// at `launch` while enabled, removed otherwise.  Best-effort: a failure is
-/// logged, never fatal.
-fn sync_login_entry(launch: &std::path::Path, enabled: bool) {
-    if let Err(e) = crate::autostart::sync(launch, enabled) {
+/// at `launch` while enabled (inside the capped scope where systemd allows,
+/// `docs/runtime/memory-ceiling.md`), removed otherwise.  Best-effort: a
+/// failure is logged, never fatal.
+fn sync_login_entry(launch: &std::path::Path, enabled: bool, memory_max_gb: u32) {
+    let ceiling = enabled
+        .then(|| {
+            crate::memory_ceiling::launch_ceiling(crate::memory_ceiling::MemoryCeiling::or_default(
+                memory_max_gb,
+            ))
+        })
+        .flatten();
+    if let Err(e) = crate::autostart::sync(launch, enabled, ceiling) {
         tracing::warn!(
             target: TRACE_TARGET,
             op = "autostart",

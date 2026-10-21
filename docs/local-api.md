@@ -98,7 +98,7 @@ carries a credential:
   "busy": false,                       // the one-job gate is taken
   "registered": true, "workerId": "w-…",
   "registration": { "state": "approved" },   // pristine | pending{requestId,since} | approved | rejected{reason}
-  "config": { "apiBaseUrl": "…", "vramThresholdGb": 12.0, "autoStart": true, "startMinimised": true, "onlyWhenIdle": false,
+  "config": { "apiBaseUrl": "…", "vramThresholdGb": 12.0, "memoryMaxGb": 32, "autoStart": true, "startMinimised": true, "onlyWhenIdle": false,
               "autoUpdateEnabled": true, "autoUpdateIntervalSecs": 1800,
               "autoUpdateFeed": "…", "autoUpdatePrerelease": false, "modelsRoot": "…" },
   "session": { "state": "connected" },       // waiting_for_approval | connecting | connected | reconnecting{attempt} | auth_failed{reason} | fatal{reason} | stopped
@@ -128,9 +128,11 @@ jobs).  `GET /jobs/:id/thumbnail` answers a PNG of at most 384 px (the 100 most
 recent image jobs).
 
 `PUT /daemon/config` takes the `config` object above; the daemon validates it
-(http(s) URLs, a threshold of 0 or more, an interval of at least 60 s, a
-non-empty models root), saves it, then applies it.  A changed `modelsRoot`
-applies to engines built after a restart.
+(http(s) URLs, a threshold of 0 or more, a memory ceiling of 4 to 1024 GB, an
+interval of at least 60 s, a non-empty models root), saves it, then applies it.
+A changed `modelsRoot` applies to engines built after a restart; a changed
+`memoryMaxGb` applies at once to a daemon inside `studio-worker.scope` (see
+[memory ceiling](runtime/memory-ceiling.md)).
 
 ### Streaming speech-to-text
 

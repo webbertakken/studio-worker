@@ -197,6 +197,17 @@ fn worker_sections(ui: &mut egui::Ui, draft: &mut ConfigDraft) {
             96.0,
         );
         hint_row(ui, "The most device memory one studio job may ask for.");
+        labeled_whole(
+            ui,
+            "Memory ceiling (GB)",
+            &mut c.memory_max_gb,
+            crate::memory_ceiling::MIN_MEMORY_MAX_GB..=crate::memory_ceiling::MAX_MEMORY_MAX_GB,
+        );
+        hint_row(
+            ui,
+            "Linux: the most memory the worker and its jobs may hold together.  A job that \
+             grows past it is stopped, not your desktop.",
+        );
     });
     section(ui, "AUTO-UPDATE", "", |ui| {
         labeled_bool(ui, "Update automatically", &mut c.auto_update_enabled);
@@ -307,6 +318,17 @@ fn labeled_slider(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max
     ui.end_row();
 }
 
+fn labeled_whole(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+) {
+    ui.label(label);
+    ui.add(egui::DragValue::new(value).range(range).speed(1.0));
+    ui.end_row();
+}
+
 fn labeled_u64(ui: &mut egui::Ui, label: &str, value: &mut u64) {
     ui.label(label);
     let mut buf = value.to_string();
@@ -374,6 +396,13 @@ mod tests {
         let cfg = Config::default();
         let mut draft = ConfigDraft::from(&cfg);
         draft.current.models_root = PathBuf::from("/tmp/other-models");
+        assert!(draft.dirty());
+    }
+
+    #[test]
+    fn draft_marks_dirty_when_the_memory_ceiling_changes() {
+        let mut draft = ConfigDraft::from(&Config::default());
+        draft.current.memory_max_gb = 24;
         assert!(draft.dirty());
     }
 
