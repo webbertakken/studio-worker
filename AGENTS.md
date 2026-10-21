@@ -119,6 +119,11 @@ CI.
   admission, swaps; with `src/lifecycle.rs` (per-model state machine),
   `src/residency.rs` (`residency.json`), `src/admission.rs` (free device
   memory), `src/loaders.rs` (in-process loaders per engine).
+- `src/llama_process/` — llama.cpp in a child process per model
+  (`studio-worker llama-serve`), so a llama.cpp abort ends one job, never
+  the daemon: the daemon's handle (`mod.rs`), the JSON-lines protocol
+  (`protocol.rs`), the process's serve loop (`serve.rs`).  See
+  [`@docs/engines/llama.md`](docs/engines/llama.md#llama-process).
 - `src/catalog.rs` — the local model catalogue (`models.json`);
   `src/local.rs` — local jobs without the studio (transient or on a lane).
 - `src/engine/vision/` (feature `vision`): detection and classification on
