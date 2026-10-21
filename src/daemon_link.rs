@@ -285,10 +285,10 @@ impl DaemonStarter for ProcessStarter {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         let pid = child.id();
         // Reap it when it exits, and say so.
-        std::thread::spawn(move || match child.wait() {
+        crate::process::reap_in_background(child, move |status| match status {
             Ok(status) => tracing::info!(
                 target: TRACE_TARGET,
                 op = "daemon_spawn",

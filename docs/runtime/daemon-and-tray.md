@@ -325,7 +325,8 @@ When the tray UI vanishes anyway (crashed, killed), the daemon starts it again
 - Every 5 s the daemon checks. A tray it has seen that has been silent for 30 s
   (`ABSENT_AFTER`) has vanished: the daemon logs `op="tray_relaunch"` (warn) with the attempt
   and the silence, and starts `<exe> --config <path> ui` as `setup` does, logging the pid
-  (info) or the failure (error).
+  (info) or the failure (error); a thread reaps it and logs its exit (`op="tray_start"`), so a
+  relaunched tray that hands over leaves no zombie.
 - Attempts that bring no tray back wait 30 s, doubling to 15 minutes. A poll starts it over.
 - A daemon that never saw a tray (a headless `run`) never starts one.
 - Quit leaves `<config dir>/ui.quit` before stopping the daemon; while it exists the daemon logs
@@ -499,6 +500,7 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `update_restart` | `studio_worker::ui` | the launch path changed; the UI restarts on it, waits, or failed to |
 | `exit` | `studio_worker::ui` | the tray UI exits, and why (event loop ended, hand-over, signal, panic) |
 | `tray_relaunch` | `studio_worker::tray_watchdog` | the daemon relaunches a vanished tray UI, failed to, or the user quit it |
+| `tray_start` | `studio_worker::setup` | a tray UI started by `setup` or the watchdog has exited |
 | `tray` | `studio_worker::ui::tray` | the Linux tray icon service started, ended, or re-registered |
 | `log_trim` | `studio_worker::log_trim` | `daemon.log` / `ui.log` trimmed, or the trim failed |
 | `presence` | `studio_worker::presence` | the user presence changed, or the idle time could not be read |

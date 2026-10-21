@@ -195,7 +195,27 @@ impl SetupOps for RealOps {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(out);
-        Ok(cmd.spawn()?.id())
+        let child = cmd.spawn()?;
+        let pid = child.id();
+        // Reap it when it exits (a tray that hands over exits at once), so the daemon's watchdog
+        // relaunches leave no zombies behind.
+        crate::process::reap_in_background(child, move |status| match status {
+            Ok(status) => info!(
+                target: TRACE_TARGET,
+                op = "tray_start",
+                pid,
+                status = %status,
+                "a tray UI this process started has exited"
+            ),
+            Err(e) => warn!(
+                target: TRACE_TARGET,
+                op = "tray_start",
+                pid,
+                error = %e,
+                "could not wait for a tray UI this process started"
+            ),
+        });
+        Ok(pid)
     }
 }
 

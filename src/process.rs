@@ -8,7 +8,7 @@
 //! Rule: docs/runtime/daemon-and-tray.md, "Child processes never show a window".
 
 use std::ffi::OsStr;
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
 
 /// `CREATE_NO_WINDOW`: a console program runs without a console window.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -45,6 +45,15 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 /// A process that outlives the worker, in its own process group, without a console window.
 pub fn detached(program: impl AsRef<OsStr>) -> Command {
     build(program.as_ref(), Launch::Detached)
+}
+
+/// Wait for `child` on a thread of its own, so a detached child that exits before the worker
+/// leaves no zombie behind; `on_exit` says how it ended.
+pub fn reap_in_background(
+    mut child: Child,
+    on_exit: impl FnOnce(std::io::Result<ExitStatus>) + Send + 'static,
+) {
+    std::thread::spawn(move || on_exit(child.wait()));
 }
 
 #[allow(clippy::disallowed_methods)] // The one place a `Command` is made.
@@ -102,6 +111,21 @@ mod tests {
         let output = command("sh").args(["-c", "echo hidden"]).output().unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hidden");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_child_reports_how_it_ended_and_leaves_no_zombie() {
+        let child = detached("sh").args(["-c", "exit 3"]).spawn().unwrap();
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        reap_in_background(child, move |status| {
+            tx.send(status.unwrap().code()).unwrap()
+        });
+        let code = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(code, Some(3));
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        assert!(!stat.contains(") Z "), "a zombie is left: {stat}");
     }
 
     #[cfg(unix)]
