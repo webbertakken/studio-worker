@@ -28,7 +28,7 @@ use crate::engine::Engine;
 use crate::http::ApiClient;
 use crate::job_run::JobRun;
 use crate::runtime::{
-    is_unsupported_kind, prompt_for, push_log_with_observers, set_session_state, truncate_prompt,
+    is_permanent_failure, prompt_for, push_log_with_observers, set_session_state, truncate_prompt,
     wait_with_stop, CurrentJob, HeartbeatOutcome, HeartbeatStatus, JobOutcome, JobSource,
     SessionState, WorkerObservers,
 };
@@ -1009,7 +1009,7 @@ async fn run_offered_job(
                 .send(&WorkerInbound::Fail {
                     job_id: job_id.clone(),
                     error: e.to_string(),
-                    retryable: !is_unsupported_kind(&e),
+                    retryable: !is_permanent_failure(&e),
                 })
                 .await;
             record_fail_send(&fail_result, &job_id, &ctx.logs, &ctx.observers);
@@ -1061,7 +1061,8 @@ async fn deliver_result(
     match result {
         TaskResult::Image { bytes, ext }
         | TaskResult::AudioTts { bytes, ext }
-        | TaskResult::Video { bytes, ext } => {
+        | TaskResult::Video { bytes, ext }
+        | TaskResult::Mesh { bytes, ext } => {
             let upload_result = tokio::task::spawn_blocking({
                 let api_base_url = ctx.api_base_url.clone();
                 let job_id = job_id.to_string();

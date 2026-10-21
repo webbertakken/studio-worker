@@ -288,22 +288,25 @@ fn normalize_base_url(base_url: &str) -> Result<String> {
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
-/// Map a binary output's file extension to the MIME type sent as the
-/// multipart `complete` upload's `Content-Type`.  Single source of
-/// truth: every engine that emits a `TaskResult` binary extension
-/// (synthetic image → `png`/`webp`, sd-cpp → `webp`, tts → `wav`,
-/// synthetic video → `webp`, the `video` feature → `gif`) routes
-/// through here, so a new extension can't silently drift into
-/// `application/octet-stream` and break the studio's stored
-/// content-type.
+/// Map a binary output's file extension to its MIME type: the multipart `complete` upload's
+/// `Content-Type` and the local API's answers.  Single source of truth: every engine that emits a
+/// `TaskResult` binary extension (synthetic image → `png`/`webp`, sd-cpp → `webp`, tts → `wav`,
+/// synthetic video → `webp`, the `video` feature → `gif`, mesh → `glb`) routes through here, so a
+/// new extension can't silently drift into `application/octet-stream` and break the studio's
+/// stored content-type.
 pub fn mime_for_ext(ext: &str) -> &'static str {
-    match ext {
-        "png" => "image/png",
+    match ext.to_ascii_lowercase().as_str() {
         "webp" => "image/webp",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "wav" => "audio/wav",
         "mp3" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg",
+        "flac" => "audio/flac",
         "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "glb" => "model/gltf-binary",
         _ => "application/octet-stream",
     }
 }
@@ -320,6 +323,8 @@ mod tests {
         assert_eq!(mime_for_ext("wav"), "audio/wav");
         assert_eq!(mime_for_ext("mp3"), "audio/mpeg");
         assert_eq!(mime_for_ext("mp4"), "video/mp4");
+        assert_eq!(mime_for_ext("glb"), "model/gltf-binary");
+        assert_eq!(mime_for_ext("JPG"), "image/jpeg");
     }
 
     #[test]
@@ -410,7 +415,7 @@ mod tests {
         // emits must resolve to a real MIME type, never the
         // octet-stream fallback.  `gif` is the one the `video`
         // feature produces and that regressed before this guard.
-        for ext in ["png", "webp", "gif", "wav"] {
+        for ext in ["png", "webp", "gif", "wav", "glb"] {
             assert_ne!(
                 mime_for_ext(ext),
                 "application/octet-stream",

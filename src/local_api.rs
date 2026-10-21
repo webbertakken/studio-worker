@@ -49,6 +49,8 @@ use crate::types::{
     AudioSttParams, AudioTtsParams, ChatMessage, LlmParams, Task, TaskKind, TaskResult, VideoParams,
 };
 
+mod mesh;
+mod picture;
 mod vision;
 
 const TRACE_TARGET: &str = "studio_worker::local_api";
@@ -525,6 +527,7 @@ impl LocalApi {
             (Method::Post, "/tts") => self.handle_tts(request),
             (Method::Post, "/stt") => self.handle_stt(request),
             (Method::Post, "/video") => self.handle_video(request),
+            (Method::Post, "/mesh") => self.handle_mesh(request),
             (Method::Get, "/models") => self.handle_list_models(request),
             (Method::Post, "/models") => self.handle_add_model(request),
             (Method::Get, "/jobs") => self.handle_jobs(request),
@@ -642,7 +645,7 @@ impl LocalApi {
         let catalog = self.catalog.lock().clone();
         match run_image(self.engine.as_ref(), &catalog, &self.observers, &req) {
             Ok(TaskResult::Image { bytes, ext }) => {
-                respond(request, 200, content_type_for(&ext), &bytes)
+                respond(request, 200, crate::http::mime_for_ext(&ext), &bytes)
             }
             Ok(_) => respond(request, 500, "text/plain", b"unexpected non-image result"),
             Err(err) => respond_local_err(request, err),
@@ -901,7 +904,7 @@ impl LocalApi {
             Task::AudioTts(params),
         ) {
             Ok(TaskResult::AudioTts { bytes, ext }) => {
-                respond(request, 200, content_type_for(&ext), &bytes)
+                respond(request, 200, crate::http::mime_for_ext(&ext), &bytes)
             }
             Ok(_) => respond(request, 500, "text/plain", b"unexpected non-audio result"),
             Err(err) => respond_local_err(request, err),
@@ -997,7 +1000,7 @@ impl LocalApi {
             Task::Video(params),
         ) {
             Ok(TaskResult::Video { bytes, ext }) => {
-                respond(request, 200, content_type_for(&ext), &bytes)
+                respond(request, 200, crate::http::mime_for_ext(&ext), &bytes)
             }
             Ok(_) => respond(request, 500, "text/plain", b"unexpected non-video result"),
             Err(err) => respond_local_err(request, err),
@@ -1452,22 +1455,6 @@ pub fn remove_discovery_file(path: &std::path::Path) {
     }
 }
 
-fn content_type_for(ext: &str) -> &'static str {
-    match ext.to_ascii_lowercase().as_str() {
-        "webp" => "image/webp",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "wav" => "audio/wav",
-        "mp3" => "audio/mpeg",
-        "ogg" | "opus" => "audio/ogg",
-        "flac" => "audio/flac",
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        _ => "application/octet-stream",
-    }
-}
-
 /// Map a [`LocalError`] onto an HTTP response: catalog/contract errors
 /// (unknown or wrong-kind model, none configured) are the caller's
 /// fault → 400 with the message; an engine failure is 500.
@@ -1631,6 +1618,7 @@ mod tests {
                 synthetic_model_of("tts", TaskKind::AudioTts),
                 synthetic_model_of("stt", TaskKind::AudioStt),
                 synthetic_model_of("vid", TaskKind::Video),
+                synthetic_model_of("mesh", TaskKind::Mesh),
             ],
             ..Default::default()
         }
@@ -2584,6 +2572,89 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), 200);
         assert!(!res.bytes().unwrap().is_empty());
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(3, 3, image::Rgb([40, 80, 120]))
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn mesh_answers_a_glb_for_a_raw_picture() {
+        let h = Harness::start(multi_kind_catalog());
+        let res = h
+            .post("/mesh?seed=3")
+            .header("content-type", "image/png")
+            .body(tiny_png())
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "model/gltf-binary");
+        let glb = res.bytes().unwrap();
+        assert_eq!(crate::glb::check(&glb), Ok(()));
+        assert_eq!(
+            glb.as_ref(),
+            crate::glb::textured_cube([40, 80, 120]).as_slice()
+        );
+    }
+
+    #[test]
+    fn mesh_reads_a_json_picture_and_names_its_model() {
+        use base64::Engine as _;
+        let h = Harness::start(multi_kind_catalog());
+        let image = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(tiny_png())
+        );
+        let res = h
+            .post("/mesh")
+            .json(&serde_json::json!({ "image": image, "model": "mesh" }))
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let unknown = h
+            .post("/mesh")
+            .json(&serde_json::json!({ "image": image, "model": "nope" }))
+            .send()
+            .unwrap();
+        assert_eq!(unknown.status(), 400);
+    }
+
+    #[test]
+    fn mesh_refuses_what_is_not_a_picture_and_unknown_options() {
+        let h = Harness::start(multi_kind_catalog());
+        let res = h
+            .post("/mesh")
+            .header("content-type", "image/png")
+            .body(b"plain words".to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let res = h
+            .post("/mesh?steps=9")
+            .header("content-type", "image/png")
+            .body(tiny_png())
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        assert!(res.text().unwrap().contains("steps"));
+    }
+
+    #[test]
+    fn mesh_respects_the_busy_gate() {
+        let gate = JobGate::new();
+        let h = Harness::start_with_gate(multi_kind_catalog(), gate.clone());
+        let _held = gate.try_reserve().unwrap();
+        let res = h
+            .post("/mesh")
+            .header("content-type", "image/png")
+            .body(tiny_png())
+            .send()
+            .unwrap();
+        assert_eq!(res.status(), 503);
     }
 
     #[test]

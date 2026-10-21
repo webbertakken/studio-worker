@@ -48,7 +48,7 @@ fn log_engine_roster(engines: &[Box<dyn Engine>]) {
 /// Engines return this (instead of an ad-hoc string) when a task of a
 /// kind they don't implement reaches their dispatch, so the session
 /// classifies the failure as non-retryable via a downcast
-/// (`runtime::is_unsupported_kind`) instead of sniffing message text.
+/// (`runtime::is_permanent_failure`) instead of sniffing message text.
 /// The rendered message keeps the legacy `<engine> engine cannot
 /// serve <kind> tasks` shape operators already grep for.
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +117,7 @@ pub mod onnx_provision;
 pub mod parakeet;
 pub mod sd_provision;
 pub mod sdcpp;
+pub mod torch;
 #[cfg(feature = "tts")]
 pub mod tts;
 #[cfg(feature = "video")]
@@ -203,6 +204,9 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
         // already resolvable, so a fresh worker serves real image jobs
         // out of the box.
         v.push(Box::new(sdcpp::SdCppEngine::new(&cfg.models_root)));
+        // PyTorch models in a child process per job (image to 3D).  Registers everywhere; it
+        // advertises the mesh kind only on Linux x86_64 with a recent NVIDIA GPU.
+        v.push(Box::new(torch::TorchEngine::new(&cfg.models_root)));
         v.push(Box::new(SyntheticEngine::new()));
         v
     };
@@ -252,6 +256,7 @@ const DEFAULT_LLM_MODELS: &[&str] = &["synthetic", "synthetic-llm"];
 const DEFAULT_STT_MODELS: &[&str] = &["synthetic", "synthetic-stt"];
 const DEFAULT_TTS_MODELS: &[&str] = &["synthetic", "synthetic-tts"];
 const DEFAULT_VIDEO_MODELS: &[&str] = &["synthetic", "synthetic-video"];
+const DEFAULT_MESH_MODELS: &[&str] = &["synthetic", "synthetic-mesh"];
 
 fn models(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_string()).collect()
@@ -269,6 +274,7 @@ impl Engine for SyntheticEngine {
         map.insert(TaskKind::AudioStt, models(DEFAULT_STT_MODELS));
         map.insert(TaskKind::AudioTts, models(DEFAULT_TTS_MODELS));
         map.insert(TaskKind::Video, models(DEFAULT_VIDEO_MODELS));
+        map.insert(TaskKind::Mesh, models(DEFAULT_MESH_MODELS));
         EngineCapabilities {
             supported_models_per_kind: map,
         }
@@ -319,6 +325,16 @@ impl Engine for SyntheticEngine {
                     TaskResult::Video {
                         bytes,
                         ext: "webp".into(),
+                    }
+                })
+            }
+            // The GPU-free stand-in for an image-to-3D model: it reads the picture, so a test can
+            // tell the picture reached the engine, and answers a cube in its average colour.
+            Task::Mesh(p) => {
+                crate::vision::load_all(std::slice::from_ref(&p.image_url)).map(|images| {
+                    TaskResult::Mesh {
+                        bytes: crate::glb::textured_cube(average_colour(&images[0])),
+                        ext: "glb".into(),
                     }
                 })
             }
@@ -463,6 +479,18 @@ pub fn render_animated_webp(prompt: &str, _w: u32, _h: u32, seconds: f32) -> Res
     render_procedural(prompt, "webp")
 }
 
+/// The average colour of a picture.
+fn average_colour(image: &crate::vision::RgbImage) -> [u8; 3] {
+    let mut sums = [0u64; 3];
+    for pixel in image.pixels.as_chunks::<3>().0 {
+        for (sum, channel) in sums.iter_mut().zip(pixel) {
+            *sum += u64::from(*channel);
+        }
+    }
+    let count = (image.pixels.len() / 3).max(1) as u64;
+    sums.map(|sum| (sum / count) as u8)
+}
+
 fn sha256_bytes(input: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
@@ -575,6 +603,45 @@ mod tests {
         let task = chat_with_images(vec!["data:image/png;base64,AAAA".into()]);
         let err = SyntheticEngine::new()
             .dispatch("synthetic", task)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("input image 1 of 1"), "{err:#}");
+    }
+
+    /// The synthetic engine is the GPU-free stand-in for an image-to-3D model: it reads the picture
+    /// and answers a whole GLB whose texture carries the picture's average colour.
+    #[test]
+    fn synthetic_mesh_reads_the_picture_and_answers_a_glb() {
+        use base64::Engine as _;
+        let picture = image::RgbImage::from_pixel(4, 2, image::Rgb([200, 100, 50]));
+        let mut png = Cursor::new(Vec::new());
+        picture.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let task = Task::Mesh(MeshParams {
+            image_url: format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+            ),
+            seed: Some(7),
+            ext: "glb".into(),
+        });
+        let TaskResult::Mesh { bytes, ext } = SyntheticEngine::new()
+            .dispatch("synthetic-mesh", task)
+            .unwrap()
+        else {
+            panic!("expected a mesh")
+        };
+        assert_eq!(ext, "glb");
+        assert_eq!(crate::glb::check(&bytes), Ok(()));
+        assert_eq!(bytes, crate::glb::textured_cube([200, 100, 50]));
+    }
+
+    #[test]
+    fn synthetic_mesh_fails_on_a_picture_it_cannot_read() {
+        let task = Task::Mesh(MeshParams {
+            image_url: "data:image/png;base64,AAAA".into(),
+            ..Default::default()
+        });
+        let err = SyntheticEngine::new()
+            .dispatch("synthetic-mesh", task)
             .unwrap_err();
         assert!(format!("{err:#}").contains("input image 1 of 1"), "{err:#}");
     }

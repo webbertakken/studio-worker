@@ -162,7 +162,7 @@ DO -> D1 : claimJobForWorker (CAS\nqueued -> claimed)
 DO -> W : Offer { claim incl. task + modelSource }
 W -> DO : Accept { jobId }
 W -> E : dispatch_with_source(model, task, source)\n(spawn_blocking)
-E -> E : route by source.engine\n(sd-cpp | llama-cpp | onnx | synthetic)\nNO fallback
+E -> E : route by source.engine\n(sd-cpp | llama-cpp | onnx | torch | synthetic)\nNO fallback
 alt binary result (image / tts / video)
   W -> Q : POST /workers/:id/jobs/:jobId/complete\n(multipart, Bearer token)
   Q -> D1 : status=done + R2 upload
@@ -199,8 +199,8 @@ strictly by `source.engine` — see the
 
 ## 4. Model provisioning
 
-Two nested on-demand downloads, both worker-side, both driven by the
-offer's `ModelSource` (see [model-source.md](../runtime/model-source.md)):
+On-demand provisioning, all worker-side, all driven by the offer's `ModelSource` (see
+[model-source.md](../runtime/model-source.md)):
 
 1. **Model files** — `ensure_file` in
    [`src/engine/download.rs`](../../src/engine/download.rs): for
@@ -215,8 +215,11 @@ offer's `ModelSource` (see [model-source.md](../runtime/model-source.md)):
    `<models_root>/bin/sd-cli` → `~/.local/bin` → `$PATH`, else
    download the pinned prebuilt stable-diffusion.cpp zip for this
    platform and extract it flat into `<models_root>/bin/`.  Vulkan
-   loader preflighted via dlopen.  Deep dive:
-   [sdcpp.md](../engines/sdcpp.md).
+. **A torch environment** — [`src/engine/torch/provision.rs`](../../src/engine/torch/provision.rs):
+   on a mesh job whose environment is missing or stale, `uv`, CPython, torch, a `CUDA_HOME` from
+   NVIDIA's redist archives, the pinned packages and sources, and the CUDA extensions built for
+   this GPU; then the pipeline's weights at pinned revisions.  About 15 minutes once.  Deep dive:
+   [torch.md](../engines/torch.md).
 
 Studio side of the contract: the `studioModels` D1 table (admin CRUD
 in `routes/models.ts`, seeded by migration `0017_seed_registry.sql`)
@@ -250,7 +253,7 @@ Worker reports, studio decides.  Studio: `repository.ts`
 | Trigger | Worker sends | Studio behaviour |
 |---|---|---|
 | Engine error (generic) | `Fail { retryable: true }` | `failJob`: requeue with `attempts+1`, terminal `failed` once attempts exhaust |
-| Engine `UnsupportedKind` / missing engine | `Fail { retryable: false }` | terminal `failed` immediately |
+| Engine `UnsupportedKind` / missing engine, unreadable picture, a torch run past its budget or misconfigured (`TorchError::is_permanent`) | `Fail { retryable: false }` | terminal `failed` immediately |
 | Offer while busy / paused | `Reject { reason, code: busy\|paused }` | `isTransientReject` branches on the structured `code` (regex on the free-text reason kept as fallback for old workers) → requeue **without** counting an attempt and **without** immediate re-offer (would spin); non-transient reject → `releaseClaim` + offer elsewhere |
 | WS close mid-job | (connection drop) | `handleWebSocketClose` releases the claim (requeue or fail by attempts) |
 | Stale heartbeat (>30s) | (silence) | DO alarm closes the session, claim released on close |

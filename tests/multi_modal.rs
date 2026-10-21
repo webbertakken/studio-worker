@@ -125,6 +125,28 @@ fn dispatch_video_emits_decodable_bytes() {
 }
 
 #[test]
+fn mesh_params_read_the_studios_wire_shape_with_defaults() {
+    let task: Task = serde_json::from_value(serde_json::json!({
+        "kind": "mesh",
+        "imageUrl": "https://studio.invalid/playground/api/run-input/r-1/picture",
+    }))
+    .unwrap();
+    let Task::Mesh(p) = &task else {
+        panic!("expected mesh")
+    };
+    assert_eq!(
+        p.image_url,
+        "https://studio.invalid/playground/api/run-input/r-1/picture"
+    );
+    assert_eq!(p.seed, None);
+    assert_eq!(p.ext, "glb");
+    assert_eq!(task.kind(), TaskKind::Mesh);
+    let wire = serde_json::to_value(&task).unwrap();
+    assert_eq!(wire["kind"], "mesh");
+    assert_eq!(wire["imageUrl"], p.image_url.as_str());
+}
+
+#[test]
 fn capabilities_flat_models_returns_all_kinds_flattened() {
     let engine = synth_engine();
     let caps = engine.capabilities();
@@ -268,6 +290,13 @@ fn task_result_kind_matches_for_every_variant() {
             },
             TaskKind::Video,
         ),
+        (
+            TaskResult::Mesh {
+                bytes: vec![1],
+                ext: "glb".into(),
+            },
+            TaskKind::Mesh,
+        ),
     ];
     for (r, expected) in cases {
         assert_eq!(r.kind(), expected);
@@ -281,6 +310,7 @@ fn task_kind_as_str_round_trips_with_serde() {
     assert_eq!(TaskKind::AudioStt.as_str(), "audio_stt");
     assert_eq!(TaskKind::AudioTts.as_str(), "audio_tts");
     assert_eq!(TaskKind::Video.as_str(), "video");
+    assert_eq!(TaskKind::Mesh.as_str(), "mesh");
 }
 
 #[test]

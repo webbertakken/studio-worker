@@ -1432,10 +1432,15 @@ pub fn prompt_for(task: &Task) -> String {
         Task::AudioStt(p) => p.input_url.clone(),
         Task::AudioTts(p) => p.text.clone(),
         Task::Video(p) => p.prompt.clone(),
+        // A mesh job has no words: its picture is the input, and its URL (a capability, or a
+        // data URL of megabytes) is never a prompt.
+        Task::Mesh(_) => String::new(),
     }
 }
 
-pub fn is_unsupported_kind(e: &anyhow::Error) -> bool {
+/// Whether a failed job would fail again on any worker: an unsupported kind, an unreadable picture, a
+/// torch run that cannot succeed as configured.  The studio does not retry it (`retryable: false`).
+pub fn is_permanent_failure(e: &anyhow::Error) -> bool {
     // Typed check first — survives context wrapping and rewording.
     // The string check remains as a fallback for error paths that
     // haven't migrated to `engine::UnsupportedTask` yet.
@@ -1446,6 +1451,9 @@ pub fn is_unsupported_kind(e: &anyhow::Error) -> bool {
             || cause
                 .downcast_ref::<crate::vision::ImageRefusal>()
                 .is_some()
+            || cause
+                .downcast_ref::<crate::engine::torch::TorchError>()
+                .is_some_and(crate::engine::torch::TorchError::is_permanent)
     }) || e.to_string().contains("cannot serve")
 }
 
@@ -1710,16 +1718,16 @@ mod tests {
     }
 
     #[test]
-    fn is_unsupported_kind_detects_typed_unsupported_task() {
+    fn is_permanent_failure_detects_typed_unsupported_task() {
         let err: anyhow::Error =
             crate::engine::UnsupportedTask::new("synthetic", TaskKind::Llm).into();
-        assert!(is_unsupported_kind(&err));
+        assert!(is_permanent_failure(&err));
         // The message keeps the legacy operator-facing shape.
         assert!(err.to_string().contains("cannot serve llm"));
     }
 
     #[test]
-    fn is_unsupported_kind_survives_context_wrapping() {
+    fn is_permanent_failure_survives_context_wrapping() {
         // String sniffing broke as soon as a caller added context (the
         // outer message no longer contains "cannot serve"); the typed
         // downcast searches the whole chain.
@@ -1728,7 +1736,7 @@ mod tests {
             TaskKind::AudioTts,
         ))
         .context("dispatching job j-1");
-        assert!(is_unsupported_kind(&err));
+        assert!(is_permanent_failure(&err));
     }
 
     fn entry(message: &str) -> LogEntry {
@@ -2214,11 +2222,11 @@ mod tests {
     }
 
     #[test]
-    fn is_unsupported_kind_matches_engine_message() {
+    fn is_permanent_failure_matches_engine_message() {
         let err = anyhow!("multi engine cannot serve llm tasks");
-        assert!(is_unsupported_kind(&err));
+        assert!(is_permanent_failure(&err));
         let other = anyhow!("network timeout");
-        assert!(!is_unsupported_kind(&other));
+        assert!(!is_permanent_failure(&other));
     }
 
     #[test]
