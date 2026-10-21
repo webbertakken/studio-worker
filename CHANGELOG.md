@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.30](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.29...studio-worker-v0.4.30) (2026-10-21)
+
+
+### Bug Fixes
+
+* run llama.cpp in a child process ([#190](https://github.com/webbertakken/studio-worker/issues/190)) ([e70ea78](https://github.com/webbertakken/studio-worker/commit/e70ea783e56dc0958875b7c6f91dc7c2580db893))
+
 ## [0.4.29](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.28...studio-worker-v0.4.29) (2026-10-21)
 
 
