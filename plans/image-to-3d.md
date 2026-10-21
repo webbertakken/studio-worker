@@ -3,7 +3,7 @@
 The worker learns a new task kind, `mesh`: a picture in, a GLB out. Three PyTorch models make it,
 Pixal3D, TRELLIS.2 and Hunyuan3D 2.1, through a new `torch` engine that provisions a Python
 runtime with custom CUDA extensions, runs a model's pipeline in a child process and hands back the
-GLB. The studio's Playground gets a 3D mode on top (minigames `plans/0245-playground-3d.md`).
+GLB. The studio's Playground gets a 3D mode on top (minigames `plans/0249-playground-3d.md`).
 
 Design: [`docs/engines/torch.md`](../docs/engines/torch.md) (written in phase 1).
 Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
@@ -139,7 +139,7 @@ Prototype: `~/Repositories/Pixal3D/setup-local.sh` and `download-local.sh`.
 - [x] TRELLIS.2 the same: at 1024 the crab runs out of memory at 17 GiB; at 512, 100 s, 4.0 GiB,
       2.2 MB; looked at.
 - [ ] Provision `hunyuan3d`; Hunyuan3D 2.1 the same.
-- [ ] A studio job end to end through a local studio (minigames plan 0245).
+- [ ] A studio job end to end through a local studio (minigames plan 0249).
 - [x] `tests/real_torch_mesh.rs` (skipped unless `RUN_REAL_ENGINE_TESTS=1`) reproduces the above.
 
 ## Phase 8: ship
