@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.28](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.27...studio-worker-v0.4.28) (2026-10-21)
+
+
+### Features
+
+* cap the worker's memory on Linux ([#183](https://github.com/webbertakken/studio-worker/issues/183)) ([627938f](https://github.com/webbertakken/studio-worker/commit/627938f67310f33908e3f9abaf4af3762305b5ae))
+
+
+### Bug Fixes
+
+* reap trays the watchdog relaunches ([#185](https://github.com/webbertakken/studio-worker/issues/185)) ([749a26c](https://github.com/webbertakken/studio-worker/commit/749a26c6c7d7d9fc8a0fce5c82ff800e261dc467))
+
 ## [0.4.27](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.26...studio-worker-v0.4.27) (2026-10-21)
 
 
