@@ -23,6 +23,7 @@ use crate::types::{LogEntry, ModelEngine, TaskKind};
 pub struct EditableConfig {
     pub api_base_url: String,
     pub vram_threshold_gb: f32,
+    pub memory_max_gb: u32,
     pub auto_start: bool,
     pub start_minimised: bool,
     pub only_when_idle: bool,
@@ -50,6 +51,7 @@ impl EditableConfig {
         Self {
             api_base_url: cfg.api_base_url.clone(),
             vram_threshold_gb: cfg.vram_threshold_gb,
+            memory_max_gb: cfg.memory_max_gb,
             auto_start: cfg.auto_start,
             start_minimised: cfg.start_minimised,
             only_when_idle: cfg.only_when_idle,
@@ -65,6 +67,7 @@ impl EditableConfig {
     pub fn apply_to(&self, cfg: &mut Config) {
         cfg.api_base_url = self.api_base_url.clone();
         cfg.vram_threshold_gb = self.vram_threshold_gb;
+        cfg.memory_max_gb = self.memory_max_gb;
         cfg.auto_start = self.auto_start;
         cfg.start_minimised = self.start_minimised;
         cfg.only_when_idle = self.only_when_idle;
@@ -88,6 +91,9 @@ impl EditableConfig {
         }
         if !self.vram_threshold_gb.is_finite() || self.vram_threshold_gb < 0.0 {
             return reject("vramThresholdGb", "must be a number of GB, 0 or more");
+        }
+        if let Err(e) = crate::memory_ceiling::MemoryCeiling::new(self.memory_max_gb) {
+            return reject("memoryMaxGb", &e.to_string());
         }
         if self.auto_update_interval_secs < MIN_AUTO_UPDATE_INTERVAL_SECS {
             return reject("autoUpdateIntervalSecs", "must be at least 60 seconds");
@@ -298,6 +304,18 @@ mod tests {
     }
 
     #[test]
+    fn the_memory_ceiling_travels_as_memory_max_gb_and_is_refused_out_of_range() {
+        let json = serde_json::to_value(editable()).unwrap();
+        assert_eq!(json["memoryMaxGb"], 32);
+        let mut edit = editable();
+        edit.memory_max_gb = 2;
+        assert_eq!(
+            edit.validate().unwrap_err().to_string(),
+            "memoryMaxGb: must be a whole number of GB from 4 to 1024 (got 2)"
+        );
+    }
+
+    #[test]
     fn apply_writes_only_the_editable_fields() {
         let mut cfg = Config {
             worker_id: Some("w-1".into()),
@@ -309,8 +327,10 @@ mod tests {
         edit.models_root = PathBuf::from("/srv/models");
         edit.auto_start = false;
         edit.only_when_idle = true;
+        edit.memory_max_gb = 24;
         edit.apply_to(&mut cfg);
         assert_eq!(cfg.vram_threshold_gb, 7.5);
+        assert_eq!(cfg.memory_max_gb, 24);
         assert!(!cfg.auto_start);
         assert!(cfg.only_when_idle);
         assert_eq!(cfg.models_root, PathBuf::from("/srv/models"));
@@ -334,6 +354,9 @@ mod tests {
             }),
             ("autoUpdateFeed", |c| c.auto_update_feed = "".into()),
             ("modelsRoot", |c| c.models_root = PathBuf::new()),
+            ("memoryMaxGb", |c| c.memory_max_gb = 3),
+            ("memoryMaxGb", |c| c.memory_max_gb = 0),
+            ("memoryMaxGb", |c| c.memory_max_gb = 1025),
         ];
         for (field, break_it) in cases {
             let mut edit = editable();

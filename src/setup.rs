@@ -9,16 +9,28 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+use crate::memory_ceiling::{self, MemoryCeiling};
+
 const TRACE_TARGET: &str = "studio_worker::setup";
 
 /// The side effects of `setup`.
 pub trait SetupOps {
     /// The executable to start and to point the login entry at.
     fn exe(&self) -> Result<PathBuf>;
-    /// Install (or refresh) the tray UI's login entry when `enabled`, remove it otherwise.
-    fn sync_login_entry(&self, exe: &Path, enabled: bool) -> Result<()>;
-    /// Start `exe args` detached, its stderr appended to `log`; its pid.
-    fn start_ui(&self, exe: &Path, args: &[OsString], log: &Path) -> std::io::Result<u32>;
+    /// Install (or refresh) the tray UI's login entry when `enabled` (under `ceiling`), remove it
+    /// otherwise.
+    fn sync_login_entry(
+        &self,
+        exe: &Path,
+        enabled: bool,
+        ceiling: Option<MemoryCeiling>,
+    ) -> Result<()>;
+    /// `ceiling` when the tray UI can start inside `studio-worker.scope`, `None` otherwise.
+    fn launch_ceiling(&self, ceiling: MemoryCeiling) -> Option<MemoryCeiling>;
+    /// Whether `studio-worker.scope` is active: a worker already runs in it.
+    fn scope_active(&self) -> bool;
+    /// Start `argv` detached, its stderr appended to `log`; its pid.
+    fn start_ui(&self, argv: &[OsString], log: &Path) -> std::io::Result<u32>;
 }
 
 /// The arguments that start the tray UI for `config_path`.
@@ -65,7 +77,8 @@ pub fn setup_summary(
 pub fn setup_with<O: SetupOps>(ops: &O, config_path: Option<&str>) -> Result<()> {
     let (cfg, path) = crate::config::load(config_path)?;
     let exe = ops.exe()?;
-    if let Err(e) = ops.sync_login_entry(&exe, cfg.auto_start) {
+    let launch = ops.launch_ceiling(MemoryCeiling::from_config(&cfg));
+    if let Err(e) = ops.sync_login_entry(&exe, cfg.auto_start, launch) {
         // The tray UI syncs it again at every start; say so and carry on.
         warn!(
             target: TRACE_TARGET,
@@ -75,14 +88,30 @@ pub fn setup_with<O: SetupOps>(ops: &O, config_path: Option<&str>) -> Result<()>
             "could not update the tray UI's login entry; the tray UI retries when it starts"
         );
     }
+    // A worker already in the scope keeps it: the new tray UI hands over to it (or, with only the
+    // daemon left there, runs beside it without a ceiling of its own).
+    let start_in = match launch {
+        Some(_) if ops.scope_active() => {
+            info!(
+                target: TRACE_TARGET,
+                op = "setup",
+                unit = memory_ceiling::SCOPE_UNIT,
+                "the scope is active; starting the tray UI plainly to hand over to the worker in it"
+            );
+            None
+        }
+        other => other,
+    };
     let log = crate::daemon_link::ui_log_path(&path);
+    let argv = memory_ceiling::tray_argv(start_in, &exe, &ui_args(config_path));
     let pid = ops
-        .start_ui(&exe, &ui_args(config_path), &log)
+        .start_ui(&argv, &log)
         .with_context(|| format!("starting the tray UI ({} ui)", exe.display()))?;
     info!(
         target: TRACE_TARGET,
         op = "setup",
         pid,
+        memory_max_gb = start_in.map(MemoryCeiling::max_gb),
         exe = %exe.display(),
         config_path = %path.display(),
         log = %log.display(),
@@ -128,20 +157,38 @@ impl SetupOps for RealOps {
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn sync_login_entry(&self, exe: &Path, enabled: bool) -> Result<()> {
-        crate::autostart::sync(exe, enabled)
+    fn sync_login_entry(
+        &self,
+        exe: &Path,
+        enabled: bool,
+        ceiling: Option<MemoryCeiling>,
+    ) -> Result<()> {
+        crate::autostart::sync(exe, enabled, ceiling)
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn launch_ceiling(&self, ceiling: MemoryCeiling) -> Option<MemoryCeiling> {
+        memory_ceiling::launch_ceiling(ceiling)
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn scope_active(&self) -> bool {
+        memory_ceiling::scope_active()
     }
 
     // Starts a real, detached tray UI; exercised by the installer runs, not unit tests.
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn start_ui(&self, exe: &Path, args: &[OsString], log: &Path) -> std::io::Result<u32> {
+    fn start_ui(&self, argv: &[OsString], log: &Path) -> std::io::Result<u32> {
         use std::process::Stdio;
+        let (program, args) = argv
+            .split_first()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty argv"))?;
         let out = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log)?;
         // Its own process group, no console, so it outlives the installer.
-        let mut cmd = crate::process::detached(exe);
+        let mut cmd = crate::process::detached(program);
         // The UI writes its own log to `log` (`ui_log`); stderr keeps what bypasses tracing (a
         // panic message).
         cmd.args(args)
@@ -163,30 +210,44 @@ mod tests {
     struct FakeOps {
         login_entry_fails: bool,
         start_fails: bool,
-        login_entries: Mutex<Vec<(PathBuf, bool)>>,
-        started: Mutex<Vec<(PathBuf, Vec<OsString>, PathBuf)>>,
+        /// `systemd-run --user` works.
+        systemd: bool,
+        scope_active: bool,
+        login_entries: Mutex<Vec<(PathBuf, bool, Option<u32>)>>,
+        started: Mutex<Vec<(Vec<OsString>, PathBuf)>>,
     }
 
     impl SetupOps for FakeOps {
         fn exe(&self) -> Result<PathBuf> {
             Ok(PathBuf::from("/opt/sw/studio-worker"))
         }
-        fn sync_login_entry(&self, exe: &Path, enabled: bool) -> Result<()> {
-            self.login_entries
-                .lock()
-                .unwrap()
-                .push((exe.to_path_buf(), enabled));
+        fn sync_login_entry(
+            &self,
+            exe: &Path,
+            enabled: bool,
+            ceiling: Option<MemoryCeiling>,
+        ) -> Result<()> {
+            self.login_entries.lock().unwrap().push((
+                exe.to_path_buf(),
+                enabled,
+                ceiling.map(MemoryCeiling::max_gb),
+            ));
             if self.login_entry_fails {
                 anyhow::bail!("no autostart dir");
             }
             Ok(())
         }
-        fn start_ui(&self, exe: &Path, args: &[OsString], log: &Path) -> std::io::Result<u32> {
-            self.started.lock().unwrap().push((
-                exe.to_path_buf(),
-                args.to_vec(),
-                log.to_path_buf(),
-            ));
+        fn launch_ceiling(&self, ceiling: MemoryCeiling) -> Option<MemoryCeiling> {
+            self.systemd.then_some(ceiling)
+        }
+        fn scope_active(&self) -> bool {
+            self.scope_active
+        }
+        fn start_ui(&self, argv: &[OsString], log: &Path) -> std::io::Result<u32> {
+            self.started
+                .lock()
+                .unwrap()
+                .push((argv.to_vec(), log.to_path_buf()));
             if self.start_fails {
                 return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
             }
@@ -218,13 +279,13 @@ mod tests {
         let logs = capture(move || setup_with(&*in_capture, Some(&config)).unwrap());
         assert_eq!(
             *ops.login_entries.lock().unwrap(),
-            [(PathBuf::from("/opt/sw/studio-worker"), true)]
+            [(PathBuf::from("/opt/sw/studio-worker"), true, None)]
         );
         let started = ops.started.lock().unwrap();
         assert_eq!(started.len(), 1);
-        let (exe, args, log) = &started[0];
-        assert_eq!(exe, Path::new("/opt/sw/studio-worker"));
-        assert_eq!(args.last().unwrap(), "ui");
+        let (argv, log) = &started[0];
+        assert_eq!(argv[0], "/opt/sw/studio-worker");
+        assert_eq!(argv.last().unwrap(), "ui");
         assert_eq!(log, &dir.path().join("ui.log"));
         assert!(
             logs.contains("op=\"setup\"") || logs.contains("op=setup"),
@@ -232,6 +293,51 @@ mod tests {
         );
         assert!(logs.contains("setup started the tray UI"), "{logs}");
         assert!(logs.contains("pid=4242"), "{logs}");
+    }
+
+    #[test]
+    fn with_systemd_the_login_entry_and_the_tray_ui_get_the_configured_ceiling() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = crate::config::Config {
+            memory_max_gb: 24,
+            ..crate::config::Config::default()
+        };
+        crate::config::save(&cfg, &path).unwrap();
+        let ops = std::sync::Arc::new(FakeOps {
+            systemd: true,
+            ..FakeOps::default()
+        });
+        let in_capture = ops.clone();
+        let config = path.to_string_lossy().into_owned();
+        let logs = capture(move || setup_with(&*in_capture, Some(&config)).unwrap());
+        assert_eq!(
+            *ops.login_entries.lock().unwrap(),
+            [(PathBuf::from("/opt/sw/studio-worker"), true, Some(24))]
+        );
+        let started = ops.started.lock().unwrap();
+        let argv = &started[0].0;
+        assert_eq!(argv[0], "systemd-run");
+        assert!(argv.contains(&OsString::from("MemoryMax=24G")), "{argv:?}");
+        assert!(argv.contains(&OsString::from("/opt/sw/studio-worker")));
+        assert_eq!(argv.last().unwrap(), "ui");
+        assert!(logs.contains("memory_max_gb=24"), "{logs}");
+    }
+
+    #[test]
+    fn with_the_scope_already_active_the_tray_ui_starts_plainly_to_hand_over() {
+        let dir = tempdir().unwrap();
+        let config = config_in(dir.path());
+        let ops = std::sync::Arc::new(FakeOps {
+            systemd: true,
+            scope_active: true,
+            ..FakeOps::default()
+        });
+        let in_capture = ops.clone();
+        let logs = capture(move || setup_with(&*in_capture, Some(&config)).unwrap());
+        assert_eq!(ops.login_entries.lock().unwrap()[0].2, Some(32));
+        assert_eq!(ops.started.lock().unwrap()[0].0[0], "/opt/sw/studio-worker");
+        assert!(logs.contains("the scope is active"), "{logs}");
     }
 
     #[test]
@@ -302,7 +408,7 @@ mod tests {
         setup_with(&ops, Some(&path.to_string_lossy())).unwrap();
         assert_eq!(
             *ops.login_entries.lock().unwrap(),
-            [(PathBuf::from("/opt/sw/studio-worker"), false)]
+            [(PathBuf::from("/opt/sw/studio-worker"), false, None)]
         );
         assert_eq!(ops.started.lock().unwrap().len(), 1);
     }

@@ -44,6 +44,7 @@ pub mod local;
 pub mod local_api;
 pub mod local_vision;
 pub mod log_trim;
+pub mod memory_ceiling;
 pub mod multipart;
 pub mod net;
 pub mod presence;

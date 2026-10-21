@@ -597,6 +597,7 @@ never reads them in-process.
 |---|---|---|
 | `api_base_url` | `https://studio.minis.gg/` | Studio API root |
 | `vram_threshold_gb` | `12.0` | Max VRAM per claim |
+| `memory_max_gb` | `32` | Linux: memory ceiling of the worker and its jobs ([memory ceiling](../runtime/memory-ceiling.md)) |
 | `auto_start` | `true` | Tray UI starts at login (Start with my machine) |
 | `start_minimised` | `true` | Tray UI window starts minimised |
 | `only_when_idle` | `false` | Experimental: take studio work only while the person is away |

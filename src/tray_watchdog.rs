@@ -160,7 +160,8 @@ pub fn relaunch(
         "the tray UI has not polled the daemon; starting it again"
     );
     let started = ops.exe().and_then(|exe| {
-        ops.start_ui(&exe, &args, &log)
+        // A child of the daemon: inside the daemon's scope (and its memory ceiling) already.
+        ops.start_ui(&crate::memory_ceiling::tray_argv(None, &exe, &args), &log)
             .map(|pid| (exe, pid))
             .map_err(anyhow::Error::from)
     });
@@ -285,7 +286,7 @@ mod relaunch_tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
-    type Started = Arc<Mutex<Vec<(PathBuf, Vec<OsString>, PathBuf)>>>;
+    type Started = Arc<Mutex<Vec<(Vec<OsString>, PathBuf)>>>;
 
     struct FakeOps {
         started: Started,
@@ -296,18 +297,31 @@ mod relaunch_tests {
         fn exe(&self) -> anyhow::Result<PathBuf> {
             Ok(PathBuf::from("/opt/sw/studio-worker"))
         }
-        fn sync_login_entry(&self, _exe: &Path, _enabled: bool) -> anyhow::Result<()> {
+        fn sync_login_entry(
+            &self,
+            _exe: &Path,
+            _enabled: bool,
+            _ceiling: Option<crate::memory_ceiling::MemoryCeiling>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
-        fn start_ui(&self, exe: &Path, args: &[OsString], log: &Path) -> std::io::Result<u32> {
+        fn launch_ceiling(
+            &self,
+            _ceiling: crate::memory_ceiling::MemoryCeiling,
+        ) -> Option<crate::memory_ceiling::MemoryCeiling> {
+            unreachable!("the watchdog starts the tray inside the daemon's scope")
+        }
+        fn scope_active(&self) -> bool {
+            unreachable!("the watchdog starts the tray inside the daemon's scope")
+        }
+        fn start_ui(&self, argv: &[OsString], log: &Path) -> std::io::Result<u32> {
             if self.fails {
                 return Err(std::io::Error::other("no display"));
             }
-            self.started.lock().unwrap().push((
-                exe.to_path_buf(),
-                args.to_vec(),
-                log.to_path_buf(),
-            ));
+            self.started
+                .lock()
+                .unwrap()
+                .push((argv.to_vec(), log.to_path_buf()));
             Ok(4242)
         }
     }
@@ -332,16 +346,20 @@ mod relaunch_tests {
         let logs = capture(move || relaunch(&ops, &control, 2, Duration::from_secs(45)));
 
         let started = started.lock().unwrap();
-        let (exe, args, log) = &started[0];
-        assert_eq!(exe, Path::new("/opt/sw/studio-worker"));
+        let (argv, log) = &started[0];
         let config = dir
             .path()
             .join("config.toml")
             .to_string_lossy()
             .into_owned();
         assert_eq!(
-            args,
-            &[OsString::from("--config"), config.into(), "ui".into()]
+            argv,
+            &[
+                OsString::from("/opt/sw/studio-worker"),
+                "--config".into(),
+                config.into(),
+                "ui".into()
+            ]
         );
         assert_eq!(log, &dir.path().join("ui.log"));
         assert!(logs.contains("op=\"tray_relaunch\""), "{logs}");

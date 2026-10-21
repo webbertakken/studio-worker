@@ -21,6 +21,8 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::memory_ceiling::MemoryCeiling;
+
 /// Tracing target for autostart events.  Stable so operators can
 /// filter with `RUST_LOG=studio_worker::autostart=debug`.
 const TRACE_TARGET: &str = "studio_worker::autostart";
@@ -31,14 +33,18 @@ pub const ENTRY_NAME: &str = "studio-worker-ui";
 // Pure renderers (cross-platform, unit-tested without any I/O).
 // ---------------------------------------------------------------------------
 
-/// Pure-data render of the `.desktop` file body.
-pub fn render_desktop_entry(exe: &str) -> String {
+/// Pure-data render of the `.desktop` file body.  With a `ceiling` the entry starts the tray UI
+/// inside `studio-worker.scope` (`docs/runtime/memory-ceiling.md`).
+pub fn render_desktop_entry(exe: &str, ceiling: Option<MemoryCeiling>) -> String {
+    let launcher = ceiling
+        .map(|c| format!("{} ", c.launcher().join(" ")))
+        .unwrap_or_default();
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=studio-worker\n\
          Comment=Pull-based generation worker for the minis.gg studio\n\
-         Exec={exe} ui\n\
+         Exec={launcher}{exe} ui\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n"
     )
@@ -103,19 +109,20 @@ pub fn ensure_action(existing: Option<&str>, wanted: &str) -> EnsureAction {
 // Exclude them from the coverage number rather than leave permanent
 // misses for code the measured build cannot exercise.
 
-/// Make sure the tray UI starts at login from `exe`: write the entry when
-/// it is missing or points at another executable.  Logs the outcome.
+/// Make sure the tray UI starts at login from `exe` (under `ceiling`, Linux only): write the
+/// entry when it is missing or says something else.  Logs the outcome.
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub fn ensure(exe: &Path) -> Result<()> {
-    backend::ensure(exe)
+pub fn ensure(exe: &Path, ceiling: Option<MemoryCeiling>) -> Result<()> {
+    backend::ensure(exe, ceiling)
 }
 
 /// Make the login entry match the operator's `auto_start`: installed and
-/// pointing at `exe` while `enabled`, absent otherwise.  Logs the outcome.
+/// pointing at `exe` (under `ceiling`, Linux only) while `enabled`, absent otherwise.  Logs the
+/// outcome.
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub fn sync(exe: &Path, enabled: bool) -> Result<()> {
+pub fn sync(exe: &Path, enabled: bool, ceiling: Option<MemoryCeiling>) -> Result<()> {
     if enabled {
-        ensure(exe)
+        ensure(exe, ceiling)
     } else {
         disable()
     }
@@ -127,10 +134,10 @@ pub fn is_enabled() -> bool {
     backend::is_enabled()
 }
 
-/// Enable autostart-on-login for `exe`.
+/// Enable autostart-on-login for `exe` (under `ceiling`, Linux only).
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub fn enable(exe: &Path) -> Result<()> {
-    backend::enable(exe)
+pub fn enable(exe: &Path, ceiling: Option<MemoryCeiling>) -> Result<()> {
+    backend::enable(exe, ceiling)
 }
 
 /// Disable autostart-on-login (idempotent).
@@ -145,7 +152,7 @@ pub fn disable() -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 mod backend {
-    use super::{ENTRY_NAME, TRACE_TARGET};
+    use super::{MemoryCeiling, ENTRY_NAME, TRACE_TARGET};
     use anyhow::{anyhow, Context, Result};
     use std::path::{Path, PathBuf};
     use tracing::{info, warn};
@@ -162,8 +169,8 @@ mod backend {
     // `~/.config/autostart`.  `is_enabled` stays measured: the Linux
     // mirror test drives it read-only.
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn enable(exe: &Path) -> Result<()> {
-        enable_at(&autostart_path()?, exe)
+    pub fn enable(exe: &Path, ceiling: Option<MemoryCeiling>) -> Result<()> {
+        enable_at(&autostart_path()?, exe, ceiling)
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -172,13 +179,13 @@ mod backend {
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn ensure(exe: &Path) -> Result<()> {
-        ensure_at(&autostart_path()?, exe)
+    pub fn ensure(exe: &Path, ceiling: Option<MemoryCeiling>) -> Result<()> {
+        ensure_at(&autostart_path()?, exe, ceiling)
     }
 
-    /// Write the entry at `path` unless it already holds what `exe` needs.
-    pub(super) fn ensure_at(path: &Path, exe: &Path) -> Result<()> {
-        let wanted = render_artefact(exe);
+    /// Write the entry at `path` unless it already holds what `exe` and `ceiling` need.
+    pub(super) fn ensure_at(path: &Path, exe: &Path, ceiling: Option<MemoryCeiling>) -> Result<()> {
+        let wanted = render_artefact(exe, ceiling);
         let existing = std::fs::read_to_string(path).ok();
         match super::ensure_action(existing.as_deref(), &wanted) {
             super::EnsureAction::AlreadyCurrent => {
@@ -217,22 +224,24 @@ mod backend {
         path.map(|p| p.exists()).unwrap_or(false)
     }
 
-    pub(super) fn enable_at(path: &Path, exe: &Path) -> Result<()> {
-        write_entry(path, &render_artefact(exe))
+    pub(super) fn enable_at(path: &Path, exe: &Path, ceiling: Option<MemoryCeiling>) -> Result<()> {
+        write_entry(path, &render_artefact(exe, ceiling))
     }
 
     pub(super) fn disable_at(path: &Path) -> Result<()> {
         remove_entry(path)
     }
 
-    pub(super) fn render_artefact(exe: &Path) -> String {
+    pub(super) fn render_artefact(exe: &Path, ceiling: Option<MemoryCeiling>) -> String {
         let exe_str = exe.to_string_lossy().to_string();
         #[cfg(target_os = "linux")]
         {
-            super::render_desktop_entry(&exe_str)
+            super::render_desktop_entry(&exe_str, ceiling)
         }
         #[cfg(target_os = "macos")]
         {
+            // No memory ceiling on macOS (docs/runtime/memory-ceiling.md).
+            let _ = ceiling;
             super::render_launch_agent(&exe_str)
         }
     }
@@ -311,27 +320,60 @@ mod backend {
 
             let logs = capture({
                 let path = path.clone();
-                move || ensure_at(&path, Path::new("/opt/new/studio-worker")).unwrap()
+                move || ensure_at(&path, Path::new("/opt/new/studio-worker"), None).unwrap()
             });
             assert!(logs.contains("autostart-on-login enabled"), "{logs}");
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
-                render_artefact(exe)
+                render_artefact(exe, None)
             );
 
             let logs = capture({
                 let path = path.clone();
-                move || ensure_at(&path, Path::new("/opt/new/studio-worker")).unwrap()
+                move || ensure_at(&path, Path::new("/opt/new/studio-worker"), None).unwrap()
             });
             assert!(logs.contains("op=\"ensure\""), "{logs}");
             assert!(logs.contains("already current"), "{logs}");
 
-            std::fs::write(&path, render_artefact(Path::new("/old/studio-worker"))).unwrap();
-            ensure_at(&path, exe).unwrap();
+            std::fs::write(
+                &path,
+                render_artefact(Path::new("/old/studio-worker"), None),
+            )
+            .unwrap();
+            ensure_at(&path, exe, None).unwrap();
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
-                render_artefact(exe)
+                render_artefact(exe, None)
             );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn ensure_at_rewrites_the_entry_when_the_ceiling_changes_or_goes() {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("entry.desktop");
+            let exe = Path::new("/opt/sw/studio-worker");
+            let c32 = MemoryCeiling::new(32).ok();
+            let c24 = MemoryCeiling::new(24).ok();
+
+            ensure_at(&path, exe, c32).unwrap();
+            assert!(std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("MemoryMax=32G"));
+            let logs = capture({
+                let path = path.clone();
+                move || ensure_at(&path, Path::new("/opt/sw/studio-worker"), c32).unwrap()
+            });
+            assert!(logs.contains("already current"), "{logs}");
+
+            ensure_at(&path, exe, c24).unwrap();
+            assert!(std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("MemoryMax=24G"));
+            ensure_at(&path, exe, None).unwrap();
+            assert!(std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("Exec=/opt/sw/studio-worker ui\n"));
         }
 
         #[test]
@@ -453,14 +495,14 @@ mod backend {
                 "a fresh tempdir must report autostart disabled"
             );
 
-            enable_at(&path, exe).unwrap();
+            enable_at(&path, exe, None).unwrap();
             assert!(
                 is_enabled_at(Some(&path)),
                 "enable_at must create the artefact so is_enabled_at sees it"
             );
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
-                render_artefact(exe),
+                render_artefact(exe, None),
                 "enable_at must persist the platform artefact verbatim"
             );
 
@@ -479,11 +521,11 @@ mod backend {
         #[test]
         fn render_artefact_selects_the_platform_template() {
             let exe = Path::new("/opt/studio-worker/studio-worker");
-            let body = render_artefact(exe);
+            let body = render_artefact(exe, None);
             #[cfg(target_os = "linux")]
             assert_eq!(
                 body,
-                crate::autostart::render_desktop_entry("/opt/studio-worker/studio-worker")
+                crate::autostart::render_desktop_entry("/opt/studio-worker/studio-worker", None)
             );
             #[cfg(target_os = "macos")]
             assert_eq!(
@@ -518,7 +560,7 @@ mod backend {
 
 #[cfg(target_os = "windows")]
 mod backend {
-    use super::{autostart_command, ENTRY_NAME, TRACE_TARGET};
+    use super::{autostart_command, MemoryCeiling, ENTRY_NAME, TRACE_TARGET};
     use anyhow::{Context, Result};
     use std::path::Path;
     use tracing::{info, warn};
@@ -534,7 +576,8 @@ mod backend {
             .is_ok()
     }
 
-    pub fn ensure(exe: &Path) -> Result<()> {
+    // No memory ceiling on Windows (docs/runtime/memory-ceiling.md): `_ceiling` is ignored.
+    pub fn ensure(exe: &Path, _ceiling: Option<MemoryCeiling>) -> Result<()> {
         let wanted = autostart_command(exe);
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let existing = hkcu
@@ -551,11 +594,11 @@ mod backend {
                 );
                 Ok(())
             }
-            super::EnsureAction::Write => enable(exe),
+            super::EnsureAction::Write => enable(exe, None),
         }
     }
 
-    pub fn enable(exe: &Path) -> Result<()> {
+    pub fn enable(exe: &Path, _ceiling: Option<MemoryCeiling>) -> Result<()> {
         let command = autostart_command(exe);
         let result = (|| -> std::io::Result<()> {
             let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -650,7 +693,7 @@ mod backend {
             let was_enabled = is_enabled();
             let exe = Path::new(r"C:\Program Files\studio-worker\studio-worker.exe");
 
-            enable(exe).expect("enable should write the Run value");
+            enable(exe, None).expect("enable should write the Run value");
             assert!(is_enabled(), "enable must make is_enabled() true");
 
             disable().expect("disable should remove the Run value");
@@ -675,10 +718,25 @@ mod tests {
 
     #[test]
     fn desktop_entry_contains_exec_and_name() {
-        let s = render_desktop_entry("/usr/local/bin/studio-worker");
+        let s = render_desktop_entry("/usr/local/bin/studio-worker", None);
         assert!(s.contains("Exec=/usr/local/bin/studio-worker ui"));
         assert!(s.contains("Name=studio-worker"));
         assert!(s.contains("Type=Application"));
+    }
+
+    #[test]
+    fn with_a_ceiling_the_desktop_entry_starts_the_tray_in_the_capped_scope() {
+        let s = render_desktop_entry(
+            "/usr/local/bin/studio-worker",
+            Some(MemoryCeiling::new(32).unwrap()),
+        );
+        assert!(
+            s.contains(
+                "Exec=systemd-run --user --scope --unit=studio-worker --collect --quiet \
+                 -p MemoryHigh=29491M -p MemoryMax=32G /usr/local/bin/studio-worker ui\n"
+            ),
+            "{s}"
+        );
     }
 
     #[test]

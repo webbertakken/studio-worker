@@ -546,6 +546,7 @@ pub fn log_startup_banner(cfg: &Config, path: &std::path::Path) {
         config_path = path.display().to_string(),
         api_base_url = cfg.api_base_url.as_str(),
         vram_threshold_gb = cfg.vram_threshold_gb,
+        memory_max_gb = cfg.memory_max_gb,
         auto_update_enabled = cfg.auto_update_enabled,
         auto_update_interval_secs = cfg.auto_update_interval_secs,
         models_root = cfg.models_root.display().to_string(),
@@ -595,6 +596,11 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
         crate::daemon_lock::Acquired::HeldElsewhere => return Ok(()),
     };
     log_startup_banner(&cfg, &path);
+    // The scope takes the configured ceiling (a hand edit since the last start included), then
+    // the log says what holds this process.
+    let ceiling = crate::memory_ceiling::MemoryCeiling::from_config(&cfg);
+    crate::memory_ceiling::reconcile(ceiling);
+    crate::memory_ceiling::log_effective(ceiling);
     // A tray-started daemon writes to daemon.log; nothing else rotates it.
     crate::log_trim::spawn(crate::daemon_link::daemon_log_path(&path));
 

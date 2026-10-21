@@ -249,6 +249,7 @@ api_base_url        = "https://studio.minis.gg"
 worker_id           = "<filled on operator approval>"
 auth_token          = "<filled on operator approval>"
 vram_threshold_gb   = 12.0                       # max GB per claim
+memory_max_gb       = 32                         # Linux: memory ceiling of the worker and its jobs
 start_minimised     = true                       # tray UI window starts minimised
 
 # Where on-demand model files are cached (defaults to ~/models).

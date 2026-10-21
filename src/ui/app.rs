@@ -97,16 +97,16 @@ pub struct AppDeps {
     /// Minimise the window on its first frame (the config's
     /// `start_minimised`, read before the daemon answers).
     pub start_minimised: bool,
-    /// Make the tray UI's login entry match `auto_start`; called with the
-    /// saved value after every successful Config save.
+    /// Make the tray UI's login entry match `auto_start` and `memory_max_gb`;
+    /// called with the saved config after every successful Config save.
     pub login_entry: LoginEntry,
     pub actions: ActionRunner,
     pub config_path: PathBuf,
     pub tokio: Handle,
 }
 
-/// Installs (`true`) or removes (`false`) the tray UI's login entry.
-pub type LoginEntry = Arc<dyn Fn(bool) + Send + Sync>;
+/// Installs (`auto_start`) or removes the tray UI's login entry, under the saved memory ceiling.
+pub type LoginEntry = Arc<dyn Fn(&EditableConfig) + Send + Sync>;
 
 /// A config save on its way to the daemon.
 type PendingSave = Arc<Mutex<Option<Result<EditableConfig, String>>>>;
@@ -571,7 +571,7 @@ impl App {
         };
         match result {
             Ok(saved) => {
-                (self.deps.login_entry)(saved.auto_start);
+                (self.deps.login_entry)(&saved);
                 let mut cfg = self.deps.replica.cfg.lock();
                 saved.apply_to(&mut cfg);
                 self.config_draft.saved(&cfg);
@@ -627,7 +627,7 @@ mod tests {
             actions: ActionRunner::new(config_path.clone(), replica.clone()),
             replica,
             start_minimised: true,
-            login_entry: Arc::new(|_| {}),
+            login_entry: Arc::new(|_: &EditableConfig| {}),
             config_path,
             tokio: tokio_handle(),
         }
@@ -856,10 +856,12 @@ mod tests {
 
     #[test]
     fn a_saved_config_syncs_the_login_entry_and_a_refused_one_does_not() {
-        let calls: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let calls: Arc<Mutex<Vec<(bool, u32)>>> = Arc::default();
         let seen = calls.clone();
         let deps = AppDeps {
-            login_entry: Arc::new(move |enabled| seen.lock().push(enabled)),
+            login_entry: Arc::new(move |saved: &EditableConfig| {
+                seen.lock().push((saved.auto_start, saved.memory_max_gb))
+            }),
             ..mock_deps()
         };
         let mut app = App::new(deps);
@@ -868,11 +870,12 @@ mod tests {
         *app.pending_save.lock() = Some(Ok(saved.clone()));
         app.take_save_result();
         saved.auto_start = true;
+        saved.memory_max_gb = 24;
         *app.pending_save.lock() = Some(Ok(saved));
         app.take_save_result();
         *app.pending_save.lock() = Some(Err("invalid config".into()));
         app.take_save_result();
-        assert_eq!(*calls.lock(), [false, true]);
+        assert_eq!(*calls.lock(), [(false, 32), (true, 24)]);
         assert!(app.deps.replica.cfg.lock().auto_start);
     }
 
