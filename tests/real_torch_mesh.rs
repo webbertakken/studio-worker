@@ -24,9 +24,9 @@ use studio_worker::types::{
 /// A pipeline's registry row as the studio holds it (budgets measured on an RTX 4090).
 fn source(pipeline: &str) -> ModelSource {
     let (budget, steps, guidance, low_vram, resolution) = match pipeline {
-        "pixal3d" => (15.5, 12, 7.5, true, Some(1024)),
+        "pixal3d" => (15.0, 12, 7.5, true, Some(1024)),
         "trellis2" => (8.0, 12, 7.5, true, Some(512)),
-        "hunyuan3d" => (16.0, 30, 5.0, false, None),
+        "hunyuan3d" => (14.5, 30, 5.0, false, None),
         other => panic!("unknown pipeline {other}"),
     };
     ModelSource {

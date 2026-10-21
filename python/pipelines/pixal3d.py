@@ -31,8 +31,12 @@ MAX_NUM_TOKENS = 49152
 SS_SAMPLER = {"guidance_rescale": 0.7, "rescale_t": 5.0}
 SHAPE_SAMPLER = {"guidance_rescale": 0.5, "rescale_t": 3.0}
 TEX_SAMPLER = {"guidance_strength": 1.0, "guidance_rescale": 0.0, "rescale_t": 3.0}
-# Pixal3D's frame to glTF's Y-up (`inference.py`).
-TO_GLTF = np.array([[-1, 0, 0, 0], [0, 0, -1, 0], [0, -1, 0, 0], [0, 0, 0, 1]], dtype=np.float64)
+# Pixal3D's frame to glTF's: its own Y-up turn (`inference.py`), then half a turn about Y, so the
+# model faces +Z, glTF's front, as TRELLIS.2's and Hunyuan3D's do (measured: without it, it faces -Z).
+# It keeps the picture's camera tilt: Pixal3D reconstructs in the camera's frame.
+PIXAL3D_UP = np.array([[-1, 0, 0, 0], [0, 0, -1, 0], [0, -1, 0, 0], [0, 0, 0, 1]], dtype=np.float64)
+HALF_TURN_Y = np.diag([-1.0, 1.0, -1.0, 1.0])
+TO_GLTF = HALF_TURN_Y @ PIXAL3D_UP
 
 _paths = {}
 

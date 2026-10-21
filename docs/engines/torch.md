@@ -42,7 +42,7 @@ Decisions and licences: `DECISIONS.md`, "Image to 3D".
   "files": [],                    // weights are the pipeline's own (below)
   "cliDefaults": {
     "pipeline": "pixal3d",        // pixal3d | trellis2 | hunyuan3d
-    "maxVramGib": 15.5,           // the budget; required
+    "maxVramGib": 15.0,           // the budget; required
     "steps": 12,                  // flow sampling steps per stage
     "cfgScale": 7.5,              // guidance of the shape stage
     "width": 1024, "height": 1024, // unused by mesh pipelines (the type requires them)
@@ -182,9 +182,9 @@ environment (numpy 2, transformers 4.57, diffusers 0.37) cannot hold, hence two 
 
 | Pipeline | Budget | Settings | Measured |
 | --- | --- | --- | --- |
-| `pixal3d` | 15.5 GiB (estimate 16.5) | `lowVram`, 1024 cascade | 107 to 178 s a run; 14.2 GiB peak on both test pictures; about 2.1 MB |
-| `trellis2` | 8 GiB (estimate 9) | `lowVram`, 512 | 100 s a run; 4.0 GiB peak; about 2.2 MB |
-| `hunyuan3d` | 16 GiB | CPU offload, 6 views of 512 px | measured in the plan's phase 7 |
+| `pixal3d` | 15 GiB (estimate 15.5) | `lowVram`, 1024 cascade | 107 to 232 s a run; 14.2 GiB peak on every test picture; 2.0 to 2.4 MB |
+| `trellis2` | 8 GiB (estimate 9) | `lowVram`, 512 | 100 to 154 s a run; 2.6 to 4.0 GiB peak; 2.0 to 2.3 MB |
+| `hunyuan3d` | 14.5 GiB (estimate 15) | no offload, 6 views of 512 px | 74 to 186 s a run; 13.0 GiB peak; 3.8 to 4.2 MB |
 
 - A run's first job also loads its weights from disk (about 50 to 90 s) and, for Pixal3D, autotunes
   FlexGEMM once (cached in `<torch>/cache`).
@@ -192,8 +192,15 @@ environment (numpy 2, transformers 4.57, diffusers 0.37) cannot hold, hence two 
   (the crab sample ran out of memory at 8, 12 and 17 GiB), which does not fit next to the shared
   models on a 24 GB card; at 512 it peaks at 4 GiB and, decimated to 40 000 triangles, keeps its
   detail. The registry can set `resolution: 1024` on a card with room.
-- The estimate is the budget plus about 1 GiB for the CUDA context; admission keeps another 1 GiB
-  in reserve, so a run fits when `estimate + 1` GiB is free.
+- The budget is the measured peak plus about 0.8 GiB; the estimate is the budget plus 0.5 GiB for
+  the CUDA context. Admission keeps another 1 GiB in reserve, so a run fits when `estimate + 1` GiB
+  is free: Pixal3D needs 16.5 GiB, which a 24 GB card has next to the worker's shared models (about
+  6 GiB). Measured: 16.5 to 16.8 GiB free there.
+- Hunyuan3D 2.1 paints without CPU offload: its custom paint pipeline breaks under both of
+  diffusers' offloads (verified), and without it the paint pass peaks at 13.0 GiB.
+- Facing: every GLB faces +Z, glTF's front. Pixal3D also keeps the picture's camera tilt: it
+  reconstructs in the camera's frame and does not estimate the world's up, so seen from the front
+  it reproduces the picture's own angle.
 
 ## Observability
 
