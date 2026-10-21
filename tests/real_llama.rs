@@ -50,8 +50,11 @@ fn ensure_model(id: &str, url: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Jobs run in the built binary's llama process (this test harness is no `studio-worker`).
 fn engine_with_cache(_path: &Path) -> LlamaEngine {
-    LlamaEngine::new(cache_root()).expect("llama backend")
+    let mut program = studio_worker::llama_process::ChildProgram::this_executable().unwrap();
+    program.program = env!("CARGO_BIN_EXE_studio-worker").into();
+    LlamaEngine::with_program(cache_root(), program)
 }
 
 #[test]

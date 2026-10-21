@@ -42,8 +42,8 @@ top-level [`README.md`](../README.md).  For active plans, see
 - [sd-cpp engine](engines/sdcpp.md) — real image inference via
   `stable-diffusion.cpp` as a subprocess.  Auto-provisions `sd-cli`
   and downloads model weights on demand, cached in `cfg.models_root`.
-- [llama engine](engines/llama.md) — chat models in process (llama.cpp), structured output and
-  vision: the pictures a model reads with its messages.
+- [llama engine](engines/llama.md) — chat models (llama.cpp) in a llama process per model, so a
+  llama.cpp abort ends one job, not the daemon; structured output and vision.
 - [torch engine](engines/torch.md) — PyTorch models with custom CUDA extensions in a child process
   per job: image to 3D (`mesh`) with Pixal3D, TRELLIS.2 and Hunyuan3D 2.1.
 - [vision engine](engines/vision.md): animal detection (MegaDetector, YOLO) and species

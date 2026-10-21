@@ -172,6 +172,8 @@ src/
 ├── residency.rs      Persisted resident set (residency.json).
 ├── admission.rs      Free-device-memory probe + admission with a safety margin.
 ├── loaders.rs        In-process loaders per engine, behind the host's ModelRuntime.
+├── llama_process/    llama.cpp in a child process per model (`llama-serve`): the daemon's
+│                     handle, the JSON-lines protocol, the process's serve loop.
 ├── stt_stream/       Streaming speech-to-text served on the LAN.
 │   ├── session.rs    The /transcribe protocol over any streaming transcriber (pure).
 │   ├── vad.rs        Energy voice-activity detection (hands-free finalise).
@@ -192,8 +194,8 @@ src/
 │   ├── mod.rs        Engine trait + dispatch / dispatch_with_source.  Always-on SyntheticEngine.
 │   ├── multi.rs      MultiEngine; routes strictly by ModelSource.engine (no fallback).
 │   ├── sdcpp.rs      Real image inference via stable-diffusion.cpp subprocess.
-│   ├── llama.rs      (feature `llama`, `cuda` for GPU) llama-cpp-2: transient jobs +
-│   │                 resident LoadedLlm, both through one `complete`.
+│   ├── llama.rs      (feature `llama`, `cuda` for GPU) llama-cpp-2: transient jobs and
+│   │                 loaded models, each in a llama process, both through one `complete`.
 │   ├── llama_subprocess.rs  Windows LLM via a llama-cli subprocess.
 │   ├── llm_core.rs   Engine-free LLM rules: context budget, BOS, reasoning split, response.
 │   ├── chat_template.rs  The model's own Jinja chat template (minijinja + pycompat).

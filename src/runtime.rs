@@ -1460,6 +1460,9 @@ pub fn is_permanent_failure(e: &anyhow::Error) -> bool {
             || cause
                 .downcast_ref::<crate::engine::torch::TorchError>()
                 .is_some_and(crate::engine::torch::TorchError::is_permanent)
+            || cause
+                .downcast_ref::<crate::llama_process::LlamaProcessError>()
+                .is_some_and(crate::llama_process::LlamaProcessError::is_permanent)
     }) || e.to_string().contains("cannot serve")
 }
 

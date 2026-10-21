@@ -82,6 +82,9 @@ Every catalogue model has exactly one state. Only the worker changes it.
 - A lane serves one request at a time; a streaming session holds its lane until it closes.
 - A transient job frees its model when it ends; nothing stays in memory that the host cannot
   see. Keeping a model warm is what residency is for.
+- A loaded LLM serves from its own [llama process](../engines/llama.md#llama-process). When that
+  process ends during a request (llama.cpp aborts on a GPU out-of-memory), the request fails, the
+  model stays `loaded`, and its next request starts a new process.
 - A transient job is admitted only if its model fits next to the loaded models; otherwise it is
   refused (`insufficient_memory`) and, for a studio offer, rejected so another worker takes it.
   - A studio offer is admitted against its `vramGbEstimate` before the job slot is reserved

@@ -39,6 +39,7 @@ pub mod job_log;
 pub mod job_run;
 pub mod legacy_service;
 pub mod lifecycle;
+pub mod llama_process;
 pub mod loaders;
 pub mod local;
 pub mod local_api;
@@ -147,6 +148,10 @@ pub async fn run_cli(args: cli::Cli) -> anyhow::Result<()> {
         cli::Command::Config => runtime::show_config(args.config.as_deref()),
         cli::Command::CheckUpdate => runtime::check_update(args.config.as_deref()).await,
         cli::Command::Ui => run_ui(args.config.as_deref()).await,
+        // `main` serves it before any logging starts: stdout carries protocol lines only.
+        cli::Command::LlamaServe => {
+            anyhow::bail!("`llama-serve` runs from `main`, before logging to stdout starts")
+        }
     }
 }
 
