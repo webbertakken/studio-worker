@@ -395,6 +395,7 @@ mod tests {
     #[test]
     fn every_error_has_its_status() {
         let refused = crate::admission::Refused {
+            memory: crate::admission::MemoryKind::Device,
             needed_gib: 2.0,
             free_gib: 1.0,
             margin_gib: 0.5,

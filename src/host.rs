@@ -6,7 +6,7 @@
 //! and unloads run on their own threads and report back through the
 //! lifecycle.  Lock order is always `entries` before `residency`.
 
-use crate::admission::{self, FreeMemory, MemoryProbe, Refused};
+use crate::admission::{self, FreeMemory, MemoryNeed, MemoryProbe, Refused};
 use crate::catalog::{Catalog, CatalogModel};
 use crate::lifecycle::{Command, Lifecycle, ModelState};
 use crate::residency::Residency;
@@ -224,13 +224,15 @@ impl ModelHost {
         loaded_gib(&catalog, &entries)
     }
 
-    /// Admit a transient job for `model` needing `needed_gib`: only if it fits next to the models
-    /// loaded now (docs/runtime/model-lifecycle.md).  A transient job never swaps a resident out.
-    /// Memory that cannot be measured (no probe, no total) admits it, as before admission: a
-    /// worker without a readable device must not turn every job away.
-    pub fn admit_transient(&self, model: &str, needed_gib: f32) -> Result<(), admission::Refused> {
+    /// Admit a transient job for `model` needing `need`: only if it fits next to the models
+    /// loaded now, and, when it keeps its weights in host memory, in the host memory available
+    /// (docs/runtime/model-lifecycle.md, docs/runtime/memory-ceiling.md).  A transient job never
+    /// swaps a resident out.  Memory that cannot be measured (no probe, no total) admits it, as
+    /// before admission: a worker without a readable device must not turn every job away.
+    pub fn admit_transient(&self, model: &str, need: MemoryNeed) -> Result<(), admission::Refused> {
+        let needed_gib = need.device_gib;
         let free = admission::free_now(self.inner.probe.as_ref(), self.loaded_gib());
-        if free == admission::FreeMemory::Unknown {
+        let device = if free == admission::FreeMemory::Unknown {
             tracing::warn!(
                 target: TRACE_TARGET,
                 op = "admit",
@@ -238,9 +240,29 @@ impl ModelHost {
                 needed_gib,
                 "device memory unknown: admitting the transient job unmeasured"
             );
-            return Ok(());
-        }
-        match admission::admit(needed_gib, &free) {
+            Ok(())
+        } else {
+            admission::admit(needed_gib, &free)
+        };
+        let host_available = need
+            .host_gib
+            .and_then(|_| self.inner.probe.host_available_gib());
+        let verdict = device.and_then(|()| match (need.host_gib, host_available) {
+            (Some(host_needed), Some(available)) => admission::admit_host(host_needed, available),
+            (Some(host_needed), None) => {
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    op = "admit",
+                    model,
+                    host_needed_gib = host_needed,
+                    "host memory unknown: admitting the transient job's host memory unmeasured"
+                );
+                Ok(())
+            }
+            (None, _) => Ok(()),
+        });
+        match verdict {
+            Ok(()) if free == admission::FreeMemory::Unknown && need.host_gib.is_none() => Ok(()),
             Ok(()) => {
                 tracing::info!(
                     target: TRACE_TARGET,
@@ -248,6 +270,8 @@ impl ModelHost {
                     model,
                     needed_gib,
                     free_gib = free.gib(),
+                    host_needed_gib = need.host_gib,
+                    host_available_gib = host_available,
                     "transient job admitted"
                 );
                 Ok(())
@@ -1144,7 +1168,11 @@ mod tests {
         f.host.load("b").unwrap();
         f.host.wait_for("a", ModelState::serves, WAIT).unwrap();
         f.host.wait_for("b", ModelState::serves, WAIT).unwrap();
-        let refused = f.host.admit_transient("qwen3-32b", 21.0).unwrap_err();
+        let refused = f
+            .host
+            .admit_transient("qwen3-32b", MemoryNeed::device(21.0))
+            .unwrap_err();
+        assert_eq!(refused.memory, admission::MemoryKind::Device);
         assert_eq!(refused.needed_gib, 21.0);
         assert!((refused.free_gib - 16.39).abs() < 0.01, "{refused:?}");
         assert_eq!(state_of(&f.host, "a"), ModelState::Loaded, "residents stay");
@@ -1155,7 +1183,95 @@ mod tests {
         let f = fixture(vec![model("a", 3.0, None)], 16.4, FakeRuntime::open());
         f.host.load("a").unwrap();
         f.host.wait_for("a", ModelState::serves, WAIT).unwrap();
-        f.host.admit_transient("mistral-small", 14.0).unwrap();
+        f.host
+            .admit_transient("mistral-small", MemoryNeed::device(14.0))
+            .unwrap();
+    }
+
+    /// A probe with room on the device and `host` GiB of host memory available.
+    struct HostProbe(Option<f32>);
+
+    impl crate::admission::MemoryProbe for HostProbe {
+        fn free_gib(&self) -> Option<f32> {
+            Some(20.0)
+        }
+        fn total_gib(&self) -> Option<f32> {
+            Some(24.0)
+        }
+        fn host_available_gib(&self) -> Option<f32> {
+            self.0
+        }
+    }
+
+    fn host_with(probe: HostProbe) -> (ModelHost, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ModelHost::new(
+            Arc::new(Mutex::new(Catalog::default())),
+            FakeRuntime::open(),
+            Arc::new(probe),
+            Residency::load_for_serving(Some(dir.path().join("residency.json"))),
+        );
+        (host, dir)
+    }
+
+    /// qwen-image-2512 offloads 13.85 GiB of weights to the CPU; on 2026-10-21 it was admitted
+    /// on device memory alone and its `sd-cli` died holding 21-27 GB.
+    #[test]
+    fn a_job_keeping_its_weights_in_host_memory_is_refused_when_the_host_lacks_it() {
+        let need = MemoryNeed {
+            device_gib: 12.0,
+            host_gib: Some(13.85),
+        };
+        let (host, _dir) = host_with(HostProbe(Some(15.0)));
+        let logs = crate::test_support::capture(move || {
+            let refused = host.admit_transient("qwen-image-2512", need).unwrap_err();
+            assert_eq!(refused.memory, admission::MemoryKind::Host);
+            assert_eq!(refused.free_gib, 15.0);
+        });
+        assert!(logs.contains("transient job refused"), "{logs}");
+        assert!(logs.contains("insufficient host memory"), "{logs}");
+
+        let (host, _dir) = host_with(HostProbe(Some(30.0)));
+        let logs = crate::test_support::capture(move || {
+            host.admit_transient("qwen-image-2512", need).unwrap();
+        });
+        assert!(logs.contains("transient job admitted"), "{logs}");
+        assert!(logs.contains("host_needed_gib=13.85"), "{logs}");
+        assert!(logs.contains("host_available_gib=30"), "{logs}");
+    }
+
+    #[test]
+    fn host_memory_is_not_checked_for_jobs_that_do_not_keep_weights_there_or_when_unknown() {
+        let (host, _dir) = host_with(HostProbe(Some(0.5)));
+        host.admit_transient("z-image", MemoryNeed::device(6.0))
+            .unwrap();
+        let (host, _dir) = host_with(HostProbe(None));
+        let logs = crate::test_support::capture(move || {
+            host.admit_transient(
+                "qwen-image-2512",
+                MemoryNeed {
+                    device_gib: 12.0,
+                    host_gib: Some(13.85),
+                },
+            )
+            .unwrap();
+        });
+        assert!(logs.contains("host memory unknown"), "{logs}");
+    }
+
+    #[test]
+    fn device_memory_is_checked_before_host_memory() {
+        let (host, _dir) = host_with(HostProbe(Some(0.5)));
+        let refused = host
+            .admit_transient(
+                "huge",
+                MemoryNeed {
+                    device_gib: 40.0,
+                    host_gib: Some(13.85),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(refused.memory, admission::MemoryKind::Device);
     }
 
     #[test]
@@ -1174,8 +1290,11 @@ mod tests {
         host.load("a").unwrap();
         host.wait_for("a", ModelState::serves, WAIT).unwrap();
         // 24 - 5.7 = 18.3 GiB, less the reserve: 21 does not fit, 16 does.
-        assert!(host.admit_transient("big", 21.0).is_err());
-        host.admit_transient("smaller", 16.0).unwrap();
+        assert!(host
+            .admit_transient("big", MemoryNeed::device(21.0))
+            .is_err());
+        host.admit_transient("smaller", MemoryNeed::device(16.0))
+            .unwrap();
     }
 
     #[test]
@@ -1188,7 +1307,8 @@ mod tests {
             Arc::new(NoProbe),
             Residency::load_for_serving(Some(dir.path().join("residency.json"))),
         );
-        host.admit_transient("any", 4.0).unwrap();
+        host.admit_transient("any", MemoryNeed::device(4.0))
+            .unwrap();
     }
 
     /// A device whose memory cannot be read at all (a CPU-only worker).
@@ -1199,6 +1319,9 @@ mod tests {
             None
         }
         fn total_gib(&self) -> Option<f32> {
+            None
+        }
+        fn host_available_gib(&self) -> Option<f32> {
             None
         }
     }
@@ -1212,6 +1335,9 @@ mod tests {
         }
         fn total_gib(&self) -> Option<f32> {
             Some(self.0)
+        }
+        fn host_available_gib(&self) -> Option<f32> {
+            None
         }
     }
 

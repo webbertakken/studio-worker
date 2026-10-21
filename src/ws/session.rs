@@ -797,7 +797,8 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
     }
     // A transient job runs only if it fits next to the loaded models; otherwise the studio gives it
     // to a worker with room, with no attempt counted (docs/runtime/model-lifecycle.md).
-    if let Err(refused) = admit_offer(&ctx.observers, &claim.model, claim.vram_gb_estimate) {
+    let need = crate::admission::MemoryNeed::of(claim.vram_gb_estimate, &claim.model_source);
+    if let Err(refused) = admit_offer(&ctx.observers, &claim.model, need) {
         push_log_with_observers(
             &ctx.logs,
             Some(&ctx.observers),
@@ -907,11 +908,11 @@ fn handle_offer(ctx: &SessionContext, claim: JobOfferClaim) {
 fn admit_offer(
     observers: &WorkerObservers,
     model: &str,
-    needed_gib: f32,
+    need: crate::admission::MemoryNeed,
 ) -> Result<(), crate::admission::Refused> {
     let host = observers.model_host.lock().clone();
     match host {
-        Some(host) => host.admit_transient(model, needed_gib),
+        Some(host) => host.admit_transient(model, need),
         None => {
             warn!(
                 target: "studio_worker::lifecycle",

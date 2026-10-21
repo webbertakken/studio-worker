@@ -129,6 +129,10 @@ impl crate::admission::MemoryProbe for FixedProbe {
     fn total_gib(&self) -> Option<f32> {
         Some(24.0)
     }
+    /// Host memory unknown: only jobs keeping weights in host memory consult it, admitted unmeasured.
+    fn host_available_gib(&self) -> Option<f32> {
+        None
+    }
 }
 
 /// A loaded model that only knows its id.

@@ -216,7 +216,10 @@ fn on_model<R>(
         *reservation = Some(ctx.gate.try_reserve().ok_or(VisionError::Busy)?);
     }
     ctx.host
-        .admit_transient(&model.id, model.vram_gb_estimate)
+        .admit_transient(
+            &model.id,
+            crate::admission::MemoryNeed::of(model.vram_gb_estimate, &model.source),
+        )
         .map_err(VisionError::InsufficientMemory)?;
     let run = begin(JobSource::Local);
     let result = run.span().in_scope(|| {

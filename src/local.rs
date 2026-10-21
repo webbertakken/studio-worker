@@ -386,8 +386,11 @@ fn dispatch_and_record(
     // A transient job: admitted only next to the loaded models, as a studio offer is.
     let host = observers.model_host.lock().clone();
     if let Some(host) = host {
-        host.admit_transient(&model.id, model.vram_gb_estimate)
-            .map_err(LocalError::InsufficientMemory)?;
+        host.admit_transient(
+            &model.id,
+            crate::admission::MemoryNeed::of(model.vram_gb_estimate, &model.source),
+        )
+        .map_err(LocalError::InsufficientMemory)?;
     }
     let run = JobRun::begin(
         observers,
