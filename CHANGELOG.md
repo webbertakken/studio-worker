@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.29](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.28...studio-worker-v0.4.29) (2026-10-21)
+
+
+### Bug Fixes
+
+* **torch:** budgets for a shared card, Pixal3D faces +Z ([#186](https://github.com/webbertakken/studio-worker/issues/186)) ([f3bae9e](https://github.com/webbertakken/studio-worker/commit/f3bae9e2e0945def32abb8bd4a43eda3891ab34a))
+
 ## [0.4.28](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.27...studio-worker-v0.4.28) (2026-10-21)
 
 
