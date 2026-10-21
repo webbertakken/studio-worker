@@ -1148,8 +1148,15 @@ mod tests {
 
     #[test]
     fn history_groups_by_day_newest_first() {
-        let now = Utc::now();
+        // A fixed noon: the seeded jobs finished seconds before the real clock, which just after
+        // midnight is yesterday.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-21T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let mut today = JobsView::build(&seeded()).history;
+        for (minutes, card) in today.iter_mut().enumerate() {
+            card.finished_at = Some(now - chrono::Duration::minutes(minutes as i64 + 1));
+        }
         let mut old = today[0].clone();
         old.job_id = "last-week".into();
         old.finished_at = Some(now - chrono::Duration::days(8));
