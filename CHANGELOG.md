@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.27](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.26...studio-worker-v0.4.27) (2026-10-21)
+
+
+### Features
+
+* image to 3D with a torch engine ([#181](https://github.com/webbertakken/studio-worker/issues/181)) ([01ed086](https://github.com/webbertakken/studio-worker/commit/01ed086769c69d6afdb317761d6e192a8aac8dc2))
+
 ## [0.4.26](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.25...studio-worker-v0.4.26) (2026-10-18)
 
 
