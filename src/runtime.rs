@@ -1005,12 +1005,15 @@ pub fn ensure_local_api_token(cfg: &SharedConfig, config_path: &std::path::Path)
     token
 }
 
-/// Bind the LAN streaming speech listener and serve it on its own thread.
-/// A failed bind is logged and leaves the port at 0, so stream-token
-/// requests answer `stream_listener_down` instead of pointing nowhere.
+/// Bind the LAN streaming speech listener (TLS, with the certificate kept
+/// beside the config) and serve it on its own thread.  A certificate that
+/// cannot be loaded or made, or a failed bind, is logged and leaves no
+/// endpoint, so stream-token requests answer `stream_listener_down`
+/// instead of pointing nowhere.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_stream_listener(
     cfg: &SharedConfig,
+    config_path: &std::path::Path,
     services: &crate::local_api::ModelServices,
     observers: &WorkerObservers,
     stop: Arc<AtomicBool>,
@@ -1020,16 +1023,30 @@ fn spawn_stream_listener(
         cfg.lock().stream_port,
     );
     let addr = format!("0.0.0.0:{port}");
+    let cert_dir = crate::stt_stream::tls::dir_for(config_path);
+    let cert = match crate::stt_stream::tls::StreamCertificate::load_or_create(&cert_dir) {
+        Ok(cert) => cert,
+        Err(err) => {
+            tracing::warn!(
+                target: "studio_worker::stt_stream",
+                dir = %cert_dir.display(),
+                error = %err,
+                "stream certificate unavailable; streaming speech is unavailable"
+            );
+            return;
+        }
+    };
     match crate::stt_stream::server::StreamServer::bind(
         &addr,
+        &cert,
         services.host.clone(),
         services.tokens.clone(),
         observers.clone(),
     ) {
         Ok(server) => {
-            let bound = server.local_addr().port();
-            services.stream_port.store(bound, Ordering::SeqCst);
-            tracing::info!(target: "studio_worker::stt_stream", addr = %server.local_addr(), "stream listener listening");
+            let endpoint = server.endpoint();
+            tracing::info!(target: "studio_worker::stt_stream", addr = %server.local_addr(), cert_sha256 = %endpoint.cert_sha256, "stream listener listening (wss)");
+            *services.stream_endpoint.write() = Some(endpoint);
             std::thread::spawn(move || server.serve(&stop));
         }
         Err(err) => tracing::warn!(
@@ -1090,7 +1107,7 @@ pub fn spawn_local_api(
     );
     *observers.model_host.lock() = Some(host.clone());
     let services = crate::local_api::ModelServices::new(host.clone());
-    spawn_stream_listener(&cfg, &services, &observers, stop.clone());
+    spawn_stream_listener(&cfg, config_path, &services, &observers, stop.clone());
     let api = crate::local_api::LocalApi::bind(
         &format!("127.0.0.1:{port}"),
         engine.clone(),

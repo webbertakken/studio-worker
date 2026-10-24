@@ -173,8 +173,10 @@ pub struct LocalApi {
 pub struct ModelServices {
     pub host: ModelHost,
     pub tokens: Arc<StreamTokens>,
-    /// Port of the running LAN stream listener; 0 while it is not listening.
-    pub stream_port: Arc<std::sync::atomic::AtomicU16>,
+    /// The running LAN stream listener's port and pinned certificate;
+    /// `None` while it is not listening.
+    pub stream_endpoint:
+        Arc<parking_lot::RwLock<Option<crate::stt_stream::server::StreamEndpoint>>>,
 }
 
 impl ModelServices {
@@ -182,7 +184,7 @@ impl ModelServices {
         Self {
             host,
             tokens: Arc::new(StreamTokens::default()),
-            stream_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            stream_endpoint: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 }
@@ -1181,14 +1183,14 @@ impl LocalApi {
                 &serde_json::json!({ "error": "not_a_stream_model" }),
             );
         }
-        let port = self.services.stream_port.load(Ordering::SeqCst);
-        if port == 0 {
+        let endpoint = self.services.stream_endpoint.read().clone();
+        let Some(endpoint) = endpoint else {
             return respond_json(
                 request,
                 503,
                 &serde_json::json!({ "error": "stream_listener_down" }),
             );
-        }
+        };
         let ttl =
             chrono::Duration::seconds(parsed.ttl_secs.unwrap_or(DEFAULT_STREAM_TOKEN_TTL_SECS));
         let grant = self
@@ -1200,6 +1202,7 @@ impl LocalApi {
             op = "stream_token",
             model = %model.id,
             expires_at = %grant.expires_at,
+            cert_sha256 = %endpoint.cert_sha256,
             "stream token minted"
         );
         respond_json(
@@ -1209,8 +1212,11 @@ impl LocalApi {
                 "token": grant.token,
                 "model": grant.model,
                 "expiresAt": grant.expires_at.to_rfc3339(),
-                "port": port,
+                "scheme": crate::stt_stream::server::STREAM_SCHEME,
+                "port": endpoint.port,
                 "path": crate::stt_stream::server::STREAM_PATH,
+                "certSha256": endpoint.cert_sha256,
+                "certPem": endpoint.cert_pem,
             }),
         )
     }
@@ -1684,9 +1690,7 @@ mod tests {
                 crate::residency::Residency::load_for_serving(None),
             );
             let services = ModelServices::new(host.clone());
-            services
-                .stream_port
-                .store(4798, std::sync::atomic::Ordering::SeqCst);
+            *services.stream_endpoint.write() = Some(test_stream_endpoint());
             let api = LocalApi::bind(
                 "127.0.0.1:0",
                 engine,
@@ -2345,6 +2349,14 @@ mod tests {
         assert_eq!(last.prompt, "lane");
     }
 
+    fn test_stream_endpoint() -> crate::stt_stream::server::StreamEndpoint {
+        crate::stt_stream::server::StreamEndpoint {
+            port: 4798,
+            cert_sha256: "ab".repeat(32),
+            cert_pem: "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n".into(),
+        }
+    }
+
     fn stream_catalog() -> Catalog {
         let mut stt = synthetic_model_of("stt-a", TaskKind::AudioStt);
         stt.source.engine = crate::types::ModelEngine::Parakeet;
@@ -2367,8 +2379,11 @@ mod tests {
         let token = body["token"].as_str().unwrap();
         assert_eq!(token.len(), 64);
         assert_eq!(body["model"], "stt-a");
+        assert_eq!(body["scheme"], "wss");
         assert_eq!(body["port"], 4798);
         assert_eq!(body["path"], "/transcribe");
+        assert_eq!(body["certSha256"], "ab".repeat(32));
+        assert_eq!(body["certPem"], test_stream_endpoint().cert_pem);
         assert!(body["expiresAt"].is_string());
         assert_eq!(
             h.services.tokens.check(token, chrono::Utc::now()),
@@ -2401,9 +2416,7 @@ mod tests {
     #[test]
     fn stream_tokens_need_a_running_listener() {
         let mut h = Harness::start(stream_catalog());
-        h.services
-            .stream_port
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        *h.services.stream_endpoint.write() = None;
         let (status, body) = json(
             h.post("/stream-tokens")
                 .json(&serde_json::json!({ "model": "stt-a" }))

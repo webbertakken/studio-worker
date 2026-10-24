@@ -55,7 +55,7 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | GET / PUT | `/daemon/config` | yes | PUT: the editable config              | the editable config (`400 invalid_config`, `500 config_not_saved`) |
 | POST   | `/daemon/registration/reset` | yes | —                             | `202` / `409 not_rejected` |
 | POST   | `/daemon/shutdown` | yes | —                                        | `202`; the daemon stops gracefully |
-| POST   | `/stream-tokens` | yes | `{model, ttlSecs?}`                     | `{token, model, expiresAt, port, path}` for the LAN stream listener |
+| POST   | `/stream-tokens` | yes | `{model, ttlSecs?}`                     | `{token, model, expiresAt, scheme, port, path, certSha256, certPem}` for the LAN stream listener |
 | GET    | `/healthz`      | no   | —                                          | runtime snapshot (below) |
 
 ### Model lifecycle
@@ -139,22 +139,54 @@ A changed `modelsRoot` applies to engines built after a restart; a changed
 Loaded streaming speech models (`engine: "parakeet"`) are served on a second
 listener that binds the **LAN** (`0.0.0.0:4798`; `stream_port` in config or
 `STUDIO_WORKER_STREAM_PORT`), so a phone on the same network can stream to it.
-It accepts only short-lived **stream tokens**, minted here with the install
-token, so the install token never leaves the host:
+It speaks **TLS only** (`wss://`), so neither the audio nor the token crosses the
+LAN in the clear, and it accepts only short-lived **stream tokens**, minted here
+with the install token, so the install token never leaves the host:
 
 ```bash
 curl -s -X POST "$(jq -r .url $DISCOVERY)/stream-tokens" \
   -H "authorization: Bearer $(jq -r .token $DISCOVERY)" \
   -H 'content-type: application/json' -d '{"model":"nemotron-3.5-stream"}'
-# {"token":"…","model":"nemotron-3.5-stream","expiresAt":"…","port":4798,"path":"/transcribe"}
+# {"token":"…","model":"nemotron-3.5-stream","expiresAt":"…","scheme":"wss",
+#  "port":4798,"path":"/transcribe","certSha256":"<64 hex>","certPem":"-----BEGIN CERTIFICATE-----…"}
 ```
 
 A token lives 10 minutes by default (`ttlSecs`, clamped to 30 s–1 h); the holder
 mints a fresh one before it expires.  Errors: `404 unknown_model`,
-`400 not_a_stream_model`, `503 stream_listener_down`.
+`400 not_a_stream_model`, `503 stream_listener_down` (the listener is not
+listening, including when its certificate could not be loaded or made).
 
-Then `ws://<host>:4798/transcribe?token=<token>`, optionally with `&endpoint=server` (the
-default) or `&endpoint=client`:
+#### The listener's certificate
+
+- The listener presents one self-signed certificate (ECDSA P-256, valid 25 years from its
+  creation), made on the daemon's first start and kept next to the config:
+  `stream-cert.pem` (public) and `stream-key.pem` (owner-only; never logged, never served).
+- Its names are `studio-worker`, `localhost`, `127.0.0.1` and `::1`.  A LAN client dials an
+  address the certificate does not name, so it **pins** the certificate rather than checking
+  the name.
+- `certSha256` is the lowercase hex SHA-256 of the certificate's DER encoding: the pin.
+  `certPem` is the same certificate, for a loopback client that trusts it as its only root.
+  Neither is a secret; both reach the holder over this loopback API, behind the install token.
+- A pair that is missing, unreadable or mismatched is replaced with a new one at start (logged
+  as a warning).  To rotate, delete both files and restart the daemon; every grant minted
+  after that carries the new pin.
+
+#### Opening a stream
+
+`wss://<host>:4798/transcribe`, optionally with `?endpoint=server` (the default) or
+`?endpoint=client`, with the token in the handshake's `Authorization: Bearer <token>`
+header.  The client trusts exactly the certificate whose SHA-256 is `certSha256`, and
+nothing else.  Refused at the handshake:
+
+| Attempt | Outcome |
+| --- | --- |
+| plain `ws://` (no TLS) | the TLS handshake fails; nothing is served |
+| a `token` in the query string, valid or not | `400` |
+| no `Authorization: Bearer` header | `401` |
+| a bad or expired token | `401` |
+| any path but `/transcribe` | `404` |
+
+The frames:
 
 | Direction | Frame | Meaning |
 | --- | --- | --- |
@@ -174,9 +206,9 @@ Who ends the utterance:
   `end` cannot hold the model.
 
 Any other `endpoint` value is refused at the handshake (400).  One session per model at a time; a second gets
-`busy`.  Unloading the model ends a session with `model unloaded`.  A bad or
-expired token is refused at the handshake (401); any other path is 404.
-Every session is recorded in the local queue.
+`busy`.  Unloading the model ends a session with `model unloaded`.
+Every session is recorded in the local queue; every refusal is logged as `stream refused`
+(target `studio_worker::stt_stream`) with its reason, never with a token.
 
 ### Health snapshot
 

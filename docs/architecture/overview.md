@@ -178,7 +178,8 @@ src/
 │   ├── session.rs    The /transcribe protocol over any streaming transcriber (pure).
 │   ├── vad.rs        Energy voice-activity detection (hands-free finalise).
 │   ├── tokens.rs     Short-lived stream tokens (stored hashed).
-│   └── server.rs     LAN WebSocket listener; one session per loaded model's lane.
+│   ├── tls.rs        The listener's self-signed certificate: made once, kept, pinned.
+│   └── server.rs     LAN WebSocket listener over TLS; one session per loaded model's lane.
 ├── setup.rs          `setup`: the tray UI's login entry, start the tray UI, print guidance.
 ├── legacy_service.rs Removes the headless service older versions installed (tray UI start).
 ├── exe_watch.rs      Notices a replaced launch path so the tray UI restarts on the new binary.
