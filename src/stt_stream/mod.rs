@@ -3,5 +3,6 @@
 
 pub mod server;
 pub mod session;
+pub mod tls;
 pub mod tokens;
 pub mod vad;

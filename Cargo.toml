@@ -96,6 +96,9 @@ tungstenite = { version = "0.27", default-features = false, features = ["handsha
 # `install_default`.  Pin to the same major as tokio-tungstenite's
 # transitive copy so only one rustls ends up in the build.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+# The stream listener's self-signed certificate, made once and pinned by its
+# clients.  ring, like rustls above, so no aws-lc-rs build.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 thiserror = "2"
 # Real-engine deps; each behind its own cargo feature so the default

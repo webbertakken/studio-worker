@@ -1,12 +1,16 @@
-//! The LAN streaming listener: `ws://<host>:<port>/transcribe?token=...`.
+//! The LAN streaming listener: `wss://<host>:<port>/transcribe`, with the
+//! stream token in the handshake's `Authorization: Bearer` header.
 //! A stream token (minted on the loopback API) names the model; the
 //! session runs on that loaded model's lane until it finalises, the
 //! client leaves, or the model is unloaded.
 //!
-//! Binds the LAN on purpose (a phone streams to it); the stream token is the
+//! Binds the LAN on purpose (a phone streams to it), over TLS only: the
+//! listener presents its pinned certificate ([`super::tls`]), so neither the
+//! audio nor the token crosses the LAN in the clear; the stream token is the
 //! guard.  One session per model at a time (`try_with_lane`).
 
 use super::session::{ClientFrame, Endpointing, Next, ServerFrame, StreamSession};
+pub use super::tls::StreamCertificate;
 pub use super::tokens::StreamTokens;
 use crate::host::{Lane, LoadedModel, ModelHost};
 use crate::job_run::JobRun;
@@ -25,6 +29,8 @@ use tungstenite::{Message, WebSocket};
 pub const DEFAULT_STREAM_PORT: u16 = 4798;
 /// The one path served.
 pub const STREAM_PATH: &str = "/transcribe";
+/// The one scheme served: WebSocket over TLS.
+pub const STREAM_SCHEME: &str = "wss";
 const TRACE_TARGET: &str = "studio_worker::stt_stream";
 /// Read timeout while streaming: how often an idle session checks for an
 /// unload.  Safe range 20..=500 ms.
@@ -34,24 +40,41 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a closing session waits for the client's close frame.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
-type Socket = WebSocket<TcpStream>;
+type Tls = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
+type Socket = WebSocket<Tls>;
+
+/// Where a client streams: the bound port and the certificate it pins.
+/// Public; the loopback API hands it out with every stream grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEndpoint {
+    pub port: u16,
+    /// Lowercase hex SHA-256 of the certificate's DER.
+    pub cert_sha256: String,
+    pub cert_pem: String,
+}
 
 /// The listener, bound but not yet serving.
 pub struct StreamServer {
     listener: TcpListener,
     addr: SocketAddr,
+    tls: Arc<rustls::ServerConfig>,
+    cert_sha256: String,
+    cert_pem: String,
     host: ModelHost,
     tokens: Arc<StreamTokens>,
     observers: WorkerObservers,
 }
 
 impl StreamServer {
+    /// Bind [addr], presenting [cert] to every client.
     pub fn bind(
         addr: &str,
+        cert: &StreamCertificate,
         host: ModelHost,
         tokens: Arc<StreamTokens>,
         observers: WorkerObservers,
     ) -> anyhow::Result<Self> {
+        let tls = cert.server_config()?;
         let listener = TcpListener::bind(addr)
             .map_err(|e| anyhow::anyhow!("stream listener bind {addr}: {e}"))?;
         listener.set_nonblocking(true)?;
@@ -59,6 +82,9 @@ impl StreamServer {
         Ok(Self {
             listener,
             addr,
+            tls,
+            cert_sha256: cert.sha256().to_owned(),
+            cert_pem: cert.pem().to_owned(),
             host,
             tokens,
             observers,
@@ -69,17 +95,28 @@ impl StreamServer {
         self.addr
     }
 
+    pub fn endpoint(&self) -> StreamEndpoint {
+        StreamEndpoint {
+            port: self.addr.port(),
+            cert_sha256: self.cert_sha256.clone(),
+            cert_pem: self.cert_pem.clone(),
+        }
+    }
+
     /// Accept sessions until `stop` is set; one thread per session.
     pub fn serve(&self, stop: &AtomicBool) {
         while !stop.load(Ordering::Relaxed) {
             match self.listener.accept() {
                 Ok((stream, peer)) => {
-                    let (host, tokens, observers) = (
+                    let (tls, host, tokens, observers) = (
+                        self.tls.clone(),
                         self.host.clone(),
                         self.tokens.clone(),
                         self.observers.clone(),
                     );
-                    std::thread::spawn(move || session(stream, peer, &host, &tokens, &observers));
+                    std::thread::spawn(move || {
+                        session(stream, peer, tls, &host, &tokens, &observers)
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(POLL / 2)
@@ -108,6 +145,18 @@ fn reject(status: u16, message: &str) -> ErrorResponse {
     resp
 }
 
+/// The token in an `Authorization: Bearer <token>` header (scheme in any case).
+fn bearer(req: &Request) -> Option<&str> {
+    let value = req
+        .headers()
+        .get(tungstenite::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
 /// Checks the path and the stream token during the WebSocket handshake,
 /// remembering which model the token opens.
 struct Handshake<'a> {
@@ -121,18 +170,27 @@ impl Callback for Handshake<'_> {
         if req.uri().path() != STREAM_PATH {
             return Err(reject(404, "not found; stream to /transcribe"));
         }
+        if query_param(req.uri().query(), "token").is_some() {
+            return Err(reject(
+                400,
+                "a stream token in the URL is refused; send Authorization: Bearer <token>",
+            ));
+        }
         let Some(endpointing) = Endpointing::parse(query_param(req.uri().query(), "endpoint"))
         else {
             return Err(reject(400, "endpoint must be server or client"));
         };
         *self.endpointing = endpointing;
-        match query_param(req.uri().query(), "token").map(|t| self.tokens.check(t, Utc::now())) {
+        match bearer(req).map(|t| self.tokens.check(t, Utc::now())) {
             Some(Ok(m)) => {
                 *self.model = Some(m);
                 Ok(resp)
             }
             Some(Err(rejection)) => Err(reject(401, &rejection.to_string())),
-            None => Err(reject(401, "missing stream token")),
+            None => Err(reject(
+                401,
+                "missing stream token; send Authorization: Bearer <token>",
+            )),
         }
     }
 }
@@ -145,9 +203,23 @@ struct Summary {
     error: Option<String>,
 }
 
+/// The TLS handshake, driven to completion before any HTTP is read, so a
+/// plain-text client is refused here and nothing it sent is parsed.
+fn accept_tls(
+    mut stream: TcpStream,
+    tls: Arc<rustls::ServerConfig>,
+) -> Result<Tls, std::io::Error> {
+    let mut conn = rustls::ServerConnection::new(tls).map_err(std::io::Error::other)?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut stream)?;
+    }
+    Ok(rustls::StreamOwned::new(conn, stream))
+}
+
 fn session(
     stream: TcpStream,
     peer: SocketAddr,
+    tls: Arc<rustls::ServerConfig>,
     host: &ModelHost,
     tokens: &StreamTokens,
     observers: &WorkerObservers,
@@ -159,6 +231,13 @@ fn session(
     {
         return;
     }
+    let stream = match accept_tls(stream, tls) {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::info!(target: TRACE_TARGET, op = "tls", %peer, error = %e, "stream refused");
+            return;
+        }
+    };
     let mut model: Option<String> = None;
     let mut endpointing = Endpointing::Server;
     let handshake = Handshake {
@@ -174,7 +253,7 @@ fn session(
         }
     };
     let Some(model) = model else { return };
-    if ws.get_ref().set_read_timeout(Some(POLL)).is_err() {
+    if ws.get_ref().sock.set_read_timeout(Some(POLL)).is_err() {
         return;
     }
     tracing::info!(target: TRACE_TARGET, op = "stream", %peer, model = %model, ?endpointing, "stream opened");
@@ -366,6 +445,9 @@ mod tests {
         tokens: Arc<StreamTokens>,
         observers: WorkerObservers,
         addr: std::net::SocketAddr,
+        endpoint: StreamEndpoint,
+        /// The certificate the listener presents; dropped with the harness.
+        _cert_dir: tempfile::TempDir,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
@@ -396,14 +478,18 @@ mod tests {
         }
         let tokens = Arc::new(StreamTokens::default());
         let observers = WorkerObservers::default();
+        let cert_dir = tempfile::tempdir().unwrap();
+        let cert = StreamCertificate::load_or_create(cert_dir.path()).unwrap();
         let server = StreamServer::bind(
             "127.0.0.1:0",
+            &cert,
             host.clone(),
             tokens.clone(),
             observers.clone(),
         )
         .unwrap();
         let addr = server.local_addr();
+        let endpoint = server.endpoint();
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
         let handle = std::thread::spawn(move || server.serve(&s));
@@ -412,24 +498,134 @@ mod tests {
             tokens,
             observers,
             addr,
+            endpoint,
+            _cert_dir: cert_dir,
             stop,
             handle: Some(handle),
         }
     }
 
-    type Client = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
+    type Client = tungstenite::WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
 
-    /// Open a session, or the HTTP status the handshake was refused with.
-    fn connect_to(h: &Harness, path: &str, token: &str) -> Result<Client, u16> {
-        let url = format!("ws://{}{path}?token={token}", h.addr);
-        match tungstenite::connect(url) {
+    /// How a client was turned away.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Refused {
+        /// The WebSocket handshake answered this HTTP status.
+        Status(u16),
+        /// The TLS handshake failed: nothing was sent.
+        Tls,
+    }
+
+    /// Trusts exactly the certificate whose SHA-256 is the pin, as the app does.
+    #[derive(Debug)]
+    struct Pin(String);
+
+    fn provider() -> rustls::crypto::CryptoProvider {
+        rustls::crypto::ring::default_provider()
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for Pin {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            use sha2::Digest as _;
+            let seen: String = sha2::Sha256::digest(end_entity.as_ref())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            if seen == self.0 {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::General(
+                    "certificate does not match the pin".into(),
+                ))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &provider().signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &provider().signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// Open `wss://<listener><target>` trusting only [pin], with [token] as
+    /// the bearer header; a session, or how it was refused.
+    fn open(h: &Harness, target: &str, token: Option<&str>, pin: &str) -> Result<Client, Refused> {
+        use tungstenite::client::IntoClientRequest as _;
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pin(pin.into())))
+            .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("studio-worker").unwrap(),
+        )
+        .unwrap();
+        let tls = rustls::StreamOwned::new(conn, TcpStream::connect(h.addr).unwrap());
+        let mut request = format!("wss://{}{target}", h.addr)
+            .into_client_request()
+            .unwrap();
+        if let Some(token) = token {
+            request
+                .headers_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        }
+        match tungstenite::client(request, tls) {
             Ok((ws, _)) => Ok(ws),
-            Err(tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
+            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(resp))) => {
+                Err(Refused::Status(resp.status().as_u16()))
+            }
+            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Io(e)))
+                if e.get_ref().is_some_and(|inner| inner.is::<rustls::Error>()) =>
+            {
+                Err(Refused::Tls)
+            }
             Err(other) => panic!("unexpected connect error: {other}"),
         }
     }
 
-    fn connect(h: &Harness, token: &str) -> Result<Client, u16> {
+    /// Open a session on [path] with a header token, trusting the listener's pin.
+    fn connect_to(h: &Harness, path: &str, token: &str) -> Result<Client, Refused> {
+        open(h, path, Some(token), &h.endpoint.cert_sha256)
+    }
+
+    fn connect(h: &Harness, token: &str) -> Result<Client, Refused> {
         connect_to(h, "/transcribe", token)
     }
 
@@ -461,7 +657,7 @@ mod tests {
     fn client_endpointing_holds_the_session_through_a_pause() {
         let h = start(true);
         let t = token(&h);
-        let mut ws = connect_to(&h, "/transcribe", &format!("{t}&endpoint=client")).unwrap();
+        let mut ws = connect_to(&h, "/transcribe?endpoint=client", &t).unwrap();
         ws.send(Message::Binary(pcm(400, 8000).into())).unwrap();
         ws.send(Message::Binary(pcm(2000, 0).into())).unwrap();
         ws.send(Message::Binary(pcm(400, 8000).into())).unwrap();
@@ -476,7 +672,7 @@ mod tests {
     fn server_endpointing_still_finalises_on_a_pause() {
         let h = start(true);
         let t = token(&h);
-        let mut ws = connect_to(&h, "/transcribe", &format!("{t}&endpoint=server")).unwrap();
+        let mut ws = connect_to(&h, "/transcribe?endpoint=server", &t).unwrap();
         ws.send(Message::Binary(pcm(400, 8000).into())).unwrap();
         ws.send(Message::Binary(pcm(2000, 0).into())).unwrap();
         let frames = drain(&mut ws);
@@ -488,8 +684,8 @@ mod tests {
         let h = start(true);
         let t = token(&h);
         assert_eq!(
-            connect_to(&h, "/transcribe", &format!("{t}&endpoint=both")).err(),
-            Some(400)
+            connect_to(&h, "/transcribe?endpoint=both", &t).err(),
+            Some(Refused::Status(400))
         );
     }
 
@@ -539,7 +735,7 @@ mod tests {
     #[test]
     fn an_unknown_token_is_refused_at_the_handshake() {
         let h = start(true);
-        assert_eq!(connect(&h, "nope").err(), Some(401));
+        assert_eq!(connect(&h, "nope").err(), Some(Refused::Status(401)));
     }
 
     #[test]
@@ -550,13 +746,83 @@ mod tests {
             ChronoDuration::minutes(1),
             chrono::Utc::now() - ChronoDuration::hours(1),
         );
-        assert_eq!(connect(&h, &old.token).err(), Some(401));
+        assert_eq!(connect(&h, &old.token).err(), Some(Refused::Status(401)));
     }
 
     #[test]
     fn only_the_transcribe_path_is_served() {
         let h = start(true);
-        assert_eq!(connect_to(&h, "/elsewhere", &token(&h)).err(), Some(404));
+        assert_eq!(
+            connect_to(&h, "/elsewhere", &token(&h)).err(),
+            Some(Refused::Status(404))
+        );
+    }
+
+    #[test]
+    fn the_endpoint_names_the_port_and_the_pinned_certificate() {
+        let h = start(true);
+        assert_eq!(h.endpoint.port, h.addr.port());
+        assert_eq!(h.endpoint.cert_sha256.len(), 64);
+        assert!(h
+            .endpoint
+            .cert_pem
+            .starts_with("-----BEGIN CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn a_missing_token_is_refused_at_the_handshake() {
+        let h = start(true);
+        assert_eq!(
+            open(&h, "/transcribe", None, &h.endpoint.cert_sha256).err(),
+            Some(Refused::Status(401))
+        );
+    }
+
+    #[test]
+    fn a_token_in_the_query_is_refused_even_when_valid() {
+        let h = start(true);
+        let t = token(&h);
+        let pin = h.endpoint.cert_sha256.clone();
+        let target = format!("/transcribe?token={t}");
+        assert_eq!(
+            open(&h, &target, None, &pin).err(),
+            Some(Refused::Status(400))
+        );
+        assert_eq!(
+            open(&h, &target, Some(&t), &pin).err(),
+            Some(Refused::Status(400)),
+            "a header does not excuse a token in the URL"
+        );
+    }
+
+    #[test]
+    fn a_wrong_pin_fails_the_tls_handshake_before_the_token_is_sent() {
+        let h = start(true);
+        let t = token(&h);
+        assert_eq!(
+            open(&h, "/transcribe", Some(&t), &"0".repeat(64)).err(),
+            Some(Refused::Tls)
+        );
+        assert!(h.observers.local_jobs.lock().is_empty());
+    }
+
+    #[test]
+    fn plain_websocket_is_refused() {
+        let h = start(true);
+        let t = token(&h);
+        let mut request = tungstenite::client::IntoClientRequest::into_client_request(format!(
+            "ws://{}/transcribe",
+            h.addr
+        ))
+        .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {t}").parse().unwrap());
+        let plain = TcpStream::connect(h.addr).unwrap();
+        plain.set_read_timeout(Some(WAIT)).unwrap();
+        assert!(tungstenite::client(request, plain).is_err());
+        assert!(h.observers.local_jobs.lock().is_empty());
+        assert!(connect(&h, &t).is_ok(), "a TLS client still gets in");
     }
 
     #[test]
