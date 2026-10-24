@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.32](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.31...studio-worker-v0.4.32) (2026-10-24)
+
+
+### Features
+
+* **stt-stream:** name the LAN address in grants ([#194](https://github.com/webbertakken/studio-worker/issues/194)) ([8004a46](https://github.com/webbertakken/studio-worker/commit/8004a46c05200945822ab574a3c652aece2557b4))
+
 ## [0.4.31](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.30...studio-worker-v0.4.31) (2026-10-24)
 
 
