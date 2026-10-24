@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.31](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.30...studio-worker-v0.4.31) (2026-10-24)
+
+
+### Features
+
+* **stt-stream:** serve the stream listener over TLS ([#192](https://github.com/webbertakken/studio-worker/issues/192)) ([d6a7105](https://github.com/webbertakken/studio-worker/commit/d6a7105b6b8c1a995e27f664ea360473bea65167))
+
 ## [0.4.30](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.29...studio-worker-v0.4.30) (2026-10-21)
 
 
