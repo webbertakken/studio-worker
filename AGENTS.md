@@ -136,6 +136,7 @@ CI.
   the worker log ring, image thumbnails, the one-transient-job gate.
 - `src/stt_stream/` — the LAN streaming speech-to-text listener
   (`server`, `session`, `vad`, `tokens`).
+- `src/stt_stream/tls.rs` — the listener's self-signed, pinned certificate.
 - `src/net.rs` (download guards), `src/secrets.rs` (local token entropy).
 - `src/ui/` (feature `ui`) — the tray UI, a client of the daemon:
   `mod.rs` (`ui::run`: UI lock, login entry, poller, eframe, display

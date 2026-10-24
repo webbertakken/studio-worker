@@ -44,6 +44,7 @@ use crate::job_gate::JobGate;
 use crate::lifecycle::ModelState;
 use crate::local::{chat_on_lane, run_image, run_kind, LocalError, LocalImageRequest};
 use crate::runtime::{JobOutcome, WorkerObservers};
+use crate::stt_stream::server::NoLanAddress;
 use crate::stt_stream::tokens::StreamTokens;
 use crate::types::{
     AudioSttParams, AudioTtsParams, ChatMessage, LlmParams, Task, TaskKind, TaskResult, VideoParams,
@@ -177,7 +178,13 @@ pub struct ModelServices {
     /// `None` while it is not listening.
     pub stream_endpoint:
         Arc<parking_lot::RwLock<Option<crate::stt_stream::server::StreamEndpoint>>>,
+    /// The machine's LAN address now, asked afresh for every grant so a new
+    /// DHCP lease reaches the next one.
+    pub lan_address: LanAddressSource,
 }
+
+/// Where a grant learns the machine's LAN address.
+pub type LanAddressSource = Arc<dyn Fn() -> Result<std::net::Ipv4Addr, NoLanAddress> + Send + Sync>;
 
 impl ModelServices {
     pub fn new(host: ModelHost) -> Self {
@@ -185,6 +192,9 @@ impl ModelServices {
             host,
             tokens: Arc::new(StreamTokens::default()),
             stream_endpoint: Arc::new(parking_lot::RwLock::new(None)),
+            lan_address: Arc::new(|| {
+                crate::stt_stream::server::lan_address(crate::stt_stream::server::route_source())
+            }),
         }
     }
 }
@@ -1197,11 +1207,24 @@ impl LocalApi {
             .services
             .tokens
             .mint(&model.id, ttl, chrono::Utc::now());
+        let host = match (self.services.lan_address)() {
+            Ok(address) => Some(address.to_string()),
+            Err(why) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    op = "stream_token",
+                    error = %why,
+                    "stream grant has no LAN address; only a loopback client can use it"
+                );
+                None
+            }
+        };
         tracing::info!(
             target: TRACE_TARGET,
             op = "stream_token",
             model = %model.id,
             expires_at = %grant.expires_at,
+            host = host.as_deref().unwrap_or(""),
             cert_sha256 = %endpoint.cert_sha256,
             "stream token minted"
         );
@@ -1213,6 +1236,7 @@ impl LocalApi {
                 "model": grant.model,
                 "expiresAt": grant.expires_at.to_rfc3339(),
                 "scheme": crate::stt_stream::server::STREAM_SCHEME,
+                "host": host,
                 "port": endpoint.port,
                 "path": crate::stt_stream::server::STREAM_PATH,
                 "certSha256": endpoint.cert_sha256,
@@ -1661,6 +1685,9 @@ mod tests {
         observers: WorkerObservers,
         host: crate::host::ModelHost,
         services: ModelServices,
+        /// What the machine's LAN address is right now; a test changes it as a new DHCP
+        /// lease would.
+        lan: Arc<parking_lot::Mutex<Result<std::net::Ipv4Addr, NoLanAddress>>>,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
@@ -1689,8 +1716,13 @@ mod tests {
                 Arc::new(crate::test_support::FixedProbe(free_gib)),
                 crate::residency::Residency::load_for_serving(None),
             );
-            let services = ModelServices::new(host.clone());
+            let mut services = ModelServices::new(host.clone());
             *services.stream_endpoint.write() = Some(test_stream_endpoint());
+            let lan = Arc::new(parking_lot::Mutex::new(Ok(std::net::Ipv4Addr::new(
+                192, 168, 1, 133,
+            ))));
+            let reported = lan.clone();
+            services.lan_address = Arc::new(move || reported.lock().clone());
             let api = LocalApi::bind(
                 "127.0.0.1:0",
                 engine,
@@ -1712,6 +1744,7 @@ mod tests {
                 observers,
                 host,
                 services,
+                lan,
                 stop,
                 handle: Some(handle),
             }
@@ -2380,6 +2413,7 @@ mod tests {
         assert_eq!(token.len(), 64);
         assert_eq!(body["model"], "stt-a");
         assert_eq!(body["scheme"], "wss");
+        assert_eq!(body["host"], "192.168.1.133");
         assert_eq!(body["port"], 4798);
         assert_eq!(body["path"], "/transcribe");
         assert_eq!(body["certSha256"], "ab".repeat(32));
@@ -2390,6 +2424,43 @@ mod tests {
             Ok("stt-a".to_string()),
             "the listener accepts it"
         );
+    }
+
+    #[test]
+    fn every_grant_names_the_lan_address_of_its_moment() {
+        let h = Harness::start(stream_catalog());
+        let mint = || {
+            json(
+                h.post("/stream-tokens")
+                    .json(&serde_json::json!({ "model": "stt-a" }))
+                    .send()
+                    .unwrap(),
+            )
+            .1
+        };
+        assert_eq!(mint()["host"], "192.168.1.133");
+        *h.lan.lock() = Ok(std::net::Ipv4Addr::new(192, 168, 1, 77));
+        assert_eq!(
+            mint()["host"],
+            "192.168.1.77",
+            "a new lease reaches the next grant"
+        );
+    }
+
+    #[test]
+    fn a_grant_without_a_lan_address_says_so_and_still_holds() {
+        let h = Harness::start(stream_catalog());
+        *h.lan.lock() = Err(NoLanAddress::NotPrivate("100.64.0.7".parse().unwrap()));
+        let (status, body) = json(
+            h.post("/stream-tokens")
+                .json(&serde_json::json!({ "model": "stt-a" }))
+                .send()
+                .unwrap(),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body["host"].is_null());
+        assert_eq!(body["token"].as_str().unwrap().len(), 64);
+        assert_eq!(body["port"], 4798);
     }
 
     #[test]

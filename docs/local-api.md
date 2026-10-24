@@ -55,7 +55,7 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | GET / PUT | `/daemon/config` | yes | PUT: the editable config              | the editable config (`400 invalid_config`, `500 config_not_saved`) |
 | POST   | `/daemon/registration/reset` | yes | —                             | `202` / `409 not_rejected` |
 | POST   | `/daemon/shutdown` | yes | —                                        | `202`; the daemon stops gracefully |
-| POST   | `/stream-tokens` | yes | `{model, ttlSecs?}`                     | `{token, model, expiresAt, scheme, port, path, certSha256, certPem}` for the LAN stream listener |
+| POST   | `/stream-tokens` | yes | `{model, ttlSecs?}`                     | `{token, model, expiresAt, scheme, host, port, path, certSha256, certPem}` for the LAN stream listener |
 | GET    | `/healthz`      | no   | —                                          | runtime snapshot (below) |
 
 ### Model lifecycle
@@ -147,7 +147,7 @@ with the install token, so the install token never leaves the host:
 curl -s -X POST "$(jq -r .url $DISCOVERY)/stream-tokens" \
   -H "authorization: Bearer $(jq -r .token $DISCOVERY)" \
   -H 'content-type: application/json' -d '{"model":"nemotron-3.5-stream"}'
-# {"token":"…","model":"nemotron-3.5-stream","expiresAt":"…","scheme":"wss",
+# {"token":"…","model":"nemotron-3.5-stream","expiresAt":"…","scheme":"wss","host":"192.168.1.133",
 #  "port":4798,"path":"/transcribe","certSha256":"<64 hex>","certPem":"-----BEGIN CERTIFICATE-----…"}
 ```
 
@@ -155,6 +155,22 @@ A token lives 10 minutes by default (`ttlSecs`, clamped to 30 s–1 h); the hold
 mints a fresh one before it expires.  Errors: `404 unknown_model`,
 `400 not_a_stream_model`, `503 stream_listener_down` (the listener is not
 listening, including when its certificate could not be loaded or made).
+
+#### The listener's LAN address
+
+- `host` is the address a LAN client dials: this machine's address on the network its default
+  route leaves by, worked out afresh for every grant, so a new DHCP lease reaches the next grant
+  without a restart.
+- It is the source address the kernel picks for traffic to `192.0.2.1` (TEST-NET-1, a route
+  lookup through a connected UDP socket; no packet is sent), never the first address of the first
+  interface: a docker or LXC bridge (`docker0`, `br-…`, `lxcbr0`) holds private addresses too,
+  but traffic for the outside never leaves by it.
+- Only a private IPv4 address (`10/8`, `172.16/12`, `192.168/16`) is a LAN address. Loopback,
+  link-local, carrier-grade NAT (`100.64/10`, a Tailscale address), a public address, or no route
+  at all gives `host: null` and a warning naming why; the rest of the grant still holds, for a
+  loopback client that dials `127.0.0.1`.
+- A VPN that takes the default route with a private address is chosen like a LAN: the address it
+  reports is then the tunnel's.
 
 #### The listener's certificate
 

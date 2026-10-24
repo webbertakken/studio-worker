@@ -17,7 +17,7 @@ use crate::job_run::JobRun;
 use crate::runtime::{CurrentJob, JobOutcome, JobSource, WorkerObservers};
 use crate::types::TaskKind;
 use chrono::Utc;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +42,38 @@ const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 type Tls = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 type Socket = WebSocket<Tls>;
+
+/// Where the route to the outside is looked up for (TEST-NET-1, RFC 5737):
+/// connecting a UDP socket only consults the routing table, nothing is sent.
+pub const ROUTE_PROBE: &str = "192.0.2.1:9";
+
+/// Why the machine has no address a LAN client could dial.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NoLanAddress {
+    #[error("no route to the outside: {0}")]
+    NoRoute(String),
+    #[error("{0} is not a private IPv4 address")]
+    NotPrivate(IpAddr),
+}
+
+/// The source address the kernel picks for traffic leaving by the default
+/// route: the interface that faces the LAN, never a bridge (docker, LXC)
+/// or loopback, whose routes stay local.
+pub fn route_source() -> std::io::Result<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect(ROUTE_PROBE)?;
+    Ok(socket.local_addr()?.ip())
+}
+
+/// [source] as the address a LAN client dials: a private IPv4 address
+/// (RFC 1918), or why it is none.
+pub fn lan_address(source: std::io::Result<IpAddr>) -> Result<Ipv4Addr, NoLanAddress> {
+    match source {
+        Ok(IpAddr::V4(v4)) if v4.is_private() => Ok(v4),
+        Ok(other) => Err(NoLanAddress::NotPrivate(other)),
+        Err(e) => Err(NoLanAddress::NoRoute(e.to_string())),
+    }
+}
 
 /// Where a client streams: the bound port and the certificate it pins.
 /// Public; the loopback API hands it out with every stream grant.
@@ -756,6 +788,60 @@ mod tests {
             connect_to(&h, "/elsewhere", &token(&h)).err(),
             Some(Refused::Status(404))
         );
+    }
+
+    fn v4(s: &str) -> std::io::Result<IpAddr> {
+        Ok(s.parse().unwrap())
+    }
+
+    #[test]
+    fn a_private_ipv4_source_is_the_lan_address() {
+        for ok in ["192.168.1.133", "10.1.0.4", "172.16.0.9", "172.31.255.1"] {
+            assert_eq!(lan_address(v4(ok)), Ok(ok.parse().unwrap()), "{ok}");
+        }
+    }
+
+    #[test]
+    fn no_address_a_phone_cannot_dial_is_a_lan_address() {
+        for not in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "169.254.3.4",
+            "100.64.0.7",
+            "100.127.1.1",
+            "8.8.8.8",
+            "172.32.0.1",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+        ] {
+            assert_eq!(
+                lan_address(v4(not)),
+                Err(NoLanAddress::NotPrivate(not.parse().unwrap())),
+                "{not}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_route_is_no_lan_address() {
+        let unreachable = std::io::Error::from(std::io::ErrorKind::NetworkUnreachable);
+        assert!(matches!(
+            lan_address(Err(unreachable)),
+            Err(NoLanAddress::NoRoute(_))
+        ));
+    }
+
+    #[test]
+    fn the_route_source_is_never_loopback() {
+        // Wherever the tests run with a network, the kernel's source for the
+        // outside is a real interface, never lo (a box with no route errs).
+        if let Ok(source) = route_source() {
+            assert!(
+                !source.is_loopback() && !source.is_unspecified(),
+                "{source}"
+            );
+        }
     }
 
     #[test]
