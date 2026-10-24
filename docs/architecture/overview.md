@@ -179,7 +179,7 @@ src/
 │   ├── vad.rs        Energy voice-activity detection (hands-free finalise).
 │   ├── tokens.rs     Short-lived stream tokens (stored hashed).
 │   ├── tls.rs        The listener's self-signed certificate: made once, kept, pinned.
-│   └── server.rs     LAN WebSocket listener over TLS; one session per loaded model's lane.
+│   └── server.rs     LAN WebSocket listener over TLS, and its LAN address; one session per lane.
 ├── setup.rs          `setup`: the tray UI's login entry, start the tray UI, print guidance.
 ├── legacy_service.rs Removes the headless service older versions installed (tray UI start).
 ├── exe_watch.rs      Notices a replaced launch path so the tray UI restarts on the new binary.
