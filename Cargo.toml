@@ -117,7 +117,7 @@ tokenizers = { version = "0.22", optional = true, default-features = false, feat
 hf-hub = { version = "0.4", optional = true, default-features = false, features = [
     "ureq",
 ] }
-gif = { version = "0.13", optional = true }
+gif = { version = "0.14", optional = true }
 # ONNX Runtime (pykeio/ort) for the LaMa object-removal image engine.
 # `download-binaries` fetches a prebuilt ONNX Runtime for the build
 # target (covers all five cargo-dist targets: win-msvc x64, linux-gnu
