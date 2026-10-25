@@ -45,4 +45,20 @@ ignore = [
     # Drop these when notify-rust / the tray stack bump quick-xml.
     "RUSTSEC-2026-0194", # quick-xml      — UI notification/tray XML (ui)
     "RUSTSEC-2026-0195", # quick-xml      — UI notification/tray XML (ui)
+    # zbus 5's split-out crates, now merged into zbus 6 and unmaintained.
+    # `ksni` and `notify-rust` (the Linux tray and notifications) still
+    # pin zbus `^5` in their latest releases.  Informational only; drop
+    # these once both move to zbus 6.
+    "RUSTSEC-2026-0370", # zvariant        — merged into zbus 6 (ui)
+    "RUSTSEC-2026-0371", # zbus_names      — merged into zbus 6 (ui)
+    "RUSTSEC-2026-0372", # zvariant_derive — merged into zbus 6 (ui)
+    # zip 8 extraction advisories (SUID bits, symlink targets).  The
+    # worker itself is on zip 9; zip 8 remains only through
+    # candle-core 0.11 (the opt-in `image-candle` feature, not shipped),
+    # which pins `^8.6` in its latest release and uses zip solely to read
+    # `.npz` tensors in memory, never `extract()`.  Drop these when
+    # candle-core moves to zip 9.
+    "RUSTSEC-2026-0367", # zip 8           — candle-core .npz reader (image-candle)
+    "RUSTSEC-2026-0368", # zip 8           — candle-core .npz reader (image-candle)
+    "RUSTSEC-2026-0369", # zip 8           — candle-core .npz reader (image-candle)
 ]

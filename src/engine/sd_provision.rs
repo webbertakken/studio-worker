@@ -396,11 +396,15 @@ fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<usize> {
         if entry.is_dir() {
             continue;
         }
-        let Some(file_name) = Path::new(entry.name()).file_name().map(|n| n.to_owned()) else {
+        let entry_name = entry
+            .name()
+            .with_context(|| format!("reading entry {i}'s name in {}", zip_path.display()))?
+            .into_owned();
+        let Some(file_name) = Path::new(&entry_name).file_name().map(|n| n.to_owned()) else {
             warn!(
                 target: TRACE_TARGET,
                 op = "extract",
-                name = entry.name(),
+                name = entry_name,
                 "skipping zip entry with no file name"
             );
             continue;
@@ -423,7 +427,8 @@ fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<usize> {
 fn apply_unix_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if let Some(mode) = mode {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        let permission_bits_only = mode & 0o777;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(permission_bits_only))
             .with_context(|| format!("chmod {}", path.display()))?;
     }
     Ok(())
@@ -970,7 +975,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             zw.start_file("sd-cli", opts).unwrap();
             zw.write_all(b"binary").unwrap();
@@ -1010,7 +1015,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             zw.add_directory("build/", opts).unwrap();
             zw.start_file("sd-cli", opts).unwrap();
@@ -1046,7 +1051,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .unix_permissions(0o755);
             zw.start_file("sd-cli", opts).unwrap();
@@ -1060,6 +1065,31 @@ mod tests {
             .permissions()
             .mode();
         assert!(mode & 0o111 != 0, "exec bit must survive: {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_drops_setuid_setgid_and_sticky_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("suid.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let regular_file_with_suid_sgid_sticky = (0o100000 | 0o7755) << 16;
+            let opts = zip::write::SimpleFileOptions::default()
+                .external_attributes(regular_file_with_suid_sgid_sticky);
+            zw.start_file("sd-cli", opts).unwrap();
+            zw.write_all(b"#!/bin/sh\n").unwrap();
+            zw.finish().unwrap();
+        }
+        let dest = dir.path().join("out");
+        extract_zip(&zip_path, &dest).unwrap();
+        let mode = std::fs::metadata(dest.join("sd-cli"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755, "only rwx bits may survive: {mode:o}");
     }
 
     #[cfg(unix)]
