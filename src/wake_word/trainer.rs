@@ -260,7 +260,8 @@ pub fn generators(spec: &TrainingSpec) -> Vec<Download> {
         .collect()
 }
 
-#[cfg(test)]
+// The trainer runs on Linux only: its paths and `PYTHONPATH` are spelled the Unix way.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::wake_word::recipe::datasets;

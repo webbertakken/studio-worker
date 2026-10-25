@@ -164,10 +164,13 @@ fn a_training_is_accepted_followed_and_listed() {
     assert_eq!(training["name"], "hey_runa");
     assert_eq!(training["phrase"], "hey runa");
     assert_eq!(training["state"], "running");
-    assert!(training["outputDir"]
-        .as_str()
-        .unwrap()
-        .ends_with(&format!("wake-word/models/hey_runa/{id}")));
+    let output = std::path::PathBuf::from(training["outputDir"].as_str().unwrap());
+    assert!(output.ends_with(
+        std::path::Path::new("wake-word")
+            .join("models")
+            .join("hey_runa")
+            .join(&id)
+    ));
 
     let training = ended(&api, &id);
     assert_eq!(training["state"], "failed");

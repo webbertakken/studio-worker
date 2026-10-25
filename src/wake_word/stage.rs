@@ -357,11 +357,22 @@ fn log_event(stage: &str, event: &Event, last_progress: &mut Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt as _;
+
+    #[cfg(unix)]
+    fn status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn status(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
 
     fn exited(code: i32) -> Ended {
         Ended::Exited {
-            status: std::process::ExitStatus::from_raw(code << 8),
+            status: status(code),
             tail: "last line".into(),
         }
     }
