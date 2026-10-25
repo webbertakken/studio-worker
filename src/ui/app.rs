@@ -286,7 +286,7 @@ impl App {
             .exact_size(chrome::RAIL_WIDTH)
             .resizable(false)
             .frame(chrome_frame)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 if let Some(page) = chrome::rail(ui, self.page, crate::AGENT_VERSION) {
                     self.page = page;
                 }
@@ -295,7 +295,7 @@ impl App {
             .exact_size(chrome::HEADER_HEIGHT)
             .resizable(false)
             .frame(chrome_frame.inner_margin(egui::Margin::symmetric(20, 8)))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 if let Some(paused) = chrome::header(ui, &pulse, glow) {
                     self.deps.actions.run(Action::SetPaused(paused));
                 }
@@ -304,7 +304,7 @@ impl App {
             .exact_size(chrome::STATUS_BAR_HEIGHT)
             .resizable(false)
             .frame(chrome_frame.inner_margin(egui::Margin::symmetric(16, 0)))
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let feedback = self.deps.actions.feedback.lock().clone();
                 chrome::status_bar(ui, &link.summary(), feedback.as_ref());
             });
@@ -314,7 +314,7 @@ impl App {
                     .fill(p.page)
                     .inner_margin(egui::Margin::same(20)),
             )
-            .show_inside(ui, |ui| self.render_page(ui, &link, &pulse, glow));
+            .show(ui, |ui| self.render_page(ui, &link, &pulse, glow));
 
         // The poller updates the replica asynchronously; keep repainting so
         // durations tick, and more often while running work glows.
@@ -653,7 +653,9 @@ mod tests {
                 .push(egui::ViewportEvent::Close);
         }
         let mut frame = eframe::Frame::_new_kittest();
-        let out = ctx.run_ui(raw, |ui| eframe::App::logic(app, ui.ctx(), &mut frame));
+        let mut out = ctx.run_ui(raw, |ui| eframe::App::logic(app, ui.ctx(), &mut frame));
+        // egui insists a frame's texture changes are handled; there is no renderer here.
+        out.textures_delta.clear();
         out.viewport_output[&egui::ViewportId::ROOT]
             .commands
             .clone()

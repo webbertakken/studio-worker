@@ -90,12 +90,7 @@ fn rail_item(ui: &mut egui::Ui, page: Page, current: Page) -> bool {
     );
     let rect = egui::Rect::from_center_size(outer.center(), vec2(width, RAIL_ITEM_HEIGHT));
     response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::SelectableLabel,
-            true,
-            selected,
-            page.label(),
-        )
+        egui::WidgetInfo::selected(egui::Role::Button, true, selected, page.label())
     });
     let radius = CornerRadius::same(CONTROL_RADIUS * 2);
     if selected {
@@ -333,22 +328,29 @@ mod tests {
     fn ctrl_digit_picks_a_page() {
         let ctx = egui::Context::default();
         let input = egui::RawInput {
-            modifiers: Modifiers::COMMAND,
-            events: vec![egui::Event::Key {
-                key: Key::Num4,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: Modifiers::COMMAND,
-            }],
+            events: vec![
+                egui::Event::ModifiersChanged(Modifiers::COMMAND),
+                egui::Event::Key {
+                    key: Key::Num4,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::COMMAND,
+                },
+            ],
             ..Default::default()
         };
         let mut picked = None;
-        let _ = ctx.run_ui(input, |ui| picked = page_shortcut(ui.ctx()));
+        // egui insists a frame's texture changes are handled; there is no renderer here.
+        ctx.run_ui(input, |ui| picked = page_shortcut(ui.ctx()))
+            .textures_delta
+            .clear();
         assert_eq!(picked, Some(Page::Logs));
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             picked = page_shortcut(ui.ctx())
-        });
+        })
+        .textures_delta
+        .clear();
         assert_eq!(picked, None);
     }
 

@@ -448,13 +448,10 @@ pub fn parse_checksum_file(text: &str) -> Option<String> {
 
 /// sha256 a file on disk and compare against the expected hex digest.
 pub fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<()> {
-    use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening {} for hashing", path.display()))?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hashing {}", path.display()))?;
-    let actual: String = hasher
-        .finalize()
+    let actual: String = crate::engine::download::sha256_of(&mut file)
+        .with_context(|| format!("hashing {}", path.display()))?
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
