@@ -172,11 +172,11 @@ pub fn shows_copied(clicked_at: Option<f64>, now: f64) -> bool {
 /// for a moment.  `id_salt` keeps several apart.
 pub fn copy_button(
     ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash,
+    id_salt: impl egui::AsIdSalt,
     label: &str,
     text: &str,
 ) -> egui::Response {
-    let id = ui.id().with(("copy", id_salt));
+    let id = ui.scope_id().with(("copy", id_salt));
     let now = ui.input(|i| i.time);
     let clicked_at: Option<f64> = ui.data(|d| d.get_temp(id));
     let copied = shows_copied(clicked_at, now);
