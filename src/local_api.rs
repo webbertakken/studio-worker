@@ -53,6 +53,7 @@ use crate::types::{
 mod mesh;
 mod picture;
 mod vision;
+mod wake_word;
 
 const TRACE_TARGET: &str = "studio_worker::local_api";
 const POLL: Duration = Duration::from_millis(200);
@@ -166,6 +167,9 @@ pub struct LocalApi {
     /// The daemon's runtime handles, for the `/daemon/*` routes.  `None`
     /// answers them `503 daemon_control_unavailable`.
     control: Option<crate::control::DaemonControl>,
+    /// Wake word trainings, for the `/wake-words` routes.  `None` answers them
+    /// `503 wake_words_unavailable`.
+    wake_words: Option<crate::wake_word::WakeWords>,
 }
 
 /// What the local API offers besides one-off jobs: the model host, and the
@@ -426,12 +430,19 @@ impl LocalApi {
             models_root,
             services,
             control: None,
+            wake_words: None,
         })
     }
 
     /// Serve the `/daemon/*` routes with `control`.
     pub fn with_control(mut self, control: crate::control::DaemonControl) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    /// Serve the `/wake-words` routes with `wake_words`.
+    pub fn with_wake_words(mut self, wake_words: crate::wake_word::WakeWords) -> Self {
+        self.wake_words = Some(wake_words);
         self
     }
 
@@ -544,6 +555,10 @@ impl LocalApi {
             (Method::Post, "/models") => self.handle_add_model(request),
             (Method::Get, "/jobs") => self.handle_jobs(request),
             (Method::Post, "/stream-tokens") => self.handle_stream_token(request),
+            (_, p) if wake_word::is_route(p) => {
+                let path = p.to_string();
+                self.handle_wake_words(request, &method, &path)
+            }
             (Method::Post, p) if vision::Route::of(p).is_some() => {
                 let route = vision::Route::of(p).expect("matched just above");
                 self.handle_vision(request, route)

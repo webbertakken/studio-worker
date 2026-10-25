@@ -1108,6 +1108,11 @@ pub fn spawn_local_api(
     *observers.model_host.lock() = Some(host.clone());
     let services = crate::local_api::ModelServices::new(host.clone());
     spawn_stream_listener(&cfg, config_path, &services, &observers, stop.clone());
+    let wake_words = crate::wake_word::WakeWords::new(
+        cfg.lock().models_root.clone(),
+        observers.clone(),
+        gate.clone(),
+    );
     let api = crate::local_api::LocalApi::bind(
         &format!("127.0.0.1:{port}"),
         engine.clone(),
@@ -1134,7 +1139,9 @@ pub fn spawn_local_api(
     });
 
     let api = match api {
-        Ok(api) => api.with_control(control.clone()),
+        Ok(api) => api
+            .with_control(control.clone())
+            .with_wake_words(wake_words),
         Err(err) => {
             tracing::warn!(target: "studio_worker::local_api", error = %err, "local api: bind failed");
             return None;
