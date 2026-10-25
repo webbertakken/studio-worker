@@ -5794,7 +5794,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tiny_http",
- "tokenizers 0.22.2",
+ "tokenizers 0.23.2",
  "tokio",
  "tokio-tungstenite",
  "toml",
