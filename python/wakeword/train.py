@@ -42,8 +42,10 @@ def _feature_sets(request):
     for negative in request["datasets"]["negativeFeatures"]:
         name = negative["name"]
         sets.append(feature_set(os.path.join(root, "negative-features", name), name, False, None))
-    for group in sorted({s["group"] for s in request["datasets"]["speech"] if s["split"] == "training"}):
-        sets.append(feature_set(os.path.join(root, f"{group}-features"), group, False, "random"))
+    # Every speech group: one weighed 0 is never sampled, and its validation_ambient audio joins
+    # the audio upstream counts false accepts on when it picks the checkpoint to keep.
+    for group in sorted({s["group"] for s in request["datasets"]["speech"]}):
+        sets.append(feature_set(os.path.join(root, f"{group}-features"), group, False, None))
     return sets
 
 

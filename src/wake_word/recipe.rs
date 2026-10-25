@@ -355,7 +355,8 @@ pub fn default_settings() -> Settings {
     };
     Settings {
         seed: 1,
-        device_memory_budget_gib: 6.0,
+        // Training validates on 22 h of ambient windows in one GPU tensor (CHiME-6 + MLS Dutch dev).
+        device_memory_budget_gib: 10.0,
         samples: SampleSettings {
             positive_per_language: 10_000,
             near_miss_per_phrase_per_language: 1_000,
@@ -413,6 +414,8 @@ pub fn default_settings() -> Settings {
                     ("no_speech", weight(5.0, 1.0)),
                     ("dinner_party_eval", weight(0.0, 1.0)),
                     ("mls-dutch", weight(3.0, 1.0)),
+                    // Never sampled: its validation audio only weighs which checkpoint is kept.
+                    ("mls-dutch-eval", weight(0.0, 1.0)),
                 ]
                 .map(|(k, v)| (k.to_string(), v)),
             ),
@@ -435,15 +438,14 @@ pub fn default_settings() -> Settings {
 }
 
 /// The feature sets the training's weights must name: positives, near misses, each negative
-/// feature set and each speech group trained on.
+/// feature set and each speech group (a group weighed 0 is never sampled: its validation audio only
+/// counts when upstream picks the checkpoint to keep).
 pub fn weighted_sets(datasets: &[Download]) -> Vec<String> {
     let mut names = vec!["positive".to_string(), "nearMiss".to_string()];
     for d in datasets {
         match &d.role {
             Role::NegativeFeatures => names.push(d.name.clone()),
-            Role::Speech { group, split }
-                if *split == "training" && !names.iter().any(|n| n == group) =>
-            {
+            Role::Speech { group, .. } if !names.iter().any(|n| n == group) => {
                 names.push((*group).to_string());
             }
             _ => {}
@@ -476,6 +478,14 @@ mod tests {
                 source.name
             );
         }
+    }
+
+    #[test]
+    fn the_dutch_validation_audio_is_weighed_but_never_trained_on() {
+        let sets = weighted_sets(&datasets());
+        assert!(sets.contains(&"mls-dutch-eval".to_string()), "{sets:?}");
+        let weight = default_settings().training.feature_weights["mls-dutch-eval"];
+        assert_eq!(weight.sampling_weight, 0.0);
     }
 
     #[test]
