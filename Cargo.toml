@@ -65,7 +65,7 @@ sentry = { version = "0.48", default-features = false, features = [
     "rustls",
 ] }
 sentry-tracing = "0.48"
-parking_lot = "0.12"
+parking_lot = "0.13"
 url = "2.5"
 chrono = { version = "0.4", features = ["clock", "serde"], default-features = false }
 hound = "3.5.1"
