@@ -130,7 +130,9 @@ gif = { version = "0.13", optional = true }
 # crate links nothing native at build time (so the binary cross-compiles on every cargo-dist target
 # with no glibc/libstdc++/MSVC-CRT prebuilt-link issues), and the ONNX Runtime shared library is
 # downloaded per-platform at runtime by `onnx_provision` and located via `ORT_DYLIB_PATH`.
-ort = { version = "2.0.0-rc.10", optional = true, default-features = false, features = [
+# Exact: ort's release candidates break their API (rc.15 changed `Session::builder`), and
+# parakeet-rs 0.3.8 builds against rc.13 only.
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
     "std",
     "ndarray",
     "tracing",
