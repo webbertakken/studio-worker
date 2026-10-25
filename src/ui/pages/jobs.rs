@@ -659,7 +659,7 @@ fn job_card(
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), CARD_HEIGHT), Sense::click());
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, is_selected, card.title())
+        egui::WidgetInfo::selected(egui::Role::Button, true, is_selected, card.title())
     });
 
     let fill = if is_selected || response.hovered() {
@@ -883,7 +883,7 @@ fn detail_image(
         .on_hover_text("View larger (Enter)")
         .on_hover_cursor(egui::CursorIcon::ZoomIn);
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "View the image larger")
+        egui::WidgetInfo::labeled(egui::Role::Button, true, "View the image larger")
     });
     if response.has_focus() {
         let p = Palette::of_ui(ui);
@@ -964,7 +964,7 @@ fn render_lightbox(
     let p = Palette::of_ui(ui);
     let screen = ui.ctx().content_rect().size();
     let max = vec2(screen.x * 0.8, screen.y * 0.75);
-    let modal = egui::Modal::new(egui::Id::new("job-lightbox"))
+    let modal = egui::Modal::new(egui::Id::unique("job-lightbox"))
         .frame(widgets::card_frame(p))
         .show(ui.ctx(), |ui| {
             let size = fit(texture.size_vec2(), max, 3.0);
