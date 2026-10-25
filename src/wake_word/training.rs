@@ -13,6 +13,7 @@ use serde::Serialize;
 use super::cutoff::{self, Evaluation, Split};
 use super::error::TrainingError;
 use super::manifest;
+use super::own_voice::{OwnVoice, OwnVoiceRecall};
 use super::recipe::{self, Download, ENVIRONMENT};
 use super::report::{self, Phonemes, StageTiming};
 use super::request::TrainingSpec;
@@ -25,6 +26,7 @@ use crate::job_gate::JobGate;
 use crate::job_run::JobRun;
 use crate::runtime::{truncate_prompt, CurrentJob, JobOutcome, JobSource, WorkerObservers};
 use crate::types::TaskKind;
+use crate::voice_samples::{Held, StoreError, VoiceSamples};
 
 /// The job's model, as the Jobs page shows it.
 pub const MODEL: &str = "microwakeword";
@@ -69,6 +71,8 @@ pub struct TrainingResult {
     /// On the testing ambient sets, pooled, at the cutoff.
     pub false_accepts_per_hour: f64,
     pub target_met: bool,
+    /// Recall on the held-out own-voice takes at the cutoff; `None` without recording sets.
+    pub own_voice_recall: Option<OwnVoiceRecall>,
 }
 
 /// A training, as the API answers it.
@@ -92,8 +96,15 @@ pub struct Training {
 pub enum Refusal {
     Busy,
     UnsupportedPlatform(String),
-    InsufficientDisk { needed_bytes: u64, free_bytes: u64 },
+    InsufficientDisk {
+        needed_bytes: u64,
+        free_bytes: u64,
+    },
     Unavailable(String),
+    /// A named recording set does not exist, or the sets cannot be split.
+    InvalidVoiceSamples(String),
+    /// The request names recording sets, and this worker keeps none.
+    VoiceSamplesUnavailable,
 }
 
 /// Why a training cannot be cancelled.
@@ -229,6 +240,7 @@ struct Inner {
     gate: JobGate,
     backend: Backend,
     trainings: Mutex<Vec<Entry>>,
+    voice_samples: Option<VoiceSamples>,
 }
 
 /// The local API's wake word trainings.
@@ -284,8 +296,36 @@ impl WakeWords {
                 gate,
                 backend,
                 trainings: Mutex::new(Vec::new()),
+                voice_samples: None,
             }),
         }
+    }
+
+    /// Train with the operator's recordings in `store` when a request names their sets.
+    pub fn with_voice_samples(mut self, store: VoiceSamples) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("configured before it is shared")
+            .voice_samples = Some(store);
+        self
+    }
+
+    /// Hold the sets `spec` names and split their takes; `None` when it names none.
+    fn own_voice(&self, spec: &TrainingSpec) -> Result<Option<(Held, OwnVoice)>, Refusal> {
+        if spec.voice_samples.is_empty() {
+            return Ok(None);
+        }
+        let Some(store) = &self.inner.voice_samples else {
+            return Err(Refusal::VoiceSamplesUnavailable);
+        };
+        let held = store.hold(&spec.voice_samples).map_err(|e| match e {
+            StoreError::UnknownSet(set) => {
+                Refusal::InvalidVoiceSamples(format!("voiceSamples: no set named {set}"))
+            }
+            other => Refusal::Unavailable(format!("reading the recordings: {other}")),
+        })?;
+        let own = OwnVoice::split(&spec.voice_samples, &held.takes)
+            .map_err(Refusal::InvalidVoiceSamples)?;
+        Ok(Some((held, own)))
     }
 
     /// Start a training on its own thread, or say why not.
@@ -311,6 +351,13 @@ impl WakeWords {
                 );
             }
         }
+        let own_voice = match self.own_voice(&spec) {
+            Ok(own_voice) => own_voice,
+            Err(refusal) => {
+                let why = format!("{refusal:?}");
+                return refuse(refusal, &why);
+            }
+        };
         let Some(reservation) = inner.gate.try_reserve() else {
             return refuse(Refusal::Busy, "another job holds the worker");
         };
@@ -362,7 +409,12 @@ impl WakeWords {
             .name(format!("wake-word-{id}"))
             .spawn(move || {
                 let _reservation = reservation;
-                service.run(&id, spec, capability, started_at, &cancel);
+                // The hold lasts as long as the training: no upload to its sets, no delete.
+                let (_held, own) = match own_voice {
+                    Some((held, own)) => (Some(held), Some(own)),
+                    None => (None, None),
+                };
+                service.run(&id, spec, own.as_ref(), capability, started_at, &cancel);
             });
         if let Err(e) = spawned {
             let message = format!("could not start the training's thread: {e}");
@@ -459,6 +511,7 @@ impl WakeWords {
         &self,
         id: &str,
         spec: TrainingSpec,
+        own: Option<&OwnVoice>,
         capability: ComputeCapability,
         started_at: DateTime<Utc>,
         cancel: &AtomicBool,
@@ -476,7 +529,10 @@ impl WakeWords {
         );
         let wall = Instant::now();
         let outcome = job.span().in_scope(|| {
-            let outcome = self.train(id, &spec, capability, started_at, cancel);
+            let outcome = self.train(id, &spec, own, capability, started_at, cancel);
+            if own.is_some() {
+                remove_own_voice(&self.inner.paths.run(id));
+            }
             match &outcome {
                 Ok(result) => tracing::info!(
                     target: TRACE_TARGET,
@@ -515,6 +571,7 @@ impl WakeWords {
         &self,
         id: &str,
         spec: &TrainingSpec,
+        own: Option<&OwnVoice>,
         capability: ComputeCapability,
         started_at: DateTime<Utc>,
         cancel: &AtomicBool,
@@ -560,6 +617,7 @@ impl WakeWords {
             &run_dir,
             &provisioned.environment,
             &inner.backend.datasets,
+            own,
         );
         std::fs::write(
             &request,
@@ -624,6 +682,7 @@ impl WakeWords {
             &mut timings,
             started,
             &provisioned,
+            own,
         )?;
         for bulk in ["samples", "features"] {
             let dir = run_dir.join(bulk);
@@ -678,6 +737,7 @@ impl WakeWords {
         timings: &mut Vec<StageTiming>,
         started: Instant,
         provisioned: &Provisioned,
+        own: Option<&OwnVoice>,
     ) -> Result<TrainingResult, TrainingError> {
         let invalid = |message: String| TrainingError::InvalidOutput {
             stage: "evaluate".into(),
@@ -688,6 +748,18 @@ impl WakeWords {
         let evaluation: Evaluation =
             serde_json::from_slice(&text).map_err(|e| invalid(format!("evaluation.json: {e}")))?;
         evaluation.check().map_err(invalid)?;
+        if let Some(own) = own {
+            let measured = evaluation
+                .own_voice
+                .as_ref()
+                .map_or(0, |o| o.held_out.len());
+            if measured != own.held_out.len() {
+                return Err(invalid(format!(
+                    "it measured {measured} held-out own-voice takes of {}",
+                    own.held_out.len()
+                )));
+            }
+        }
         let model = PathBuf::from(&evaluation.model.path);
         if !model.is_file() {
             return Err(invalid(format!("no model at {}", model.display())));
@@ -741,6 +813,7 @@ impl WakeWords {
             datasets: self.inner.backend.datasets.clone(),
             generators: trainer::generators(spec),
             tensor_arena_size: arena,
+            own_voice: own,
         });
         let report_out = out.join("report.json");
         std::fs::write(
@@ -760,7 +833,30 @@ impl WakeWords {
             recall: testing_recall,
             false_accepts_per_hour: testing_rate,
             target_met: choice.target_met,
+            own_voice_recall: report.own_voice.as_ref().map(|o| o.recall),
         })
+    }
+}
+
+/// Remove what a training derived from the operator's takes: links to them and their features.
+/// Their audio stays only in the store.
+fn remove_own_voice(run_dir: &Path) {
+    let mut dirs = vec![run_dir.join("own_voice")];
+    if let Ok(entries) = std::fs::read_dir(run_dir.join("features")) {
+        dirs.extend(entries.flatten().map(|e| e.path()).filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("own_"))
+        }));
+    }
+    for dir in dirs {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(target: TRACE_TARGET, op = "wake_word", dir = %dir.display(), error = %e,
+                "could not remove what the training derived from the operator's takes")
+            }
+        }
     }
 }
 

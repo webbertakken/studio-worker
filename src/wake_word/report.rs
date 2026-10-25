@@ -9,10 +9,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::cutoff::{accepted_share, poisson_upper_95, Choice, Evaluation, Split};
+use super::own_voice::{OwnVoice, OwnVoiceRecall};
 use super::recipe::{Download, ENVIRONMENT};
 use super::request::{slug, TrainingSpec};
 use super::settings::Settings;
 use crate::engine::torch::recipe::Source;
+use crate::voice_samples::TakeFile;
 
 /// Grid points shown on each side of the chosen cutoff in the report's table.
 const TABLE_REACH: usize = 5;
@@ -134,6 +136,22 @@ pub struct Report {
     pub gpu: Option<String>,
     pub recipe: RecipeFacts,
     pub caveats: Vec<String>,
+    /// The operator's own takes, when the training named recording sets.
+    pub own_voice: Option<OwnVoiceReport>,
+}
+
+/// What a training learned from, and measured on, the operator's own takes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnVoiceReport {
+    pub sets: Vec<String>,
+    pub trained_positive: usize,
+    pub near_miss: usize,
+    pub speech: usize,
+    /// On the held-out takes, at the cutoff.
+    pub recall: OwnVoiceRecall,
+    /// Every take used (set, kind, number, phrase, sha256): never its audio or its path.
+    pub takes: Vec<TakeFile>,
 }
 
 /// Everything a report is built from.
@@ -151,6 +169,7 @@ pub struct Facts<'a> {
     pub datasets: Vec<Download>,
     pub generators: Vec<Download>,
     pub tensor_arena_size: u64,
+    pub own_voice: Option<&'a OwnVoice>,
 }
 
 fn ambient_result(name: &str, hours: f64, count: u64) -> AmbientResult {
@@ -289,6 +308,24 @@ pub fn build(facts: Facts<'_>) -> Report {
              non-commercial use."
                 .into(),
         ],
+        own_voice: facts.own_voice.map(|own| {
+            let scores = e.own_voice.as_ref().map(|o| o.held_out.as_slice()).unwrap_or(&[]);
+            OwnVoiceReport {
+                sets: own.sets.clone(),
+                trained_positive: own.train_positive.len(),
+                near_miss: own.near_miss.len(),
+                speech: own.speech.len(),
+                recall: OwnVoiceRecall::at(scores, facts.choice.cutoff),
+                takes: own
+                    .train_positive
+                    .iter()
+                    .chain(&own.held_out)
+                    .chain(&own.near_miss)
+                    .chain(&own.speech)
+                    .cloned()
+                    .collect(),
+            }
+        }),
     }
 }
 
@@ -401,6 +438,23 @@ pub fn markdown(report: &Report) -> String {
         );
     }
 
+    if let Some(own) = &report.own_voice {
+        let _ = writeln!(out, "\n## Your own voice\n");
+        let r = own.recall;
+        let _ = writeln!(
+            out,
+            "At the cutoff the model heard {} of {} held-out takes ({}), from set {}; {} positive, {} near-miss and {} speech takes trained.",
+            r.accepted,
+            r.held_out,
+            percent(r.recall),
+            own.sets.join(", "),
+            own.trained_positive,
+            own.near_miss,
+            own.speech
+        );
+        let _ = writeln!(out, "\nThe takes it used, by sha256, are in `report.json`.");
+    }
+
     let _ = writeln!(out, "\n## How the voices read it\n");
     let _ = writeln!(out, "| Language | Role | Text | Phonemes |");
     let _ = writeln!(out, "| --- | --- | --- | --- |");
@@ -486,11 +540,14 @@ mod tests {
     use crate::wake_word::request;
 
     fn report() -> Report {
+        report_with(evaluation(), None)
+    }
+
+    fn report_with(e: Evaluation, own_voice: Option<&OwnVoice>) -> Report {
         let spec = request::parse(
             br#"{"phrase":"hey runa","languages":["en","nl"],"negatives":["hey luna"]}"#,
         )
         .unwrap();
-        let e = evaluation();
         let choice = choose(&e, 0.5);
         let started = "2026-10-25T10:00:00Z".parse().unwrap();
         build(Facts {
@@ -517,7 +574,59 @@ mod tests {
             datasets: datasets(),
             generators: vec![Language::En.generator()],
             tensor_arena_size: 32_768,
+            own_voice,
         })
+    }
+
+    #[test]
+    fn own_voice_recall_is_reported_apart_with_its_takes() {
+        use crate::voice_samples::{Kind, TakeFile};
+        let take = |kind, number| TakeFile {
+            set: "s1".into(),
+            kind,
+            number,
+            phrase: None,
+            path: "/never/in/the/report.wav".into(),
+            sha256: format!("{number:064}"),
+        };
+        let takes: Vec<TakeFile> = (1..=8)
+            .map(|n| take(Kind::Positive, n))
+            .chain([take(Kind::Speech, 1)])
+            .collect();
+        let own = OwnVoice::split(&["s1".into()], &takes).unwrap();
+        let mut e = evaluation();
+        e.own_voice = Some(crate::wake_word::cutoff::OwnVoiceScores {
+            held_out: vec![0.95, 0.4],
+        });
+        let r = report_with(e, Some(&own));
+        let own_report = r.own_voice.as_ref().unwrap();
+        assert_eq!(
+            own_report.recall,
+            OwnVoiceRecall {
+                recall: 0.5,
+                accepted: 1,
+                held_out: 2
+            }
+        );
+        assert_eq!(
+            (
+                own_report.trained_positive,
+                own_report.near_miss,
+                own_report.speech
+            ),
+            (6, 0, 1)
+        );
+        assert_eq!(own_report.takes.len(), 9);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("/never/in/the/report.wav"),
+            "no path to a take"
+        );
+        let md = markdown(&r);
+        assert!(md.contains("## Your own voice"), "{md}");
+        assert!(md.contains("heard 1 of 2 held-out takes (50.0%)"), "{md}");
+        assert!(report().own_voice.is_none());
+        assert!(!markdown(&report()).contains("Your own voice"));
     }
 
     #[test]

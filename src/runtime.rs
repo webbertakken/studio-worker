@@ -1042,7 +1042,11 @@ fn spawn_stream_listener(
         services.host.clone(),
         services.tokens.clone(),
         observers.clone(),
-    ) {
+    )
+    .map(|server| match &services.voice_samples {
+        Some(store) => server.with_voice_samples(services.voice_tokens.clone(), store.clone()),
+        None => server,
+    }) {
         Ok(server) => {
             let endpoint = server.endpoint();
             tracing::info!(target: "studio_worker::stt_stream", addr = %server.local_addr(), cert_sha256 = %endpoint.cert_sha256, "stream listener listening (wss)");
@@ -1106,13 +1110,21 @@ pub fn spawn_local_api(
         )),
     );
     *observers.model_host.lock() = Some(host.clone());
-    let services = crate::local_api::ModelServices::new(host.clone());
+    let mut services = crate::local_api::ModelServices::new(host.clone());
+    let voice_samples = crate::voice_samples::store::dir_for(config_path)
+        .map(crate::voice_samples::VoiceSamples::new);
+    if let Some(store) = &voice_samples {
+        services = services.with_voice_samples(store.clone());
+    }
     spawn_stream_listener(&cfg, config_path, &services, &observers, stop.clone());
-    let wake_words = crate::wake_word::WakeWords::new(
+    let mut wake_words = crate::wake_word::WakeWords::new(
         cfg.lock().models_root.clone(),
         observers.clone(),
         gate.clone(),
     );
+    if let Some(store) = voice_samples {
+        wake_words = wake_words.with_voice_samples(store);
+    }
     let api = crate::local_api::LocalApi::bind(
         &format!("127.0.0.1:{port}"),
         engine.clone(),

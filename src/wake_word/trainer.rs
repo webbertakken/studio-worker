@@ -133,6 +133,7 @@ pub fn request_json(
     run_dir: &Path,
     environment: &Environment,
     datasets: &[Download],
+    own_voice: Option<&super::own_voice::OwnVoice>,
 ) -> serde_json::Value {
     let piper = source_dir(environment, PIPER_SAMPLE_GENERATOR.name);
     let languages: Vec<_> = spec
@@ -201,6 +202,7 @@ pub fn request_json(
             })).collect::<Vec<_>>(),
         },
         "settings": spec.settings,
+        "ownVoice": own_voice.map(|own| own.request()),
     })
 }
 
@@ -295,7 +297,14 @@ mod tests {
         .unwrap();
         let paths = Paths::new(dir.path());
         let run = paths.run("local-1");
-        let json = request_json(&spec, &paths, &run, &environment(dir.path()), &datasets());
+        let json = request_json(
+            &spec,
+            &paths,
+            &run,
+            &environment(dir.path()),
+            &datasets(),
+            None,
+        );
         let root = dir.path().join("wake-word");
         assert_eq!(json["workDir"], path_of(&root.join("runs/local-1")));
         assert_eq!(json["languages"][0]["code"], "en");
@@ -341,6 +350,10 @@ mod tests {
         assert!(test.get("selectionHours").is_none());
         assert_eq!(json["evaluation"]["ambient"][2]["name"], "dipco");
         assert_eq!(json["settings"]["samples"]["positivePerLanguage"], 10_000);
+        assert!(
+            json["ownVoice"].is_null(),
+            "no recording sets, no own voice"
+        );
     }
 
     #[test]

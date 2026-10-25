@@ -56,6 +56,14 @@ fn refusal(refusal: Refusal) -> (u16, serde_json::Value) {
             (507, body)
         }
         Refusal::Unavailable(message) => (500, error("unavailable", message)),
+        Refusal::InvalidVoiceSamples(message) => (400, error("invalid_voice_samples", message)),
+        Refusal::VoiceSamplesUnavailable => (
+            503,
+            error(
+                "voice_samples_unavailable",
+                "the request names recording sets; this worker keeps none",
+            ),
+        ),
     }
 }
 
@@ -178,6 +186,14 @@ mod tests {
         assert_eq!(
             code(Refusal::Unavailable("x".into())),
             (500, "unavailable".into())
+        );
+        assert_eq!(
+            code(Refusal::InvalidVoiceSamples("x".into())),
+            (400, "invalid_voice_samples".into())
+        );
+        assert_eq!(
+            code(Refusal::VoiceSamplesUnavailable),
+            (503, "voice_samples_unavailable".into())
         );
         let (status, body) = refusal(Refusal::InsufficientDisk {
             needed_bytes: 30 * 1024 * 1024 * 1024,
