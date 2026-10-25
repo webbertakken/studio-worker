@@ -243,52 +243,47 @@ pub fn run(stage: StageRun<'_>) -> Result<StageDone, TrainingError> {
     let mut last_progress: Option<Instant> = None;
     let on_event = stage.on_event;
     let stop = stage.stop;
-    let ended = stream::run_until(
-        command,
-        stage.phase.timeout(),
-        || stop(),
-        |pipe, line| {
-            let _ = writeln!(log_file, "{line}");
-            match pipe {
-                Pipe::Stdout => match serde_json::from_str::<Event>(line) {
-                    Ok(event) => {
-                        log_event(name, &event, &mut last_progress);
-                        on_event(&event);
-                        match event {
-                            Event::Done {
+    let ended = stream::run_until(command, stage.phase.timeout(), stop, |pipe, line| {
+        let _ = writeln!(log_file, "{line}");
+        match pipe {
+            Pipe::Stdout => match serde_json::from_str::<Event>(line) {
+                Ok(event) => {
+                    log_event(name, &event, &mut last_progress);
+                    on_event(&event);
+                    match event {
+                        Event::Done {
+                            seconds,
+                            device_memory_peak_mib,
+                            summary,
+                            ..
+                        } => {
+                            done = Some(StageDone {
                                 seconds,
                                 device_memory_peak_mib,
                                 summary,
-                                ..
-                            } => {
-                                done = Some(StageDone {
-                                    seconds,
-                                    device_memory_peak_mib,
-                                    summary,
-                                })
-                            }
-                            Event::Failed { class, message } => failure = Some((class, message)),
-                            _ => {}
+                            })
                         }
+                        Event::Failed { class, message } => failure = Some((class, message)),
+                        _ => {}
                     }
-                    Err(_) => {
-                        tracing::debug!(target: TRACE_TARGET, op = "stage_line", stage = name, line)
-                    }
-                },
-                Pipe::Stderr => match line_level(line) {
-                    LineLevel::Warn => {
-                        tracing::warn!(target: TRACE_TARGET, op = "stage_line", stage = name, line)
-                    }
-                    LineLevel::Info => {
-                        tracing::info!(target: TRACE_TARGET, op = "stage_line", stage = name, line)
-                    }
-                    LineLevel::Debug => {
-                        tracing::debug!(target: TRACE_TARGET, op = "stage_line", stage = name, line)
-                    }
-                },
-            }
-        },
-    )
+                }
+                Err(_) => {
+                    tracing::debug!(target: TRACE_TARGET, op = "stage_line", stage = name, line)
+                }
+            },
+            Pipe::Stderr => match line_level(line) {
+                LineLevel::Warn => {
+                    tracing::warn!(target: TRACE_TARGET, op = "stage_line", stage = name, line)
+                }
+                LineLevel::Info => {
+                    tracing::info!(target: TRACE_TARGET, op = "stage_line", stage = name, line)
+                }
+                LineLevel::Debug => {
+                    tracing::debug!(target: TRACE_TARGET, op = "stage_line", stage = name, line)
+                }
+            },
+        }
+    })
     .map_err(|e| TrainingError::StageFailed {
         stage: name.into(),
         status: "not started".into(),

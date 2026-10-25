@@ -441,10 +441,10 @@ pub fn weighted_sets(datasets: &[Download]) -> Vec<String> {
     for d in datasets {
         match &d.role {
             Role::NegativeFeatures => names.push(d.name.clone()),
-            Role::Speech { group, split } if *split == "training" => {
-                if !names.iter().any(|n| n == group) {
-                    names.push((*group).to_string());
-                }
+            Role::Speech { group, split }
+                if *split == "training" && !names.iter().any(|n| n == group) =>
+            {
+                names.push((*group).to_string());
             }
             _ => {}
         }

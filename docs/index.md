@@ -48,6 +48,8 @@ top-level [`README.md`](../README.md).  For active plans, see
   per job: image to 3D (`mesh`) with Pixal3D, TRELLIS.2 and Hunyuan3D 2.1.
 - [vision engine](engines/vision.md): animal detection (MegaDetector, YOLO) and species
   classification on ONNX Runtime, CUDA when present; `/vision/*` on the local API.
+- [Wake word training](engines/wake-word.md): train a microWakeWord model (ESPHome's format) for
+  a phrase as a local job; `/wake-words` on the local API.
 
 ## Operations
 

@@ -55,6 +55,9 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | GET / PUT | `/daemon/config` | yes | PUT: the editable config              | the editable config (`400 invalid_config`, `500 config_not_saved`) |
 | POST   | `/daemon/registration/reset` | yes | —                             | `202` / `409 not_rejected` |
 | POST   | `/daemon/shutdown` | yes | —                                        | `202`; the daemon stops gracefully |
+| POST   | `/wake-words`   | yes  | `{phrase, name?, displayName?, languages?, spellings?, negatives?, author?, website?, targetFalseAcceptsPerHour?, settings?}` | `202` the training: trains a microWakeWord model ([wake word training](engines/wake-word.md)) |
+| GET    | `/wake-words`, `/wake-words/:id` | yes | - | the trainings, newest first; one training (`404 unknown_training`) |
+| DELETE | `/wake-words/:id` | yes | -                                       | `202`; stops a running training (`409 not_running`) |
 | POST   | `/stream-tokens` | yes | `{model, ttlSecs?}`                     | `{token, model, expiresAt, scheme, host, port, path, certSha256, certPem}` for the LAN stream listener |
 | GET    | `/healthz`      | no   | —                                          | runtime snapshot (below) |
 
