@@ -21,11 +21,12 @@ pub enum Icon {
     Film,
     Eye,
     Cube,
+    Waveform,
     Pin,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 13] = [
+    pub const ALL: [Icon; 14] = [
         Icon::Jobs,
         Icon::Models,
         Icon::Worker,
@@ -38,6 +39,7 @@ impl Icon {
         Icon::Film,
         Icon::Eye,
         Icon::Cube,
+        Icon::Waveform,
         Icon::Pin,
     ];
 
@@ -51,6 +53,7 @@ impl Icon {
             TaskKind::Video => Icon::Film,
             TaskKind::Mesh => Icon::Cube,
             TaskKind::Vision => Icon::Eye,
+            TaskKind::WakeWord => Icon::Waveform,
         }
     }
 }
@@ -202,6 +205,13 @@ pub fn shapes(icon: Icon, rect: Rect, colour: Color32) -> Vec<Shape> {
             ]),
             path(vec![p(3.5, 7.0), p(12.0, 11.5), p(20.5, 7.0)]),
             path(vec![p(12.0, 11.5), p(12.0, 21.5)]),
+        ],
+        Icon::Waveform => vec![
+            path(vec![p(4.0, 10.5), p(4.0, 13.5)]),
+            path(vec![p(8.0, 7.0), p(8.0, 17.0)]),
+            path(vec![p(12.0, 3.5), p(12.0, 20.5)]),
+            path(vec![p(16.0, 7.0), p(16.0, 17.0)]),
+            path(vec![p(20.0, 10.5), p(20.0, 13.5)]),
         ],
         Icon::Pin => vec![
             circle(p(12.0, 8.5), 5.0),

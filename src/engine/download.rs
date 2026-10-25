@@ -31,9 +31,9 @@ use crate::types::ModelFile;
 /// with `RUST_LOG=studio_worker::engine::download=debug`.
 const TRACE_TARGET: &str = "studio_worker::engine::download";
 
-/// HTTP client timeout per request — a GGUF / safetensors file is up to
-/// a few GiB so a 30-minute ceiling is generous.
-const DOWNLOAD_TIMEOUT_SECS: u64 = 30 * 60;
+/// How long a download may wait for its response, and for each read of its body: reqwest's
+/// blocking client applies its timeout per read, so this bounds a stall, not the whole download.
+const DOWNLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Map a model id onto a safe single directory-segment name: every
 /// character outside `[A-Za-z0-9._-]` becomes `_`, and a leading `.`
@@ -514,8 +514,35 @@ pub fn decode_image_data_url(url: &str) -> Result<Vec<u8>> {
 /// that ignore the range (200) fall back to a fresh full download;
 /// `416` or a `Content-Range` that doesn't start where we asked drops
 /// the stale part and restarts clean.
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&str>) -> Result<()> {
+    download_file_verified_within(url, dest, expected_sha256, DOWNLOAD_STALL)
+}
+
+/// Whether `error` is a download that stalled: no response, or no bytes, within its stall bound.
+pub fn is_stall(error: &anyhow::Error) -> bool {
+    let reqwest_timeout = |e: &(dyn std::error::Error + 'static)| {
+        e.downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    };
+    error.chain().any(|cause| {
+        reqwest_timeout(cause)
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                // A body read wraps reqwest's error in an io::Error, whose `source()` skips it.
+                io.kind() == std::io::ErrorKind::TimedOut
+                    || io.get_ref().is_some_and(|inner| reqwest_timeout(inner))
+            })
+    })
+}
+
+/// [`download_file_verified`], failing once the response, or any read of its body, takes longer
+/// than `stall`.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn download_file_verified_within(
+    url: &str,
+    dest: &Path,
+    expected_sha256: Option<&str>,
+    stall: std::time::Duration,
+) -> Result<()> {
     // Transport gate first: a plaintext-http model URL is a MITM away
     // from model poisoning, so it never gets a request at all.
     crate::net::validate_download_url(url, "model file")?;
@@ -525,7 +552,7 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
     }
     let part = dest.with_extension("part");
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
+        .timeout(stall)
         .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let resume_from = std::fs::metadata(&part)
@@ -579,7 +606,7 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
             "range not satisfiable; restarting the download from scratch"
         );
         remove_temp_file(&part);
-        return download_file_verified(url, dest, expected_sha256);
+        return download_file_verified_within(url, dest, expected_sha256, stall);
     }
     if !status.is_success() {
         warn!(
@@ -614,7 +641,7 @@ pub fn download_file_verified(url: &str, dest: &Path, expected_sha256: Option<&s
                 "206 Content-Range does not start at our offset; restarting from scratch"
             );
             remove_temp_file(&part);
-            return download_file_verified(url, dest, expected_sha256);
+            return download_file_verified_within(url, dest, expected_sha256, stall);
         }
     }
     // For a 206 this is the *remainder* length — exactly what we are

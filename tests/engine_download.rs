@@ -587,3 +587,52 @@ fn download_rejects_a_remote_http_url_before_any_request() {
     assert!(!dest.exists(), "nothing may be cached");
     assert!(!dest.with_extension("part").exists());
 }
+
+/// A server that answers 200 with a 9999-byte body, sends 16 bytes of it, then goes silent while
+/// holding the connection open: a stalled CDN.
+fn serve_stalling_response() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9999\r\n\r\nonly a few bytes");
+            let _ = stream.flush();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    });
+    format!("http://{addr}/speech.zip")
+}
+
+#[test]
+fn a_download_that_stops_sending_fails_as_a_stall_within_its_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("speech.zip");
+    let started = std::time::Instant::now();
+
+    let err = download::download_file_verified_within(
+        &serve_stalling_response(),
+        &dest,
+        None,
+        std::time::Duration::from_millis(500),
+    )
+    .expect_err("a stalled body fails");
+
+    assert!(download::is_stall(&err), "named a stall: {err:#}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(!dest.exists(), "nothing lands in the cache");
+}
+
+#[test]
+fn a_refused_connection_is_not_a_stall() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = download::download_file_verified(
+        &refused_loopback_url(),
+        &dir.path().join("model.gguf"),
+        None,
+    )
+    .expect_err("refused");
+    assert!(!download::is_stall(&err), "{err:#}");
+}

@@ -110,17 +110,28 @@ pub struct Provisioner {
 }
 
 /// The tools provisioning runs besides `uv`, with what to do when one is missing.
-const TOOLS: [(&str, &str); 3] = [
-    ("git", "install git (e.g. `sudo apt install git`)"),
-    (
-        "tar",
-        "install tar with xz support (e.g. `sudo apt install tar xz-utils`)",
-    ),
-    (
-        "c++",
-        "install a C++ compiler (e.g. `sudo apt install build-essential`)",
-    ),
-];
+const GIT: (&str, &str) = ("git", "install git (e.g. `sudo apt install git`)");
+const TAR: (&str, &str) = (
+    "tar",
+    "install tar with xz support (e.g. `sudo apt install tar xz-utils`)",
+);
+const CPP: (&str, &str) = (
+    "c++",
+    "install a C++ compiler (e.g. `sudo apt install build-essential`)",
+);
+
+/// The tools building `recipe` runs: `tar` unpacks `uv` and the toolkit, `git` checks sources
+/// out, a C++ compiler builds extensions.
+fn tools_for(recipe: &Recipe) -> Vec<(&'static str, &'static str)> {
+    let mut tools = vec![TAR];
+    if !recipe.sources.is_empty() {
+        tools.push(GIT);
+    }
+    if !recipe.builds.is_empty() {
+        tools.push(CPP);
+    }
+    tools
+}
 
 /// Whether `tool` is on the `PATH`.
 fn on_path(tool: &str) -> bool {
@@ -175,6 +186,11 @@ fn run_command(step_name: &str, command: Command) -> Result<(), TorchError> {
             message: format!("{program}: {}", stream::describe(&status)),
             tail,
         }),
+        Ended::Stopped { tail } => Err(TorchError::Provision {
+            step: step_name.into(),
+            message: format!("{program} was stopped"),
+            tail,
+        }),
         Ended::TimedOut { tail } => Err(TorchError::Provision {
             step: step_name.into(),
             message: format!(
@@ -215,7 +231,7 @@ impl Provisioner {
             compute_capability = %self.capability,
             "building the environment (first job, or its recipe changed)"
         );
-        for (tool, remedy) in TOOLS {
+        for (tool, remedy) in tools_for(recipe) {
             if !on_path(tool) {
                 return Err(TorchError::MissingTool { tool, remedy });
             }
@@ -380,27 +396,29 @@ impl Provisioner {
             args.extend(["--index-url", recipe.torch_index]);
             run_command("torch", self.pip(uv, environment, &args))
         })?;
-        step("cuda", name, || {
-            let manifest_sha = match &self.cuda.manifest_sha256 {
-                Some(sha) => sha.clone(),
-                None => cuda::manifest_sha256(recipe.cuda)
-                    .ok_or_else(|| {
-                        TorchError::provision(
-                            "cuda",
-                            format!("CUDA {} has no pinned manifest", recipe.cuda),
-                        )
-                    })?
-                    .to_string(),
-            };
-            cuda::assemble(
-                &self.cuda.redist_url,
-                recipe.cuda,
-                &manifest_sha,
-                &self.layout.archives(),
-                &environment.cuda_home,
-                &cuda::site_packages(&environment.venv(), recipe.python),
-            )
-        })?;
+        if let Some(version) = recipe.cuda {
+            step("cuda", name, || {
+                let manifest_sha = match &self.cuda.manifest_sha256 {
+                    Some(sha) => sha.clone(),
+                    None => cuda::manifest_sha256(version)
+                        .ok_or_else(|| {
+                            TorchError::provision(
+                                "cuda",
+                                format!("CUDA {version} has no pinned manifest"),
+                            )
+                        })?
+                        .to_string(),
+                };
+                cuda::assemble(
+                    &self.cuda.redist_url,
+                    version,
+                    &manifest_sha,
+                    &self.layout.archives(),
+                    &environment.cuda_home,
+                    &cuda::site_packages(&environment.venv(), recipe.python),
+                )
+            })?;
+        }
         step("packages", name, || {
             run_command("packages", self.pip(uv, environment, recipe.packages))
         })?;
@@ -711,6 +729,23 @@ mod tests {
             provisioner(dir.path()).ensure_uv().unwrap(),
             PathBuf::from("/opt/uv")
         );
+    }
+
+    #[test]
+    fn a_recipe_needs_only_the_tools_it_runs() {
+        let names = |recipe: &Recipe| {
+            tools_for(recipe)
+                .iter()
+                .map(|(tool, _)| *tool)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&TRELLIS), ["tar", "git", "c++"]);
+        let wheels_only = Recipe {
+            sources: &[],
+            builds: &[],
+            ..TRELLIS
+        };
+        assert_eq!(names(&wheels_only), ["tar"]);
     }
 
     #[cfg(unix)]

@@ -160,6 +160,13 @@ pub fn outcome(
 ) -> Result<Report, TorchError> {
     let (status, tail) = match ended {
         Ended::TimedOut { .. } => return Err(TorchError::Timeout(timeout)),
+        Ended::Stopped { tail } => {
+            return Err(TorchError::Runner {
+                status: "stopped".into(),
+                message: "the run was stopped".into(),
+                tail,
+            })
+        }
         Ended::Exited { status, tail } => (status, tail),
     };
     let message = failure
@@ -364,6 +371,10 @@ mod tests {
         assert!(matches!(
             outcome(Ended::TimedOut { tail: String::new() }, None, None, 16.0, t),
             Err(TorchError::Timeout(d)) if d == t
+        ));
+        assert!(matches!(
+            outcome(Ended::Stopped { tail: "last".into() }, None, None, 16.0, t),
+            Err(TorchError::Runner { status, .. }) if status == "stopped"
         ));
     }
 

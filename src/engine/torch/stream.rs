@@ -27,8 +27,17 @@ pub enum Pipe {
 /// How a streamed run ended.
 #[derive(Debug)]
 pub enum Ended {
-    Exited { status: ExitStatus, tail: String },
-    TimedOut { tail: String },
+    Exited {
+        status: ExitStatus,
+        tail: String,
+    },
+    TimedOut {
+        tail: String,
+    },
+    /// Asked to stop ([`run_until`]) and killed.
+    Stopped {
+        tail: String,
+    },
 }
 
 /// The first [`FIRST_ERROR_LINES`] lines that name an error, and the last [`TAIL_LINES`] lines of
@@ -95,8 +104,19 @@ fn forward(pipe: impl Read, which: Pipe, sender: mpsc::Sender<(Pipe, String)>) {
 /// Run `command` to its end, or until `timeout` passes (then it is killed), handing every line to
 /// `on_line` as it arrives.
 pub fn run(
+    command: Command,
+    timeout: Duration,
+    on_line: impl FnMut(Pipe, &str),
+) -> std::io::Result<Ended> {
+    run_until(command, timeout, || false, on_line)
+}
+
+/// [`run`], also killing the child once `stop` answers true (checked with every line, and every
+/// [`POLL`] while the child prints nothing).
+pub fn run_until(
     mut command: Command,
     timeout: Duration,
+    stop: impl Fn() -> bool,
     mut on_line: impl FnMut(Pipe, &str),
 ) -> std::io::Result<Ended> {
     command
@@ -123,11 +143,11 @@ pub fn run(
     let mut tail = Tail::default();
     let mut exited: Option<(ExitStatus, Instant)> = None;
     loop {
-        match receiver.recv_timeout(POLL) {
+        let quiet = match receiver.recv_timeout(POLL) {
             Ok((pipe, line)) => {
                 tail.push(&line);
                 on_line(pipe, &line);
-                continue;
+                false
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if exited.is_none() {
@@ -135,21 +155,27 @@ pub fn run(
                 }
                 break;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
+            Err(mpsc::RecvTimeoutError::Timeout) => true,
+        };
         if exited.is_none() {
             if let Some(status) = child.try_wait()? {
                 exited = Some((status, Instant::now()));
             }
         }
         match exited {
-            Some((_, at)) if at.elapsed() > DRAIN_GRACE => break,
+            // Lines still arriving after the exit are drained; only a quiet pipe ends the wait.
+            Some((_, at)) if quiet && at.elapsed() > DRAIN_GRACE => break,
             Some(_) => {}
             None if started.elapsed() > timeout => {
                 // Already gone is fine: the kill only has to make sure it is.
                 let _ = child.kill();
                 let _ = child.wait();
                 return Ok(Ended::TimedOut { tail: tail.text() });
+            }
+            None if stop() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(Ended::Stopped { tail: tail.text() });
             }
             None => {}
         }
@@ -260,6 +286,38 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(ended, Ended::TimedOut { ref tail } if tail == "started"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_run_that_never_stops_printing_still_meets_its_limit() {
+        let started = Instant::now();
+        let ended = run(
+            sh("while true; do echo tick; sleep 0.01; done"),
+            Duration::from_millis(500),
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(matches!(ended, Ended::TimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_run_asked_to_stop_is_killed() {
+        let started = Instant::now();
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let ended = run_until(
+            sh("echo started; sleep 30"),
+            Duration::from_secs(60),
+            || asked.load(std::sync::atomic::Ordering::SeqCst),
+            |_, line| {
+                if line == "started" {
+                    asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        )
+        .unwrap();
+        assert!(matches!(ended, Ended::Stopped { ref tail } if tail == "started"));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 

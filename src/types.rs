@@ -19,10 +19,12 @@ pub enum TaskKind {
     /// Detection and classification on a picture (see `docs/engines/vision.md`).  Local only:
     /// served by the local API, never offered by the studio.
     Vision,
+    /// Training a wake word model from a phrase (see `docs/engines/wake-word.md`).  Local only.
+    WakeWord,
 }
 
 impl TaskKind {
-    pub const ALL: [TaskKind; 7] = [
+    pub const ALL: [TaskKind; 8] = [
         TaskKind::Image,
         TaskKind::Llm,
         TaskKind::AudioStt,
@@ -30,6 +32,7 @@ impl TaskKind {
         TaskKind::Video,
         TaskKind::Mesh,
         TaskKind::Vision,
+        TaskKind::WakeWord,
     ];
 
     /// The kinds the studio offers as jobs: every kind but the local-only ones.
@@ -51,6 +54,7 @@ impl TaskKind {
             TaskKind::Video => "video",
             TaskKind::Mesh => "mesh",
             TaskKind::Vision => "vision",
+            TaskKind::WakeWord => "wake_word",
         }
     }
 }
@@ -909,5 +913,16 @@ mod tests {
             let back: TaskKind = serde_json::from_str(&s).unwrap();
             assert_eq!(kind, back);
         }
+    }
+
+    #[test]
+    fn wake_word_is_a_local_only_kind() {
+        assert_eq!(TaskKind::WakeWord.as_str(), "wake_word");
+        assert_eq!(
+            serde_json::to_string(&TaskKind::WakeWord).unwrap(),
+            "\"wake_word\""
+        );
+        assert!(TaskKind::ALL.contains(&TaskKind::WakeWord));
+        assert!(!TaskKind::STUDIO.contains(&TaskKind::WakeWord));
     }
 }

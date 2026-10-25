@@ -65,9 +65,10 @@ pub struct Recipe {
     pub name: &'static str,
     /// The CPython `uv python install` fetches.
     pub python: &'static str,
-    /// The NVIDIA redist release `CUDA_HOME` is assembled from; matches torch's CUDA.
-    pub cuda: &'static str,
-    /// torch and torchvision, from `torch_index`.
+    /// The NVIDIA redist release `CUDA_HOME` is assembled from; matches torch's CUDA.  `None` for
+    /// an environment that builds nothing against a toolkit (its wheels carry their CUDA).
+    pub cuda: Option<&'static str>,
+    /// torch and its companions, from `torch_index`.
     pub torch: &'static [&'static str],
     pub torch_index: &'static str,
     /// Everything else, resolved together.
@@ -108,7 +109,7 @@ const CU124_INDEX: &str = "https://download.pytorch.org/whl/cu124";
 pub const TRELLIS: Recipe = Recipe {
     name: "trellis",
     python: PYTHON,
-    cuda: CUDA,
+    cuda: Some(CUDA),
     torch: &["torch==2.6.0", "torchvision==0.21.0"],
     torch_index: CU124_INDEX,
     packages: &[
@@ -248,7 +249,7 @@ pub const TRELLIS: Recipe = Recipe {
 pub const HUNYUAN3D: Recipe = Recipe {
     name: "hunyuan3d",
     python: PYTHON,
-    cuda: CUDA,
+    cuda: Some(CUDA),
     torch: &["torch==2.5.1", "torchvision==0.20.1"],
     torch_index: CU124_INDEX,
     packages: &[
@@ -329,6 +330,13 @@ mod tests {
 
     const ADA: ComputeCapability = ComputeCapability { major: 8, minor: 9 };
     const AMPERE: ComputeCapability = ComputeCapability { major: 8, minor: 6 };
+
+    #[test]
+    fn a_pinned_toolkit_serialises_as_a_bare_version() {
+        // Built environments are keyed by this serialisation: `Some` must not change it.
+        let json = serde_json::to_value(TRELLIS).unwrap();
+        assert_eq!(json["cuda"], "12.4.1");
+    }
 
     #[test]
     fn the_hash_follows_the_recipe_and_the_gpu() {
