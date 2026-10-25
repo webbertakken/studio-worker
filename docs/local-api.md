@@ -55,7 +55,10 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | GET / PUT | `/daemon/config` | yes | PUT: the editable config              | the editable config (`400 invalid_config`, `500 config_not_saved`) |
 | POST   | `/daemon/registration/reset` | yes | —                             | `202` / `409 not_rejected` |
 | POST   | `/daemon/shutdown` | yes | —                                        | `202`; the daemon stops gracefully |
-| POST   | `/wake-words`   | yes  | `{phrase, name?, displayName?, languages?, spellings?, negatives?, author?, website?, targetFalseAcceptsPerHour?, settings?}` | `202` the training: trains a microWakeWord model ([wake word training](engines/wake-word.md)) |
+| POST   | `/voice-sample-tokens` | yes | `{ttlSecs?}` | `{token, expiresAt, scheme, host, port, path, certSha256, certPem}`: a grant to upload takes on the LAN listener ([recordings](#recordings-the-operators-voice)) |
+| GET    | `/voice-samples` | yes | - | `{sets: [{set, positive, nearMiss, speech, seconds, bytes, updatedAt, inTraining}]}` |
+| DELETE | `/voice-samples`, `/voice-samples/:set` | yes | - | `{deleted: [...]}`; `404 unknown_set`, `409 set_in_training` |
+| POST   | `/wake-words`   | yes  | `{phrase, name?, displayName?, languages?, spellings?, negatives?, author?, website?, targetFalseAcceptsPerHour?, voiceSamples?, settings?}` | `202` the training: trains a microWakeWord model ([wake word training](engines/wake-word.md)) |
 | GET    | `/wake-words`, `/wake-words/:id` | yes | - | the trainings, newest first; one training (`404 unknown_training`) |
 | DELETE | `/wake-words/:id` | yes | -                                       | `202`; stops a running training (`409 not_running`) |
 | POST   | `/stream-tokens` | yes | `{model, ttlSecs?}`                     | `{token, model, expiresAt, scheme, host, port, path, certSha256, certPem}` for the LAN stream listener |
@@ -228,6 +231,91 @@ Any other `endpoint` value is refused at the handshake (400).  One session per m
 `busy`.  Unloading the model ends a session with `model unloaded`.
 Every session is recorded in the local queue; every refusal is logged as `stream refused`
 (target `studio_worker::stt_stream`) with its reason, never with a token.
+
+### Recordings (the operator's voice)
+
+The operator's own takes, recorded on his phone for wake word training, reach the worker over
+the same LAN listener, on its own route, with a **recording token** of its own. A stream token
+never uploads, and a recording token never opens `/transcribe`. Design and rules:
+[wake word training, "The operator's voice"](engines/wake-word.md#the-operators-voice).
+
+#### Recording grant (loopback)
+
+```bash
+curl -s -X POST "$(jq -r .url $DISCOVERY)/voice-sample-tokens" \
+  -H "authorization: Bearer $(jq -r .token $DISCOVERY)" \
+  -H 'content-type: application/json' -d '{"ttlSecs":600}'
+# {"token":"<64 hex>","expiresAt":"…","scheme":"https","host":"192.168.1.133","port":4798,
+#  "path":"/voice-samples","certSha256":"<64 hex>","certPem":"-----BEGIN CERTIFICATE-----…"}
+```
+
+The body may be empty. `ttlSecs` defaults to 600 and is clamped to 30 s–1 h; the holder mints
+a fresh grant before it expires. `host`, the certificate and its pin are those of the stream
+grant (above). Errors: `400 bad_request` (an unknown field), `503 voice_samples_unavailable`,
+`503 stream_listener_down`.
+
+#### Uploading a take (LAN listener)
+
+One take per request, to `https://<host>:<port><path>/<set>/<kind>/<take>.wav`, trusting
+exactly the certificate whose SHA-256 is `certSha256`:
+
+```http
+PUT /voice-samples/2026-10-26/near_miss/hey_luna-002.wav HTTP/1.1
+Authorization: Bearer <recording token>
+Content-Type: audio/wav
+Content-Length: 64044
+
+<the WAV>
+```
+
+| Part | Rule |
+| --- | --- |
+| `set` | `[a-z0-9][a-z0-9_-]{0,63}`: one sitting of the recording guide |
+| `kind` | `positive` (the phrase), `near_miss`, `speech` (talk without the phrase) |
+| `take` of `positive`, `speech` | its number, 1 to 4 digits: `007` |
+| `take` of `near_miss` | the near miss's slug and its number: `hey_luna-002` (slug `[a-z0-9]+(_[a-z0-9]+)*`) |
+| body | a WAV: 16 kHz, mono, 16-bit PCM, 0.25 to 31 s, at most 1 MiB; `Content-Length` required |
+
+The take's name is its identity: uploading the same take again replaces it (a redo).
+`201` a new take, `200` a take replaced or unchanged:
+
+```json
+{"set":"2026-10-26","kind":"near_miss","take":"hey_luna-002","number":2,"phrase":"hey_luna",
+ "seconds":2.0,"bytes":64044,"created":true}
+```
+
+Refusals answer `{"error", "message"}`: `400 bad_name`, `400 bad_wav`, `401 unauthorized`,
+`404 not_found` (any other path), `405 method_not_allowed`, `409 set_in_training` (a training
+holds the set: retry when it ends), `411 length_required`, `413 too_large`, `500 not_stored`,
+`503 voice_samples_unavailable`. Every upload is logged (target `studio_worker::voice_samples`)
+with its path and status, never its token or audio.
+
+Takes live in `<config dir>/voice-samples/<set>/<kind>/<take>.wav`, directories 0700 and files
+0600, and nowhere else.
+
+#### Sets (loopback)
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| `GET` | `/voice-samples` | `{sets: [...]}`, newest first (below) |
+| `DELETE` | `/voice-samples/<set>` | `{deleted: ["<set>"]}`; `404 unknown_set`, `400 bad_name` |
+| `DELETE` | `/voice-samples` | `{deleted: [...]}`: every set |
+
+```json
+{"sets":[{"set":"2026-10-26","positive":60,"nearMiss":{"hey_luna":3,"runner":3},"speech":3,
+  "seconds":228.0,"bytes":7296600,"updatedAt":"…","inTraining":false}]}
+```
+
+A delete that reaches a set a training holds answers `409 set_in_training` and deletes nothing.
+
+#### Training with a set
+
+`POST /wake-words` takes `voiceSamples: ["<set>", …]` (up to 8). Every 4th positive by take
+number (a number divisible by 4) is held out and measured apart; the rest train beside the
+synthetic voices; near-miss and speech takes train as negatives. The training's `result`
+carries `ownVoiceRecall: {recall, accepted, heldOut}` (`null` without sets), and its report a
+"Your own voice" section. Refusals: `400 invalid_voice_samples` (an unknown set, or not enough
+positives to hold one out and train one), `503 voice_samples_unavailable`.
 
 ### Health snapshot
 
