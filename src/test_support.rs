@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn capture_works_inside_a_multi_thread_tokio_runtime() {
-        // Mirrors the `#[tokio::test]` cases in tests/http_errors.rs:
+        // Mirrors the `#[tokio::test]` cases in tests/integration/http_errors.rs:
         // closures that need a non-tokio thread (e.g. reqwest::blocking)
         // must Just Work via `capture` without manual `detached(...)`
         // wrapping.

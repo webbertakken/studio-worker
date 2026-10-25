@@ -6,7 +6,7 @@ use studio_worker::vision::{self, MAX_IMAGE_BYTES};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const WEBP: &[u8] = include_bytes!("fixtures/lossy-vp8.webp");
+const WEBP: &[u8] = include_bytes!("../fixtures/lossy-vp8.webp");
 
 /// `reqwest::blocking` runs its own runtime; keep it off the test's tokio runtime.
 fn detached<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {

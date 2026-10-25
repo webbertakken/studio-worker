@@ -31,7 +31,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-const WEBP: &[u8] = include_bytes!("fixtures/lossy-vp8.webp");
+const WEBP: &[u8] = include_bytes!("../fixtures/lossy-vp8.webp");
 
 fn echo_subprotocol(_req: &Request, mut resp: Response) -> Result<Response, ErrorResponse> {
     resp.headers_mut().insert(

@@ -9,7 +9,7 @@
 //! defaults, or failed to read/parse).  The events deliberately omit
 //! the secret fields
 //! (`auth_token`, `registration_secret`) so logs can be shipped
-//! off-box without leaking credentials.  See `tests/config_tracing.rs`
+//! off-box without leaking credentials.  See `tests/integration/config_tracing.rs`
 //! for the regression contract.
 //!
 //! What lives here vs. what's stripped from the user-editable surface:

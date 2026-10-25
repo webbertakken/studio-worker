@@ -1757,7 +1757,7 @@ mod tests {
 
     // The reqwest blocking client doesn't follow `file://` URLs, so we
     // use wiremock-served feeds for the apply tests via the integration
-    // suite (`tests/auto_update.rs`).  Here we just verify the unit-test
+    // suite (`tests/integration/auto_update.rs`).  Here we just verify the unit-test
     // branches: missing release, missing asset.
     #[test]
     fn apply_with_errors_when_release_missing() {
