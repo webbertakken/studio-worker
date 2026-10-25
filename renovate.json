@@ -2,5 +2,12 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "local>webbertakken/.github:renovate-config"
+  ],
+  "packageRules": [
+    {
+      "description": "ort's release candidates break their API, and parakeet-rs builds against one of them: a bump waits for a person and CI, never automerges.",
+      "matchPackageNames": ["ort", "ort-sys", "parakeet-rs"],
+      "automerge": false
+    }
   ]
 }
