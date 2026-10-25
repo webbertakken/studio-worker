@@ -80,7 +80,7 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # missing GPU runtime surfaces an actionable message instead of a
 # cryptic sd-cli linker crash.  Tiny dlopen/LoadLibrary wrapper, no
 # native libs.
-libloading = "0.8"
+libloading = "0.9"
 # Free-disk-space probe for the model-download preflight (statvfs /
 # GetDiskFreeSpaceExW).  `sync` only — no async runtime; rustix +
 # windows-sys are already in the tree (tempfile / everything).
