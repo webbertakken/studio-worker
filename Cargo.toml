@@ -147,7 +147,7 @@ flate2 = { version = "1", optional = true, default-features = false, features = 
 tar = { version = "0.4", optional = true }
 # UI deps — gated behind the `ui` feature so headless installs stay
 # free of GL / winit / dbus.  Default = off (see DECISIONS.md).
-egui = { version = "0.34", optional = true, default-features = false }
+egui = { version = "0.37", optional = true, default-features = false }
 eframe = { version = "0.37", optional = true, default-features = false, features = [
     "default_fonts",
     "glow",
