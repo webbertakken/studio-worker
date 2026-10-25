@@ -146,6 +146,7 @@ Every failure ends the training `failed` with a reason and a message that names 
 | `bad_input` | a stage refused the request (e.g. a spelling no voice can speak) |
 | `stage_timed_out` | a stage passed its time limit and was stopped |
 | `stage_failed` | a stage failed otherwise; the message carries its exit and last lines |
+| `killed` | a stage was killed by SIGKILL without saying why: most often the out-of-memory killer |
 | `invalid_output` | the stages ended without the files the next one reads |
 
 ## Layout
@@ -208,8 +209,8 @@ TensorFlow finds its CUDA wheels only with their `lib` directories on `LD_LIBRAR
 | [agkphysics/AudioSet](https://huggingface.co/datasets/agkphysics/AudioSet) `bal_train/09.parquet` | background noise for augmentation | CC BY 4.0 |
 | [mchl914/fma_xsmall](https://huggingface.co/datasets/mchl914/fma_xsmall) | background music for augmentation | MIT (the dataset); tracks CC |
 | [MIT environmental impulse responses](https://huggingface.co/datasets/davidscripka/MIT_environmental_impulse_responses) | room reverberation | unknown |
-| [Multilingual LibriSpeech](https://huggingface.co/datasets/facebook/multilingual_librispeech) Dutch `9_hours` | Dutch speech negatives for training | CC BY 4.0 |
-| same, Dutch `dev` and `test` | Dutch ambient sets, 12.8 h each (validation, testing) | CC BY 4.0 |
+| [Multilingual LibriSpeech](https://huggingface.co/datasets/facebook/multilingual_librispeech) Dutch `9_hours` and `train` shards 0 and 24 | Dutch speech negatives for training, about 74 h | CC BY 4.0 |
+| same, Dutch `dev` and `test` | Dutch ambient sets, 12.8 h each (validation, testing); the first `SELECTION_HOURS` of `dev` again for upstream's checkpoint choice | CC BY 4.0 |
 
 Revisions, URLs, sizes and sha256s are in `recipe::DATASETS`.
 The `*_background` feature sets of the same repository are 20 ms features and do not fit the 10 ms recipe.
@@ -238,10 +239,12 @@ The defaults are `recipe::default_settings()`; the request's `settings` override
 | `samples.positivePerLanguage` | 10 000 | per language, the spellings alternating |
 | `samples.nearMissPerPhrasePerLanguage` | 1 000 | |
 | `features.positiveRepetitions` | 2 | upstream's |
-| `training.steps` | 20 000, 10 000 | two phases |
+| `training.steps` | 10 000, 5 000 | two phases; both 30 000-step runs kept a checkpoint from before step 6 500 |
 | `training.learningRates` | 0.001, 0.0001 | |
 | `training.negativeClassWeight` | 20, 20 | upstream's |
-| `training.featureWeights` | positive 2, near miss 2, speech 10, dinner party 10, no speech 5, Dutch speech 3 | sampling weights |
+| `training.featureWeights` | positive 2, near miss 2, speech 10, dinner party 10, no speech 5, Dutch speech 6 | sampling weights; Dutch speech gave 11 of 13 testing false accepts at 3 |
+| `training.featureWeights` (evaluation only) | dinner party eval 0, Dutch eval 0 | never sampled; CHiME-6 dev/eval and `SELECTION_HOURS` of Dutch dev pick the checkpoint |
+| `deviceMemoryBudgetGib` | 10 | upstream validates on its ambient windows in one tensor: 22 h peaked at 10.6 GiB with the context (measured) |
 | `training.model` | upstream's notebook mixednet | |
 | `evaluation.slidingWindow` | 5 | the manifest's `sliding_window_size` |
 | `seed` | 1 | every random choice follows it |
@@ -252,10 +255,17 @@ The evaluate stage measures on a 0.01 grid of cutoffs; the worker chooses.
 
 - **Validation** (chooses): the ambient sets CHiME-6 dev and eval and MLS Dutch dev; the validation splits of the
   positives and near misses.
+  Upstream's training keeps the checkpoint with the best average viable recall on CHiME-6 and the first
+  `SELECTION_HOURS` (3.2 h) of Dutch dev. With CHiME-6 alone it kept a checkpoint blind to Dutch speech, where 11 of
+  13 testing false accepts fell; that checkpoint choice raised testing recall from 36% to 66% (2026-10-25).
+  All 12.8 h of Dutch dev held 26 GB of host memory in upstream's validation, and the system killed it.
 - **Testing** (reports): the ambient sets DiPCo and MLS Dutch test, never seen in training or in the choice; the
   testing splits of the positives and near misses.
-- The cutoff is the lowest on the grid at which validation's false accepts per hour, and those of every higher cutoff,
-  are at most the target. Recall only falls as the cutoff rises, so the lowest such cutoff keeps the most.
+- The cutoff is the lowest on the grid at which the 95% upper bound (Poisson) of validation's false accepts per hour,
+  and that of every higher cutoff, is at most the target. Recall only falls as the cutoff rises, so the lowest such
+  cutoff keeps the most.
+  The bound, not the point estimate: 22 h of audio pin a rate loosely, and cutoffs chosen at the point estimate's edge
+  came out at 1.4 to 3.1 times the target on testing audio in all four measurements (2026-10-25).
 - When no cutoff meets the target, the cutoff with the fewest validation false accepts per hour (the lowest of those)
   is chosen, the training completes with `targetMet: false`, and the log says so (warn).
 - A detection is counted as upstream's test counts it: the model's output averaged over `slidingWindow` slices, above
@@ -301,7 +311,7 @@ ESPHome's v2 model manifest:
 - the recipe: environment pins and the environment's full `pip freeze`, sources, datasets (URL, revision, sha256),
   generators, effective settings, seed;
 - the model: size, sha256, tensor arena;
-- wall time per stage, device memory peak per stage, the GPU.
+- wall time, device memory peak and host memory peak per stage, the GPU.
 
 ## Observability
 
