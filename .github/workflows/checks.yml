@@ -40,7 +40,7 @@ jobs:
             flags: "--no-default-features --features all-engines-stt"
             fmt: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       # The all-backends / stt-backend builds static-link candle +
       # whisper + llama (ggml), whose object files + the cache tarball
@@ -90,7 +90,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
         with:
