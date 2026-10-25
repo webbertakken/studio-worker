@@ -242,6 +242,8 @@ The defaults are `recipe::default_settings()`; the request's `settings` override
 | `training.learningRates` | 0.001, 0.0001 | |
 | `training.negativeClassWeight` | 20, 20 | upstream's |
 | `training.featureWeights` | positive 2, near miss 2, speech 10, dinner party 10, no speech 5, Dutch speech 3 | sampling weights |
+| `training.featureWeights` (evaluation only) | dinner party eval 0, Dutch eval 0 | never sampled; their validation audio picks the checkpoint |
+| `deviceMemoryBudgetGib` | 10 | train peaks at 10.6 GiB with the context (measured): upstream validates on 22 h of ambient windows in one tensor |
 | `training.model` | upstream's notebook mixednet | |
 | `evaluation.slidingWindow` | 5 | the manifest's `sliding_window_size` |
 | `seed` | 1 | every random choice follows it |
@@ -252,6 +254,9 @@ The evaluate stage measures on a 0.01 grid of cutoffs; the worker chooses.
 
 - **Validation** (chooses): the ambient sets CHiME-6 dev and eval and MLS Dutch dev; the validation splits of the
   positives and near misses.
+  Upstream's training keeps the checkpoint with the best average viable recall on the same ambient audio, so the
+  checkpoint and the cutoff are chosen on one set; with CHiME-6 alone it kept a checkpoint blind to Dutch speech, where
+  11 of 13 testing false accepts fell (2026-10-25).
 - **Testing** (reports): the ambient sets DiPCo and MLS Dutch test, never seen in training or in the choice; the
   testing splits of the positives and near misses.
 - The cutoff is the lowest on the grid at which validation's false accepts per hour, and those of every higher cutoff,
