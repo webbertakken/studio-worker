@@ -396,11 +396,15 @@ fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<usize> {
         if entry.is_dir() {
             continue;
         }
-        let Some(file_name) = Path::new(entry.name()).file_name().map(|n| n.to_owned()) else {
+        let entry_name = entry
+            .name()
+            .context("reading a zip entry name")?
+            .into_owned();
+        let Some(file_name) = Path::new(&entry_name).file_name().map(|n| n.to_owned()) else {
             warn!(
                 target: TRACE_TARGET,
                 op = "extract",
-                name = entry.name(),
+                name = %entry_name,
                 "skipping zip entry with no file name"
             );
             continue;
@@ -970,7 +974,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             zw.start_file("sd-cli", opts).unwrap();
             zw.write_all(b"binary").unwrap();
@@ -1010,7 +1014,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             zw.add_directory("build/", opts).unwrap();
             zw.start_file("sd-cli", opts).unwrap();
@@ -1046,7 +1050,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .unix_permissions(0o755);
             zw.start_file("sd-cli", opts).unwrap();

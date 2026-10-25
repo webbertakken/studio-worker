@@ -149,7 +149,11 @@ fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<usize> {
         if entry.is_dir() {
             continue;
         }
-        let Some(name) = Path::new(entry.name()).file_name().map(|n| n.to_owned()) else {
+        let entry_name = entry
+            .name()
+            .context("reading a zip entry name")?
+            .into_owned();
+        let Some(name) = Path::new(&entry_name).file_name().map(|n| n.to_owned()) else {
             continue;
         };
         let out = dest_dir.join(&name);
@@ -451,7 +455,7 @@ mod tests {
             use std::io::Write as _;
             let f = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(f);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
             zw.start_file("build/bin/llama-cli.exe", opts).unwrap();
             zw.write_all(b"MZ fake binary").unwrap();
             zw.start_file("build/bin/ggml.dll", opts).unwrap();
