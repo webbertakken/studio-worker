@@ -51,7 +51,7 @@ hex = "0.4"
 # OS CSPRNG for the install id + registration secret.  Tiny syscall
 # wrapper (getrandom(2) / BCryptGenRandom / getentropy), not the full
 # `rand` crate; already in the tree transitively via rustls + sentry.
-getrandom = "0.3"
+getrandom = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg"] }
 directories = "5.0"
 tracing = "0.1"
