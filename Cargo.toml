@@ -106,7 +106,7 @@ thiserror = "2"
 # below — see the note there.)
 whisper-rs = { version = "0.14", optional = true, default-features = false }
 candle-core = { version = "0.11.0", optional = true }
-candle-nn = { version = "0.10.2", optional = true }
+candle-nn = { version = "0.11.0", optional = true }
 candle-transformers = { version = "0.11.0", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 # Blocking (ureq) HF download API — candle_image uses `api::sync`.
