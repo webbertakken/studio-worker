@@ -155,7 +155,7 @@ eframe = { version = "0.37", optional = true, default-features = false, features
     "x11",
 ] }
 notify-rust = { version = "4", optional = true }
-rfd = { version = "0.17", optional = true, default-features = false, features = ["xdg-portal", "tokio"] }
+rfd = { version = "0.17", optional = true, default-features = false, features = ["xdg-portal"] }
 
 # System tray, split per-OS so the Linux build stays free of GTK / cairo
 # / appindicator (the pkg-config pain that broke `cargo install` on a
