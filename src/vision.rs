@@ -116,7 +116,7 @@ pub fn fetch(url: &str) -> Result<Vec<u8>> {
         return Ok(bytes);
     }
     crate::net::validate_download_url(url, "input image")?;
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::net::http_client()
         .timeout(FETCH_TIMEOUT)
         .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
         .build()

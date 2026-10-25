@@ -7,7 +7,27 @@
 //! execution.  Every downloader routes its URL through
 //! [`validate_download_url`] before the first byte is requested.
 
+use std::sync::OnceLock;
+
 use anyhow::{bail, Context, Result};
+
+/// A blocking HTTP client builder that trusts only the Mozilla roots
+/// baked into the binary, never the host trust store, so a bare box
+/// without a CA bundle still reaches the studio, GitHub and the model
+/// hosts.  Every outbound client starts here.
+pub fn http_client() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder().tls_certs_only(baked_roots().iter().cloned())
+}
+
+fn baked_roots() -> &'static [reqwest::Certificate] {
+    static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+            .collect()
+    })
+}
 
 /// Refuse any download URL that is not `https`.  Loopback `http` is
 /// allowed so test suites (wiremock) and air-gapped local mirrors keep
@@ -36,6 +56,20 @@ pub fn validate_download_url(raw: &str, what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_baked_root_is_trusted() {
+        assert_eq!(
+            baked_roots().len(),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len()
+        );
+        assert!(!baked_roots().is_empty());
+    }
+
+    #[test]
+    fn the_http_client_builds_on_the_baked_roots() {
+        http_client().build().expect("client builds");
+    }
 
     #[test]
     fn https_urls_pass() {

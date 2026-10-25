@@ -28,7 +28,7 @@ pub enum CheckOutcome {
 
 /// Resolve the feed URL to a JSON document and parse a release list.
 pub fn fetch_releases(feed_url: &str) -> Result<Vec<GithubRelease>> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::net::http_client()
         .timeout(Duration::from_secs(15))
         .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -326,7 +326,7 @@ pub struct RealRunner;
 impl UpdateRunner for RealRunner {
     fn download(&self, url: &str, dest: &Path) -> Result<()> {
         validate_installer_download_url(url)?;
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::net::http_client()
             .timeout(Duration::from_secs(300))
             .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
             .build()?;
@@ -357,7 +357,7 @@ impl UpdateRunner for RealRunner {
 
     fn fetch_checksum(&self, url: &str) -> Result<Option<String>> {
         validate_installer_download_url(url)?;
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::net::http_client()
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
             .build()?;
