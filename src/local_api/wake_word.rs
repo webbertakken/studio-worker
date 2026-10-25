@@ -13,6 +13,44 @@ pub(super) fn is_route(path: &str) -> bool {
     path == "/wake-words" || path.starts_with("/wake-words/")
 }
 
+/// `/wake-words/<id>/files/<file>` -> `Some((id, file))`, each non-empty and without slashes.
+fn output_route(path: &str) -> Option<(&str, &str)> {
+    let (id, file) = path.strip_prefix("/wake-words/")?.split_once("/files/")?;
+    let plain = |s: &str| !s.is_empty() && !s.contains('/');
+    (plain(id) && plain(file)).then_some((id, file))
+}
+
+impl LocalApi {
+    fn serve_output_file(
+        &self,
+        request: Request,
+        service: &crate::wake_word::WakeWords,
+        id: &str,
+        file: &str,
+    ) -> std::io::Result<()> {
+        use crate::wake_word::files::FileRefusal;
+        match service.output_file(id, file) {
+            Ok(found) => match std::fs::read(&found.path) {
+                Ok(bytes) => super::respond(request, 200, found.content_type, &bytes),
+                Err(e) => respond_json(request, 500, &error("not_read", format!("reading {file}: {e}"))),
+            },
+            Err(FileRefusal::UnknownTraining) => respond_json(
+                request,
+                404,
+                &error("unknown_training", format!("no completed training {id} has output files")),
+            ),
+            Err(FileRefusal::UnknownFile) => respond_json(
+                request,
+                404,
+                &error(
+                    "unknown_file",
+                    format!("{file} is not an output of training {id}: <name>.tflite, <name>.json, report.json, report.md"),
+                ),
+            ),
+        }
+    }
+}
+
 /// `/wake-words/<id>` -> `Some(id)` for a non-empty id without slashes.
 fn training_id(path: &str) -> Option<&str> {
     let id = path.strip_prefix("/wake-words/")?;
@@ -114,6 +152,10 @@ impl LocalApi {
                 }
             }
             (Method::Get, "/wake-words") => respond_json(request, 200, &as_json(service.list())),
+            (Method::Get, path) if output_route(path).is_some() => {
+                let (id, file) = output_route(path).expect("matched just above");
+                self.serve_output_file(request, &service, id, file)
+            }
             (method, path) => {
                 let Some(id) = training_id(path) else {
                     return respond_json(
@@ -161,6 +203,18 @@ impl LocalApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_routes_parse() {
+        assert_eq!(
+            output_route("/wake-words/local-1-1/files/report.md"),
+            Some(("local-1-1", "report.md"))
+        );
+        assert_eq!(output_route("/wake-words/local-1-1/files/"), None);
+        assert_eq!(output_route("/wake-words/local-1-1/files/a/b"), None);
+        assert_eq!(output_route("/wake-words//files/x"), None);
+        assert_eq!(output_route("/wake-words/local-1-1"), None);
+    }
 
     #[test]
     fn routes_and_ids_parse() {

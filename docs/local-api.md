@@ -61,6 +61,7 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | POST   | `/wake-words`   | yes  | `{phrase, name?, displayName?, languages?, spellings?, negatives?, author?, website?, targetFalseAcceptsPerHour?, voiceSamples?, settings?}` | `202` the training: trains a microWakeWord model ([wake word training](engines/wake-word.md)) |
 | GET    | `/wake-words`, `/wake-words/:id` | yes | - | the trainings, newest first; one training (`404 unknown_training`) |
 | DELETE | `/wake-words/:id` | yes | -                                       | `202`; stops a running training (`409 not_running`) |
+| GET    | `/wake-words/:id/files/:file` | yes | - | a completed training's `<name>.tflite`, `<name>.json`, `report.json` or `report.md` ([output files](engines/wake-word.md#output-files)); `404 unknown_training`, `404 unknown_file` |
 | POST   | `/stream-tokens` | yes | `{model, ttlSecs?}`                     | `{token, model, expiresAt, scheme, host, port, path, certSha256, certPem}` for the LAN stream listener |
 | GET    | `/healthz`      | no   | —                                          | runtime snapshot (below) |
 
@@ -316,6 +317,28 @@ synthetic voices; near-miss and speech takes train as negatives. The training's 
 carries `ownVoiceRecall: {recall, accepted, heldOut}` (`null` without sets), and its report a
 "Your own voice" section. Refusals: `400 invalid_voice_samples` (an unknown set, or not enough
 positives to hold one out and train one), `503 voice_samples_unavailable`.
+
+### Wake word output files
+
+A completed training's files, for a client that cannot read `models_root` (Runa runs in a
+container). Only the four outputs are served, found on disk by the training's id, so they
+outlive a daemon restart (`GET /wake-words/:id` lists this daemon's trainings only):
+
+```bash
+for f in hey_runa.tflite hey_runa.json report.json report.md; do
+  curl -sf -o "$f" "$(jq -r .url $DISCOVERY)/wake-words/$ID/files/$f" \
+    -H "authorization: Bearer $(jq -r .token $DISCOVERY)"
+done
+```
+
+| File | Content type |
+| --- | --- |
+| `<name>.tflite` | `application/octet-stream` |
+| `<name>.json`, `report.json` | `application/json` |
+| `report.md` | `text/markdown; charset=utf-8` |
+
+`<name>` is the training's `name` (`hey_runa`). Anything else answers `404 unknown_file`; an
+id that is not a training's, or a training without completed output, `404 unknown_training`.
 
 ### Health snapshot
 

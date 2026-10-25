@@ -427,6 +427,15 @@ impl WakeWords {
         Ok(training)
     }
 
+    /// One of training `id`'s output files, found on disk (so it outlives a daemon restart).
+    pub fn output_file(
+        &self,
+        id: &str,
+        file: &str,
+    ) -> Result<super::files::OutputFile, super::files::FileRefusal> {
+        super::files::output_file(&self.inner.paths, id, file)
+    }
+
     pub fn get(&self, id: &str) -> Option<Training> {
         self.inner
             .trainings

@@ -36,6 +36,7 @@ Errors answer `{"error": <code>, "message": <text>}`.
 | `GET` | `/wake-words` | | every training of this daemon's lifetime, newest first |
 | `GET` | `/wake-words/:id` | | the training |
 | `DELETE` | `/wake-words/:id` | | `202` the training, stopping |
+| `GET` | `/wake-words/:id/files/:file` | | one of a completed training's output files ("Output files") |
 | `GET` | `/jobs/:id/log` | | the training's log, as for every job |
 
 ### Request
@@ -409,6 +410,19 @@ ESPHome's v2 model manifest:
   generators, effective settings, seed;
 - the model: size, sha256, tensor arena;
 - wall time, device memory peak and host memory peak per stage, the GPU.
+- the operator's own voice, when the training named recording sets: recall on the held-out takes and every take used
+  by sha256.
+
+### Output files
+
+`GET /wake-words/:id/files/:file` serves a completed training's outputs to a client that cannot read `models_root`
+(Runa runs in a container): `<name>.tflite` (`application/octet-stream`), `<name>.json` and `report.json`
+(`application/json`), `report.md` (`text/markdown`).
+
+- It finds them on disk, in `<models_root>/wake-word/models/<name>/<id>/` (the one holding `report.json`), so they
+  outlive a daemon restart; `GET /wake-words/:id` lists trainings of this daemon's lifetime only.
+- Nothing else is served: an id not of the worker's form (`local-<millis>-<n>`) or without completed output answers
+  `404 unknown_training`, any other file name `404 unknown_file`.
 
 ## Observability
 
