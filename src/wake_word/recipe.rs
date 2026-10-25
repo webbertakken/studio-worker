@@ -83,7 +83,7 @@ pub const ENVIRONMENT: Recipe = Recipe {
 };
 
 /// What a download is for, and so how the trainer prepares it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "role", rename_all = "camelCase")]
 pub enum Role {
     /// microWakeWord's spectrogram features, zipped.
@@ -96,13 +96,17 @@ pub enum Role {
     Speech {
         group: &'static str,
         split: &'static str,
+        /// Hours of a validation set upstream's training weighs checkpoints on; the rest still
+        /// chooses the cutoff.  `None`: training never sees it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selection_hours: Option<f64>,
     },
     /// A multi-speaker piper generator for one language.
     Generator,
 }
 
 /// One pinned file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Download {
     /// The dataset's name: its directory under `downloads/`, and the prepared set's name.
@@ -124,6 +128,10 @@ const GENERATORS: &str =
     "https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0";
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
+/// Hours of MLS Dutch dev that upstream's training weighs checkpoints on.  Its validation holds
+/// every ambient window in host memory twice: 22 h (all of Dutch dev beside CHiME-6) peaked at
+/// 26 GB and the system's out-of-memory killer ended it (2026-10-25).  Safe range 1 to 6 h.
+pub const SELECTION_HOURS: f64 = 3.2;
 
 #[allow(clippy::too_many_arguments)]
 fn download(
@@ -162,27 +170,24 @@ pub fn datasets() -> Vec<Download> {
             prepared,
         )
     };
-    let mls = |name: &str,
-               file: &str,
-               sha: &str,
-               bytes: u64,
-               split: &'static str,
-               group: &'static str| {
+    let mls = |name: &str, file: &str, sha: &str, bytes: u64, role: Role, prepared: u64| {
         download(
             name,
-            &format!("{file}.parquet"),
-            format!("{MLS_DUTCH}/{file}-00000-of-00001.parquet"),
+            file,
+            format!("{MLS_DUTCH}/{file}"),
             sha,
             bytes,
             "CC BY 4.0",
-            Role::Speech { group, split },
-            if group == "mls-dutch" {
-                500 * MIB
-            } else {
-                700 * MIB
-            },
+            role,
+            prepared,
         )
     };
+    let speech = |group, split, selection_hours| Role::Speech {
+        group,
+        split,
+        selection_hours,
+    };
+    let training = || speech("mls-dutch", "training", None);
     vec![
         features("speech", "68b6b811b347b8321169f9e75ea2b9be73245943b4470af9532ca288d9f1b3cc", 3_183_001_091, 14 * GIB),
         features("dinner_party", "18a0885d595ced7faa73736a8680206f5ba6e80113ca3e6ce43130e510aac18f", 444_310_142, 2_300 * MIB),
@@ -218,9 +223,12 @@ pub fn datasets() -> Vec<Download> {
             Role::ImpulseResponses,
             6 * MIB,
         ),
-        mls("mls-dutch-9h", "9_hours", "173586e5abe761359d5d6906d630f6826a66e41a588945c0add7a8ecdb883c74", 139_332_979, "training", "mls-dutch"),
-        mls("mls-dutch-dev", "dev", "0c40d8db30f3cc86041430fb43f091768cba1e65b0b27d8cc3cda02e28571881", 198_983_422, "validation_ambient", "mls-dutch-eval"),
-        mls("mls-dutch-test", "test", "feb88a282be746e7c14e1f09c017b4f69b07df9c25c94a3943eaac5ca7794ad5", 198_390_898, "testing_ambient", "mls-dutch-eval"),
+        mls("mls-dutch-9h", "9_hours-00000-of-00001.parquet", "173586e5abe761359d5d6906d630f6826a66e41a588945c0add7a8ecdb883c74", 139_332_979, training(), 500 * MIB),
+        // Two of the 48 training shards (about 32 h each), from both ends for different speakers.
+        mls("mls-dutch-train-00", "train-00000-of-00048.parquet", "d5197c6697455438f0f22a32e8108fd9295b8f21071d46c06f8ef5822e879b1b", 498_278_678, training(), 2 * GIB),
+        mls("mls-dutch-train-24", "train-00024-of-00048.parquet", "f55d61f3301ef7f59463129a13b2b4bb0e969d616f3250be621a8024a515bc10", 496_357_824, training(), 2 * GIB),
+        mls("mls-dutch-dev", "dev-00000-of-00001.parquet", "0c40d8db30f3cc86041430fb43f091768cba1e65b0b27d8cc3cda02e28571881", 198_983_422, speech("mls-dutch-eval", "validation_ambient", Some(SELECTION_HOURS)), 900 * MIB),
+        mls("mls-dutch-test", "test-00000-of-00001.parquet", "feb88a282be746e7c14e1f09c017b4f69b07df9c25c94a3943eaac5ca7794ad5", 198_390_898, speech("mls-dutch-eval", "testing_ambient", None), 700 * MIB),
     ]
 }
 
@@ -391,7 +399,8 @@ pub fn default_settings() -> Settings {
             near_miss_repetitions: 1,
         },
         training: TrainingSettings {
-            steps: vec![20_000, 10_000],
+            // Both full runs kept a checkpoint from before step 6 500 of 30 000 (2026-10-25).
+            steps: vec![10_000, 5_000],
             learning_rates: vec![0.001, 0.0001],
             positive_class_weight: vec![1.0, 1.0],
             negative_class_weight: vec![20.0, 20.0],
@@ -413,7 +422,8 @@ pub fn default_settings() -> Settings {
                     ("dinner_party", weight(10.0, 1.0)),
                     ("no_speech", weight(5.0, 1.0)),
                     ("dinner_party_eval", weight(0.0, 1.0)),
-                    ("mls-dutch", weight(3.0, 1.0)),
+                    // Dutch speech gave 11 of 13 testing false accepts at 3 (2026-10-25).
+                    ("mls-dutch", weight(6.0, 1.0)),
                     // Never sampled: its validation audio only weighs which checkpoint is kept.
                     ("mls-dutch-eval", weight(0.0, 1.0)),
                 ]
@@ -478,6 +488,42 @@ mod tests {
                 source.name
             );
         }
+    }
+
+    #[test]
+    fn dutch_training_speech_spans_the_9_hour_set_and_two_full_shards() {
+        let training: Vec<String> = datasets()
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d.role,
+                    Role::Speech {
+                        split: "training",
+                        ..
+                    }
+                )
+            })
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(
+            training,
+            ["mls-dutch-9h", "mls-dutch-train-00", "mls-dutch-train-24"]
+        );
+    }
+
+    #[test]
+    fn only_the_dutch_dev_audio_is_capped_for_checkpoint_selection() {
+        let capped: Vec<(String, f64)> = datasets()
+            .into_iter()
+            .filter_map(|d| match d.role {
+                Role::Speech {
+                    selection_hours: Some(hours),
+                    ..
+                } => Some((d.name, hours)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(capped, [("mls-dutch-dev".to_string(), SELECTION_HOURS)]);
     }
 
     #[test]

@@ -134,8 +134,9 @@ def _audio_to_wavs(source, kind):
     return build
 
 
-def _speech_features(source, track_seconds):
-    """Spectrogram features of a speech parquet, the clips joined into tracks of `track_seconds`.
+def _speech_features(source, track_seconds, max_seconds=None):
+    """Spectrogram features of a speech parquet, the clips joined into tracks of `track_seconds`;
+    only its first `max_seconds` when given.
 
     Tracks long enough to stream through make the false-accept count of an ambient set match how a
     device listens; training reads random windows of them all the same.
@@ -148,15 +149,20 @@ def _speech_features(source, track_seconds):
         name = os.path.basename(into).split(".")[0]
         out = os.path.join(into, f"{name.replace('-', '_')}_mmap")
         track_samples = int(track_seconds * SAMPLE_RATE)
+        budget = None if max_seconds is None else int(max_seconds * SAMPLE_RATE)
 
         def tracks():
             pending = []
             pending_samples = 0
+            taken = 0
             for clip_name, payload in _parquet_audio(source):
+                if budget is not None and taken + pending_samples >= budget:
+                    break
                 pending.append(_decode(clip_name, payload))
                 pending_samples += pending[-1].size
                 if pending_samples >= track_samples:
                     yield generate_features_for_clip(np.concatenate(pending))
+                    taken += pending_samples
                     pending, pending_samples = [], 0
             if pending:
                 yield generate_features_for_clip(np.concatenate(pending))
@@ -183,6 +189,12 @@ def run(request, events):
         # A group's sets go where their split says: training, validation_ambient or testing_ambient.
         target = os.path.join(root, f"{speech['group']}-features", speech["split"], speech["name"])
         items.append((target, speech["sha256"], _speech_features(speech["path"], speech["trackSeconds"])))
+        hours = speech.get("selectionHours")
+        if hours is not None:
+            # The first hours again, for upstream's training to weigh checkpoints on.
+            target = os.path.join(root, f"{speech['group']}-select-features", speech["split"], speech["name"])
+            items.append((target, f"{speech['sha256']}:{hours}",
+                          _speech_features(speech["path"], speech["trackSeconds"], hours * 3600)))
 
     for index, (target, key, build) in enumerate(items):
         if _build(target, key, build):

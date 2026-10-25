@@ -8,6 +8,7 @@ else, 2 out of memory, 3 bad input, 4 disk full.
 """
 
 import importlib
+import resource
 import sys
 import time
 import traceback
@@ -53,6 +54,8 @@ def main(argv):
             stage=stage,
             seconds=round(time.monotonic() - started, 1),
             deviceMemoryPeakMib=memory.stop(),
+            # ru_maxrss is in KiB on Linux.
+            hostMemoryPeakMib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024,
             summary=summary,
         )
         return EXIT_DONE

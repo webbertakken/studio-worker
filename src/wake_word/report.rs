@@ -34,6 +34,7 @@ pub struct StageTiming {
     pub stage: String,
     pub seconds: f64,
     pub device_memory_peak_mib: u64,
+    pub host_memory_peak_mib: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -423,13 +424,16 @@ pub fn markdown(report: &Report) -> String {
     if let Some(gpu) = &report.gpu {
         let _ = writeln!(out, "GPU: {gpu}.\n");
     }
-    let _ = writeln!(out, "| Stage | Seconds | Device memory peak (MiB) |");
-    let _ = writeln!(out, "| --- | --- | --- |");
+    let _ = writeln!(
+        out,
+        "| Stage | Seconds | Device memory peak (MiB) | Host memory peak (MiB) |"
+    );
+    let _ = writeln!(out, "| --- | --- | --- | --- |");
     for s in &report.stages {
         let _ = writeln!(
             out,
-            "| {} | {:.0} | {} |",
-            s.stage, s.seconds, s.device_memory_peak_mib
+            "| {} | {:.0} | {} | {} |",
+            s.stage, s.seconds, s.device_memory_peak_mib, s.host_memory_peak_mib
         );
     }
 
@@ -506,6 +510,7 @@ mod tests {
                 stage: "train".into(),
                 seconds: 2400.0,
                 device_memory_peak_mib: 4498,
+                host_memory_peak_mib: 21000,
             }],
             freeze: vec!["torch==2.14.1+cu126".into()],
             gpu: Some("NVIDIA GeForce RTX 4090, 24564 MiB".into()),
@@ -547,7 +552,7 @@ mod tests {
             md.contains("microWakeWord `https://github.com/kahrendt/microWakeWord.git`"),
             "{md}"
         );
-        assert!(md.contains("| train | 2400 | 4498 |"), "{md}");
+        assert!(md.contains("| train | 2400 | 4498 | 21000 |"), "{md}");
         let json = serde_json::to_value(report()).unwrap();
         assert_eq!(json["recipe"]["datasets"][0]["role"], "negativeFeatures");
         assert_eq!(
