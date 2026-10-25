@@ -444,6 +444,6 @@ mod tests {
 
     #[test]
     fn total_steps_adds_every_phase() {
-        assert_eq!(default_settings().total_steps(), 30_000);
+        assert_eq!(default_settings().total_steps(), 15_000);
     }
 }

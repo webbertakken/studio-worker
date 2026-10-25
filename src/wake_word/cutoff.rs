@@ -137,24 +137,34 @@ pub struct Choice {
     pub validation_false_accepts: u64,
     pub validation_hours: f64,
     pub validation_false_accepts_per_hour: f64,
+    /// The one-sided 95% upper bound on that rate (Poisson): what the rule holds to the target.
+    pub validation_upper_95: f64,
     pub validation_recall: f64,
     /// The rule, in words, with its numbers.
     pub why: String,
 }
 
-/// The lowest grid cutoff at which validation's false accepts per hour, and those of every higher
-/// cutoff, are at most `target`; else the lowest cutoff with the fewest.
+/// The lowest grid cutoff at which the 95% upper bound of validation's false accepts per hour, and
+/// that of every higher cutoff, is at most `target`; else the lowest cutoff with the fewest.
+///
+/// The bound, not the point estimate: a few hours of audio pin a rate loosely, and a cutoff chosen
+/// at the point estimate's edge came out at twice the target on testing audio (2026-10-25).
 pub fn choose(evaluation: &Evaluation, target: f64) -> Choice {
-    let rates: Vec<(u64, f64, f64)> = (0..evaluation.cutoffs.len())
+    let rates: Vec<(u64, f64, f64, f64)> = (0..evaluation.cutoffs.len())
         .map(|i| {
             let (count, hours) = evaluation.false_accepts(Split::Validation, i);
-            (count, hours, count as f64 / hours)
+            (
+                count,
+                hours,
+                count as f64 / hours,
+                poisson_upper_95(count) / hours,
+            )
         })
         .collect();
-    // From the top of the grid down, the lowest index from which every rate is within target.
+    // From the top of the grid down, the lowest index from which every bound is within target.
     let mut lowest_within = None;
-    for (i, (_, _, rate)) in rates.iter().enumerate().rev() {
-        if *rate > target {
+    for (i, (_, _, _, upper)) in rates.iter().enumerate().rev() {
+        if *upper > target {
             break;
         }
         lowest_within = Some(i);
@@ -164,18 +174,18 @@ pub fn choose(evaluation: &Evaluation, target: f64) -> Choice {
         None => {
             let fewest = rates
                 .iter()
-                .map(|(count, _, _)| *count)
+                .map(|(count, ..)| *count)
                 .min()
                 .expect("a grid has cutoffs");
             let i = rates
                 .iter()
-                .position(|(count, _, _)| *count == fewest)
+                .position(|(count, ..)| *count == fewest)
                 .expect("the minimum is in the list");
             (i, false)
         }
     };
     let cutoff = evaluation.cutoffs[index];
-    let (count, hours, rate) = rates[index];
+    let (count, hours, rate, upper) = rates[index];
     let recall = evaluation.recall(Split::Validation, cutoff);
     let sets: Vec<String> = evaluation
         .ambient_of(Split::Validation)
@@ -184,8 +194,9 @@ pub fn choose(evaluation: &Evaluation, target: f64) -> Choice {
     let why = if met {
         format!(
             "the lowest cutoff on the {step} grid at which the validation ambient audio ({sets}) \
-             gives at most {target} false accepts per hour, at that cutoff and every higher one: \
-             {count} in {hours:.1} h ({rate:.3} per hour); recall only falls as the cutoff rises, \
+             gives at most {target} false accepts per hour with 95% confidence, at that cutoff and \
+             every higher one: {count} in {hours:.1} h ({rate:.3} per hour, upper bound \
+             {upper:.3}); recall only falls as the cutoff rises, \
              so the lowest such cutoff keeps the most ({recall:.1}% of validation positives)",
             step = grid_step(evaluation),
             sets = sets.join(", "),
@@ -194,8 +205,9 @@ pub fn choose(evaluation: &Evaluation, target: f64) -> Choice {
     } else {
         format!(
             "no cutoff on the grid keeps the validation ambient audio ({sets}) at or below {target} \
-             false accepts per hour; this is the lowest cutoff with the fewest: {count} in \
-             {hours:.1} h ({rate:.3} per hour), recall {recall:.1}%",
+             false accepts per hour with 95% confidence; this is the lowest cutoff with the \
+             fewest: {count} in {hours:.1} h ({rate:.3} per hour, upper bound {upper:.3}), recall \
+             {recall:.1}%",
             sets = sets.join(", "),
             recall = recall * 100.0,
         )
@@ -208,6 +220,7 @@ pub fn choose(evaluation: &Evaluation, target: f64) -> Choice {
         validation_false_accepts: count,
         validation_hours: hours,
         validation_false_accepts_per_hour: rate,
+        validation_upper_95: upper,
         validation_recall: recall,
         why,
     }
@@ -335,6 +348,22 @@ pub(crate) mod tests {
             "{}",
             choice.why
         );
+    }
+
+    #[test]
+    fn a_rate_within_target_only_by_its_point_estimate_is_not_enough() {
+        let mut e = evaluation();
+        // 20 h: 8 false accepts is 0.4 per hour, but its 95% upper bound is 0.72 per hour.
+        e.ambient[0].false_accepts = vec![90, 80, 70, 60, 50, 40, 8, 4, 0, 0, 0];
+        e.ambient[1].false_accepts = vec![0; 11];
+        let choice = choose(&e, 0.5);
+        assert_eq!(choice.cutoff, 0.7);
+        assert_eq!(choice.validation_false_accepts, 4);
+        assert!(
+            (choice.validation_upper_95 - 9.154 / 20.0).abs() < 0.01,
+            "{choice:?}"
+        );
+        assert!(choice.why.contains("with 95% confidence"), "{}", choice.why);
     }
 
     #[test]

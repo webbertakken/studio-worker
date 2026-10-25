@@ -88,7 +88,7 @@ impl Paths {
             Role::BackgroundAudio { .. } | Role::ImpulseResponses => {
                 datasets.join(format!("{}-16k", download.name))
             }
-            Role::Speech { group, split } => datasets
+            Role::Speech { group, split, .. } => datasets
                 .join(format!("{group}-features"))
                 .join(split)
                 .join(&download.name),
@@ -156,10 +156,17 @@ pub fn request_json(
         match &d.role {
             Role::BackgroundAudio { kind } => entry["kind"] = json!(kind),
             Role::ImpulseResponses => entry["kind"] = json!("parquet"),
-            Role::Speech { group, split } => {
+            Role::Speech {
+                group,
+                split,
+                selection_hours,
+            } => {
                 entry["group"] = json!(group);
                 entry["split"] = json!(split);
                 entry["trackSeconds"] = json!(SPEECH_TRACK_SECONDS);
+                if let Some(hours) = selection_hours {
+                    entry["selectionHours"] = json!(hours);
+                }
             }
             Role::NegativeFeatures | Role::Generator => {}
         }
@@ -319,7 +326,19 @@ mod tests {
         assert_eq!(json["datasets"]["backgroundAudio"][1]["kind"], "zip");
         assert_eq!(json["datasets"]["impulseResponses"]["kind"], "parquet");
         assert_eq!(json["datasets"]["speech"][0]["group"], "mls-dutch");
-        assert_eq!(json["datasets"]["speech"][2]["split"], "testing_ambient");
+        let speech = json["datasets"]["speech"].as_array().unwrap();
+        let dev = speech
+            .iter()
+            .find(|s| s["name"] == "mls-dutch-dev")
+            .unwrap();
+        assert_eq!(dev["split"], "validation_ambient");
+        assert_eq!(dev["selectionHours"], 3.2);
+        let test = speech
+            .iter()
+            .find(|s| s["name"] == "mls-dutch-test")
+            .unwrap();
+        assert_eq!(test["split"], "testing_ambient");
+        assert!(test.get("selectionHours").is_none());
         assert_eq!(json["evaluation"]["ambient"][2]["name"], "dipco");
         assert_eq!(json["settings"]["samples"]["positivePerLanguage"], 10_000);
     }

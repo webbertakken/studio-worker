@@ -98,6 +98,9 @@ pub enum Event {
         stage: String,
         seconds: f64,
         device_memory_peak_mib: u64,
+        /// The most host memory the stage held (`ru_maxrss`); 0 from a trainer that does not say.
+        #[serde(default)]
+        host_memory_peak_mib: u64,
         summary: serde_json::Value,
     },
     Failed {
@@ -111,6 +114,7 @@ pub enum Event {
 pub struct StageDone {
     pub seconds: f64,
     pub device_memory_peak_mib: u64,
+    pub host_memory_peak_mib: u64,
     pub summary: serde_json::Value,
 }
 
@@ -193,6 +197,7 @@ pub fn outcome(
         (Some(EXIT_BAD_INPUT), _, _) | (_, Some(FailureClass::BadInput), _) => {
             Err(TrainingError::BadInput { stage, message })
         }
+        (None, None, _) if killed_outright(&status) => Err(TrainingError::Killed { stage }),
         (Some(0), _, None) => Err(TrainingError::StageFailed {
             stage,
             status: "exit 0".into(),
@@ -205,6 +210,20 @@ pub fn outcome(
             message,
             tail,
         }),
+    }
+}
+
+/// Ended by SIGKILL: nothing the stage could catch, most often the out-of-memory killer.
+fn killed_outright(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal() == Some(9)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        false
     }
 }
 
@@ -254,12 +273,14 @@ pub fn run(stage: StageRun<'_>) -> Result<StageDone, TrainingError> {
                         Event::Done {
                             seconds,
                             device_memory_peak_mib,
+                            host_memory_peak_mib,
                             summary,
                             ..
                         } => {
                             done = Some(StageDone {
                                 seconds,
                                 device_memory_peak_mib,
+                                host_memory_peak_mib,
                                 summary,
                             })
                         }
@@ -299,6 +320,7 @@ pub fn run(stage: StageRun<'_>) -> Result<StageDone, TrainingError> {
             stage = name,
             seconds,
             device_memory_peak_mib = done.device_memory_peak_mib,
+            host_memory_peak_mib = done.host_memory_peak_mib,
             "finished"
         ),
         Err(error) => tracing::warn!(
@@ -381,6 +403,7 @@ mod tests {
         StageDone {
             seconds: 1.0,
             device_memory_peak_mib: 10,
+            host_memory_peak_mib: 0,
             summary: serde_json::json!({}),
         }
     }
@@ -396,12 +419,13 @@ mod tests {
         );
         assert_eq!(
             read(
-                r#"{"event":"done","stage":"samples","seconds":5.6,"deviceMemoryPeakMib":2890,"summary":{"a":1}}"#
+                r#"{"event":"done","stage":"samples","seconds":5.6,"deviceMemoryPeakMib":2890,"hostMemoryPeakMib":1200,"summary":{"a":1}}"#
             ),
             Event::Done {
                 stage: "samples".into(),
                 seconds: 5.6,
                 device_memory_peak_mib: 2890,
+                host_memory_peak_mib: 1200,
                 summary: serde_json::json!({"a":1})
             }
         );
@@ -422,6 +446,22 @@ mod tests {
             ),
             Event::Phonemes { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stage_killed_without_a_word_names_the_out_of_memory_killer() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let killed = Ended::Exited {
+            status: std::process::ExitStatus::from_raw(9),
+            tail: "last line".into(),
+        };
+        let error = outcome(Phase::Train, killed, None, None).unwrap_err();
+        assert_eq!(error.reason(), "killed");
+        assert!(
+            error.to_string().contains("journalctl -u earlyoom"),
+            "{error}"
+        );
     }
 
     #[test]
