@@ -132,7 +132,7 @@ gif = { version = "0.13", optional = true }
 # downloaded per-platform at runtime by `onnx_provision` and located via `ORT_DYLIB_PATH`.
 # Exact: ort's release candidates break their API (rc.15 changed `Session::builder`), and
 # parakeet-rs 0.3.8 builds against rc.13 only.
-ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = [
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
     "std",
     "ndarray",
     "tracing",
