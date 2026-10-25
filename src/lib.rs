@@ -69,6 +69,7 @@ pub mod ui_log;
 pub mod update;
 pub mod variant;
 pub mod vision;
+pub mod voice_samples;
 pub mod wake_word;
 pub mod ws;
 

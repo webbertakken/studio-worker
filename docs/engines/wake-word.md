@@ -54,6 +54,7 @@ Errors answer `{"error": <code>, "message": <text>}`.
   "author": "Webber Takken",               // optional: the manifest's author; default "studio-worker"
   "website": "https://example.org",        // optional: the manifest's website; default the repository
   "targetFalseAcceptsPerHour": 0.5,        // optional: above 0, at most 10; default 0.5
+  "voiceSamples": ["2026-10-26"],          // optional: up to 8 recording sets ("The operator's voice")
   "settings": { "training": { "steps": [40000] } }  // optional: merged over the recipe's settings
 }
 ```
@@ -77,7 +78,8 @@ Errors answer `{"error": <code>, "message": <text>}`.
   "result": null                           // when completed:
   // {"model": ".../hey_runa.tflite", "manifest": ".../hey_runa.json", "report": ".../report.json",
   //  "reportMarkdown": ".../report.md", "cutoff": 0.93, "recall": 0.91, "falseAcceptsPerHour": 0.11,
-  //  "targetMet": true}
+  //  "targetMet": true,
+  //  "ownVoiceRecall": {"recall": 0.8, "accepted": 12, "heldOut": 15}}   // null without voiceSamples
 }
 ```
 
@@ -86,11 +88,104 @@ Errors answer `{"error": <code>, "message": <text>}`.
 | Status | `error` | When |
 | --- | --- | --- |
 | 400 | `invalid_request` | the body is not a valid request; the message names the field |
+| 400 | `invalid_voice_samples` | a named set does not exist, or its sets hold fewer than 4 positive takes |
+| 503 | `voice_samples_unavailable` | the request names sets but this worker keeps none |
 | 404 | `unknown_training` | no training with that id |
 | 409 | `busy` | another job holds the worker (one job at a time) |
 | 409 | `not_running` | `DELETE` on a training that already ended |
 | 503 | `unsupported_platform` | not Linux x86_64 with an NVIDIA GPU of compute capability 6.0 or more |
 | 507 | `insufficient_disk` | the models filesystem has less free space than the training needs; carries `neededGib`, `freeGib` |
+
+## The operator's voice
+
+The operator records his own voice on his phone (takken-assistant's "Teach Runa your voice"), so a model learns his
+voice and accent; synthetic voices alone heard a Dutch accent poorly (run 3 heard 18% of Dutch synthetic positives).
+Runa owns what happens to the recordings (runa's wake word spec, "The operator's voice"); this is the worker's part.
+
+### Terms
+
+| Term | Meaning |
+| --- | --- |
+| take | one recording: a 16 kHz mono 16-bit WAV, at most `MAX_TAKE_SECONDS` |
+| set | one sitting of the recording guide: its takes, named by the client |
+| kind | `positive` (the phrase), `near_miss` (a near miss, named in the take), `speech` (talk without the phrase) |
+| recording token | a short-lived token that uploads takes, and does nothing else |
+
+### Where takes live
+
+- `<config dir>/voice-samples/<set>/<kind>/<take>.wav` (beside `config.toml`, as every piece of worker state):
+  directories mode 0700, files 0600. Nowhere else: not under `models_root`, never copied.
+- A training reads the takes in place and, while it runs, holds its sets: an upload to them, or their deletion,
+  answers `409 set_in_training`.
+- What a training derives from them (their features, links to them) lives under its run directory and is removed
+  when the training ends, on every path. The report names the takes it used (set, kind, take, sha256), never their
+  audio.
+
+### Names
+
+| Part | Rule |
+| --- | --- |
+| set | `[a-z0-9][a-z0-9_-]{0,63}` |
+| take of `positive`, `speech` | its number, 1 to 4 digits: `007` |
+| take of `near_miss` | the near miss's slug and its number: `hey_luna-002`; the slug is `[a-z0-9]+(_[a-z0-9]+)*` |
+
+The name and its number are the take's identity: uploading the same take again replaces it (a redo).
+
+### Uploads: the LAN listener
+
+Takes travel from the phone to the LAN listener (`0.0.0.0:4798`, the TLS listener that serves `/transcribe`, with its
+pinned certificate), one take per request:
+
+```http
+PUT /voice-samples/<set>/<kind>/<take>.wav
+Authorization: Bearer <recording token>
+Content-Type: audio/wav
+Content-Length: <bytes>
+
+<the WAV>
+```
+
+- `201` a new take, `200` a take replaced (or unchanged):
+  `{"set", "kind", "take", "number", "phrase": "hey_luna" | null, "seconds", "bytes", "created": bool}`.
+- The listener reads the request's head itself: `/transcribe` goes on to the WebSocket handshake as before, every
+  other path is plain HTTP/1.1, answered and closed.
+- A recording token never opens `/transcribe`, and a stream token never uploads: they live in two stores.
+
+| Status | `error` | When |
+| --- | --- | --- |
+| 400 | `bad_name` | the set, kind or take does not follow "Names" |
+| 400 | `bad_wav` | not a 16 kHz mono PCM16 WAV, empty, or longer than `MAX_TAKE_SECONDS` |
+| 401 | `unauthorized` | no recording token, or an unknown or expired one |
+| 404 | `not_found` | any other path |
+| 405 | `method_not_allowed` | not `PUT` |
+| 409 | `set_in_training` | a training holds the set |
+| 411 | `length_required` | no `Content-Length` (chunked bodies are refused) |
+| 413 | `too_large` | `Content-Length` above `MAX_TAKE_BYTES` |
+| 500 | `not_stored` | the take could not be written; nothing changed |
+| 503 | `voice_samples_unavailable` | this worker keeps no takes |
+
+### Loopback routes
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| `POST` | `/voice-sample-tokens` | `{ttlSecs?}` (default 600, clamped to 30 s..1 h) | `{token, expiresAt, scheme: "https", host, port, path: "/voice-samples", certSha256, certPem}` |
+| `GET` | `/voice-samples` | | `{sets: [{set, positive, nearMiss: {<slug>: n}, speech, seconds, bytes, updatedAt, inTraining}]}`, newest first |
+| `DELETE` | `/voice-samples/<set>` | | `{deleted: [<set>]}`; `404 unknown_set`, `409 set_in_training` |
+| `DELETE` | `/voice-samples` | | `{deleted: [...]}`: every set; `409 set_in_training` deletes none |
+
+`host` is the machine's LAN address now (`null` without one); `503 stream_listener_down` while the listener is not up.
+
+### Training with a set
+
+- `voiceSamples` names one or more sets; every set must exist, and together they need 4 positive takes or more.
+- **Held out**: every 4th positive by take number (number divisible by 4), per set. They never train and never
+  choose the cutoff; streamed through the model as recorded (1 s of silence before each), they give
+  `ownVoiceRecall`: the share above the cutoff, with its counts.
+- **The other positives** train beside the synthetic voices, as their own feature set (`ownPositive`): silence
+  trimmed, augmented as the synthetic clips are (`features.ownVoiceRepetitions` times each).
+- **Near-miss takes** train as negatives (`ownNearMiss`), augmented the same way; **speech takes** train as
+  negatives (`ownSpeech`), split into 3 s windows.
+- The report gives own-voice recall at the cutoff and around it, the takes used, and how many were held out.
 
 ## A training
 
@@ -246,6 +341,8 @@ The defaults are `recipe::default_settings()`; the request's `settings` override
 | `training.featureWeights` (evaluation only) | dinner party eval 0, Dutch eval 0 | never sampled; CHiME-6 dev/eval and `SELECTION_HOURS` of Dutch dev pick the checkpoint |
 | `deviceMemoryBudgetGib` | 10 | upstream validates on its ambient windows in one tensor: 22 h peaked at 10.6 GiB with the context (measured) |
 | `training.model` | upstream's notebook mixednet | |
+| `features.ownVoiceRepetitions` | 40 | augmented copies of each own-voice take | 1 to 200 |
+| `training.featureWeights` (own voice) | own positive 1, own near miss 0.5, own speech 0.25 | used when the request names sets |
 | `evaluation.slidingWindow` | 5 | the manifest's `sliding_window_size` |
 | `seed` | 1 | every random choice follows it |
 
@@ -339,3 +436,8 @@ All under target `studio_worker::wake_word`.
 | `STAGE_TIMEOUTS` | prepare 2 h, samples 1 h, features 3 h, train 8 h, evaluate 1 h | a hang, not a slow run | |
 | `PROGRESS_LOG_INTERVAL` | 30 s | | 5 to 300 s |
 | `MINIMUM_ESPHOME_VERSION` | 2024.7.0 | ESPHome's v2 manifests | |
+| `MAX_TAKE_SECONDS` | 31 s | the guide's longest take is 30 s, plus its timer's slack | 30 to 60 s |
+| `MAX_TAKE_BYTES` | 1 MiB | 31 s of 16 kHz PCM16 is 992 044 bytes with its header | 1 to 4 MiB |
+| `MIN_TAKE_SECONDS` | 0.25 s | shorter is not a word | 0.1 to 1 s |
+| `HOLD_OUT_EVERY` | 4 | Runa's spec: every 4th positive is held out | 3 to 10 |
+| `DEFAULT_RECORDING_TOKEN_TTL` | 600 s | as stream tokens; the holder refreshes | 30 s to 1 h |
