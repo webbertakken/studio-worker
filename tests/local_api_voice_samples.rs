@@ -25,6 +25,7 @@ struct Worker {
     listener: std::net::SocketAddr,
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    store: VoiceSamples,
     _dir: tempfile::TempDir,
 }
 
@@ -38,6 +39,10 @@ impl Drop for Worker {
 }
 
 fn start(with_store: bool) -> Worker {
+    start_with(with_store, true, true)
+}
+
+fn start_with(with_store: bool, listening: bool, on_a_lan: bool) -> Worker {
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(Mutex::new(Catalog::default()));
     let host = ModelHost::new(
@@ -47,7 +52,15 @@ fn start(with_store: bool) -> Worker {
         studio_worker::residency::Residency::load_for_serving(None),
     );
     let mut services = ModelServices::new(host.clone());
-    services.lan_address = Arc::new(|| Ok(std::net::Ipv4Addr::new(192, 168, 1, 20)));
+    services.lan_address = if on_a_lan {
+        Arc::new(|| Ok(std::net::Ipv4Addr::new(192, 168, 1, 20)))
+    } else {
+        Arc::new(|| {
+            studio_worker::stt_stream::server::lan_address(Ok(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::new(100, 64, 0, 1),
+            )))
+        })
+    };
     let store = VoiceSamples::new(dir.path().join("voice-samples"));
     if with_store {
         services = services.with_voice_samples(store.clone());
@@ -62,9 +75,11 @@ fn start(with_store: bool) -> Worker {
     )
     .unwrap();
     if with_store {
-        server = server.with_voice_samples(services.voice_tokens.clone(), store);
+        server = server.with_voice_samples(services.voice_tokens.clone(), store.clone());
     }
-    *services.stream_endpoint.write() = Some(server.endpoint());
+    if listening {
+        *services.stream_endpoint.write() = Some(server.endpoint());
+    }
     let listener = server.local_addr();
     let engine: Arc<dyn Engine> = Arc::new(SyntheticEngine::new());
     let api = LocalApi::bind(
@@ -91,6 +106,7 @@ fn start(with_store: bool) -> Worker {
         listener,
         stop,
         threads,
+        store,
         _dir: dir,
     }
 }
@@ -340,4 +356,50 @@ fn bad_requests_are_refused_by_name() {
         .send()
         .unwrap();
     assert_eq!(unauthenticated.status().as_u16(), 401);
+}
+
+#[test]
+fn a_set_a_training_holds_is_not_deleted() {
+    let w = start(true);
+    let take = studio_worker::voice_samples::Take {
+        kind: studio_worker::voice_samples::Kind::Positive,
+        number: 1,
+        phrase: None,
+    };
+    w.store.put("s1", &take, &wav(2.0)).unwrap();
+    let held = w.store.hold(&["s1".into()]).unwrap();
+    let (status, body) = call(&w, reqwest::Method::DELETE, "/voice-samples/s1", None);
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("set_in_training"))
+    );
+    let (status, body) = call(&w, reqwest::Method::DELETE, "/voice-samples", None);
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("set_in_training"))
+    );
+    let (_, list) = call(&w, reqwest::Method::GET, "/voice-samples", None);
+    assert_eq!(list["sets"][0]["inTraining"], true);
+    drop(held);
+    let (status, _) = call(&w, reqwest::Method::DELETE, "/voice-samples", None);
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn a_grant_says_when_there_is_no_listener_or_no_lan() {
+    let w = start_with(true, false, true);
+    let (status, body) = call(&w, reqwest::Method::POST, "/voice-sample-tokens", None);
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (503, Some("stream_listener_down"))
+    );
+    let w = start_with(true, true, false);
+    let (status, grant) = call(
+        &w,
+        reqwest::Method::POST,
+        "/voice-sample-tokens",
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(status, 200);
+    assert!(grant["host"].is_null(), "no LAN address, no host: {grant}");
 }
