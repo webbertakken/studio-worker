@@ -89,7 +89,7 @@ tokio-tungstenite = { version = "0.27", default-features = false, features = ["c
 # Streaming ASR (Nemotron / Parakeet EOU) over the same load-dynamic ort.
 parakeet-rs = { version = "=0.3.8", optional = true, default-features = false, features = ["load-dynamic", "api-24"] }
 # LAN streaming speech listener (sync, thread per session, like the local API).
-tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Direct rustls dep so we can call `crypto::ring::default_provider`.
 # rustls 0.23 stopped auto-picking a CryptoProvider from cargo
 # features; the first wss/https handshake panics without an explicit
