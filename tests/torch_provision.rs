@@ -196,7 +196,7 @@ fn recipe(f: &Fixture, packages: &'static [&'static str]) -> Recipe {
     Recipe {
         name: "fake",
         python: "3.10.22",
-        cuda: "fake",
+        cuda: Some("fake"),
         torch: &["torch==0.0.0"],
         torch_index: "https://example.invalid/whl/cu000",
         packages,

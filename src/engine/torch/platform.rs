@@ -50,26 +50,39 @@ impl Platform {
     }
 }
 
-/// Decide from the target and `nvidia-smi`'s answer (its stdout, or `None` when it did not run).
-pub fn classify(linux_x86_64: bool, nvidia_smi: Option<&str>) -> Platform {
+/// The first NVIDIA GPU's compute capability, from the target and `nvidia-smi`'s answer (its
+/// stdout, or `None` when it did not run); or why there is none to use.
+pub fn read_gpu(
+    linux_x86_64: bool,
+    nvidia_smi: Option<&str>,
+    minimum: ComputeCapability,
+) -> Result<ComputeCapability, String> {
     if !linux_x86_64 {
-        return Platform::Unsupported("the torch engine runs on Linux x86_64 only".into());
+        return Err("this runs on Linux x86_64 only".into());
     }
     let Some(stdout) = nvidia_smi else {
-        return Platform::Unsupported("no NVIDIA GPU: nvidia-smi did not answer".into());
+        return Err("no NVIDIA GPU: nvidia-smi did not answer".into());
     };
     let Some(capability) = stdout.lines().next().and_then(ComputeCapability::parse) else {
-        return Platform::Unsupported(format!(
+        return Err(format!(
             "nvidia-smi gave no compute capability ({:?})",
             stdout.trim()
         ));
     };
-    if capability < MIN_COMPUTE_CAPABILITY {
-        return Platform::Unsupported(format!(
-            "the GPU's compute capability {capability} is below {MIN_COMPUTE_CAPABILITY}"
+    if capability < minimum {
+        return Err(format!(
+            "the GPU's compute capability {capability} is below {minimum}"
         ));
     }
-    Platform::Supported(capability)
+    Ok(capability)
+}
+
+/// Decide from the target and `nvidia-smi`'s answer (its stdout, or `None` when it did not run).
+pub fn classify(linux_x86_64: bool, nvidia_smi: Option<&str>) -> Platform {
+    match read_gpu(linux_x86_64, nvidia_smi, MIN_COMPUTE_CAPABILITY) {
+        Ok(capability) => Platform::Supported(capability),
+        Err(reason) => Platform::Unsupported(reason),
+    }
 }
 
 /// This machine, probed once per process (the engine roster is built more than once), and logged
@@ -79,19 +92,31 @@ pub fn probe() -> Platform {
     PROBED.get_or_init(probe_now).clone()
 }
 
+/// This machine's target, and `nvidia-smi`'s compute capabilities: what [`read_gpu`] reads.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn probe_gpu() -> (bool, Option<String>) {
+    static PROBED: std::sync::OnceLock<(bool, Option<String>)> = std::sync::OnceLock::new();
+    PROBED
+        .get_or_init(|| {
+            let linux_x86_64 = cfg!(all(target_os = "linux", target_arch = "x86_64"));
+            let nvidia_smi = linux_x86_64
+                .then(|| {
+                    crate::process::command("nvidia-smi")
+                        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                })
+                .flatten();
+            (linux_x86_64, nvidia_smi)
+        })
+        .clone()
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn probe_now() -> Platform {
-    let linux_x86_64 = cfg!(all(target_os = "linux", target_arch = "x86_64"));
-    let nvidia_smi = linux_x86_64
-        .then(|| {
-            crate::process::command("nvidia-smi")
-                .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        })
-        .flatten();
+    let (linux_x86_64, nvidia_smi) = probe_gpu();
     let platform = classify(linux_x86_64, nvidia_smi.as_deref());
     log(&platform);
     platform

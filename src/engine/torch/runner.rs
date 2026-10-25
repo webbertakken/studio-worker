@@ -112,9 +112,15 @@ pub fn is_progress_frame(line: &str) -> bool {
 
 /// Write the runner's files into `dir`, rewriting only what differs.
 pub fn install(dir: &Path) -> std::io::Result<()> {
-    for (name, content) in FILES {
+    install_files(dir, &FILES)
+}
+
+/// Write embedded `files` (relative name, content) into `dir`, rewriting only what differs, each
+/// through a partial file so a reader never sees half of one.
+pub fn install_files(dir: &Path, files: &[(&str, &str)]) -> std::io::Result<()> {
+    for (name, content) in files {
         let path = dir.join(name);
-        if std::fs::read_to_string(&path).ok().as_deref() == Some(content) {
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(*content) {
             continue;
         }
         std::fs::create_dir_all(path.parent().expect("a runner file lives in a directory"))?;
