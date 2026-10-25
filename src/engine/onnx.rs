@@ -89,10 +89,10 @@ impl OnnxImageEngine {
     /// live dev loop + the `#[ignore]` golden test.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn run_session(&self, model_path: &Path, image: Vec<f32>, mask: Vec<f32>) -> Result<Vec<f32>> {
-        self.ensure_ort_runtime()?;
+        let runtime = self.ensure_ort_runtime()?;
         let mut guard = self.cached.lock();
         if guard.as_ref().map(|(p, _)| p.as_path()) != Some(model_path) {
-            let session = Session::builder()
+            let session = Session::builder(&runtime.environment)
                 .context("ort Session::builder")?
                 .commit_from_file(model_path)
                 .with_context(|| format!("loading onnx model {}", model_path.display()))?;
@@ -126,7 +126,7 @@ impl OnnxImageEngine {
     /// engine) is provisioned and `ort` points at it, before the first
     /// session is created. Idempotent.
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn ensure_ort_runtime(&self) -> Result<()> {
+    fn ensure_ort_runtime(&self) -> Result<onnx_provision::OrtRuntime> {
         let runtime = onnx_provision::ensure_runtime(&self.models_root)?;
         info!(
             target: TRACE_TARGET,
@@ -136,7 +136,7 @@ impl OnnxImageEngine {
             version = onnx_provision::ORT_VERSION,
             "onnx runtime ready"
         );
-        Ok(())
+        Ok(runtime)
     }
 
     /// Full LaMa removal for one image job.

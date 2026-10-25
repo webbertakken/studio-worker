@@ -4264,9 +4264,9 @@ dependencies = [
 
 [[package]]
 name = "parakeet-rs"
-version = "0.3.8"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f54545a861dca6b43c8d44e3dd932764ca196d84bcf0d1b48ea212b43b29666"
+checksum = "bf03b9b2448f62f1a7e16edd16f7dea820eb79a67af3ff8aa845082338a492a1"
 dependencies = [
  "eyre",
  "hound",
