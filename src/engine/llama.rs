@@ -24,7 +24,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{
     mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunks, MtmdInputText,
 };
@@ -136,35 +136,20 @@ impl LlamaEngine {
     }
 }
 
-/// Append a sampled token's decoded text to the running completion.
+/// The text of a sampled token's bytes, decoded by the completion's one UTF-8 `decoder`.
 ///
-/// `llama.cpp`'s `token_to_piece` occasionally fails to decode a token
-/// to UTF-8 text — a partial multi-byte sequence at a token boundary, or
-/// a byte-fallback piece the decoder rejects — which surfaces as an
-/// `Err`.  A failed piece is dropped from the completion (preserving the
-/// existing behaviour) but counted and warn-logged, so a truncated
-/// completion can never pass for a complete one and the "generation
-/// complete" breadcrumb reports the real `decode_failures`.  Generic
-/// over the error so it's unit-testable without a loaded model.
-fn append_piece<E: std::fmt::Display>(
-    out: &mut String,
-    step: usize,
-    piece: std::result::Result<String, E>,
-    decode_failures: &mut u32,
-) {
-    match piece {
-        Ok(s) => out.push_str(&s),
-        Err(e) => {
-            *decode_failures += 1;
-            warn!(
-                target: TRACE_TARGET,
-                op = "generate",
-                step,
-                error = %e,
-                "llama token piece decode failed; dropping it from the completion"
-            );
-        }
-    }
+/// A character split across two tokens comes out whole once both halves arrive: the decoder keeps
+/// the incomplete tail of one token for the next.  Bytes that can never form UTF-8 become U+FFFD.
+fn decode_piece(decoder: &mut encoding_rs::Decoder, bytes: &[u8]) -> String {
+    // `decode_to_string` never grows its destination; this bound covers the bytes plus the
+    // incomplete sequence the decoder kept from the previous token.
+    let capacity = decoder
+        .max_utf8_buffer_length(bytes.len())
+        .unwrap_or(bytes.len().saturating_mul(3).saturating_add(4));
+    let mut text = String::with_capacity(capacity);
+    let (_, read, _) = decoder.decode_to_string(bytes, &mut text, false);
+    debug_assert_eq!(read, bytes.len(), "the capacity bound fits the whole token");
+    text
 }
 
 /// All layers on the GPU when built with CUDA; CPU otherwise.
@@ -188,15 +173,12 @@ fn load_model(backend: &LlamaBackend, id: &str, path: &Path) -> Result<LlamaMode
 
 /// Special-token text a template may reference.
 fn template_vars(model: &LlamaModel) -> TemplateVars {
-    let text = |token| {
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        model
-            .token_to_piece(token, &mut decoder, true, None)
-            .unwrap_or_default()
-    };
+    let vocab = model.vocab();
+    let text =
+        |token| String::from_utf8_lossy(&vocab.token_to_piece(token, true, None)).into_owned();
     TemplateVars {
-        bos_token: text(model.token_bos()),
-        eos_token: text(model.token_eos()),
+        bos_token: text(vocab.bos()),
+        eos_token: text(vocab.eos()),
     }
 }
 
@@ -365,18 +347,7 @@ pub fn complete(
     let bos = template_vars(model).bos_token;
     let add_bos = should_add_bos(model_adds_bos(model), &prompt, &bos);
     let tokenized = match &projector {
-        None => Prompt::Text(
-            model
-                .str_to_token(
-                    &prompt,
-                    if add_bos {
-                        AddBos::Always
-                    } else {
-                        AddBos::Never
-                    },
-                )
-                .map_err(|e| anyhow!("tokenize prompt: {e:?}"))?,
-        ),
+        None => Prompt::Text(model.vocab().tokenize(prompt.as_bytes(), add_bos, true)),
         Some(projector) => {
             Prompt::Media(tokenize_media(projector, prompt, add_bos, &params.images)?)
         }
@@ -429,9 +400,9 @@ pub fn complete(
             }
             logits_at = batch.n_tokens() - 1;
         }
-        (Prompt::Media(chunks), Some(projector)) => {
+        (Prompt::Media(chunks), Some(mut projector)) => {
             pos = chunks
-                .eval_chunks(&projector, &ctx, 0, 0, PROMPT_BATCH as i32, true)
+                .eval_chunks(&mut projector, &mut ctx, 0, 0, PROMPT_BATCH as i32, true)
                 .map_err(|e| anyhow!("decoding the prompt with its images: {e}"))?;
         }
         (Prompt::Media(_), None) => bail!("a prompt with images needs the vision projector"),
@@ -442,25 +413,19 @@ pub fn complete(
     // One decoder for the whole completion: a character split across two
     // tokens decodes once both halves arrive.
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut piece = String::new();
-    let (mut generated, mut hit_end, mut decode_failures) = (0u32, false, 0u32);
+    let vocab = model.vocab();
+    let (mut generated, mut hit_end) = (0u32, false);
     while generated < budget {
         if cancelled() {
             bail!("cancelled: the model is unloading or the client left");
         }
         // `sample` accepts the token itself; a second accept would advance a grammar twice.
         let token = sampler.sample(&ctx, logits_at);
-        if model.is_eog_token(token) {
+        if vocab.is_eog(token) {
             hit_end = true;
             break;
         }
-        piece.clear();
-        append_piece(
-            &mut piece,
-            generated as usize,
-            model.token_to_piece(token, &mut decoder, false, None),
-            &mut decode_failures,
-        );
+        let piece = decode_piece(&mut decoder, &vocab.token_to_piece(token, false, None));
         generated += 1;
         let safe = hold.push(&piece);
         if !safe.is_empty() {
@@ -493,7 +458,6 @@ pub fn complete(
         images,
         completion_tokens = generated,
         finish = finish.as_str(),
-        decode_failures,
         elapsed_ms,
         "generation complete"
     );
@@ -538,15 +502,10 @@ impl ChatModel for LoadedLlm {
     }
 
     fn tokenize(&self, text: &str, add_special: bool) -> Result<Vec<i32>> {
-        let add_bos = if add_special {
-            AddBos::Always
-        } else {
-            AddBos::Never
-        };
         Ok(self
             .model
-            .str_to_token(text, add_bos)
-            .map_err(|e| anyhow!("tokenize: {e:?}"))?
+            .vocab()
+            .tokenize(text.as_bytes(), add_special, true)
             .into_iter()
             .map(|t| t.0)
             .collect())
@@ -806,69 +765,32 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------
-    // append_piece — accumulates a sampled token's decoded text into the
-    // running completion.  llama.cpp's `token_to_piece` occasionally
-    // fails to decode a token to UTF-8 text; a failed piece is dropped
-    // from the completion (preserving the existing behaviour) but
-    // counted and warn-logged, so a truncated completion can never pass
-    // for a complete one and the "generation complete" breadcrumb
-    // reports the real decode_failures.
+    // decode_piece: one decoder per completion turns each sampled token's
+    // bytes into text, carrying a character split across tokens over to
+    // the next one.
     // -----------------------------------------------------------------
 
     #[test]
-    fn append_piece_concatenates_ok_pieces() {
-        let mut out = String::new();
-        let mut failures = 0u32;
-        append_piece(&mut out, 0, Ok::<_, &str>("hel".to_string()), &mut failures);
-        append_piece(&mut out, 1, Ok::<_, &str>("lo".to_string()), &mut failures);
-        assert_eq!(out, "hello");
-        assert_eq!(failures, 0);
+    fn decode_piece_concatenates_whole_pieces() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let text = decode_piece(&mut decoder, b"hel") + &decode_piece(&mut decoder, b"lo");
+        assert_eq!(text, "hello");
     }
 
     #[test]
-    fn append_piece_drops_and_counts_failed_pieces() {
-        // A token whose text can't be decoded is dropped from the
-        // completion but counted, never silently lost — so a truncated
-        // completion can't pass for a complete one.
-        let mut out = String::new();
-        let mut failures = 0u32;
-        append_piece(
-            &mut out,
-            0,
-            Ok::<_, &str>("kept".to_string()),
-            &mut failures,
-        );
-        append_piece(&mut out, 1, Err("invalid utf-8"), &mut failures);
-        append_piece(
-            &mut out,
-            2,
-            Ok::<_, &str>(" tail".to_string()),
-            &mut failures,
-        );
-        assert_eq!(out, "kept tail");
-        assert_eq!(failures, 1);
+    fn decode_piece_joins_a_character_split_across_tokens() {
+        let crab = "🦀".as_bytes();
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let first = decode_piece(&mut decoder, &crab[..2]);
+        let second = decode_piece(&mut decoder, &crab[2..]);
+        assert_eq!(first, "");
+        assert_eq!(second, "🦀");
     }
 
     #[test]
-    fn append_piece_warns_on_each_decode_failure() {
-        let logs = crate::test_support::capture(|| {
-            let mut out = String::new();
-            let mut failures = 0u32;
-            append_piece(&mut out, 7, Err("decode boom"), &mut failures);
-        });
-        assert!(
-            logs.contains("studio_worker::engine::llama"),
-            "expected llama target, got: {logs}"
-        );
-        assert!(logs.contains("WARN"), "expected WARN level, got: {logs}");
-        assert!(
-            logs.contains("decode boom"),
-            "expected the underlying error, got: {logs}"
-        );
-        assert!(
-            logs.contains("step=7"),
-            "expected the step index, got: {logs}"
-        );
+    fn decode_piece_replaces_bytes_that_are_never_utf8() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, b"a\xffb"), "a\u{fffd}b");
     }
 
     /// Regression: `global_backend()` once used a bounded spin-wait for

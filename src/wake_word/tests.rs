@@ -40,7 +40,7 @@ case "$stage" in
   evaluate)
     [ -n "$FAKE_NO_EVALUATION" ] || cat > "$work/evaluation.json" <<EOF
 {"cutoffs":[0.0,0.5,1.0],"slidingWindow":5,"cooldownSlices":25,"stride":3,
- "ambient":[{"name":"chime6","split":"validation","hours":10,"falseAccepts":[50,${FAKE_FA:-2},${FAKE_FA_TOP:-0}]},
+ "ambient":[{"name":"chime6","split":"validation","hours":10,"falseAccepts":[50,${FAKE_FA:-0},${FAKE_FA_TOP:-0}]},
             {"name":"dipco","split":"testing","hours":5,"falseAccepts":[20,1,0]}],
  "positive":[{"language":"en","split":"validation","scores":[0.9,0.8,0.3]},
              {"language":"en","split":"testing","scores":[0.95,0.4]}],
@@ -224,7 +224,7 @@ fn a_training_runs_every_stage_and_writes_the_model_its_manifest_and_report() {
     let report = std::fs::read_to_string(&result.report_markdown).unwrap();
     assert!(report.contains("hey luna: 50.0% of 2 clips"), "{report}");
     assert!(report.contains("/hˈeɪ ɹˈuːnə/"), "{report}");
-    assert!(report.contains("| samples | 2 | 100 |"), "{report}");
+    assert!(report.contains("| samples | 2 | 100 | 0 |"), "{report}");
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&result.report).unwrap()).unwrap();
     assert_eq!(

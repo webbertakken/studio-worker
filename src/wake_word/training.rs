@@ -527,6 +527,7 @@ impl WakeWords {
                 stage: phase.as_str().into(),
                 seconds: started.elapsed().as_secs_f64(),
                 device_memory_peak_mib: 0,
+                host_memory_peak_mib: 0,
             })
         };
 
@@ -608,6 +609,7 @@ impl WakeWords {
                 stage: phase.as_str().into(),
                 seconds: done.seconds,
                 device_memory_peak_mib: done.device_memory_peak_mib,
+                host_memory_peak_mib: done.host_memory_peak_mib,
             });
         }
 
@@ -723,6 +725,7 @@ impl WakeWords {
             stage: Phase::Package.as_str().into(),
             seconds: started.elapsed().as_secs_f64(),
             device_memory_peak_mib: 0,
+            host_memory_peak_mib: 0,
         });
         let report = report::build(report::Facts {
             id,

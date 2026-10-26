@@ -30,6 +30,11 @@ pub enum TrainingError {
         message: String,
         tail: String,
     },
+    #[error(
+        "the {stage} stage was killed (SIGKILL) without a word: usually the system's out-of-memory \
+         killer, when host memory ran out; `journalctl -u earlyoom` and `journalctl -k` say which"
+    )]
+    Killed { stage: String },
     #[error("the {stage} stage did not leave what comes next: {message}")]
     InvalidOutput { stage: String, message: String },
     #[error("cancelled")]
@@ -56,6 +61,7 @@ impl TrainingError {
             TrainingError::BadInput { .. } => "bad_input",
             TrainingError::StageTimedOut { .. } => "stage_timed_out",
             TrainingError::StageFailed { .. } => "stage_failed",
+            TrainingError::Killed { .. } => "killed",
             TrainingError::InvalidOutput { .. } => "invalid_output",
             TrainingError::Cancelled => "cancelled",
         }
