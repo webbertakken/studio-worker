@@ -8,6 +8,12 @@
       "description": "ort's release candidates break their API, and parakeet-rs builds against one of them: a bump waits for a person and CI, never automerges.",
       "matchPackageNames": ["ort", "ort-sys", "parakeet-rs"],
       "automerge": false
+    },
+    {
+      "description": "Runner images are pinned on purpose: ubuntu-22.04 sets the release binaries' glibc floor and carries a GCC that CUDA 12.9's nvcc accepts; ubuntu-24.04-arm builds the sd-cli prebuilt. See docs/operations/release.md.",
+      "matchManagers": ["github-actions"],
+      "matchDepTypes": ["github-runner"],
+      "enabled": false
     }
   ]
 }
