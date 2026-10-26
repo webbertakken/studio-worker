@@ -21,6 +21,7 @@ mod http_contract;
 mod http_errors;
 mod llama_process;
 mod local_api_vision;
+mod local_api_voice_samples;
 mod local_api_wake_word;
 mod multi_modal;
 mod real_candle_image;
