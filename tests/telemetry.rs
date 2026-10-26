@@ -187,7 +187,10 @@ fn build_client_options_populates_release_environment_and_server_name() {
     assert_eq!(opts.release.as_deref(), Some("4.5.6"));
     assert_eq!(opts.environment.as_deref(), Some("staging"));
     assert_eq!(opts.server_name.as_deref(), Some("box-7"));
-    assert_eq!(opts.traces_sample_rate, 0.0);
+    assert!(matches!(
+        opts.traces_sampling_strategy,
+        sentry::TracesSamplingStrategy::Disabled
+    ));
     assert!(opts.dsn.is_some(), "DSN should round-trip into options");
 }
 

@@ -18,7 +18,6 @@
 //! `sentry`'s default feature set).
 use crate::{sys, RELEASE_NAME};
 use sentry_tracing::EventFilter;
-use std::borrow::Cow;
 
 /// Tracing target for telemetry events.  Stable so operators can
 /// filter with `RUST_LOG=studio_worker::telemetry=debug`.
@@ -89,17 +88,16 @@ pub fn build_client_options(cfg: &SentryConfig) -> Option<sentry::ClientOptions>
             return None;
         }
     };
-    Some(sentry::ClientOptions {
-        dsn: Some(dsn),
-        release: Some(Cow::Owned(cfg.release.clone())),
-        environment: Some(Cow::Owned(cfg.environment.clone())),
-        server_name: Some(Cow::Owned(cfg.server_name.clone())),
-        // We use Sentry purely for error/panic reporting; performance
-        // tracing would add network traffic for very little value on a
-        // worker that already ships structured logs.
-        traces_sample_rate: 0.0,
-        ..Default::default()
-    })
+    let mut options = sentry::ClientOptions::new()
+        .release(cfg.release.clone())
+        .environment(cfg.environment.clone())
+        .server_name(cfg.server_name.clone());
+    options.dsn = Some(dsn);
+    // We use Sentry purely for error/panic reporting; performance
+    // tracing would add network traffic for very little value on a
+    // worker that already ships structured logs.
+    options.traces_sampling_strategy = sentry::TracesSamplingStrategy::Disabled;
+    Some(options)
 }
 
 /// Initialise Sentry from the process environment.
@@ -182,9 +180,12 @@ mod tests {
         // structured logs, so sampling traces would only add network
         // traffic (see build_client_options).
         assert!(
-            opts.traces_sample_rate.abs() < f32::EPSILON,
-            "traces_sample_rate must be disabled (0.0), got {}",
-            opts.traces_sample_rate
+            matches!(
+                opts.traces_sampling_strategy,
+                sentry::TracesSamplingStrategy::Disabled
+            ),
+            "performance tracing must be disabled, got {:?}",
+            opts.traces_sampling_strategy
         );
     }
 
