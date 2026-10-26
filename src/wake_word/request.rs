@@ -21,6 +21,7 @@ const MAX_SPELLINGS: usize = 8;
 const MAX_NEGATIVES: usize = 32;
 const MAX_AUTHOR_CHARS: usize = 128;
 const MAX_WEBSITE_CHARS: usize = 256;
+const MAX_VOICE_SAMPLE_SETS: usize = 8;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -44,6 +45,8 @@ struct Body {
     target_false_accepts_per_hour: Option<f64>,
     #[serde(default)]
     settings: Option<serde_json::Value>,
+    #[serde(default)]
+    voice_samples: Vec<String>,
 }
 
 /// A checked training request.
@@ -63,6 +66,8 @@ pub struct TrainingSpec {
     pub website: String,
     pub target_false_accepts_per_hour: f64,
     pub settings: Settings,
+    /// The operator's recording sets this training learns from.
+    pub voice_samples: Vec<String>,
 }
 
 /// Why a request is refused.
@@ -292,6 +297,22 @@ pub fn parse(body: &[u8]) -> Result<TrainingSpec, Invalid> {
         ));
     }
 
+    if body.voice_samples.len() > MAX_VOICE_SAMPLE_SETS {
+        return invalid(format!(
+            "voiceSamples may name at most {MAX_VOICE_SAMPLE_SETS} sets, not {}",
+            body.voice_samples.len()
+        ));
+    }
+    let mut voice_samples: Vec<String> = Vec::new();
+    for set in body.voice_samples {
+        crate::voice_samples::take::check_set(&set)
+            .map_err(|bad| Invalid(format!("voiceSamples: {}", bad.0)))?;
+        if voice_samples.contains(&set) {
+            return invalid(format!("voiceSamples: {set} is named twice"));
+        }
+        voice_samples.push(set);
+    }
+
     let settings =
         settings::with_overrides(&default_settings(), body.settings.as_ref()).map_err(Invalid)?;
     for language in &languages {
@@ -313,6 +334,7 @@ pub fn parse(body: &[u8]) -> Result<TrainingSpec, Invalid> {
         author,
         website,
         target_false_accepts_per_hour: target,
+        voice_samples,
         settings,
     })
 }
@@ -461,6 +483,28 @@ mod tests {
             let message = refused(body.clone());
             assert!(message.contains(needle), "{body}: {message}");
         }
+    }
+
+    #[test]
+    fn recording_sets_are_named_safely_once_each() {
+        assert!(parsed(json!({"phrase": "hey runa"}))
+            .unwrap()
+            .voice_samples
+            .is_empty());
+        let spec =
+            parsed(json!({"phrase": "hey runa", "voiceSamples": ["2026-10-26", "s2"]})).unwrap();
+        assert_eq!(spec.voice_samples, ["2026-10-26", "s2"]);
+        assert!(
+            refused(json!({"phrase": "hey runa", "voiceSamples": ["../x"]}))
+                .contains("voiceSamples")
+        );
+        assert!(
+            refused(json!({"phrase": "hey runa", "voiceSamples": ["s1", "s1"]})).contains("twice")
+        );
+        assert!(
+            refused(json!({"phrase": "hey runa", "voiceSamples": vec!["s"; 9]}))
+                .contains("at most 8")
+        );
     }
 
     #[test]

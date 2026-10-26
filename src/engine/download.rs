@@ -282,6 +282,16 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
+/// The sha256 digest of everything `reader` yields.
+pub(crate) fn sha256_of(reader: &mut impl std::io::Read) -> std::io::Result<[u8; 32]> {
+    let mut writer = HashingWriter {
+        inner: std::io::sink(),
+        hasher: Sha256::new(),
+    };
+    std::io::copy(reader, &mut writer)?;
+    Ok(writer.hasher.finalize().into())
+}
+
 /// Sniff an image's container format from its leading magic bytes and
 /// return the file extension `sd-cli` expects for it, or `None` when
 /// the bytes match no format we hand to `sd-cli`.
@@ -1176,6 +1186,13 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn sha256_of_digests_the_whole_reader() {
+        let source = vec![7u8; 200_000];
+        let digest = sha256_of(&mut source.as_slice()).unwrap();
+        assert_eq!(hex(&digest), hex(&Sha256::digest(&source)));
     }
 
     #[test]

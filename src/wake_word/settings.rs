@@ -46,6 +46,8 @@ pub struct AugmentationSettings {
 pub struct FeatureSettings {
     pub positive_repetitions: u32,
     pub near_miss_repetitions: u32,
+    /// Augmented copies of each own-voice take (positive and near miss).
+    pub own_voice_repetitions: u32,
 }
 
 /// How often a feature set is drawn into a batch, and how much a wrong answer on it costs.
@@ -282,6 +284,12 @@ impl Settings {
             1,
             10,
         )?;
+        within(
+            "features.ownVoiceRepetitions",
+            self.features.own_voice_repetitions,
+            1,
+            200,
+        )?;
         self.check_training()?;
         let e = &self.evaluation;
         within("evaluation.slidingWindow", e.sliding_window, 1, 50)?;
@@ -444,6 +452,6 @@ mod tests {
 
     #[test]
     fn total_steps_adds_every_phase() {
-        assert_eq!(default_settings().total_steps(), 30_000);
+        assert_eq!(default_settings().total_steps(), 15_000);
     }
 }

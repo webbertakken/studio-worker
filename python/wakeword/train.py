@@ -42,8 +42,22 @@ def _feature_sets(request):
     for negative in request["datasets"]["negativeFeatures"]:
         name = negative["name"]
         sets.append(feature_set(os.path.join(root, "negative-features", name), name, False, None))
-    for group in sorted({s["group"] for s in request["datasets"]["speech"] if s["split"] == "training"}):
-        sets.append(feature_set(os.path.join(root, f"{group}-features"), group, False, "random"))
+    speech = request["datasets"]["speech"]
+    for group in sorted({s["group"] for s in speech if s["split"] == "training"}):
+        sets.append(feature_set(os.path.join(root, f"{group}-features"), group, False, None))
+    # A group's selection hours (weighed 0, never sampled) join the audio upstream counts false
+    # accepts on when it picks the checkpoint to keep.
+    for group in sorted({s["group"] for s in speech if s.get("selectionHours") is not None}):
+        sets.append(feature_set(os.path.join(root, f"{group}-select-features"), group, False, None))
+    # The operator's own takes, beside the synthetic ones (their held-out takes never train).
+    for directory, name, truth, truncation in (
+        ("own_positive", "ownPositive", True, "truncate_start"),
+        ("own_near_miss", "ownNearMiss", False, "truncate_start"),
+        ("own_speech", "ownSpeech", False, "random"),
+    ):
+        own = os.path.join(work, "features", directory)
+        if request.get("ownVoice") and os.path.isdir(own):
+            sets.append(feature_set(own, name, truth, truncation))
     return sets
 
 

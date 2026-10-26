@@ -9,7 +9,9 @@
 
 pub mod cutoff;
 mod error;
+pub mod files;
 pub mod manifest;
+pub mod own_voice;
 pub mod recipe;
 pub mod report;
 pub mod request;

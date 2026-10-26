@@ -75,7 +75,7 @@ tempfile = "3"
 # `sd-cli`.  Pure-Rust deflate (miniz_oxide, already in the tree via
 # sentry-backtrace) — no native libs, keeps `cargo install` on a bare
 # box working.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 # Probe the Vulkan loader (libvulkan.so.1 / vulkan-1.dll) at runtime so a
 # missing GPU runtime surfaces an actionable message instead of a
 # cryptic sd-cli linker crash.  Tiny dlopen/LoadLibrary wrapper, no
@@ -108,7 +108,7 @@ whisper-rs = { version = "0.14", optional = true, default-features = false }
 candle-core = { version = "0.11.0", optional = true }
 candle-nn = { version = "0.11.0", optional = true }
 candle-transformers = { version = "0.11.0", optional = true }
-tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
 # Blocking (ureq) HF download API — candle_image uses `api::sync`.
 # `default-features = false` drops hf-hub's `default-tls` (= native-tls
 # -> openssl-sys) and its async `tokio`/reqwest stack; the `ureq`
@@ -155,7 +155,7 @@ eframe = { version = "0.37", optional = true, default-features = false, features
     "x11",
 ] }
 notify-rust = { version = "4", optional = true }
-rfd = { version = "0.17", optional = true, default-features = false, features = ["xdg-portal", "tokio"] }
+rfd = { version = "0.17", optional = true, default-features = false, features = ["xdg-portal"] }
 
 # System tray, split per-OS so the Linux build stays free of GTK / cairo
 # / appindicator (the pkg-config pain that broke `cargo install` on a
@@ -256,7 +256,7 @@ all = ["ui", "llama", "image-candle", "image-onnx", "stt-stream", "vision", "vid
 [dev-dependencies]
 wiremock = "0.6"
 # Build fake sd-cli release zips in the provisioning integration test.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 dirs = "6.0.0"
 # Mirror the main dep's `default-features = false`: sentry's default

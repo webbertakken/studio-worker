@@ -35,17 +35,18 @@ case "$stage" in
     echo '{"event":"phonemes","language":"en","text":"hey roona","role":"positive","phonemes":"hˈeɪ ɹˈuːnə"}'
     echo '{"event":"progress","stage":"samples positive en","done":1,"total":1}'
     mkdir -p "$work/samples";;
-  features) mkdir -p "$work/features";;
+  features) mkdir -p "$work/features/positive"; [ -n "$FAKE_OWN" ] && mkdir -p "$work/features/own_positive" "$work/own_voice";;
   train) mkdir -p "$work/train"; printf 'TFL3' > "$work/train/model.tflite";;
   evaluate)
+    own=""; [ -n "$FAKE_OWN" ] && own=",\"ownVoice\":{\"heldOut\":[$FAKE_OWN]}"
     [ -n "$FAKE_NO_EVALUATION" ] || cat > "$work/evaluation.json" <<EOF
 {"cutoffs":[0.0,0.5,1.0],"slidingWindow":5,"cooldownSlices":25,"stride":3,
- "ambient":[{"name":"chime6","split":"validation","hours":10,"falseAccepts":[50,${FAKE_FA:-2},${FAKE_FA_TOP:-0}]},
+ "ambient":[{"name":"chime6","split":"validation","hours":10,"falseAccepts":[50,${FAKE_FA:-0},${FAKE_FA_TOP:-0}]},
             {"name":"dipco","split":"testing","hours":5,"falseAccepts":[20,1,0]}],
  "positive":[{"language":"en","split":"validation","scores":[0.9,0.8,0.3]},
              {"language":"en","split":"testing","scores":[0.95,0.4]}],
  "nearMiss":[{"phrase":"hey_luna","split":"testing","scores":[0.7,0.1]}],
- "model":{"path":"$work/train/model.tflite","bytes":4,"sha256":"ab","tensorArenaMinBytes":25609}}
+ "model":{"path":"$work/train/model.tflite","bytes":4,"sha256":"ab","tensorArenaMinBytes":25609}$own}
 EOF
     ;;
 esac
@@ -54,6 +55,7 @@ echo "{\"event\":\"done\",\"stage\":\"$stage\",\"seconds\":1.5,\"deviceMemoryPea
 
 struct Harness {
     _dir: tempfile::TempDir,
+    store: crate::voice_samples::VoiceSamples,
     root: PathBuf,
     observers: WorkerObservers,
     gate: JobGate,
@@ -97,6 +99,8 @@ struct Options {
     free: Option<u64>,
     datasets: Vec<Download>,
     provision_fails: bool,
+    /// Keep recordings: the store, holding these takes.
+    voice_samples: Option<Vec<(&'static str, crate::voice_samples::Take)>>,
 }
 
 impl Default for Options {
@@ -107,6 +111,7 @@ impl Default for Options {
             free: None,
             datasets: vec![dataset("speech", "https://example.invalid/speech.zip")],
             provision_fails: false,
+            voice_samples: None,
         }
     }
 }
@@ -155,9 +160,19 @@ fn harness(options: Options) -> Harness {
     };
     let observers = WorkerObservers::default();
     let gate = JobGate::new();
-    let service = WakeWords::with_backend(root.clone(), observers.clone(), gate.clone(), backend);
+    let mut service =
+        WakeWords::with_backend(root.clone(), observers.clone(), gate.clone(), backend);
+    let store = crate::voice_samples::VoiceSamples::new(dir.path().join("config/voice-samples"));
+    if let Some(takes) = options.voice_samples {
+        for (set, take) in takes {
+            let audio = crate::voice_samples::take::tests::wav(2.0);
+            store.put(set, &take, &audio).unwrap();
+        }
+        service = service.with_voice_samples(store.clone());
+    }
     Harness {
         _dir: dir,
+        store,
         root,
         observers,
         gate,
@@ -224,7 +239,7 @@ fn a_training_runs_every_stage_and_writes_the_model_its_manifest_and_report() {
     let report = std::fs::read_to_string(&result.report_markdown).unwrap();
     assert!(report.contains("hey luna: 50.0% of 2 clips"), "{report}");
     assert!(report.contains("/hˈeɪ ɹˈuːnə/"), "{report}");
-    assert!(report.contains("| samples | 2 | 100 |"), "{report}");
+    assert!(report.contains("| samples | 2 | 100 | 0 |"), "{report}");
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&result.report).unwrap()).unwrap();
     assert_eq!(
@@ -453,4 +468,158 @@ fn the_disk_estimate_counts_only_what_is_missing() {
     std::fs::write(&marker, b"{}").unwrap();
     let after = super::training::disk_needed(&spec, &paths, std::slice::from_ref(&speech));
     assert_eq!(before - after, 20, "the download and its prepared set");
+}
+
+fn recordings() -> Vec<(&'static str, crate::voice_samples::Take)> {
+    use crate::voice_samples::{Kind, Take};
+    let mut takes: Vec<_> = (1..=8)
+        .map(|n| {
+            (
+                "s1",
+                Take {
+                    kind: Kind::Positive,
+                    number: n,
+                    phrase: None,
+                },
+            )
+        })
+        .collect();
+    takes.push((
+        "s1",
+        Take {
+            kind: Kind::NearMiss,
+            number: 1,
+            phrase: Some("hey_luna".into()),
+        },
+    ));
+    takes.push((
+        "s1",
+        Take {
+            kind: Kind::Speech,
+            number: 1,
+            phrase: None,
+        },
+    ));
+    takes
+}
+
+fn spec_with_sets(sets: &str) -> request::TrainingSpec {
+    request::parse(format!(r#"{{"phrase":"hey runa","voiceSamples":{sets}}}"#).as_bytes()).unwrap()
+}
+
+#[test]
+fn a_training_with_a_recording_set_reports_own_voice_recall_apart() {
+    let h = harness(Options {
+        env: vec![("FAKE_OWN", "0.95,0.4")],
+        voice_samples: Some(recordings()),
+        ..Default::default()
+    });
+    let started = h.service.start(spec_with_sets(r#"["s1"]"#)).unwrap();
+    assert!(
+        h.store.list().unwrap()[0].in_training,
+        "the set is held while it trains"
+    );
+    let training = wait_until_ended(&h, &started.id);
+    assert_eq!(training.state, State::Completed, "{:?}", training.failure);
+    let own = training.result.unwrap().own_voice_recall.unwrap();
+    assert_eq!((own.accepted, own.held_out, own.recall), (1, 2, 0.5));
+    let request: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            h.root
+                .join("wake-word/runs")
+                .join(&started.id)
+                .join("request.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request["ownVoice"]["heldOut"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        request["ownVoice"]["trainPositive"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    let run = h.root.join("wake-word/runs").join(&started.id);
+    assert!(!run.join("own_voice").exists() && !run.join("features").exists());
+    assert!(
+        !h.store.list().unwrap()[0].in_training,
+        "released when it ends"
+    );
+}
+
+#[test]
+fn a_failed_training_removes_what_it_derived_from_the_takes() {
+    let h = harness(Options {
+        env: vec![("FAKE_OWN", "0.95,0.4"), ("FAKE_FAIL", "train:internal:1")],
+        voice_samples: Some(recordings()),
+        ..Default::default()
+    });
+    let started = h.service.start(spec_with_sets(r#"["s1"]"#)).unwrap();
+    assert_eq!(wait_until_ended(&h, &started.id).state, State::Failed);
+    let run = h.root.join("wake-word/runs").join(&started.id);
+    assert!(
+        run.join("features/positive").exists(),
+        "the synthetic features are kept for a look"
+    );
+    assert!(!run.join("features/own_positive").exists() && !run.join("own_voice").exists());
+}
+
+#[test]
+fn an_evaluation_without_the_held_out_takes_is_invalid_output() {
+    let h = harness(Options {
+        voice_samples: Some(recordings()),
+        ..Default::default()
+    });
+    let started = h.service.start(spec_with_sets(r#"["s1"]"#)).unwrap();
+    let failure = wait_until_ended(&h, &started.id).failure.unwrap();
+    assert_eq!(failure.reason, "invalid_output");
+    assert!(
+        failure.message.contains("0 held-out own-voice takes of 2"),
+        "{}",
+        failure.message
+    );
+}
+
+#[test]
+fn recording_sets_that_cannot_train_are_refused_by_name() {
+    let h = harness(Options {
+        voice_samples: Some(recordings()),
+        ..Default::default()
+    });
+    let Err(Refusal::InvalidVoiceSamples(why)) = h.service.start(spec_with_sets(r#"["s9"]"#))
+    else {
+        panic!("an unknown set is refused")
+    };
+    assert!(why.contains("no set named s9"), "{why}");
+    h.store.delete(Some("s1")).unwrap();
+    use crate::voice_samples::{Kind, Take};
+    for n in 1..=3 {
+        let audio = crate::voice_samples::take::tests::wav(2.0);
+        h.store
+            .put(
+                "s2",
+                &Take {
+                    kind: Kind::Positive,
+                    number: n,
+                    phrase: None,
+                },
+                &audio,
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        h.service.start(spec_with_sets(r#"["s2"]"#)),
+        Err(Refusal::InvalidVoiceSamples(why)) if why.contains("3 positive takes, 0 of them")
+    ));
+    assert!(
+        !h.store.list().unwrap()[0].in_training,
+        "a refused training holds nothing"
+    );
+    let without_store = harness(Options::default());
+    assert_eq!(
+        without_store.service.start(spec_with_sets(r#"["s1"]"#)),
+        Err(Refusal::VoiceSamplesUnavailable)
+    );
 }

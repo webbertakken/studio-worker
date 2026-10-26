@@ -127,12 +127,12 @@ pub fn render(
                 .inner_margin(egui::Margin::symmetric(0, 10)),
         )
         .exact_size(FOOTER_HEIGHT)
-        .show_inside(ui, |ui| {
+        .show(ui, |ui| {
             outcome.save = footer(ui, draft);
         });
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
-        .show_inside(ui, |ui| {
+        .show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("config")
                 .auto_shrink([false, false])

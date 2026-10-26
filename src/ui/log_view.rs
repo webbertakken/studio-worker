@@ -159,7 +159,7 @@ fn layout_job(text: &str, composed: &Composed, p: &Palette, font: egui::FontId) 
 /// holds).  `follow` keeps the newest line in view.
 pub fn show(
     ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash,
+    id_salt: impl egui::AsIdSalt,
     composed: &Composed,
     follow: bool,
     height: f32,

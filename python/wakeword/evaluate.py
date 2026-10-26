@@ -172,6 +172,11 @@ def run(request, events):
             "tensorArenaMinBytes": arena,
         },
     }
+    held_out = os.path.join(features, "own_held_out", "testing", "own_held_out_mmap")
+    if request.get("ownVoice"):
+        scores = _scores(model, held_out, window, cooldown)
+        evaluation["ownVoice"] = {"heldOut": scores}
+        log(f"own voice: {len(scores)} held-out takes measured")
     out = os.path.join(work, "evaluation.json")
     write_json(out, evaluation)
     return {"evaluation": out, "modelBytes": len(model_bytes), "tensorArenaMinBytes": arena}

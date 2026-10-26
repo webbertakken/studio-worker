@@ -117,6 +117,8 @@ def is_out_of_memory(error):
         or "CUDA out of memory" in text
         or "OOM when allocating" in text
         or "CUDA_ERROR_OUT_OF_MEMORY" in text
+        # TensorFlow's answer when a tensor copied to the GPU does not fit its memory limit.
+        or "Dst tensor is not initialized" in text
     )
 
 

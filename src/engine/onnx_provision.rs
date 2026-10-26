@@ -393,7 +393,7 @@ fn extract_zip(archive: &Path, dir: &Path, flavour: OrtFlavour, main_name: &str)
     let mut zip = zip::ZipArchive::new(file)?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
+        let name = entry.name()?.into_owned();
         if entry.is_file() && wanted_lib(flavour, &name) {
             write_lib(&mut entry, &dir.join(cached_name(&name, main_name)))?;
         }

@@ -53,6 +53,7 @@ use crate::types::{
 mod mesh;
 mod picture;
 mod vision;
+mod voice_samples;
 mod wake_word;
 
 const TRACE_TARGET: &str = "studio_worker::local_api";
@@ -185,6 +186,10 @@ pub struct ModelServices {
     /// The machine's LAN address now, asked afresh for every grant so a new
     /// DHCP lease reaches the next one.
     pub lan_address: LanAddressSource,
+    /// Recording tokens: their own store, so they upload takes and nothing else.
+    pub voice_tokens: Arc<StreamTokens>,
+    /// The operator's recordings; `None` answers their routes `503 voice_samples_unavailable`.
+    pub voice_samples: Option<crate::voice_samples::VoiceSamples>,
 }
 
 /// Where a grant learns the machine's LAN address.
@@ -199,7 +204,15 @@ impl ModelServices {
             lan_address: Arc::new(|| {
                 crate::stt_stream::server::lan_address(crate::stt_stream::server::route_source())
             }),
+            voice_tokens: Arc::new(StreamTokens::default()),
+            voice_samples: None,
         }
+    }
+
+    /// Keep the operator's recordings in `store`.
+    pub fn with_voice_samples(mut self, store: crate::voice_samples::VoiceSamples) -> Self {
+        self.voice_samples = Some(store);
+        self
     }
 }
 
@@ -555,6 +568,10 @@ impl LocalApi {
             (Method::Post, "/models") => self.handle_add_model(request),
             (Method::Get, "/jobs") => self.handle_jobs(request),
             (Method::Post, "/stream-tokens") => self.handle_stream_token(request),
+            (_, p) if voice_samples::is_route(p) => {
+                let path = p.to_string();
+                self.handle_voice_samples(request, &method, &path)
+            }
             (_, p) if wake_word::is_route(p) => {
                 let path = p.to_string();
                 self.handle_wake_words(request, &method, &path)
