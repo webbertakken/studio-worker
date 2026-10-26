@@ -10,6 +10,7 @@ use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_transformers::models::stable_diffusion;
+use hf_hub::{split_id, HFClientSync, HFResult};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -56,7 +57,6 @@ impl CandleImageEngine {
     }
 
     fn build_pipeline(&self, width: usize, height: usize) -> Result<Pipeline> {
-        use hf_hub::api::sync::Api;
         info!(
             target: TRACE_TARGET,
             op = "build_pipeline",
@@ -66,7 +66,7 @@ impl CandleImageEngine {
             "building SD pipeline (may download weights)"
         );
         let build_started = Instant::now();
-        let api = Api::new().context("creating hf-hub api")?;
+        let api = HFClientSync::new().context("creating hf-hub client")?;
 
         let tokenizer_path = download_with_trace(&api, HF_TOKENIZER, "tokenizer.json")
             .context("downloading clip tokenizer")?;
@@ -160,11 +160,7 @@ impl CandleImageEngine {
     }
 }
 
-fn download_with_trace(
-    api: &hf_hub::api::sync::Api,
-    repo: &str,
-    file: &str,
-) -> Result<PathBuf, hf_hub::api::sync::ApiError> {
+fn download_with_trace(api: &HFClientSync, repo: &str, file: &str) -> HFResult<PathBuf> {
     debug!(
         target: TRACE_TARGET,
         op = "download",
@@ -173,7 +169,8 @@ fn download_with_trace(
         "requesting weight file"
     );
     let started = Instant::now();
-    let result = api.model(repo.to_string()).get(file);
+    let (owner, name) = split_id(repo);
+    let result = api.model(owner, name).download_file().filename(file).send();
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match &result {
         Ok(path) => debug!(
@@ -389,10 +386,13 @@ impl Engine for CandleImageEngine {
 /// Where hf-hub will cache downloaded model weights.  Reported for
 /// diagnostics only — the engine doesn't manage this directory itself.
 pub fn hf_cache_path() -> Option<PathBuf> {
-    let api = hf_hub::api::sync::Api::new().ok()?;
+    let api = HFClientSync::new().ok()?;
+    let (owner, name) = split_id(HF_REPO_V1_5);
     let path = api
-        .model(HF_REPO_V1_5.to_string())
-        .get("model_index.json")
+        .model(owner, name)
+        .download_file()
+        .filename("model_index.json")
+        .send()
         .ok()?;
     path.parent().map(|x| x.to_path_buf())
 }
