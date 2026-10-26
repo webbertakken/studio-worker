@@ -74,9 +74,7 @@ pub fn render_chat(
     ctx.insert("add_generation_prompt".into(), Value::Bool(true));
     ctx.insert("bos_token".into(), vars.bos_token.clone().into());
     ctx.insert("eos_token".into(), vars.eos_token.clone().into());
-    compiled
-        .render(minijinja::Value::from_serialize(&ctx))
-        .map_err(err)
+    compiled.render(minijinja::value::Serde(&ctx)).map_err(err)
 }
 
 /// Model defaults overlaid with the request's own kwargs (request wins).
