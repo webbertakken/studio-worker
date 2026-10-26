@@ -10,12 +10,15 @@ use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::ffi::c_int;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 /// Tracing target for the whisper engine.  Stable so operators can
 /// filter with `RUST_LOG=studio_worker::engine::whisper=debug`.
@@ -303,9 +306,9 @@ impl Engine for WhisperEngine {
         }
 
         state.full(params, &audio).context("whisper full decode")?;
-        let segments = state.full_n_segments().unwrap_or(0);
+        let segments = state.full_n_segments();
         let (text, decode_failures) =
-            collect_segment_text((0..segments).map(|i| state.full_get_segment_text(i)));
+            collect_segment_text((0..segments).map(|i| segment_text(&state, i)));
         let duration_seconds = audio.len() as f32 / 16_000.0;
         let decode_ms = decode_started.elapsed().as_millis() as u64;
         info!(
@@ -333,7 +336,7 @@ impl Engine for WhisperEngine {
 ///
 /// A segment whose text can't be decoded — whisper.cpp occasionally
 /// emits a partial multi-byte UTF-8 sequence at a segment boundary,
-/// which surfaces as a `WhisperError` from `full_get_segment_text` — is
+/// which surfaces as a `WhisperError` from `WhisperSegment::to_str` — is
 /// dropped from the transcript (preserving the existing behaviour) but
 /// counted and warn-logged, so a truncated transcript can never pass
 /// for a complete one and the "transcription complete" breadcrumb
@@ -360,6 +363,17 @@ fn collect_segment_text<E: std::fmt::Display>(
         }
     }
     (text, decode_failures)
+}
+
+/// The decoded text of one segment of a finished `full` decode.
+fn segment_text(state: &WhisperState, index: c_int) -> Result<String, String> {
+    let segment = state
+        .get_segment(index)
+        .ok_or_else(|| format!("segment {index} is out of bounds"))?;
+    segment
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|e| e.to_string())
 }
 
 fn num_cpus_for_decode() -> usize {
