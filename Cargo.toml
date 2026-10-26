@@ -75,7 +75,7 @@ tempfile = "3"
 # `sd-cli`.  Pure-Rust deflate (miniz_oxide, already in the tree via
 # sentry-backtrace) — no native libs, keeps `cargo install` on a bare
 # box working.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 # Probe the Vulkan loader (libvulkan.so.1 / vulkan-1.dll) at runtime so a
 # missing GPU runtime surfaces an actionable message instead of a
 # cryptic sd-cli linker crash.  Tiny dlopen/LoadLibrary wrapper, no
@@ -256,7 +256,7 @@ all = ["ui", "llama", "image-candle", "image-onnx", "stt-stream", "vision", "vid
 [dev-dependencies]
 wiremock = "0.6"
 # Build fake sd-cli release zips in the provisioning integration test.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 dirs = "6.0.0"
 # Mirror the main dep's `default-features = false`: sentry's default

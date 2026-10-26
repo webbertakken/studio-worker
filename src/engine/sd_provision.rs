@@ -396,11 +396,15 @@ fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<usize> {
         if entry.is_dir() {
             continue;
         }
-        let Some(file_name) = Path::new(entry.name()).file_name().map(|n| n.to_owned()) else {
+        let entry_name = entry
+            .name()
+            .with_context(|| format!("reading entry {i} name in {}", zip_path.display()))?
+            .into_owned();
+        let Some(file_name) = Path::new(&entry_name).file_name().map(|n| n.to_owned()) else {
             warn!(
                 target: TRACE_TARGET,
                 op = "extract",
-                name = entry.name(),
+                name = %entry_name,
                 "skipping zip entry with no file name"
             );
             continue;

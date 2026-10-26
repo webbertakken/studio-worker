@@ -45,4 +45,20 @@ ignore = [
     # Drop these when notify-rust / the tray stack bump quick-xml.
     "RUSTSEC-2026-0194", # quick-xml      — UI notification/tray XML (ui)
     "RUSTSEC-2026-0195", # quick-xml      — UI notification/tray XML (ui)
+    # zbus 6 folded zbus_names / zvariant / zvariant_derive into itself,
+    # so the zbus 5 split crates are unmaintained.  ksni and notify-rust
+    # (Linux tray + notifications) still require zbus 5 in their latest
+    # releases.  Informational only, no vulnerability.  Drop these when
+    # ksni and notify-rust move to zbus 6.
+    "RUSTSEC-2026-0370", # zvariant        — zbus 5 split crate (ui)
+    "RUSTSEC-2026-0371", # zbus_names      — zbus 5 split crate (ui)
+    "RUSTSEC-2026-0372", # zvariant_derive — zbus 5 split crate (ui)
+    # zip < 9 extraction flaws (SUID bits, symlink targets).  The worker
+    # itself uses zip 9.  candle-core 0.11 (latest, `image-candle`, opt-in
+    # and not shipped) still pins zip 8, and only reads `.npz` / pickle
+    # archives with `by_name`; it never calls `extract`, the only
+    # affected API.  Drop these when candle-core moves to zip 9.
+    "RUSTSEC-2026-0367", # zip 8          — candle-core, extract only (image-candle)
+    "RUSTSEC-2026-0368", # zip 8          — candle-core, extract only (image-candle)
+    "RUSTSEC-2026-0369", # zip 8          — candle-core, extract only (image-candle)
 ]
