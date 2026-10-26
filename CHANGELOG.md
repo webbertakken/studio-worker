@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.33](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.32...studio-worker-v0.4.33) (2026-10-26)
+
+
+### Features
+
+* train wake words with the operator's voice ([#243](https://github.com/webbertakken/studio-worker/issues/243)) ([c22b61f](https://github.com/webbertakken/studio-worker/commit/c22b61f52b3a4e60ff6d933f048e8951d3ea15a4))
+* wake word training (microWakeWord) ([#196](https://github.com/webbertakken/studio-worker/issues/196)) ([cc67e17](https://github.com/webbertakken/studio-worker/commit/cc67e177764f6bbf9383a6543bfe59ad6635fdb1))
+
+
+### Bug Fixes
+
+* build against egui 0.37, rfd 0.17, sha2 0.11 ([#234](https://github.com/webbertakken/studio-worker/issues/234)) ([8dd144a](https://github.com/webbertakken/studio-worker/commit/8dd144ae045869ded84b6d09329bd84dea1e8808))
+* **deps:** hold ort at rc.13, no automerge ([#226](https://github.com/webbertakken/studio-worker/issues/226)) ([caeaa97](https://github.com/webbertakken/studio-worker/commit/caeaa979b59ca7fd8a42d36af663d8e9faef5f4a))
+* **deps:** pin ort at rc.13 for parakeet-rs ([#210](https://github.com/webbertakken/studio-worker/issues/210)) ([928474b](https://github.com/webbertakken/studio-worker/commit/928474b1994e9f14e3bc552499601c7b67787549))
+* **wake-word:** Dutch-aware, margin-safe cutoffs ([#209](https://github.com/webbertakken/studio-worker/issues/209)) ([e4169e5](https://github.com/webbertakken/studio-worker/commit/e4169e5434ac50490b12b28e75a163d563424df4))
+
 ## [0.4.32](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.31...studio-worker-v0.4.32) (2026-10-24)
 
 
