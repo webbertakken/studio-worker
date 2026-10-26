@@ -181,7 +181,7 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # Windows), so it's a plain target dep — no feature gate, no system libs.
 # system-idle-time wraps `GetLastInputInfo` for user presence.
 [target.'cfg(target_os = "windows")'.dependencies]
-winreg = "0.52"
+winreg = "0.56"
 system-idle-time = { version = "1.0.4", default-features = false }
 
 # In-process llama.cpp LLM — gated OFF Windows.  llama-cpp-2 0.1.x builds
