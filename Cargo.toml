@@ -112,13 +112,12 @@ candle-core = { version = "0.11.0", optional = true }
 candle-nn = { version = "0.11.0", optional = true }
 candle-transformers = { version = "0.11.0", optional = true }
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
-# Blocking (ureq) HF download API — candle_image uses `api::sync`.
-# `default-features = false` drops hf-hub's `default-tls` (= native-tls
-# -> openssl-sys) and its async `tokio`/reqwest stack; the `ureq`
-# feature keeps the sync client, and ureq defaults to rustls, so the
-# `image-candle` / `all` build stays OpenSSL-free like the rest.
+# Blocking HF download API: candle_image uses `HFClientSync`, which runs
+# its own tokio runtime.  `default-features = false` keeps the TLS stack
+# on the reqwest 0.13 default (rustls), so the `image-candle` / `all`
+# build stays OpenSSL-free like the rest.
 hf-hub = { version = "1.0", optional = true, default-features = false, features = [
-    "ureq",
+    "blocking",
 ] }
 gif = { version = "0.14", optional = true }
 # ONNX Runtime (pykeio/ort) for the LaMa object-removal image engine.
