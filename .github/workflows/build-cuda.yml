@@ -42,7 +42,7 @@ jobs:
   build-cuda:
     name: CUDA variant (x86_64-unknown-linux-gnu)
     # The runner cargo-dist builds x86_64 Linux on, so both variants need the same glibc.
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
