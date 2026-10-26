@@ -69,7 +69,7 @@ fn shared_client() -> Result<Client> {
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
-    let built = Client::builder()
+    let built = crate::net::http_client()
         .timeout(Duration::from_secs(60))
         .build()
         .context("building reqwest client")?;

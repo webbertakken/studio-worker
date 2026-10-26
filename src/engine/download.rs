@@ -561,7 +561,7 @@ pub fn download_file_verified_within(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let part = dest.with_extension("part");
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::net::http_client()
         .timeout(stall)
         .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
         .build()?;

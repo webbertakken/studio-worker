@@ -31,18 +31,21 @@ toml = "0.8"
 # Tiny synchronous HTTP server for the always-on local image API
 # (127.0.0.1 only). Pure-Rust, no native deps.
 tiny_http = "0.12"
-# rustls instead of the default native-tls so a source build needs no
-# OpenSSL dev headers on Linux (`cargo install studio-worker` must work
-# on a bare box).  webpki-roots ships a baked CA bundle so we don't
-# depend on the host trust store either.
-reqwest = { version = "0.12", default-features = false, features = [
+# rustls instead of native-tls so a source build needs no OpenSSL dev
+# headers on Linux (`cargo install studio-worker` must work on a bare
+# box).  Clients come from `net::http_client`, which trusts only the
+# baked Mozilla roots of `webpki-root-certs`, so we don't depend on the
+# host trust store either.  `rustls` carries an aws-lc-rs fallback, but
+# `main` installs ring as the process default, which reqwest prefers.
+reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "json",
     "multipart",
-    "rustls-tls-webpki-roots",
+    "rustls",
     "charset",
     "http2",
 ] }
+webpki-root-certs = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 hostname = "0.4"
 whoami = "2.1"

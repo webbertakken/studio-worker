@@ -138,7 +138,7 @@ pub fn fetch_and_decode_audio(url: &str) -> Result<Vec<f32>> {
         f.read_to_end(&mut buf)?;
         buf
     } else {
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::net::http_client()
             .timeout(Duration::from_secs(120))
             .user_agent(concat!("studio-worker/", env!("CARGO_PKG_VERSION")))
             .build()?;
