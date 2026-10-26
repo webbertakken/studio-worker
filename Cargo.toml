@@ -85,7 +85,7 @@ libloading = "0.9"
 # GetDiskFreeSpaceExW).  `sync` only — no async runtime; rustix +
 # windows-sys are already in the tree (tempfile / everything).
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
-tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # Streaming ASR (Nemotron / Parakeet EOU) over the same load-dynamic ort.
 parakeet-rs = { version = "=0.4.3", optional = true, default-features = false, features = ["load-dynamic", "api-24"] }
 # LAN streaming speech listener (sync, thread per session, like the local API).
@@ -265,7 +265,7 @@ dirs = "6.0.0"
 # lockfile.  The `test` capture helpers need no transport; the rustls
 # transport is supplied by the normal dep via feature unification.
 sentry = { version = "0.48", default-features = false, features = ["test"] }
-tokio-tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
