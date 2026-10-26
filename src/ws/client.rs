@@ -1028,7 +1028,7 @@ mod tests {
             .status(status)
             .body(body.map(<[u8]>::to_vec))
             .expect("a valid response");
-        TError::Http(response)
+        TError::Http(Box::new(response))
     }
 
     #[test]
