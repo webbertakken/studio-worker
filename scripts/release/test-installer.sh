@@ -70,8 +70,8 @@ cuda_sha="$(binary_sha "$CUDA_ARCHIVE")"
 # as an auto-update when <update> is 1 (default: DEFAULT_UPDATE).
 # Sets $status, $output and $installed (the installed binary's sha256, or "none").
 run_installer() {
-  local variant="$1" from="$2" update="${3-$DEFAULT_UPDATE}" home="$work/home-$RANDOM"
-  mkdir -p "$home"
+  local variant="$1" from="$2" update="${3-$DEFAULT_UPDATE}" home
+  home="$(mktemp -d "$work/home-XXXXXX")"
   status=0
   output="$(
     env -i PATH="$PATH" HOME="$home" \
