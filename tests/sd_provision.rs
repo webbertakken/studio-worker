@@ -44,14 +44,14 @@ fn fake_release_zip(include_binary: bool) -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+        let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .unix_permissions(0o755);
         if include_binary {
             zw.start_file(sd_provision::binary_name(), opts).unwrap();
             zw.write_all(b"#!/bin/sh\necho fake-sd-cli\n").unwrap();
         }
-        let lib_opts: zip::write::FileOptions<()> =
+        let lib_opts: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         zw.start_file("libstable-diffusion.so", lib_opts).unwrap();
         zw.write_all(b"pretend shared library").unwrap();
