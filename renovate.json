@@ -5,8 +5,9 @@
   ],
   "packageRules": [
     {
-      "description": "ort's release candidates break their API, and parakeet-rs builds against one of them: a bump waits for a person and CI, never automerges.",
+      "description": "ort's release candidates break their API, and parakeet-rs builds against one of them: they move together, in a PR of their own that waits for a person and CI and never automerges (in the weekly group they would hold every other update).",
       "matchPackageNames": ["ort", "ort-sys", "parakeet-rs"],
+      "groupName": "ort and parakeet-rs",
       "automerge": false
     }
   ]
