@@ -642,7 +642,7 @@ Every load + save emits a structured `tracing` event on the
 without leaking credentials.
 
 Coverage regression contract in
-[`tests/config_tracing.rs`](../../tests/config_tracing.rs).
+[`tests/integration/config_tracing.rs`](../../tests/integration/config_tracing.rs).
 
 ---
 
@@ -887,7 +887,7 @@ captures them.
   token in WS Hello + as Bearer on the multipart complete route.
 - **No tokens logged**: `tracing` events at `studio_worker::config`
   redact `auth_token` and `registration_secret` (regression-tested
-  in [`tests/config_tracing.rs`](../../tests/config_tracing.rs)).
+  in [`tests/integration/config_tracing.rs`](../../tests/integration/config_tracing.rs)).
 - **Rate limited at the edge**: the studio binds
   `REGISTER_REQUEST_RATE_LIMIT` (Cloudflare native rate limiter,
   10 req / 60s / source IP) to `POST /workers/register-request`.
@@ -925,4 +925,4 @@ declarations in `apps/studio/src/shared/types/{worker,workerWs}.ts`
 are the source of truth, and [`src/types.rs`](../../src/types.rs) +
 [`src/ws/types.rs`](../../src/ws/types.rs) are hand-written
 mirrors with regression tests in
-[`tests/ws_wire.rs`](../../tests/ws_wire.rs).
+[`tests/integration/ws_wire.rs`](../../tests/integration/ws_wire.rs).

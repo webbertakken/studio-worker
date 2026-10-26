@@ -158,86 +158,88 @@ CI.
 - `src/types.rs` — shared types (capabilities, tasks, results) used by
   both the HTTP and the WS surfaces.
 
-Integration tests in `tests/`:
+Integration tests in `tests/integration/`:
+
+- Add integration tests as modules of `tests/integration/main.rs`
 
 WebSocket session + wire format:
 
-- `tests/ws_wire.rs` — round-trip every frame against the TS contract.
-- `tests/ws_client_contract.rs` — WS client against a real
+- `tests/integration/ws_wire.rs` — round-trip every frame against the TS contract.
+- `tests/integration/ws_client_contract.rs` — WS client against a real
   tokio-tungstenite server (upgrade, hello, 401 → AuthFailed, close
   4001 → AuthFailed, binary-frame rejection, close idempotency).
-- `tests/ws_session_full_loop.rs` — end-to-end hello → welcome →
+- `tests/integration/ws_session_full_loop.rs` — end-to-end hello → welcome →
   LLM offer → accept + completeJson → STT offer → accept +
   completeJson → clean close.
 
 Surviving HTTP surface (wiremock):
 
-- `tests/http_contract.rs` — register + multipart `complete` against
+- `tests/integration/http_contract.rs` — register + multipart `complete` against
   wiremock.
-- `tests/http_errors.rs` — error-status paths + tracing-emission.
+- `tests/integration/http_errors.rs` — error-status paths + tracing-emission.
 
 Auto-register + register CLI:
 
-- `tests/auto_register_http.rs` — register-request + poll-status wire
+- `tests/integration/auto_register_http.rs` — register-request + poll-status wire
   contract against a wiremock fake studio.
-- `tests/auto_register_orchestration.rs` — the orchestration tick
+- `tests/integration/auto_register_orchestration.rs` — the orchestration tick
   driving Pristine → Pending → Approved with config persistence.
-- `tests/auto_register_save_tracing.rs` — regression cover for silent
+- `tests/integration/auto_register_save_tracing.rs` — regression cover for silent
   `config::save` failures inside the poll loop.
-- `tests/auto_register_log_fields.rs` — every auto-register breadcrumb
+- `tests/integration/auto_register_log_fields.rs` — every auto-register breadcrumb
   carries structured `op` + `error` fields (register-request + poll
   WARN, credential-save ERROR).
-- `tests/register_reset.rs` — `register` CLI contracts (`--reset`
+- `tests/integration/register_reset.rs` — `register` CLI contracts (`--reset`
   clears local registration state, etc.).
-- `tests/registration_gate.rs` — `runtime::ensure_registered`, the
+- `tests/integration/registration_gate.rs` — `runtime::ensure_registered`, the
   startup gate: already-registered short-circuit, Ctrl-C abort,
   operator-rejection (with reset guidance), and approval pass-through.
 
 Runtime helpers + loops:
 
-- `tests/runtime_helpers.rs` — one-shot CLI helpers + cli dispatch
+- `tests/integration/runtime_helpers.rs` — one-shot CLI helpers + cli dispatch
   (wiremock studio + temp config dir).
-- `tests/runtime_observers.rs` — `WorkerObservers` slots the optional
+- `tests/integration/runtime_observers.rs` — `WorkerObservers` slots the optional
   native UI subscribes to.
-- `tests/runtime_startup_tracing.rs` — startup banner + `set_threshold`
+- `tests/integration/runtime_startup_tracing.rs` — startup banner + `set_threshold`
   emit operator-visible tracing.
-- `tests/runtime_ticks.rs` — per-tick auto-updater loop + clean-abort
+- `tests/integration/runtime_ticks.rs` — per-tick auto-updater loop + clean-abort
   smoke test for `runtime::run`.
 
 Auto-update:
 
-- `tests/auto_update.rs` — update check against a wiremock GitHub
+- `tests/integration/auto_update.rs` — update check against a wiremock GitHub
   Releases feed (no installer execution).
 
 Engines + multi-modal:
 
-- `tests/multi_modal.rs` — every TaskKind round-trips through the
+- `tests/integration/multi_modal.rs` — every TaskKind round-trips through the
   synthetic engine + decoders.
-- `tests/engine_tracing.rs` — every engine emits tracing on dispatch
+- `tests/integration/engine_tracing.rs` — every engine emits tracing on dispatch
   and on its key failure paths.
-- `tests/engine_download.rs` — the shared model downloader against a
+- `tests/integration/engine_download.rs` — the shared model downloader against a
   wiremock server (happy path, non-2xx, cache reuse).
-- `tests/sd_provision.rs` — the `sd-cli` auto-provisioner against a
+- `tests/integration/sd_provision.rs` — the `sd-cli` auto-provisioner against a
   wiremock release zip (download + extract, cache reuse, missing-binary
   error).
-- `tests/local_api_vision.rs`: `/vision/*` over HTTP with canned networks
+- `tests/integration/local_api_vision.rs`: `/vision/*` over HTTP with canned networks
   (raw, multipart and JSON pictures; refusals; lanes and the job gate).
 
 Telemetry + host-probe tracing:
 
-- `tests/config_tracing.rs` — config persistence leaves tracing
+- `tests/integration/config_tracing.rs` — config persistence leaves tracing
   breadcrumbs on load/save.
-- `tests/host_probe_tracing.rs` — `sys.rs` probes (VRAM, hostname,
+- `tests/integration/host_probe_tracing.rs` — `sys.rs` probes (VRAM, hostname,
   user) leave tracing breadcrumbs.
-- `tests/telemetry.rs` — Sentry telemetry contract.
+- `tests/integration/telemetry.rs` — Sentry telemetry contract.
 
 Real-backend E2E (feature-gated, off on free-tier CI — download real
 weights, run with the matching feature):
 
-- `tests/real_candle_image.rs` — `image-candle` SD v1.5 image gen.
-- `tests/real_llama.rs` — `llama` GGUF chat-completion.
-- `tests/real_whisper.rs` — `whisper` whisper-tiny.en STT.
-- `tests/real_vision.rs`: `vision` MegaDetector + bird classifier on
+- `tests/integration/real_candle_image.rs` — `image-candle` SD v1.5 image gen.
+- `tests/integration/real_llama.rs` — `llama` GGUF chat-completion.
+- `tests/integration/real_whisper.rs` — `whisper` whisper-tiny.en STT.
+- `tests/integration/real_vision.rs`: `vision` MegaDetector + bird classifier on
   pictures named by env.
 
 ## CI

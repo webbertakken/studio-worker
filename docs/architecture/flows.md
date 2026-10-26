@@ -399,7 +399,7 @@ Completion / failure notifications go through the `Notifier` trait
 `warn!` breadcrumbs, tagged `release = studio-worker@<version>` +
 `server_name`.  Credential fields are redacted from all config
 tracing (regression-tested in
-[`tests/config_tracing.rs`](../../tests/config_tracing.rs)).
+[`tests/integration/config_tracing.rs`](../../tests/integration/config_tracing.rs)).
 Independent of the studio-bound log shipping (flow 8).
 
 ---

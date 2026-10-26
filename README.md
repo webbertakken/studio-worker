@@ -460,26 +460,26 @@ Truly-untestable bits excluded from the gate:
 - `update::restart_self` — calls `execvp`, never returns.
 - `sys::detect_vram_gb` NVIDIA-specific branch — requires NVIDIA hardware.
 
-Integration tests live under `tests/`:
+Integration tests are modules of one test binary, `tests/integration/main.rs`; a new suite is a module there, never a new `tests/*.rs` file (each would link its own binary):
 
-- `tests/ws_wire.rs` — round-trip tests for every `WorkerInbound` /
+- `tests/integration/ws_wire.rs` — round-trip tests for every `WorkerInbound` /
   `WorkerOutbound` frame against the TS contract.
-- `tests/ws_client_contract.rs` — the WS client against a live
+- `tests/integration/ws_client_contract.rs` — the WS client against a live
   tokio-tungstenite server (upgrade headers, hello roundtrip, 401 →
   AuthFailed, close 4001 → AuthFailed, binary-frame rejection, close
   idempotency).
-- `tests/ws_session_full_loop.rs` — end-to-end walk: hello → welcome
+- `tests/integration/ws_session_full_loop.rs` — end-to-end walk: hello → welcome
   → LLM offer → accept + completeJson → STT offer → accept +
   completeJson → clean close.
-- `tests/http_contract.rs` — register + multipart `complete` (image
+- `tests/integration/http_contract.rs` — register + multipart `complete` (image
   + audio) against wiremock.
-- `tests/http_errors.rs` — error-status paths for register +
+- `tests/integration/http_errors.rs` — error-status paths for register +
   multipart `complete` plus the tracing-emission contract.
-- `tests/multi_modal.rs` — every TaskKind round-trips through the
+- `tests/integration/multi_modal.rs` — every TaskKind round-trips through the
   synthetic engine + decoders.
-- `tests/auto_update.rs` — release feed parsing + apply_with full flow.
-- `tests/runtime_helpers.rs` — one-shot CLI helpers via wiremock.
-- `tests/runtime_ticks.rs` — auto-update ticks + `run_returns_when_aborted`
+- `tests/integration/auto_update.rs` — release feed parsing + apply_with full flow.
+- `tests/integration/runtime_helpers.rs` — one-shot CLI helpers via wiremock.
+- `tests/integration/runtime_ticks.rs` — auto-update ticks + `run_returns_when_aborted`
   smoke test that exercises the AuthFailed exit path.
 
 ## Release process
