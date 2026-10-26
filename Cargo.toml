@@ -87,7 +87,7 @@ libloading = "0.9"
 # Free-disk-space probe for the model-download preflight (statvfs /
 # GetDiskFreeSpaceExW).  `sync` only — no async runtime; rustix +
 # windows-sys are already in the tree (tempfile / everything).
-fs4 = { version = "0.13", default-features = false, features = ["sync"] }
+fs4 = { version = "1.0", default-features = false, features = ["sync"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # Streaming ASR (Nemotron / Parakeet EOU) over the same load-dynamic ort.
 parakeet-rs = { version = "=0.4.3", optional = true, default-features = false, features = ["load-dynamic", "api-24"] }
