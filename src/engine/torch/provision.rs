@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use fs4::fs_std::FileExt as _;
-
 use super::cuda;
 use super::error::TorchError;
 use super::layout::Layout;
@@ -219,7 +217,7 @@ impl Provisioner {
             .write(true)
             .open(self.layout.lock())
             .map_err(io_error("lock"))?;
-        lock.lock_exclusive().map_err(io_error("lock"))?;
+        lock.lock().map_err(io_error("lock"))?;
         if self.is_ready(recipe, &environment) {
             tracing::debug!(target: TRACE_TARGET, op = "provision", environment = recipe.name, "ready");
             return Ok(environment);
