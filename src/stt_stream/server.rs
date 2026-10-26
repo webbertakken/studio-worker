@@ -41,7 +41,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 type Tls = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
-type Socket = WebSocket<Tls>;
+type Socket = WebSocket<crate::voice_samples::upload::Prefixed<Tls>>;
 
 /// Where the route to the outside is looked up for (TEST-NET-1, RFC 5737):
 /// connecting a UDP socket only consults the routing table, nothing is sent.
@@ -95,6 +95,10 @@ pub struct StreamServer {
     host: ModelHost,
     tokens: Arc<StreamTokens>,
     observers: WorkerObservers,
+    /// Recording tokens: a store of their own, so a stream token never uploads and a recording
+    /// token never transcribes.
+    voice_tokens: Arc<StreamTokens>,
+    voice_samples: Option<crate::voice_samples::VoiceSamples>,
 }
 
 impl StreamServer {
@@ -120,7 +124,20 @@ impl StreamServer {
             host,
             tokens,
             observers,
+            voice_tokens: Arc::new(StreamTokens::default()),
+            voice_samples: None,
         })
+    }
+
+    /// Take uploads (`PUT /voice-samples/...`) opened by `tokens` into `store`.
+    pub fn with_voice_samples(
+        mut self,
+        tokens: Arc<StreamTokens>,
+        store: crate::voice_samples::VoiceSamples,
+    ) -> Self {
+        self.voice_tokens = tokens;
+        self.voice_samples = Some(store);
+        self
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -146,8 +163,12 @@ impl StreamServer {
                         self.tokens.clone(),
                         self.observers.clone(),
                     );
+                    let uploads = Uploads {
+                        tokens: self.voice_tokens.clone(),
+                        store: self.voice_samples.clone(),
+                    };
                     std::thread::spawn(move || {
-                        session(stream, peer, tls, &host, &tokens, &observers)
+                        session(stream, peer, tls, &host, &tokens, &observers, &uploads)
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -248,6 +269,12 @@ fn accept_tls(
     Ok(rustls::StreamOwned::new(conn, stream))
 }
 
+/// What the listener needs to take uploads.
+struct Uploads {
+    tokens: Arc<StreamTokens>,
+    store: Option<crate::voice_samples::VoiceSamples>,
+}
+
 fn session(
     stream: TcpStream,
     peer: SocketAddr,
@@ -255,6 +282,7 @@ fn session(
     host: &ModelHost,
     tokens: &StreamTokens,
     observers: &WorkerObservers,
+    uploads: &Uploads,
 ) {
     let started = Instant::now();
     let started_at = Utc::now();
@@ -263,13 +291,34 @@ fn session(
     {
         return;
     }
-    let stream = match accept_tls(stream, tls) {
+    let mut stream = match accept_tls(stream, tls) {
         Ok(stream) => stream,
         Err(e) => {
             tracing::info!(target: TRACE_TARGET, op = "tls", %peer, error = %e, "stream refused");
             return;
         }
     };
+    // The head decides: an upload is plain HTTP, everything else goes on to the WebSocket
+    // handshake, which reads the same head again.
+    let read = match crate::voice_samples::upload::read_head(&mut stream) {
+        Ok(read) => read,
+        Err(e) => {
+            tracing::info!(target: TRACE_TARGET, op = "handshake", %peer, error = %e, "stream refused");
+            return;
+        }
+    };
+    if crate::voice_samples::upload::is_upload_path(&read.head.path) {
+        crate::voice_samples::upload::serve_logged(
+            &mut stream,
+            &read.head,
+            read.body(),
+            &uploads.tokens,
+            uploads.store.as_ref(),
+            peer,
+        );
+        return;
+    }
+    let stream = crate::voice_samples::upload::Prefixed::new(read.consumed, stream);
     let mut model: Option<String> = None;
     let mut endpointing = Endpointing::Server;
     let handshake = Handshake {
@@ -285,7 +334,13 @@ fn session(
         }
     };
     let Some(model) = model else { return };
-    if ws.get_ref().sock.set_read_timeout(Some(POLL)).is_err() {
+    if ws
+        .get_ref()
+        .inner
+        .sock
+        .set_read_timeout(Some(POLL))
+        .is_err()
+    {
         return;
     }
     tracing::info!(target: TRACE_TARGET, op = "stream", %peer, model = %model, ?endpointing, "stream opened");
@@ -478,7 +533,9 @@ mod tests {
         observers: WorkerObservers,
         addr: std::net::SocketAddr,
         endpoint: StreamEndpoint,
-        /// The certificate the listener presents; dropped with the harness.
+        voice_tokens: Arc<StreamTokens>,
+        voice_samples: crate::voice_samples::VoiceSamples,
+        /// The certificate the listener presents and the takes; dropped with the harness.
         _cert_dir: tempfile::TempDir,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
@@ -512,6 +569,9 @@ mod tests {
         let observers = WorkerObservers::default();
         let cert_dir = tempfile::tempdir().unwrap();
         let cert = StreamCertificate::load_or_create(cert_dir.path()).unwrap();
+        let voice_tokens = Arc::new(StreamTokens::default());
+        let voice_samples =
+            crate::voice_samples::VoiceSamples::new(cert_dir.path().join("voice-samples"));
         let server = StreamServer::bind(
             "127.0.0.1:0",
             &cert,
@@ -519,7 +579,8 @@ mod tests {
             tokens.clone(),
             observers.clone(),
         )
-        .unwrap();
+        .unwrap()
+        .with_voice_samples(voice_tokens.clone(), voice_samples.clone());
         let addr = server.local_addr();
         let endpoint = server.endpoint();
         let stop = Arc::new(AtomicBool::new(false));
@@ -531,6 +592,8 @@ mod tests {
             observers,
             addr,
             endpoint,
+            voice_tokens,
+            voice_samples,
             _cert_dir: cert_dir,
             stop,
             handle: Some(handle),
@@ -650,6 +713,84 @@ mod tests {
             }
             Err(other) => panic!("unexpected connect error: {other}"),
         }
+    }
+
+    /// `PUT` one take over TLS, trusting the listener's pin: the status and the JSON answered.
+    fn upload(h: &Harness, path: &str, token: &str, body: &[u8]) -> (u16, serde_json::Value) {
+        use std::io::{Read as _, Write as _};
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pin(h.endpoint.cert_sha256.clone())))
+            .with_no_client_auth();
+        let conn = rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("studio-worker").unwrap(),
+        )
+        .unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, TcpStream::connect(h.addr).unwrap());
+        write!(
+            tls,
+            "PUT {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\n\r\n",
+            h.addr,
+            body.len()
+        )
+        .unwrap();
+        tls.write_all(body).unwrap();
+        tls.flush().unwrap();
+        let mut answer = Vec::new();
+        // The listener closes after its answer; a TLS close without close_notify is fine here.
+        let _ = tls.read_to_end(&mut answer);
+        let text = String::from_utf8(answer).unwrap();
+        let status = text[9..12].parse().unwrap();
+        let body = text.split("\r\n\r\n").nth(1).unwrap();
+        (status, serde_json::from_str(body).unwrap())
+    }
+
+    fn recording_token(h: &Harness) -> String {
+        h.voice_tokens
+            .mint(
+                "voice-samples",
+                ChronoDuration::minutes(5),
+                chrono::Utc::now(),
+            )
+            .token
+    }
+
+    #[test]
+    fn a_take_uploaded_over_tls_is_stored() {
+        let h = start(false);
+        let take = crate::voice_samples::take::tests::wav(2.0);
+        let (status, body) = upload(
+            &h,
+            "/voice-samples/s1/positive/001.wav",
+            &recording_token(&h),
+            &take,
+        );
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["take"], "001");
+        assert_eq!(h.voice_samples.list().unwrap()[0].positive, 1);
+    }
+
+    #[test]
+    fn a_stream_token_never_uploads_and_a_recording_token_never_transcribes() {
+        let h = start(true);
+        let take = crate::voice_samples::take::tests::wav(2.0);
+        let (status, body) = upload(&h, "/voice-samples/s1/positive/001.wav", &token(&h), &take);
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (401, Some("unauthorized"))
+        );
+        assert!(h.voice_samples.list().unwrap().is_empty());
+        assert_eq!(
+            connect(&h, &recording_token(&h)).err(),
+            Some(Refused::Status(401))
+        );
+        assert!(
+            connect(&h, &token(&h)).is_ok(),
+            "a stream token still transcribes"
+        );
     }
 
     /// Open a session on [path] with a header token, trusting the listener's pin.

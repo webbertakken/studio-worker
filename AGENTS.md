@@ -131,6 +131,7 @@ CI.
   `src/local_vision.rs` serves them (lane or transient, jobs, `/vision/species`);
   `src/local_api/vision.rs` the `/vision/*` routes; `src/multipart.rs` form
   bodies.  See [`docs/engines/vision.md`](docs/engines/vision.md).
+- `src/wake_word/` — wake word training (microWakeWord) as a local job; `python/wakeword/` its trainer.  See [`docs/engines/wake-word.md`](docs/engines/wake-word.md).
 - `src/job_run.rs`, `src/job_log.rs`, `src/thumbnail.rs`, `src/job_gate.rs` —
   one job's bookkeeping (running list, `job` span, rings), per-job logs and
   the worker log ring, image thumbnails, the one-transient-job gate.

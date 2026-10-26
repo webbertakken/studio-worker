@@ -397,6 +397,7 @@ pub fn default_settings() -> Settings {
         features: FeatureSettings {
             positive_repetitions: 2,
             near_miss_repetitions: 1,
+            own_voice_repetitions: 40,
         },
         training: TrainingSettings {
             // Both full runs kept a checkpoint from before step 6 500 of 30 000 (2026-10-25).
@@ -426,6 +427,10 @@ pub fn default_settings() -> Settings {
                     ("mls-dutch", weight(6.0, 1.0)),
                     // Never sampled: its validation audio only weighs which checkpoint is kept.
                     ("mls-dutch-eval", weight(0.0, 1.0)),
+                    // The operator's own takes, when a training names recording sets.
+                    ("ownPositive", weight(1.0, 1.0)),
+                    ("ownNearMiss", weight(0.5, 1.0)),
+                    ("ownSpeech", weight(0.25, 1.0)),
                 ]
                 .map(|(k, v)| (k.to_string(), v)),
             ),
