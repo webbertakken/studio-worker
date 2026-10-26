@@ -42,10 +42,10 @@ jobs:
   build-cuda:
     name: CUDA variant (x86_64-unknown-linux-gnu)
     # The runner cargo-dist builds x86_64 Linux on, so both variants need the same glibc.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -89,7 +89,7 @@ jobs:
         run: scripts/release/cuda-variant.sh package target/distrib
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # `artifacts-*` is the pattern the release jobs download and attach.
           name: artifacts-build-cuda
