@@ -443,6 +443,21 @@ fn a_training_is_refused_when_it_cannot_run_here() {
 }
 
 #[test]
+fn an_ended_training_has_already_freed_the_worker() {
+    for _ in 0..20 {
+        let h = harness(Options::default());
+        let training = h.service.start(spec()).unwrap();
+        while h.service.get(&training.id).unwrap().state == State::Running {
+            std::hint::spin_loop();
+        }
+        assert!(
+            !h.gate.is_busy(),
+            "the worker is free once the training reads ended"
+        );
+    }
+}
+
+#[test]
 fn trainings_are_listed_newest_first() {
     let h = harness(Options::default());
     let first = h.service.start(spec()).unwrap();
