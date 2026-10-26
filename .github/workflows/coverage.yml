@@ -22,14 +22,14 @@ jobs:
       # effect under the `coverage_nightly` cfg cargo-llvm-cov sets on
       # nightly. On stable those exclusions compile to nothing, so the
       # gate would measure untestable code and drift with the host GPU.
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           components: llvm-tools-preview
 
       - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@f9ee2b3488b5862cca1caf86effaa61f55953001 # cargo-llvm-cov
 
       # Measure the headless core.  The `ui` feature (now on by default)
       # is egui rendering + OS tray glue that isn't unit-testable, so we
