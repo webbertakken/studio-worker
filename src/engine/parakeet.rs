@@ -5,7 +5,7 @@
 //! a fresh utterance state over them.
 
 use crate::catalog::CatalogModel;
-use crate::engine::onnx_provision::{self, OrtFlavour};
+use crate::engine::onnx_provision::{self, OrtRuntime};
 use crate::host::{LoadedModel, StreamingModel};
 use crate::stt_stream::session::StreamingTranscriber;
 use anyhow::{anyhow, Context, Result};
@@ -102,12 +102,12 @@ impl StreamingTranscriber for EouStream {
     fn reset(&mut self) {}
 }
 
-/// Session options for the process's ONNX Runtime flavour.  On CUDA the
-/// provider is registered strictly: if it cannot load, the model fails
+/// Session options for the process's ONNX Runtime: its environment, and on
+/// CUDA the provider, registered strictly: if it cannot load, the model fails
 /// to load rather than running on the CPU unnoticed.
-fn exec_config(flavour: OrtFlavour) -> ExecutionConfig {
-    let config = ExecutionConfig::new();
-    if flavour.is_cuda() {
+fn exec_config(runtime: &OrtRuntime) -> ExecutionConfig {
+    let config = ExecutionConfig::new().with_environment(runtime.environment.clone());
+    if runtime.flavour.is_cuda() {
         config.with_custom_configure(|builder| {
             Ok(builder
                 .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])?)
@@ -143,7 +143,7 @@ pub fn load_resident(models_root: &Path, model: &CatalogModel) -> Result<LoadedS
         );
     }
     let started = Instant::now();
-    let config = Some(exec_config(runtime.flavour));
+    let config = Some(exec_config(&runtime));
     let handle = match kind {
         StreamKind::Nemotron => Handle::Nemotron(NemotronHandle::from_pretrained(&dir, config)?),
         StreamKind::Eou => Handle::Eou(ParakeetEOUHandle::from_pretrained(&dir, config)?),

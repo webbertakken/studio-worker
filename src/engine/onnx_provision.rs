@@ -4,7 +4,8 @@
 //! `ort` (load-dynamic) links nothing native at build time — so the worker
 //! binary cross-compiles on every cargo-dist target with no
 //! glibc/libstdc++/MSVC-CRT prebuilt-link issues — and loads the ONNX Runtime
-//! shared library at runtime from the `ORT_DYLIB_PATH` env var.
+//! shared library at runtime, when the process's one `ort` environment is
+//! created from it ([`ensure_runtime`]).
 //!
 //! We download Microsoft's official ONNX Runtime build (version [`ORT_VERSION`],
 //! ORT_API_VERSION 24) for the host platform on first use, cache it under
@@ -58,11 +59,13 @@ impl OrtFlavour {
     }
 }
 
-/// The loaded runtime: its flavour and main shared library.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The loaded runtime: its flavour, main shared library, and the process's
+/// one `ort` environment, which every ONNX session is built in.
+#[derive(Debug, Clone)]
 pub struct OrtRuntime {
     pub flavour: OrtFlavour,
     pub lib: PathBuf,
+    pub environment: ort::environment::Environment,
 }
 
 enum Archive {
@@ -299,19 +302,28 @@ pub fn ensure_runtime(models_root: &Path) -> Result<OrtRuntime> {
     if let Some(rt) = RUNTIME.get() {
         return Ok(rt.clone());
     }
-    let runtime = match std::env::var_os("ORT_DYLIB_PATH") {
+    let (flavour, lib) = match std::env::var_os("ORT_DYLIB_PATH") {
         // Set by the operator: use it as-is; only a pinned flavour says it is CUDA.
-        Some(path) => OrtRuntime {
-            flavour: flavour_override(std::env::var(FLAVOUR_ENV).ok().as_deref())?
+        Some(path) => (
+            flavour_override(std::env::var(FLAVOUR_ENV).ok().as_deref())?
                 .unwrap_or(OrtFlavour::Cpu),
-            lib: PathBuf::from(path),
-        },
+            PathBuf::from(path),
+        ),
         None => {
             let flavour = detect_flavour()?;
-            let lib = provision_flavour(models_root, flavour)?;
-            std::env::set_var("ORT_DYLIB_PATH", &lib);
-            OrtRuntime { flavour, lib }
+            (flavour, provision_flavour(models_root, flavour)?)
         }
+    };
+    // ort allows one environment per process, ever: it lives in `RUNTIME` from here on.
+    let environment = ort::init_from(&lib)
+        .with_context(|| format!("loading ONNX Runtime from {}", lib.display()))?
+        .with_name("studio-worker")
+        .build()
+        .context("creating the ONNX Runtime environment")?;
+    let runtime = OrtRuntime {
+        flavour,
+        lib,
+        environment,
     };
     tracing::info!(
         target: TRACE_TARGET,
@@ -393,7 +405,10 @@ fn extract_zip(archive: &Path, dir: &Path, flavour: OrtFlavour, main_name: &str)
     let mut zip = zip::ZipArchive::new(file)?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let name = entry.name()?.into_owned();
+        let name = entry
+            .name()
+            .with_context(|| format!("reading entry {i} of {}", archive.display()))?
+            .into_owned();
         if entry.is_file() && wanted_lib(flavour, &name) {
             write_lib(&mut entry, &dir.join(cached_name(&name, main_name)))?;
         }

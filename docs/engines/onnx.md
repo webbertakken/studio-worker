@@ -26,14 +26,15 @@ runtime** — exactly like `sd-cli` and model weights are provisioned on demand.
 On the first onnx job the worker:
 
 1. picks the Microsoft ONNX Runtime release asset for the host platform
-   (version pinned to **`ORT_VERSION` = 1.24.2**, the build `ort` 2.0.0-rc.12
-   targets — `ORT_API_VERSION` 24);
+   (version pinned to **`ORT_VERSION` = 1.24.2**, matching the `api-24` level
+   `ort` is built with: `ORT_API_VERSION` 24);
 2. downloads it from
    `https://github.com/microsoft/onnxruntime/releases/download/v<ver>/<asset>`
    and extracts the main shared library (pure-Rust `flate2`+`tar` for `.tgz`,
    `zip` for `.zip`) into `<models_root>/onnxruntime/`;
-3. points `ort` at it via the `ORT_DYLIB_PATH` env var (set once, before the
-   first session).
+3. loads it into the process's one `ort` environment (`ort::init_from`, once,
+   before the first session). `ort` allows a single environment per process,
+   so LaMa, vision and streaming speech all build their sessions in it.
 
 The download is cached, so subsequent jobs reuse the local library. A different
 ONNX model id just needs a `studioModels` row with `engine = "onnx"`; the engine

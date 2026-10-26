@@ -90,7 +90,7 @@ pub fn load(models_root: &Path, model: &CatalogModel) -> Result<OnnxVision> {
     };
     let spec = VisionSpec::from_model(model, labels.as_deref())?;
 
-    let mut builder = Session::builder()?;
+    let mut builder = Session::builder(&runtime.environment)?;
     if runtime.flavour.is_cuda() {
         // Strict: a CUDA provider that cannot load fails the load instead of running on the
         // CPU unnoticed.
