@@ -27,7 +27,7 @@ serde_json = "1.0"
 # pycompat covers the Python string methods real templates call.
 minijinja = { version = "3", features = ["json", "loop_controls", "serde", "unicode"] }
 minijinja-contrib = { version = "3", default-features = false, features = ["pycompat"] }
-toml = "0.9"
+toml = "1.0"
 # Tiny synchronous HTTP server for the always-on local image API
 # (127.0.0.1 only). Pure-Rust, no native deps.
 tiny_http = "0.12"
