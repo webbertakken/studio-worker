@@ -22,7 +22,7 @@ use super::trainer::{self, Paths};
 use super::TRACE_TARGET;
 use crate::engine::torch::platform::ComputeCapability;
 use crate::engine::torch::provision::Environment;
-use crate::job_gate::JobGate;
+use crate::job_gate::{JobGate, JobReservation};
 use crate::job_run::JobRun;
 use crate::runtime::{truncate_prompt, CurrentJob, JobOutcome, JobSource, WorkerObservers};
 use crate::types::TaskKind;
@@ -233,6 +233,14 @@ struct Entry {
     cancel: Arc<AtomicBool>,
 }
 
+/// What a running training holds: the worker's job slot and, with own-voice samples, the hold
+/// on them (no upload to its sets, no delete). Both are released as the training ends.
+struct Claim {
+    _reservation: JobReservation,
+    _voice: Option<Held>,
+    own: Option<OwnVoice>,
+}
+
 struct Inner {
     models_root: PathBuf,
     paths: Paths,
@@ -408,19 +416,20 @@ impl WakeWords {
         let spawned = std::thread::Builder::new()
             .name(format!("wake-word-{id}"))
             .spawn(move || {
-                let _reservation = reservation;
-                // The hold lasts as long as the training: no upload to its sets, no delete.
-                let (_held, own) = match own_voice {
-                    Some((held, own)) => (Some(held), Some(own)),
-                    None => (None, None),
+                let (voice, own) = own_voice.unzip();
+                let claim = Claim {
+                    _reservation: reservation,
+                    _voice: voice,
+                    own,
                 };
-                service.run(&id, spec, own.as_ref(), capability, started_at, &cancel);
+                service.run(&id, spec, claim, capability, started_at, &cancel);
             });
         if let Err(e) = spawned {
             let message = format!("could not start the training's thread: {e}");
             self.end(
                 &training.id,
                 Err(TrainingError::ProvisionFailed(message.clone())),
+                None,
             );
             return Err(Refusal::Unavailable(message));
         }
@@ -486,7 +495,9 @@ impl WakeWords {
         }
     }
 
-    fn end(&self, id: &str, outcome: Result<TrainingResult, TrainingError>) {
+    /// Records training `id`'s outcome and releases its `claim` under the same lock, so whoever
+    /// sees the training ended finds the worker free.
+    fn end(&self, id: &str, outcome: Result<TrainingResult, TrainingError>, claim: Option<Claim>) {
         let mut trainings = self.inner.trainings.lock();
         let Some(entry) = trainings.iter_mut().find(|e| e.training.id == id) else {
             return;
@@ -513,6 +524,8 @@ impl WakeWords {
                 });
             }
         }
+        drop(claim);
+        drop(trainings);
     }
 
     /// The training's thread: a job from start to end.
@@ -520,7 +533,7 @@ impl WakeWords {
         &self,
         id: &str,
         spec: TrainingSpec,
-        own: Option<&OwnVoice>,
+        claim: Claim,
         capability: ComputeCapability,
         started_at: DateTime<Utc>,
         cancel: &AtomicBool,
@@ -538,8 +551,15 @@ impl WakeWords {
         );
         let wall = Instant::now();
         let outcome = job.span().in_scope(|| {
-            let outcome = self.train(id, &spec, own, capability, started_at, cancel);
-            if own.is_some() {
+            let outcome = self.train(
+                id,
+                &spec,
+                claim.own.as_ref(),
+                capability,
+                started_at,
+                cancel,
+            );
+            if claim.own.is_some() {
                 remove_own_voice(&self.inner.paths.run(id));
             }
             match &outcome {
@@ -572,7 +592,7 @@ impl WakeWords {
                 reason: format!("{}: {error}", error.reason()),
             },
         };
-        self.end(id, outcome);
+        self.end(id, outcome, Some(claim));
         job.finish(job_outcome);
     }
 
