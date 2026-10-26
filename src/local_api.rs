@@ -1645,20 +1645,24 @@ mod tests {
     /// An engine that sleeps in `dispatch` so a generation stays
     /// in-flight long enough to prove the pool keeps `/healthz`
     /// answering while a job runs.
-    struct SlowEngine {
+    /// An engine whose job announces that it started, then holds until the
+    /// test releases it: a job provably in flight, with no clock involved.
+    struct GatedEngine {
         inner: SyntheticEngine,
-        delay: std::time::Duration,
+        started: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
-    impl Engine for SlowEngine {
+    impl Engine for GatedEngine {
         fn name(&self) -> &'static str {
-            "slow"
+            "gated"
         }
         fn capabilities(&self) -> EngineCapabilities {
             self.inner.capabilities()
         }
         fn dispatch(&self, model: &str, task: Task) -> anyhow::Result<TaskResult> {
-            std::thread::sleep(self.delay);
+            self.started.lock().send(()).ok();
+            self.release.lock().recv().ok();
             self.inner.dispatch(model, task)
         }
     }
@@ -2963,17 +2967,18 @@ mod tests {
 
     #[test]
     fn healthz_answers_while_a_generation_is_in_flight() {
-        // The whole point of the worker pool: a slow (~400 ms) job must
-        // not block liveness / cheap routes.  On the old
-        // single-threaded loop this `/healthz` would queue behind the
-        // generation and only answer after it finished.
-        let engine: Arc<dyn Engine> = Arc::new(SlowEngine {
+        // The whole point of the worker pool: a running job must not
+        // block liveness / cheap routes.  The job holds until `/healthz`
+        // has answered, so a serial loop could never answer it.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let engine: Arc<dyn Engine> = Arc::new(GatedEngine {
             inner: SyntheticEngine::new(),
-            delay: std::time::Duration::from_millis(400),
+            started: Mutex::new(started_tx),
+            release: Mutex::new(release_rx),
         });
         let observers = WorkerObservers::default();
         let catalog = Arc::new(Mutex::new(seeded_catalog()));
-        let gate = JobGate::new();
         let api = LocalApi::bind(
             "127.0.0.1:0",
             engine,
@@ -2981,7 +2986,7 @@ mod tests {
             None,
             observers,
             TEST_TOKEN.to_string(),
-            gate.clone(),
+            JobGate::new(),
             None,
             ModelServices::new(test_host(&catalog)),
         )
@@ -3005,27 +3010,20 @@ mod tests {
                 .as_u16()
         });
 
-        // Wait until the generation holds the job gate (a fixed sleep raced it on a loaded CI
-        // runner), then time a /healthz: it must answer well within the generation's 400 ms.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !gate.is_busy() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the generation never started"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let start = std::time::Instant::now();
-        let health = reqwest::blocking::get(format!("{url}/healthz")).unwrap();
-        let elapsed = start.elapsed();
+        // The generation reached the engine and holds a worker until released.
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the generation never started");
+        let health = reqwest::blocking::Client::new()
+            .get(format!("{url}/healthz"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .expect("healthz must answer while the generation holds a worker");
         assert_eq!(health.status(), 200);
-        assert!(
-            elapsed < std::time::Duration::from_millis(250),
-            "healthz blocked behind the generation ({elapsed:?}); the pool isn't concurrent"
-        );
         // While the job runs, healthz reports busy=true.
         let body: serde_json::Value = health.json().unwrap();
         assert_eq!(body["busy"], true, "a running job must show busy=true");
+        release_tx.send(()).unwrap();
 
         assert_eq!(gen.join().unwrap(), 200, "the generation still succeeds");
         stop.store(true, Ordering::Relaxed);
