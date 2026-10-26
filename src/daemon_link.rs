@@ -318,6 +318,8 @@ pub struct Poller {
     /// Since when no daemon has been running (none while one runs).
     absent_since: Option<Instant>,
     spawn_grace: Duration,
+    /// What the grace and backoff measure time with.
+    now: Box<dyn Fn() -> Instant + Send>,
 }
 
 impl Poller {
@@ -330,7 +332,14 @@ impl Poller {
             spawn_backoff: SPAWN_BACKOFF,
             absent_since: None,
             spawn_grace: SPAWN_GRACE,
+            now: Box::new(Instant::now),
         }
+    }
+
+    /// Override the clock (tests).
+    pub fn with_clock(mut self, now: impl Fn() -> Instant + Send + 'static) -> Self {
+        self.now = Box::new(now);
+        self
     }
 
     /// Override [`SPAWN_GRACE`] (tests).
@@ -394,8 +403,9 @@ impl Poller {
                 LinkState::Starting { error }
             }
             Ok(false) => {
-                let since = *self.absent_since.get_or_insert_with(Instant::now);
-                if since.elapsed() < self.spawn_grace {
+                let now = (self.now)();
+                let since = *self.absent_since.get_or_insert(now);
+                if now.duration_since(since) < self.spawn_grace {
                     return LinkState::Unreachable {
                         error,
                         started_daemon: false,
@@ -403,14 +413,14 @@ impl Poller {
                 }
                 let due = self
                     .last_spawn
-                    .is_none_or(|at| at.elapsed() >= self.spawn_backoff);
+                    .is_none_or(|at| now.duration_since(at) >= self.spawn_backoff);
                 if !due {
                     return LinkState::Unreachable {
                         error,
                         started_daemon: true,
                     };
                 }
-                self.last_spawn = Some(Instant::now());
+                self.last_spawn = Some(now);
                 match self.starter.start() {
                     Ok(pid) => {
                         tracing::info!(
@@ -585,6 +595,22 @@ mod tests {
         }
     }
 
+    /// A clock that only moves when the test advances it.
+    #[derive(Clone)]
+    struct ManualClock(Arc<Mutex<Instant>>);
+
+    impl ManualClock {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Instant::now())))
+        }
+        fn now(&self) -> Instant {
+            *self.0.lock()
+        }
+        fn advance(&self, by: Duration) {
+            *self.0.lock() += by;
+        }
+    }
+
     fn poller_for(config: &Path, starter: FakeStarter) -> (Poller, Replica) {
         let replica = Replica::default();
         // No grace in tests that are about spawning itself.
@@ -654,8 +680,15 @@ mod tests {
         let config = dir.path().join("config.toml");
         let starter = FakeStarter::default();
         let (poller, replica) = poller_for(&config, starter.clone());
-        let mut poller = poller.with_spawn_grace(Duration::from_millis(200));
+        let clock = ManualClock::new();
+        let mut poller = poller
+            .with_spawn_grace(Duration::from_millis(200))
+            .with_clock({
+                let clock = clock.clone();
+                move || clock.now()
+            });
         poller.tick();
+        clock.advance(Duration::from_millis(199));
         poller.tick();
         assert_eq!(starter.starts.load(Ordering::SeqCst), 0, "within the grace");
         assert!(matches!(
@@ -665,7 +698,7 @@ mod tests {
                 ..
             }
         ));
-        std::thread::sleep(Duration::from_millis(250));
+        clock.advance(Duration::from_millis(1));
         poller.tick();
         assert_eq!(
             starter.starts.load(Ordering::SeqCst),
@@ -680,13 +713,19 @@ mod tests {
         let config = dir.path().join("config.toml");
         let starter = FakeStarter::default();
         let (poller, _replica) = poller_for(&config, starter.clone());
-        let mut poller = poller.with_spawn_grace(Duration::from_millis(200));
+        let clock = ManualClock::new();
+        let mut poller = poller
+            .with_spawn_grace(Duration::from_millis(200))
+            .with_clock({
+                let clock = clock.clone();
+                move || clock.now()
+            });
         poller.tick();
-        std::thread::sleep(Duration::from_millis(150));
+        clock.advance(Duration::from_millis(150));
         starter.running.store(true, Ordering::SeqCst);
         poller.tick();
         starter.running.store(false, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(100));
+        clock.advance(Duration::from_millis(100));
         poller.tick();
         assert_eq!(
             starter.starts.load(Ordering::SeqCst),
