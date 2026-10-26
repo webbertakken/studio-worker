@@ -46,6 +46,8 @@ pub struct AugmentationSettings {
 pub struct FeatureSettings {
     pub positive_repetitions: u32,
     pub near_miss_repetitions: u32,
+    /// Augmented copies of each own-voice take (positive and near miss).
+    pub own_voice_repetitions: u32,
 }
 
 /// How often a feature set is drawn into a batch, and how much a wrong answer on it costs.
@@ -281,6 +283,12 @@ impl Settings {
             self.features.near_miss_repetitions,
             1,
             10,
+        )?;
+        within(
+            "features.ownVoiceRepetitions",
+            self.features.own_voice_repetitions,
+            1,
+            200,
         )?;
         self.check_training()?;
         let e = &self.evaluation;

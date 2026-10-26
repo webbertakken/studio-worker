@@ -279,3 +279,60 @@ fn a_training_is_refused_when_the_worker_is_busy_or_unfit() {
         (503, Some("wake_words_unavailable"))
     );
 }
+
+#[test]
+fn a_completed_trainings_files_are_served_and_nothing_else() {
+    let api = Api::start(Setup::default());
+    let dir = api
+        ._models
+        .path()
+        .join("wake-word/models/hey_runa/local-5-5");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, bytes) in [
+        ("hey_runa.tflite", &b"TFL3model"[..]),
+        ("hey_runa.json", b"{\"type\":\"micro\"}"),
+        ("report.json", b"{}"),
+        ("report.md", b"# Wake word"),
+        ("secret.txt", b"no"),
+    ] {
+        std::fs::write(dir.join(file), bytes).unwrap();
+    }
+    let get = |path: &str| {
+        reqwest::blocking::Client::new()
+            .get(format!("{}{path}", api.url))
+            .bearer_auth(TOKEN)
+            .send()
+            .unwrap()
+    };
+    let model = get("/wake-words/local-5-5/files/hey_runa.tflite");
+    assert_eq!(model.status().as_u16(), 200);
+    assert_eq!(model.headers()["content-type"], "application/octet-stream");
+    assert_eq!(model.bytes().unwrap().as_ref(), b"TFL3model");
+    let manifest = get("/wake-words/local-5-5/files/hey_runa.json");
+    assert_eq!(manifest.headers()["content-type"], "application/json");
+    assert_eq!(
+        get("/wake-words/local-5-5/files/report.md").text().unwrap(),
+        "# Wake word"
+    );
+
+    let (status, body) = api.get("/wake-words/local-5-5/files/secret.txt");
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (404, Some("unknown_file"))
+    );
+    let (status, body) = api.get("/wake-words/local-6-6/files/report.json");
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (404, Some("unknown_training"))
+    );
+    let (status, _) = api.get("/wake-words/local-5-5/files/..%2Fsecret.txt");
+    assert_eq!(status, 404);
+    let unauthenticated = reqwest::blocking::Client::new()
+        .get(format!(
+            "{}/wake-words/local-5-5/files/hey_runa.tflite",
+            api.url
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(unauthenticated.status().as_u16(), 401);
+}

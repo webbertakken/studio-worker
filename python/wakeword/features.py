@@ -102,5 +102,86 @@ def run(request, events):
             events,
             f"features near miss {phrase}",
         )
+    own_voice = request.get("ownVoice")
+    if own_voice:
+        sizes["ownVoice"] = _own_voice(request, own_voice, augmenter, out, events)
     write_json(os.path.join(work, "features.json"), sizes)
+    return sizes
+
+
+# The held-out takes are streamed with this much silence before them, so the stream's first
+# slices (which never accept) fall before the phrase.
+HELD_OUT_LEAD_SECONDS = 1.0
+# The operator's talk is cut into windows this long.
+SPEECH_WINDOW_SECONDS = 3.0
+
+
+def _linked(work, group, paths):
+    """A directory of links to `paths` (never copies: the takes live only in the worker's store)."""
+    into = os.path.join(work, "own_voice", group)
+    os.makedirs(into, exist_ok=True)
+    for index, path in enumerate(paths):
+        os.symlink(path, os.path.join(into, f"{index:04d}.wav"))
+    return into
+
+
+def _own_voice(request, own_voice, augmenter, out, events):
+    """The operator's takes: training positives and negatives augmented, held-out takes as recorded."""
+    import numpy as np
+    from mmap_ninja.ragged import RaggedMmap
+    from microwakeword.audio.audio_utils import generate_features_for_clip
+    from microwakeword.audio.clips import Clips
+    from microwakeword.audio.spectrograms import SpectrogramGeneration
+
+    work = request["workDir"]
+    repetitions = request["settings"]["features"]["ownVoiceRepetitions"]
+    sizes = {}
+
+    def write(name, generator):
+        target = os.path.join(out, name)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        RaggedMmap.from_generator(out_dir=target, sample_generator=generator, batch_size=100, verbose=False)
+        sizes[name] = len(RaggedMmap(target))
+        log(f"own voice {name}: {sizes[name]} spectrograms")
+
+    def augmented(group, paths):
+        clips = Clips(
+            input_directory=_linked(work, group, paths),
+            file_pattern="*.wav",
+            max_clip_duration_s=None,
+            remove_silence=True,
+            random_split_seed=None,
+        )
+        generation = SpectrogramGeneration(clips=clips, augmenter=augmenter, slide_frames=10, step_ms=10)
+        return generation.spectrogram_generator(repeat=repetitions)
+
+    if own_voice["trainPositive"]:
+        write("own_positive/training/own_positive_mmap", augmented("positive", own_voice["trainPositive"]))
+    if own_voice["nearMiss"]:
+        write("own_near_miss/training/own_near_miss_mmap", augmented("near_miss", own_voice["nearMiss"]))
+    if own_voice["speech"]:
+        clips = Clips(
+            input_directory=_linked(work, "speech", own_voice["speech"]),
+            file_pattern="*.wav",
+            max_clip_duration_s=None,
+            remove_silence=False,
+            random_split_seed=None,
+        )
+        generation = SpectrogramGeneration(
+            clips=clips, augmenter=None, split_spectrogram_duration_s=SPEECH_WINDOW_SECONDS, step_ms=10
+        )
+        write("own_speech/training/own_speech_mmap", generation.spectrogram_generator())
+
+    def held_out():
+        import soundfile
+
+        lead = np.zeros(int(HELD_OUT_LEAD_SECONDS * 16000), dtype=np.float32)
+        for path in own_voice["heldOut"]:
+            audio, rate = soundfile.read(path, dtype="float32")
+            if rate != 16000:
+                raise ValueError(f"{path} is {rate} Hz, not 16 kHz")
+            yield generate_features_for_clip(np.concatenate([lead, audio]), 10)
+
+    write("own_held_out/testing/own_held_out_mmap", held_out())
+    events.progress("features own voice", 1, 1)
     return sizes

@@ -54,6 +54,15 @@ pub struct Evaluation {
     pub positive: Vec<Scores>,
     pub near_miss: Vec<Scores>,
     pub model: ModelFacts,
+    /// The held-out own-voice takes' best scores, when the training named recording sets.
+    #[serde(default)]
+    pub own_voice: Option<OwnVoiceScores>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnVoiceScores {
+    pub held_out: Vec<f64>,
 }
 
 impl Evaluation {
@@ -324,6 +333,7 @@ pub(crate) mod tests {
                 sha256: "ab".repeat(32),
                 tensor_arena_min_bytes: 25_609,
             },
+            own_voice: None,
         }
     }
 
