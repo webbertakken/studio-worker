@@ -261,7 +261,7 @@ wiremock = "0.6"
 # Build fake sd-cli release zips in the provisioning integration test.
 zip = { version = "9.1", default-features = false, features = ["deflate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
-dirs = "6.0.0"
+dirs = "7.0.0"
 # Mirror the main dep's `default-features = false`: sentry's default
 # `transport` feature drags in reqwest+native-tls (-> openssl-sys),
 # which would otherwise leak OpenSSL back into the test build + the

@@ -5644,7 +5644,7 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
- "dirs 6.0.0",
+ "dirs 7.0.0",
  "eframe",
  "egui",
  "encoding_rs",
