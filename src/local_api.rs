@@ -2973,6 +2973,7 @@ mod tests {
         });
         let observers = WorkerObservers::default();
         let catalog = Arc::new(Mutex::new(seeded_catalog()));
+        let gate = JobGate::new();
         let api = LocalApi::bind(
             "127.0.0.1:0",
             engine,
@@ -2980,7 +2981,7 @@ mod tests {
             None,
             observers,
             TEST_TOKEN.to_string(),
-            JobGate::new(),
+            gate.clone(),
             None,
             ModelServices::new(test_host(&catalog)),
         )
@@ -3004,9 +3005,16 @@ mod tests {
                 .as_u16()
         });
 
-        // Give the generation time to occupy a worker, then time a
-        // /healthz: it must answer well within the generation's 400 ms.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Wait until the generation holds the job gate (a fixed sleep raced it on a loaded CI
+        // runner), then time a /healthz: it must answer well within the generation's 400 ms.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !gate.is_busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the generation never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let start = std::time::Instant::now();
         let health = reqwest::blocking::get(format!("{url}/healthz")).unwrap();
         let elapsed = start.elapsed();
