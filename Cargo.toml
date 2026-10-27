@@ -173,7 +173,7 @@ ksni = { version = "0.3", optional = true }
 # Wayland compositors' D-Bus idle monitors.  Both pure Rust: no libX11,
 # no libdbus.  x11rb stays on the 0.13 line eframe already compiles.
 x11rb = { version = "0.14", default-features = false, features = ["screensaver"] }
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus = { version = "6", default-features = false, features = ["tokio"] }
 
 # Real autostart-on-login on Windows is an HKCU \Run registry value.
 # winreg is a tiny pure-FFI wrapper over advapi32 (always present on
