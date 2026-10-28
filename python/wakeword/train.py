@@ -12,6 +12,7 @@ import sys
 import yaml
 
 from wakeword.common import GIB, log, write_json
+from wakeword import validation
 
 # Where upstream writes the quantised streaming model, under its train_dir.
 STREAMING_MODEL = os.path.join("tflite_stream_state_internal_quant", "stream_state_internal_quant.tflite")
@@ -137,6 +138,7 @@ def run(request, events):
         yaml.safe_dump(config, file)
 
     argv = sys.argv
+    validation.install()
     sys.argv = arguments(config_path, request["settings"]["training"]["model"])
     try:
         runpy.run_module("microwakeword.model_train_eval", run_name="__main__")

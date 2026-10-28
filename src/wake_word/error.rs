@@ -37,6 +37,14 @@ pub enum TrainingError {
     Killed { stage: String },
     #[error("the {stage} stage did not leave what comes next: {message}")]
     InvalidOutput { stage: String, message: String },
+    #[error(
+        "the {stage} stage waited {} minutes for memory and gave up: {last}", waited.as_secs() / 60
+    )]
+    MemoryUnavailable {
+        stage: String,
+        waited: Duration,
+        last: String,
+    },
     #[error("cancelled")]
     Cancelled,
 }
@@ -63,6 +71,7 @@ impl TrainingError {
             TrainingError::StageFailed { .. } => "stage_failed",
             TrainingError::Killed { .. } => "killed",
             TrainingError::InvalidOutput { .. } => "invalid_output",
+            TrainingError::MemoryUnavailable { .. } => "memory_unavailable",
             TrainingError::Cancelled => "cancelled",
         }
     }
@@ -133,6 +142,15 @@ mod tests {
                 },
                 "stage_timed_out",
                 "the train stage passed its 480 minute limit and was stopped",
+            ),
+            (
+                TrainingError::MemoryUnavailable {
+                    stage: "train".into(),
+                    waited: Duration::from_secs(3600),
+                    last: "5.0 GiB available".into(),
+                },
+                "memory_unavailable",
+                "the train stage waited 60 minutes for memory and gave up: 5.0 GiB available",
             ),
             (TrainingError::Cancelled, "cancelled", "cancelled"),
             (

@@ -8,7 +8,6 @@ else, 2 out of memory, 3 bad input, 4 disk full.
 """
 
 import importlib
-import resource
 import sys
 import time
 import traceback
@@ -23,6 +22,7 @@ from wakeword.common import (
     DeviceMemory,
     Events,
     die_with_parent,
+    take_worker_name,
     first_sentences,
     is_disk_full,
     is_out_of_memory,
@@ -35,6 +35,7 @@ STAGES = ("prepare", "samples", "features", "train", "evaluate")
 def main(argv):
     events = Events()
     die_with_parent()
+    take_worker_name()
     if len(argv) != 3 or argv[1] not in STAGES:
         events.emit(
             "failed",
@@ -54,8 +55,8 @@ def main(argv):
             stage=stage,
             seconds=round(time.monotonic() - started, 1),
             deviceMemoryPeakMib=memory.stop(),
-            # ru_maxrss is in KiB on Linux.
-            hostMemoryPeakMib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024,
+            hostMemoryPeakMib=memory.host_peak_mib(),
+            anonMemoryPeakMib=memory.anon_peak_mib,
             summary=summary,
         )
         return EXIT_DONE

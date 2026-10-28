@@ -127,6 +127,7 @@ type Provision =
     dyn Fn(&Path, ComputeCapability) -> Result<Provisioned, TrainingError> + Send + Sync;
 type Describe = dyn Fn() -> Option<String> + Send + Sync;
 type FreeSpace = dyn Fn(&Path) -> Option<u64> + Send + Sync;
+type MemoryProbe = dyn Fn() -> Option<super::memory::Snapshot> + Send + Sync;
 
 /// What a training runs on: [`Backend::system`] is this machine; tests swap parts.
 pub struct Backend {
@@ -136,6 +137,11 @@ pub struct Backend {
     pub free_space: Box<FreeSpace>,
     pub datasets: Vec<Download>,
     pub stall: Duration,
+    /// The machine's memory now, for stage admission.
+    pub memory: Box<MemoryProbe>,
+    /// How long, and how often, a stage waits for memory.
+    pub memory_wait: Duration,
+    pub memory_poll: Duration,
 }
 
 impl Backend {
@@ -156,6 +162,9 @@ impl Backend {
             free_space: Box::new(|dir| fs4::available_space(existing_ancestor(dir)).ok()),
             datasets: recipe::datasets(),
             stall: DOWNLOAD_STALL,
+            memory: Box::new(super::memory::probe_system),
+            memory_wait: super::memory::WAIT_TIMEOUT,
+            memory_poll: super::memory::POLL,
         }
     }
 }
@@ -483,6 +492,49 @@ impl WakeWords {
         Ok(entry.training.clone())
     }
 
+    /// Wait, as `waiting_for_memory`, until the machine has the memory `phase` needs.
+    fn admit(&self, id: &str, phase: Phase, stop: &dyn Fn() -> bool) -> Result<(), TrainingError> {
+        use super::memory::{self, Waited};
+        let backend = &self.inner.backend;
+        let need = memory::need(phase);
+        let mut last_log: Option<Instant> = None;
+        let mut on_wait = |why: &str| {
+            self.set_stage(id, Phase::WaitingForMemory);
+            if last_log.is_none_or(|at| at.elapsed() >= memory::LOG_EVERY) {
+                last_log = Some(Instant::now());
+                tracing::warn!(target: TRACE_TARGET, op = "memory", id, stage = phase.as_str(), why,
+                    "waiting for memory before the stage starts");
+            }
+        };
+        match memory::wait_for(
+            need,
+            &*backend.memory,
+            stop,
+            backend.memory_wait,
+            backend.memory_poll,
+            &mut on_wait,
+        ) {
+            Waited::Admitted { waited } => {
+                if !waited.is_zero() || last_log.is_some() {
+                    tracing::info!(target: TRACE_TARGET, op = "memory", id, stage = phase.as_str(),
+                        waited_seconds = waited.as_secs(), "memory is free; the stage starts");
+                }
+                Ok(())
+            }
+            Waited::Unknown => {
+                tracing::warn!(target: TRACE_TARGET, op = "memory", id, stage = phase.as_str(),
+                    "cannot read the machine's memory; the stage starts unchecked");
+                Ok(())
+            }
+            Waited::Cancelled => Err(TrainingError::Cancelled),
+            Waited::TimedOut { last } => Err(TrainingError::MemoryUnavailable {
+                stage: phase.as_str().into(),
+                waited: backend.memory_wait,
+                last,
+            }),
+        }
+    }
+
     fn set_stage(&self, id: &str, phase: Phase) {
         if let Some(entry) = self
             .inner
@@ -614,6 +666,7 @@ impl WakeWords {
                 seconds: started.elapsed().as_secs_f64(),
                 device_memory_peak_mib: 0,
                 host_memory_peak_mib: 0,
+                anon_memory_peak_mib: 0,
             })
         };
 
@@ -666,6 +719,7 @@ impl WakeWords {
             if stop() {
                 return Err(TrainingError::Cancelled);
             }
+            self.admit(id, phase, &stop)?;
             self.set_stage(id, phase);
             let mut on_event = |event: &Event| {
                 if let Event::Phonemes {
@@ -697,6 +751,7 @@ impl WakeWords {
                 seconds: done.seconds,
                 device_memory_peak_mib: done.device_memory_peak_mib,
                 host_memory_peak_mib: done.host_memory_peak_mib,
+                anon_memory_peak_mib: done.anon_memory_peak_mib,
             });
         }
 
@@ -827,6 +882,7 @@ impl WakeWords {
             seconds: started.elapsed().as_secs_f64(),
             device_memory_peak_mib: 0,
             host_memory_peak_mib: 0,
+            anon_memory_peak_mib: 0,
         });
         let report = report::build(report::Facts {
             id,

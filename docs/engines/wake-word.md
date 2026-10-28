@@ -72,7 +72,7 @@ Errors answer `{"error": <code>, "message": <text>}`.
   "id": "local-1761400000000-1",           // also its job id: /jobs/:id/log
   "name": "hey_runa", "phrase": "hey runa",
   "state": "running",                      // running | completed | failed | cancelled
-  "stage": "train",                        // provision | download | prepare | samples | features | train | evaluate | package
+  "stage": "train",                        // provision | download | waiting_for_memory | prepare | samples | features | train | evaluate | package
   "startedAt": "…", "finishedAt": null,
   "outputDir": "<models_root>/wake-word/models/hey_runa/<id>",
   "failure": null,                         // {reason, message} when failed (below)
@@ -243,7 +243,65 @@ Every failure ends the training `failed` with a reason and a message that names 
 | `stage_timed_out` | a stage passed its time limit and was stopped |
 | `stage_failed` | a stage failed otherwise; the message carries its exit and last lines |
 | `killed` | a stage was killed by SIGKILL without saying why: most often the out-of-memory killer |
+| `memory_unavailable` | a stage waited `memory::WAIT_TIMEOUT` (60 min) for memory and never got it ("Memory") |
 | `invalid_output` | the stages ended without the files the next one reads |
+
+## Memory
+
+A training shares the machine with everything else on it: the worker's scope may hold 32 GiB and the agents beside
+it 45.7 GiB, more together than the 62 GiB there is. When memory and swap both fall below 10 %, earlyoom kills the
+process with the highest `oom_score`; twice that was the train stage (26 GB at the time), mid-validation.
+
+### What the stages hold (measured 2026-10-28)
+
+The train stage of a 2-language, 8-near-miss request, sampled every second (`/proc/<pid>/status`):
+
+| | Upstream validation | Validation in chunks |
+| --- | --- | --- |
+| Anonymous peak (`RssAnon`) | 21 271 MiB | 6 988 MiB |
+| Resident peak (`VmRSS`) | 21 426 MiB | 17 455 MiB (10 460 MiB of it mapped feature files) |
+| Device memory peak | 10 640 MiB | 5 718 MiB |
+
+- The peak is upstream's validation: it builds every ambient window of the validation audio (about 155 000 windows
+  of 203 x 40 float32 for 13 h: 5 GiB) into one array, which Keras copies again.
+- `python/wakeword/validation.py` mirrors upstream's `validate_nonstreaming` with one change: the ambient windows
+  are evaluated `AMBIENT_CHUNK` (16 384, 0.5 GiB) at a time, and the validation set is freed before them. Upstream
+  already accumulates metrics across `evaluate` calls, so every metric is the same: all ten matched to the bit
+  when both ran on the same model (2026-10-28).
+- It refuses a microWakeWord revision whose function is not the one mirrored (sha256 of its source), so a new
+  revision is reviewed before it trains.
+- Mapped feature files (the datasets, read through mmap) are clean page cache: reclaimable, and not taken from
+  `MemAvailable`. They do count in the kernel's `oom_score`.
+- Each stage reports `deviceMemoryPeakMib`, `hostMemoryPeakMib` (`VmHWM`: the process's own high-water mark;
+  `ru_maxrss` carries the daemon's over fork and exec) and `anonMemoryPeakMib` (`RssAnon`, sampled every 5 s).
+
+### Admission
+
+Before each stage starts, the worker checks the machine (`/proc/meminfo`) and its own scope (the daemon's cgroup):
+
+- the stage starts when `MemAvailable` is at least its need plus 10 % of RAM (earlyoom's threshold) plus 2 GiB, and
+  the scope's headroom (its `memory.high`, else `memory.max`, less its anonymous memory) is at least its need;
+- the needs (`memory::need`): train 12 GiB (its anonymous peak, 7 GiB, and 5 GiB for the feature pages it keeps
+  hot); every other stage 4 GiB (under 2 GiB measured at smoke scale);
+- otherwise the training's `stage` is `waiting_for_memory` and it looks again every 15 s (`POLL`), logging why at
+  most every minute; after 60 minutes (`WAIT_TIMEOUT`) it fails `memory_unavailable`;
+- a cancel ends the wait at once; memory that cannot be read lets the stage start, with a warning.
+
+Admission is checked when a stage starts, not while it runs.
+
+### Protection while running
+
+Every stage's process names itself `studio-worker` (`prctl(PR_SET_NAME)`; its command line still reads
+`python -m wakeword <stage>`). The machine's earlyoom keeps `studio-worker` on its `--avoid` list, which matches
+process names and takes 300 from their `oom_score`: the trainer, named `python`, was never covered. Other levers, and why not:
+
+| Lever | Why not |
+| --- | --- |
+| a negative `oom_score_adj` | lowering it needs `CAP_SYS_RESOURCE`; an unprivileged write is refused (checked) |
+| `MemoryLow` on the scope | it guides the kernel's reclaim only, never earlyoom; it is capped by the ancestors' protection (`user.slice`, root's); and it would push other cgroups into a swap that is already full |
+| changing earlyoom's configuration | system-wide, needs root; its `--avoid` already names `studio-worker` |
+
+When the machine still runs out while a stage runs, earlyoom then picks other processes first.
 
 ## Layout
 
@@ -433,6 +491,7 @@ All under target `studio_worker::wake_word`.
 | `wake_word` | a training accepted, refused (and why), finished (outcome, seconds), cancelled |
 | `stage` | a stage started, finished (seconds, device memory) or failed (reason) |
 | `stage_event` | a stage's progress (at most every `PROGRESS_LOG_INTERVAL`), phonemes |
+| `memory` | a stage waiting for memory (at most every minute, with why), starting after a wait, or starting unchecked |
 | `stage_line` | a stage's stderr line: warnings and errors at warn, upstream's validation lines at info, the rest debug |
 | `download` | a download started, skipped (on disk), finished or failed (the shared downloader's own breadcrumbs too) |
 | `cutoff` | the cutoff chosen, the rule's numbers, whether the target was met |
@@ -450,6 +509,10 @@ All under target `studio_worker::wake_word`.
 | `STAGE_TIMEOUTS` | prepare 2 h, samples 1 h, features 3 h, train 8 h, evaluate 1 h | a hang, not a slow run | |
 | `PROGRESS_LOG_INTERVAL` | 30 s | | 5 to 300 s |
 | `MINIMUM_ESPHOME_VERSION` | 2024.7.0 | ESPHome's v2 manifests | |
+| `memory::need` | train 12 GiB, others 4 GiB | measured peaks plus room ("Memory") | the measured peak and up |
+| `memory::WAIT_TIMEOUT` | 60 min | a box that frees nothing in an hour will not | 10 to 240 min |
+| `memory::POLL` | 15 s | | 5 to 120 s |
+| `AMBIENT_CHUNK` | 16 384 windows | 0.5 GiB of float32 windows | 1 024 and up |
 | `MAX_TAKE_SECONDS` | 31 s | the guide's longest take is 30 s, plus its timer's slack | 30 to 60 s |
 | `MAX_TAKE_BYTES` | 1 MiB | 31 s of 16 kHz PCM16 is 992 044 bytes with its header | 1 to 4 MiB |
 | `MIN_TAKE_SECONDS` | 0.25 s | shorter is not a word | 0.1 to 1 s |

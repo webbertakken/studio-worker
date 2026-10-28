@@ -23,6 +23,8 @@ pub enum Phase {
     Train,
     Evaluate,
     Package,
+    /// Before a stage: waiting until the machine has the memory it needs.
+    WaitingForMemory,
 }
 
 impl Phase {
@@ -45,6 +47,7 @@ impl Phase {
             Phase::Train => "train",
             Phase::Evaluate => "evaluate",
             Phase::Package => "package",
+            Phase::WaitingForMemory => "waiting_for_memory",
         }
     }
 
@@ -101,6 +104,9 @@ pub enum Event {
         /// The most host memory the stage held (`ru_maxrss`); 0 from a trainer that does not say.
         #[serde(default)]
         host_memory_peak_mib: u64,
+        /// The most anonymous memory the stage held (sampled `RssAnon`); 0 from an older trainer.
+        #[serde(default)]
+        anon_memory_peak_mib: u64,
         summary: serde_json::Value,
     },
     Failed {
@@ -115,6 +121,7 @@ pub struct StageDone {
     pub seconds: f64,
     pub device_memory_peak_mib: u64,
     pub host_memory_peak_mib: u64,
+    pub anon_memory_peak_mib: u64,
     pub summary: serde_json::Value,
 }
 
@@ -274,6 +281,7 @@ pub fn run(stage: StageRun<'_>) -> Result<StageDone, TrainingError> {
                             seconds,
                             device_memory_peak_mib,
                             host_memory_peak_mib,
+                            anon_memory_peak_mib,
                             summary,
                             ..
                         } => {
@@ -281,6 +289,7 @@ pub fn run(stage: StageRun<'_>) -> Result<StageDone, TrainingError> {
                                 seconds,
                                 device_memory_peak_mib,
                                 host_memory_peak_mib,
+                                anon_memory_peak_mib,
                                 summary,
                             })
                         }
@@ -321,6 +330,7 @@ pub fn run(stage: StageRun<'_>) -> Result<StageDone, TrainingError> {
             seconds,
             device_memory_peak_mib = done.device_memory_peak_mib,
             host_memory_peak_mib = done.host_memory_peak_mib,
+            anon_memory_peak_mib = done.anon_memory_peak_mib,
             "finished"
         ),
         Err(error) => tracing::warn!(
@@ -404,6 +414,7 @@ mod tests {
             seconds: 1.0,
             device_memory_peak_mib: 10,
             host_memory_peak_mib: 0,
+            anon_memory_peak_mib: 0,
             summary: serde_json::json!({}),
         }
     }
@@ -426,6 +437,7 @@ mod tests {
                 seconds: 5.6,
                 device_memory_peak_mib: 2890,
                 host_memory_peak_mib: 1200,
+                anon_memory_peak_mib: 0,
                 summary: serde_json::json!({"a":1})
             }
         );
