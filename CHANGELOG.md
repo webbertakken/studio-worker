@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.34](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.33...studio-worker-v0.4.34) (2026-10-28)
+
+
+### Bug Fixes
+
+* **wake-word:** trainings survive a busy machine ([#264](https://github.com/webbertakken/studio-worker/issues/264)) ([ea4670e](https://github.com/webbertakken/studio-worker/commit/ea4670e66bb24e25c7f6c3ba4f96a162b99f1d2e))
+
 ## [0.4.33](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.32...studio-worker-v0.4.33) (2026-10-26)
 
 
