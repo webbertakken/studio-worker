@@ -99,6 +99,8 @@ struct Options {
     free: Option<u64>,
     datasets: Vec<Download>,
     provision_fails: bool,
+    /// GiB available on each look at the machine's memory (the last repeats); empty: unreadable.
+    memory_gib: Vec<u64>,
     /// Keep recordings: the store, holding these takes.
     voice_samples: Option<Vec<(&'static str, crate::voice_samples::Take)>>,
 }
@@ -111,6 +113,7 @@ impl Default for Options {
             free: None,
             datasets: vec![dataset("speech", "https://example.invalid/speech.zip")],
             provision_fails: false,
+            memory_gib: vec![64],
             voice_samples: None,
         }
     }
@@ -141,6 +144,8 @@ fn harness(options: Options) -> Harness {
     let gpu = options.gpu.clone();
     let free = options.free;
     let provision_fails = options.provision_fails;
+    let looks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let memory_gib = options.memory_gib.clone();
     let backend = Backend {
         gpu: Box::new(move || gpu.clone()),
         provision: Box::new(move |_, _| {
@@ -157,6 +162,17 @@ fn harness(options: Options) -> Harness {
         free_space: Box::new(move |_| free),
         datasets: options.datasets,
         stall: Duration::from_secs(2),
+        memory: Box::new(move || {
+            let look = looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let gib = *memory_gib.get(look).or(memory_gib.last())?;
+            Some(super::memory::Snapshot {
+                total: 64 << 30,
+                available: gib << 30,
+                scope_headroom: None,
+            })
+        }),
+        memory_wait: Duration::from_millis(300),
+        memory_poll: Duration::from_millis(10),
     };
     let observers = WorkerObservers::default();
     let gate = JobGate::new();
@@ -239,7 +255,7 @@ fn a_training_runs_every_stage_and_writes_the_model_its_manifest_and_report() {
     let report = std::fs::read_to_string(&result.report_markdown).unwrap();
     assert!(report.contains("hey luna: 50.0% of 2 clips"), "{report}");
     assert!(report.contains("/hˈeɪ ɹˈuːnə/"), "{report}");
-    assert!(report.contains("| samples | 2 | 100 | 0 |"), "{report}");
+    assert!(report.contains("| samples | 2 | 100 | 0 | 0 |"), "{report}");
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&result.report).unwrap()).unwrap();
     assert_eq!(
@@ -637,4 +653,60 @@ fn recording_sets_that_cannot_train_are_refused_by_name() {
         without_store.service.start(spec_with_sets(r#"["s1"]"#)),
         Err(Refusal::VoiceSamplesUnavailable)
     );
+}
+
+#[test]
+fn a_stage_waits_for_memory_then_the_training_goes_on() {
+    // Starved for the first looks (prepare's), then room.
+    let h = harness(Options {
+        memory_gib: vec![5, 5, 5, 5, 64],
+        ..Default::default()
+    });
+    let started = h.service.start(spec()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_waiting = false;
+    while h.service.get(&started.id).unwrap().state == State::Running {
+        saw_waiting |= h.service.get(&started.id).unwrap().stage == Phase::WaitingForMemory;
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(saw_waiting, "the training showed waiting_for_memory");
+    let training = wait_until_ended(&h, &started.id);
+    assert_eq!(training.state, State::Completed, "{:?}", training.failure);
+}
+
+#[test]
+fn a_stage_that_never_gets_its_memory_fails_by_name() {
+    let h = harness(Options {
+        memory_gib: vec![5],
+        ..Default::default()
+    });
+    let started = h.service.start(spec()).unwrap();
+    let training = wait_until_ended(&h, &started.id);
+    let failure = training.failure.unwrap();
+    assert_eq!(failure.reason, "memory_unavailable");
+    assert!(
+        failure.message.contains("the prepare stage waited"),
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure.message.contains("5.0 GiB available"),
+        "{}",
+        failure.message
+    );
+    assert_eq!(
+        serde_json::to_value(Phase::WaitingForMemory).unwrap(),
+        "waiting_for_memory"
+    );
+}
+
+#[test]
+fn unreadable_memory_lets_the_stages_start() {
+    let h = harness(Options {
+        memory_gib: vec![],
+        ..Default::default()
+    });
+    let started = h.service.start(spec()).unwrap();
+    assert_eq!(wait_until_ended(&h, &started.id).state, State::Completed);
 }

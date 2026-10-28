@@ -67,16 +67,57 @@ def die_with_parent():
     threading.Thread(target=watch, daemon=True, name="parent-watch").start()
 
 
+# The name every stage takes: the worker's, so the system's out-of-memory policy for studio-worker
+# (earlyoom's --avoid matches process names) covers its trainer too. Linux names are 15 bytes.
+PROCESS_NAME = b"studio-worker"
+
+
+def take_worker_name():
+    """Name this process studio-worker (prctl PR_SET_NAME); its command line still says what it is."""
+    try:
+        import ctypes
+
+        pr_set_name = 15
+        if ctypes.CDLL("libc.so.6", use_errno=True).prctl(pr_set_name, PROCESS_NAME, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_NAME) failed")
+        log(f"process named {PROCESS_NAME.decode()}")
+    except Exception as error:  # not Linux, or no libc: the stage runs under its own name
+        log(f"could not take the worker's process name ({error}); the out-of-memory policy sees python")
+
+
+def process_status_mib(text, field):
+    """A `kB` field of /proc/<pid>/status in MiB; 0 when it is missing."""
+    for line in text.splitlines():
+        if line.startswith(field + ":"):
+            return int(line.split()[1]) // 1024
+    return 0
+
+
+def _own_status():
+    try:
+        with open("/proc/self/status", encoding="utf-8") as file:
+            return file.read()
+    except OSError:
+        return ""
+
+
 class DeviceMemory:
-    """The most device memory this process held, sampled from nvidia-smi (context included)."""
+    """The most device memory this process held, sampled from nvidia-smi (context included), and
+    the most host memory: `VmHWM` (this process's own high-water mark; `ru_maxrss` carries the
+    parent's over fork and exec) and `RssAnon`, sampled."""
 
     def __init__(self):
         self.peak_mib = 0
+        self.anon_peak_mib = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="device-memory")
         self._thread.start()
 
+    def host_peak_mib(self):
+        return process_status_mib(_own_status(), "VmHWM")
+
     def _sample(self):
+        self.anon_peak_mib = max(self.anon_peak_mib, process_status_mib(_own_status(), "RssAnon"))
         try:
             out = subprocess.run(
                 [

@@ -68,6 +68,9 @@ impl Api {
             free_space: Box::new(move |_| free),
             datasets: vec![],
             stall: Duration::from_secs(1),
+            memory: Box::new(|| None),
+            memory_wait: Duration::from_secs(1),
+            memory_poll: Duration::from_millis(10),
         };
         let mut api = LocalApi::bind(
             "127.0.0.1:0",
