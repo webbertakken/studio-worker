@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.35](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.34...studio-worker-v0.4.35) (2026-10-28)
+
+
+### Bug Fixes
+
+* **wake-word:** embed validation.py in the binary ([#266](https://github.com/webbertakken/studio-worker/issues/266)) ([75e1914](https://github.com/webbertakken/studio-worker/commit/75e1914ed8cfc2838455320bf5ab4e09a5d67af3))
+
 ## [0.4.34](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.33...studio-worker-v0.4.34) (2026-10-28)
 
 
