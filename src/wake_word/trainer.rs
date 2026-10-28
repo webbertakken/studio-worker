@@ -13,7 +13,7 @@ use super::request::{slug, TrainingSpec};
 use crate::engine::torch::provision::Environment;
 
 /// The trainer's Python files, embedded so a worker carries the version it was built with.
-pub const FILES: [(&str, &str); 8] = [
+pub const FILES: [(&str, &str); 9] = [
     (
         "wakeword/__init__.py",
         include_str!("../../python/wakeword/__init__.py"),
@@ -45,6 +45,10 @@ pub const FILES: [(&str, &str); 8] = [
     (
         "wakeword/evaluate.py",
         include_str!("../../python/wakeword/evaluate.py"),
+    ),
+    (
+        "wakeword/validation.py",
+        include_str!("../../python/wakeword/validation.py"),
     ),
 ];
 
@@ -401,6 +405,28 @@ mod tests {
         assert!(!ld.contains("not-a-lib"), "{ld}");
         assert_eq!(var("TF_FORCE_GPU_ALLOW_GROWTH"), "true");
         assert!(cuda_wheel_libraries(&dir.path().join("nowhere")).is_empty());
+    }
+
+    #[test]
+    fn every_trainer_file_is_embedded_byte_for_byte() {
+        // A file left out installs nothing, and the stage that imports it fails on a real
+        // machine only (0.4.34 shipped without validation.py).
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("python/wakeword");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&source)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".py"))
+            .map(|name| format!("wakeword/{name}"))
+            .collect();
+        on_disk.sort();
+        let mut embedded: Vec<String> = FILES.iter().map(|(name, _)| name.to_string()).collect();
+        embedded.sort();
+        assert_eq!(embedded, on_disk);
+        for (name, content) in FILES {
+            let path = source.join(name.trim_start_matches("wakeword/"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content, "{name}");
+        }
     }
 
     #[test]
