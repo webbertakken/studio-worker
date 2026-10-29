@@ -10,14 +10,17 @@
 //!   `sentry::init`.  The returned `ClientInitGuard` must live for the
 //!   entire program — `main.rs` keeps it in a binding that drops on
 //!   shutdown, flushing any in-flight events.
-//! * `tracing_layer()` returns a `sentry-tracing` layer that maps
-//!   `error` -> Sentry event, `warn` -> breadcrumb, lower -> ignored.
+//! * `tracing_layer()` returns the `sentry-tracing` breadcrumb + error
+//!   layers, filtered so `error` -> Sentry event, `warn` -> breadcrumb,
+//!   lower -> ignored.
 //!   Layered into the global `tracing-subscriber` registry in `main.rs`.
 //!
 //! Panic capture is on by default (the `panic` feature is part of
 //! `sentry`'s default feature set).
 use crate::{sys, RELEASE_NAME};
-use sentry_tracing::EventFilter;
+use sentry_tracing::{BreadcrumbLayer, ErrorLayer};
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::Layer;
 
 /// Tracing target for telemetry events.  Stable so operators can
 /// filter with `RUST_LOG=studio_worker::telemetry=debug`.
@@ -127,6 +130,17 @@ pub fn init() -> Option<sentry::ClientInitGuard> {
     Some(guard)
 }
 
+/// What Sentry does with a tracing event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SentryAction {
+    /// Raise a Sentry error event (an operator-visible alert).
+    Event,
+    /// Record a breadcrumb attached to the next event.
+    Breadcrumb,
+    /// Send nothing.
+    Ignore,
+}
+
 /// Map a tracing severity level to the Sentry ingest action.
 ///
 /// * `ERROR` -> Sentry event (operator-visible alert)
@@ -137,21 +151,27 @@ pub fn init() -> Option<sentry::ClientInitGuard> {
 /// Split out of [`tracing_layer`] so the severity-mapping policy is a
 /// pure function unit tests can pin without constructing a subscriber
 /// or mutating global Sentry state.
-pub fn event_filter_for_level(level: tracing::Level) -> EventFilter {
+pub fn sentry_action_for_level(level: tracing::Level) -> SentryAction {
     match level {
-        tracing::Level::ERROR => EventFilter::Event,
-        tracing::Level::WARN => EventFilter::Breadcrumb,
-        _ => EventFilter::Ignore,
+        tracing::Level::ERROR => SentryAction::Event,
+        tracing::Level::WARN => SentryAction::Breadcrumb,
+        _ => SentryAction::Ignore,
     }
 }
 
-/// Build the `sentry-tracing` layer with our chosen severity mapping
-/// (see [`event_filter_for_level`]).
-pub fn tracing_layer<S>() -> sentry_tracing::SentryLayer<S>
+/// Build the `sentry-tracing` breadcrumb and error layers, each filtered
+/// to the events [`sentry_action_for_level`] routes to it.  The
+/// breadcrumb layer comes first so a breadcrumb recorded by an event is
+/// in place before any error event that follows it.
+pub fn tracing_layer<S>() -> impl Layer<S> + Send + Sync
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
-    sentry_tracing::layer().event_filter(|md| event_filter_for_level(*md.level()))
+    let routed_to =
+        |action: SentryAction| filter_fn(move |md| sentry_action_for_level(*md.level()) == action);
+    BreadcrumbLayer::new()
+        .with_filter(routed_to(SentryAction::Breadcrumb))
+        .and_then(ErrorLayer::new().with_filter(routed_to(SentryAction::Event)))
 }
 
 #[cfg(test)]
@@ -229,17 +249,14 @@ mod tests {
         // had no test, so a regression flipping WARN -> Event would
         // flood Sentry with warning spam, and ERROR -> Breadcrumb would
         // silently drop every alert — both invisible until production.
-        // EventFilter is a bitflags struct without PartialEq, so we
-        // compare the raw bits.
-        use sentry_tracing::EventFilter;
         assert_eq!(
-            event_filter_for_level(tracing::Level::ERROR).bits(),
-            EventFilter::Event.bits(),
+            sentry_action_for_level(tracing::Level::ERROR),
+            SentryAction::Event,
             "ERROR must surface as a Sentry event"
         );
         assert_eq!(
-            event_filter_for_level(tracing::Level::WARN).bits(),
-            EventFilter::Breadcrumb.bits(),
+            sentry_action_for_level(tracing::Level::WARN),
+            SentryAction::Breadcrumb,
             "WARN must attach a breadcrumb, not raise an event"
         );
         for quiet in [
@@ -248,8 +265,8 @@ mod tests {
             tracing::Level::TRACE,
         ] {
             assert_eq!(
-                event_filter_for_level(quiet).bits(),
-                EventFilter::Ignore.bits(),
+                sentry_action_for_level(quiet),
+                SentryAction::Ignore,
                 "{quiet} must be ignored by Sentry (it ships via the log shipper)"
             );
         }
