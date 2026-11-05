@@ -4,7 +4,7 @@
 //! remain on the HTTP side; this file pushes the failure branches
 //! on both routes plus the tracing emission contract.
 
-use studio_worker::http::ApiClient;
+use studio_worker::http::{ApiClient, JobOutput};
 use studio_worker::test_support::capture as captured_logs_for;
 use studio_worker::types::*;
 use wiremock::matchers::{method, path};
@@ -48,7 +48,7 @@ async fn complete_surfaces_4xx() {
     let uri = server.uri();
     let err = detached(move || {
         let api = ApiClient::new(uri).unwrap();
-        api.complete("w", "t", "j", "webp", "p", vec![1, 2, 3])
+        api.complete("w", "t", "j", &JobOutput::new("webp", "p", vec![1, 2, 3]))
             .unwrap_err()
     });
     assert!(err.to_string().contains("complete failed"));
@@ -80,9 +80,7 @@ async fn complete_with_retry_survives_transient_5xx() {
             "w",
             "t",
             "j",
-            "webp",
-            "p",
-            vec![1, 2, 3],
+            &JobOutput::new("webp", "p", vec![1, 2, 3]),
             2,
             std::time::Duration::from_millis(1),
         )
@@ -106,9 +104,7 @@ async fn complete_with_retry_gives_up_after_the_retry_budget() {
             "w",
             "t",
             "j",
-            "webp",
-            "p",
-            vec![1, 2, 3],
+            &JobOutput::new("webp", "p", vec![1, 2, 3]),
             2,
             std::time::Duration::from_millis(1),
         )
@@ -136,9 +132,7 @@ async fn complete_with_retry_does_not_retry_4xx() {
             "w",
             "t",
             "j",
-            "webp",
-            "p",
-            vec![1, 2, 3],
+            &JobOutput::new("webp", "p", vec![1, 2, 3]),
             2,
             std::time::Duration::from_millis(1),
         )
@@ -158,7 +152,7 @@ async fn complete_for_mp3_uses_audio_mime() {
     let uri = server.uri();
     detached(move || {
         let api = ApiClient::new(uri).unwrap();
-        api.complete("w", "t", "j", "mp3", "p", vec![1, 2, 3])
+        api.complete("w", "t", "j", &JobOutput::new("mp3", "p", vec![1, 2, 3]))
             .unwrap();
     });
 }
@@ -174,7 +168,7 @@ async fn complete_for_mp4_uses_video_mime() {
     let uri = server.uri();
     detached(move || {
         let api = ApiClient::new(uri).unwrap();
-        api.complete("w", "t", "j", "mp4", "p", vec![1, 2, 3])
+        api.complete("w", "t", "j", &JobOutput::new("mp4", "p", vec![1, 2, 3]))
             .unwrap();
     });
 }
@@ -190,7 +184,7 @@ async fn complete_for_unknown_ext_falls_back_to_octet_stream() {
     let uri = server.uri();
     detached(move || {
         let api = ApiClient::new(uri).unwrap();
-        api.complete("w", "t", "j", "bin", "p", vec![1, 2, 3])
+        api.complete("w", "t", "j", &JobOutput::new("bin", "p", vec![1, 2, 3]))
             .unwrap();
     });
 }
@@ -211,8 +205,13 @@ async fn complete_logs_upload_byte_size() {
     let uri = server.uri();
     let logs = captured_logs_for(move || {
         let api = ApiClient::new(uri).unwrap();
-        api.complete("w", "t", "j", "webp", "p", vec![1, 2, 3, 4, 5])
-            .unwrap();
+        api.complete(
+            "w",
+            "t",
+            "j",
+            &JobOutput::new("webp", "p", vec![1, 2, 3, 4, 5]),
+        )
+        .unwrap();
     });
     assert!(
         logs.contains("op=\"complete\""),
@@ -237,7 +236,12 @@ async fn complete_logs_upload_byte_size_even_on_failure() {
     let uri = server.uri();
     let logs = captured_logs_for(move || {
         let api = ApiClient::new(uri).unwrap();
-        let _ = api.complete("w", "t", "j", "webp", "p", vec![1, 2, 3, 4, 5, 6, 7]);
+        let _ = api.complete(
+            "w",
+            "t",
+            "j",
+            &JobOutput::new("webp", "p", vec![1, 2, 3, 4, 5, 6, 7]),
+        );
     });
     assert!(
         logs.contains("bytes=7"),

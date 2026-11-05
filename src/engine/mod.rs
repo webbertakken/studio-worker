@@ -98,6 +98,7 @@ impl EngineCapabilities {
 #[cfg(feature = "image-candle")]
 pub mod candle_image;
 pub mod chat_template;
+pub mod convert;
 pub mod download;
 pub mod llm_core;
 // llama-cpp-2 doesn't link on Windows MSVC (see Cargo.toml), so the
@@ -207,6 +208,9 @@ pub fn build(cfg: &Config) -> Result<Box<dyn Engine>> {
         // PyTorch models in a child process per job (image to 3D).  Registers everywhere; it
         // advertises the mesh kind only on Linux x86_64 with a recent NVIDIA GPU.
         v.push(Box::new(torch::TorchEngine::new(&cfg.models_root)));
+        // Model conversion to ONNX in a child process per job, on the CPU.  Registers everywhere; it
+        // advertises model_convert only on Linux x86_64.
+        v.push(Box::new(convert::ConvertEngine::new(&cfg.models_root)));
         v.push(Box::new(SyntheticEngine::new()));
         v
     };
@@ -257,6 +261,7 @@ const DEFAULT_STT_MODELS: &[&str] = &["synthetic", "synthetic-stt"];
 const DEFAULT_TTS_MODELS: &[&str] = &["synthetic", "synthetic-tts"];
 const DEFAULT_VIDEO_MODELS: &[&str] = &["synthetic", "synthetic-video"];
 const DEFAULT_MESH_MODELS: &[&str] = &["synthetic", "synthetic-mesh"];
+const DEFAULT_CONVERT_MODELS: &[&str] = &["synthetic", "synthetic-convert"];
 
 fn models(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_string()).collect()
@@ -275,6 +280,7 @@ impl Engine for SyntheticEngine {
         map.insert(TaskKind::AudioTts, models(DEFAULT_TTS_MODELS));
         map.insert(TaskKind::Video, models(DEFAULT_VIDEO_MODELS));
         map.insert(TaskKind::Mesh, models(DEFAULT_MESH_MODELS));
+        map.insert(TaskKind::ModelConvert, models(DEFAULT_CONVERT_MODELS));
         EngineCapabilities {
             supported_models_per_kind: map,
         }
@@ -338,6 +344,9 @@ impl Engine for SyntheticEngine {
                     }
                 })
             }
+            // The network- and Python-free stand-in for a conversion: a tiny ONNX model and a report
+            // of the real one's shape.
+            Task::ModelConvert(p) => Ok(convert::synthetic::result(&p)),
         };
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match &result {

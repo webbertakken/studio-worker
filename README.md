@@ -38,6 +38,7 @@ worker HTTP routes (`heartbeat`, `claim`, `complete-json`, `fail`,
 | Audio TTS   | `audio_tts`   | real WAV (sine wave keyed by hash(text))     | `tts-piper`               |
 | Video       | `video`       | real WebP image (single-frame stand-in)      | `video-ffmpeg`            |
 | 3D model    | `mesh`        | real GLB (a textured cube in the picture's colour) | `torch` (Pixal3D, TRELLIS.2, Hunyuan3D 2.1) |
+| Model conversion | `model_convert` | a tiny ONNX model and a report of the real one's shape | `convert` (tf2onnx, CPU) |
 
 The synthetic engine is the default and exercises the full pipeline
 end-to-end with no GPU, no model downloads, and ~0 ms per task — exactly
@@ -346,6 +347,10 @@ incoming job to the first backend that supports its `(kind, model)` pair
   NVIDIA GPU of compute capability 8.0 or more; provisions its own Python, CUDA toolkit, extensions
   and weights under `models_root` on the first job (about 15 minutes once).  See
   [`docs/engines/torch.md`](docs/engines/torch.md).
+- **`convert`** — a published classifier converted to ONNX with tf2onnx and scored, with its
+  source model, on a held-out gate set, a child process per job on the CPU.  Advertised on Linux
+  x86_64; provisions its own Python environment under `models_root` on the first job.  See
+  [`docs/engines/convert.md`](docs/engines/convert.md).
 - **`onnx-vision`** (feature `vision`, on by default): animal detection
   (MegaDetector) and species classification (525 birds) on ONNX Runtime,
   CUDA when present.  Local only: served on `/vision/*` of the local API,
