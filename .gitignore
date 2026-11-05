@@ -6,3 +6,6 @@
 
 # Local run configs (contain prod auth tokens) — never commit
 /.run/
+
+# Python bytecode from running the embedded Python programs in place
+__pycache__/

@@ -10,7 +10,7 @@ use super::cuda;
 use super::error::TorchError;
 use super::layout::Layout;
 use super::platform::ComputeCapability;
-use super::recipe::{BuildHow, Recipe, Source, SourceHome};
+use super::recipe::{target_name, BuildHow, Recipe, Source, SourceHome};
 use super::stream::{self, Ended};
 use super::TRACE_TARGET;
 
@@ -98,11 +98,12 @@ impl Environment {
     }
 }
 
-/// Builds environments under a [`Layout`] for one GPU.
+/// Builds environments under a [`Layout`] for one GPU, or for the CPU only.
 #[derive(Debug, Clone)]
 pub struct Provisioner {
     pub layout: Layout,
-    pub capability: ComputeCapability,
+    /// The GPU extensions are built for; `None` builds for the CPU only (no extension builds).
+    pub capability: Option<ComputeCapability>,
     pub uv: UvSource,
     pub cuda: CudaSource,
 }
@@ -226,7 +227,7 @@ impl Provisioner {
             target: TRACE_TARGET,
             op = "provision",
             environment = recipe.name,
-            compute_capability = %self.capability,
+            target = %target_name(self.capability),
             "building the environment (first job, or its recipe changed)"
         );
         for (tool, remedy) in tools_for(recipe) {
@@ -239,7 +240,7 @@ impl Provisioner {
         let marker = serde_json::json!({
             "hash": recipe.hash(self.capability),
             "recipe": recipe,
-            "computeCapability": self.capability.to_string(),
+            "computeCapability": target_name(self.capability),
             "builtAt": chrono::Utc::now().to_rfc3339(),
         });
         std::fs::write(
@@ -321,8 +322,7 @@ impl Provisioner {
             .map(|n| (n.get() / 2).clamp(1, BUILD_JOBS_MAX))
             .unwrap_or(1)
             .to_string();
-        let arch = self.capability.to_string();
-        vec![
+        let mut variables = vec![
             ("CUDA_HOME".into(), lossy(&environment.cuda_home)),
             ("VIRTUAL_ENV".into(), lossy(&environment.venv())),
             (
@@ -340,11 +340,15 @@ impl Provisioner {
                 "LD_LIBRARY_PATH".into(),
                 join(lib64, inherited("LD_LIBRARY_PATH")),
             ),
-            ("TORCH_CUDA_ARCH_LIST".into(), arch.clone()),
-            ("NATTEN_CUDA_ARCH".into(), arch),
             ("MAX_JOBS".into(), jobs.clone()),
             ("NATTEN_N_WORKERS".into(), jobs),
-        ]
+        ];
+        if let Some(capability) = self.capability {
+            let arch = capability.to_string();
+            variables.push(("TORCH_CUDA_ARCH_LIST".into(), arch.clone()));
+            variables.push(("NATTEN_CUDA_ARCH".into(), arch));
+        }
+        variables
     }
 
     fn uv_command(&self, uv: &Path, args: &[&str]) -> Command {
@@ -389,11 +393,13 @@ impl Provisioner {
                 self.uv_command(uv, &["venv", "--python", recipe.python, &venv]),
             )
         })?;
-        step("torch", name, || {
-            let mut args = recipe.torch.to_vec();
-            args.extend(["--index-url", recipe.torch_index]);
-            run_command("torch", self.pip(uv, environment, &args))
-        })?;
+        if recipe.has_torch() {
+            step("torch", name, || {
+                let mut args = recipe.torch.to_vec();
+                args.extend(["--index-url", recipe.torch_index]);
+                run_command("torch", self.pip(uv, environment, &args))
+            })?;
+        }
         if let Some(version) = recipe.cuda {
             step("cuda", name, || {
                 let manifest_sha = match &self.cuda.manifest_sha256 {
@@ -595,7 +601,7 @@ mod tests {
     fn provisioner(root: &Path) -> Provisioner {
         Provisioner {
             layout: Layout::new(root),
-            capability: ComputeCapability { major: 8, minor: 9 },
+            capability: Some(ComputeCapability { major: 8, minor: 9 }),
             uv: UvSource::Binary(PathBuf::from("/opt/uv")),
             cuda: CudaSource::default(),
         }

@@ -82,19 +82,29 @@ pub struct Recipe {
 }
 
 impl Recipe {
-    /// What identifies a built environment: the recipe, the format and the GPU it was built for.
-    /// A different hash means the environment is rebuilt.
-    pub fn hash(&self, capability: ComputeCapability) -> String {
+    /// What identifies a built environment: the recipe, the format and the GPU it was built for
+    /// (`None`: built for the CPU only).  A different hash means the environment is rebuilt.
+    pub fn hash(&self, capability: Option<ComputeCapability>) -> String {
         let mut hasher = Sha256::new();
         hasher.update(RECIPE_FORMAT.to_le_bytes());
         hasher.update(serde_json::to_vec(self).expect("a recipe serialises"));
-        hasher.update(capability.to_string());
+        hasher.update(target_name(capability));
         hex::encode(hasher.finalize())
+    }
+
+    /// Installs torch: its `torch` list is not empty.
+    pub fn has_torch(&self) -> bool {
+        !self.torch.is_empty()
     }
 
     pub fn source(&self, name: &str) -> Option<&Source> {
         self.sources.iter().find(|source| source.name == name)
     }
+}
+
+/// What an environment is built for: a GPU's compute capability (`8.9`), or `cpu`.
+pub fn target_name(capability: Option<ComputeCapability>) -> String {
+    capability.map_or_else(|| "cpu".to_string(), |c| c.to_string())
 }
 
 /// CPython for both environments: the newest 3.10 `uv` 0.13.3 installs (TRELLIS.2, Pixal3D and
@@ -328,8 +338,8 @@ pub const HUNYUAN3D: Recipe = Recipe {
 mod tests {
     use super::*;
 
-    const ADA: ComputeCapability = ComputeCapability { major: 8, minor: 9 };
-    const AMPERE: ComputeCapability = ComputeCapability { major: 8, minor: 6 };
+    const ADA: Option<ComputeCapability> = Some(ComputeCapability { major: 8, minor: 9 });
+    const AMPERE: Option<ComputeCapability> = Some(ComputeCapability { major: 8, minor: 6 });
 
     #[test]
     fn a_pinned_toolkit_serialises_as_a_bare_version() {
@@ -348,6 +358,19 @@ mod tests {
             ..TRELLIS
         };
         assert_ne!(TRELLIS.hash(ADA), changed.hash(ADA));
+    }
+
+    #[test]
+    fn a_gpu_environment_keeps_its_hash_and_a_cpu_one_differs() {
+        // Built environments are keyed by this hash: a GPU target hashes as its compute capability.
+        let mut hasher = Sha256::new();
+        hasher.update(RECIPE_FORMAT.to_le_bytes());
+        hasher.update(serde_json::to_vec(&TRELLIS).unwrap());
+        hasher.update("8.9");
+        assert_eq!(TRELLIS.hash(ADA), hex::encode(hasher.finalize()));
+        assert_ne!(TRELLIS.hash(None), TRELLIS.hash(ADA));
+        assert_eq!(target_name(None), "cpu");
+        assert_eq!(target_name(ADA), "8.9");
     }
 
     #[test]
