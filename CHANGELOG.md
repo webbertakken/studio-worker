@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.37](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.36...studio-worker-v0.4.37) (2026-11-06)
+
+
+### Bug Fixes
+
+* **ci:** build Apple silicon releases on macos-15 ([#277](https://github.com/webbertakken/studio-worker/issues/277)) ([0c1b165](https://github.com/webbertakken/studio-worker/commit/0c1b165960c21d074b2611826ffb1b8cd41435e0))
+
 ## [0.4.36](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.35...studio-worker-v0.4.36) (2026-11-06)
 
 
