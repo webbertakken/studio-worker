@@ -425,7 +425,7 @@ mod tests {
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
         let provisioner = Provisioner {
             layout: Layout::new(dir.path().join("models")),
-            capability: ComputeCapability { major: 8, minor: 9 },
+            capability: Some(ComputeCapability { major: 8, minor: 9 }),
             uv: UvSource::Binary("/nonexistent/uv".into()),
             cuda: CudaSource::default(),
         };

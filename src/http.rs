@@ -179,7 +179,7 @@ impl ApiClient {
         Ok(Some(response.json()?))
     }
 
-    /// Complete a job with binary output (image / audio / video).
+    /// Complete a job with binary output (image / audio / video / mesh / model).
     ///
     /// This is the only worker-side HTTP route that survives the WS
     /// migration: R2 multipart doesn't fit cleanly into WS frames.
@@ -191,12 +191,11 @@ impl ApiClient {
         worker_id: &str,
         token: &str,
         job_id: &str,
-        ext: &str,
-        prompt: &str,
-        image: Vec<u8>,
+        output: &JobOutput,
     ) -> Result<()> {
+        let ext = output.ext.as_str();
         let mime = mime_for_ext(ext);
-        let bytes = image.len() as u64;
+        let bytes = output.bytes.len() as u64;
         // Emitted before the (potentially slow or failing) upload so the
         // attempted payload size is always in the operator's logs, even
         // when the request itself never completes.
@@ -207,15 +206,19 @@ impl ApiClient {
             ext,
             mime,
             bytes,
+            generation_meta_bytes = output.generation_meta.as_ref().map(String::len),
             "uploading job result"
         );
-        let part = reqwest::blocking::multipart::Part::bytes(image)
+        let part = reqwest::blocking::multipart::Part::bytes(output.bytes.clone())
             .file_name(format!("{job_id}.{ext}"))
             .mime_str(mime)?;
-        let form = reqwest::blocking::multipart::Form::new()
-            .text("prompt", prompt.to_string())
-            .text("ext", ext.to_string())
-            .part("image", part);
+        let mut form = reqwest::blocking::multipart::Form::new()
+            .text("prompt", output.prompt.clone())
+            .text("ext", ext.to_string());
+        if let Some(meta) = &output.generation_meta {
+            form = form.text("generationMeta", meta.clone());
+        }
+        let form = form.part("image", part);
         let url = self.url(&format!("/workers/{worker_id}/jobs/{job_id}/complete"));
         let started = Instant::now();
         let response = self
@@ -234,21 +237,18 @@ impl ApiClient {
     /// immediately.  Keeps a brief upload blip from costing a full GPU
     /// regeneration — a reported `Fail` makes the studio requeue and
     /// re-render the whole job.
-    #[allow(clippy::too_many_arguments)]
     pub fn complete_with_retry(
         &self,
         worker_id: &str,
         token: &str,
         job_id: &str,
-        ext: &str,
-        prompt: &str,
-        image: Vec<u8>,
+        output: &JobOutput,
         retries: u32,
         pause: Duration,
     ) -> Result<()> {
         let mut attempt: u32 = 0;
         loop {
-            match self.complete(worker_id, token, job_id, ext, prompt, image.clone()) {
+            match self.complete(worker_id, token, job_id, output) {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < retries && is_transient_upload_error(&e) => {
                     attempt += 1;
@@ -307,7 +307,31 @@ pub fn mime_for_ext(ext: &str) -> &'static str {
         "mp4" => "video/mp4",
         "webm" => "video/webm",
         "glb" => "model/gltf-binary",
+        // A converted model: the studio stores it as `application/octet-stream` too.
+        "onnx" => "application/octet-stream",
         _ => "application/octet-stream",
+    }
+}
+
+/// A job's binary result as the multipart `/complete` route takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobOutput {
+    pub ext: String,
+    pub prompt: String,
+    pub bytes: Vec<u8>,
+    /// JSON the studio stores as the job's `generationMeta` (a conversion report).
+    pub generation_meta: Option<String>,
+}
+
+impl JobOutput {
+    /// A binary result with no generation metadata.
+    pub fn new(ext: impl Into<String>, prompt: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            ext: ext.into(),
+            prompt: prompt.into(),
+            bytes,
+            generation_meta: None,
+        }
     }
 }
 

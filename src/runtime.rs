@@ -1477,6 +1477,8 @@ pub fn prompt_for(task: &Task) -> String {
         // A mesh job has no words: its picture is the input, and its URL (a capability, or a
         // data URL of megabytes) is never a prompt.
         Task::Mesh(_) => String::new(),
+        // A conversion names what it converts.
+        Task::ModelConvert(p) => format!("{} {}", p.source, p.file),
     }
 }
 
@@ -1496,6 +1498,9 @@ pub fn is_permanent_failure(e: &anyhow::Error) -> bool {
             || cause
                 .downcast_ref::<crate::engine::torch::TorchError>()
                 .is_some_and(crate::engine::torch::TorchError::is_permanent)
+            || cause
+                .downcast_ref::<crate::engine::convert::ConvertError>()
+                .is_some_and(crate::engine::convert::ConvertError::is_permanent)
             || cause
                 .downcast_ref::<crate::llama_process::LlamaProcessError>()
                 .is_some_and(crate::llama_process::LlamaProcessError::is_permanent)

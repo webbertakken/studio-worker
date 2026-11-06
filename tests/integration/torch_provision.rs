@@ -226,7 +226,7 @@ fn recipe(f: &Fixture, packages: &'static [&'static str]) -> Recipe {
 fn provisioner(f: &Fixture) -> Provisioner {
     Provisioner {
         layout: Layout::new(f.root.path().join("models")),
-        capability: ComputeCapability { major: 8, minor: 9 },
+        capability: Some(ComputeCapability { major: 8, minor: 9 }),
         uv: UvSource::Release {
             url: format!("{}/uv.tar.gz", f.server.uri()),
             sha256: f.uv_sha.clone(),
@@ -336,4 +336,47 @@ fn a_uv_release_that_does_not_match_its_checksum_is_refused() {
     let err = p.ensure_uv().unwrap_err();
     assert!(err.to_string().contains("sha256 mismatch"), "{err}");
     assert!(!p.layout.uv().exists());
+}
+
+#[test]
+fn a_cpu_environment_installs_its_packages_without_torch_or_a_toolkit() {
+    let f = fixture();
+    let p = Provisioner {
+        capability: None,
+        ..provisioner(&f)
+    };
+    let cpu = Recipe {
+        name: "cpu-only",
+        python: "3.12.15",
+        cuda: None,
+        torch: &[],
+        torch_index: "",
+        packages: &["onnx==1.23.2"],
+        no_deps: &[],
+        sources: &[],
+        builds: &[],
+        imports: &["onnx"],
+    };
+
+    let environment = p.ensure(&cpu).expect("the environment builds");
+
+    let python = environment.python.display().to_string();
+    assert_eq!(
+        calls(&f),
+        [
+            "uv python install 3.12.15".to_string(),
+            format!("uv venv --python 3.12.15 {}", environment.venv().display()),
+            format!("uv pip install --python {python} onnx==1.23.2"),
+            "python -c import onnx".to_string(),
+        ]
+    );
+    assert!(!environment.cuda_home.exists());
+    let marker: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(environment.dir.join("recipe.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker["computeCapability"], "cpu");
+    assert!(p.is_ready(&cpu, &environment));
+    // Built for the CPU, it is not the GPU build of the same recipe.
+    assert!(!provisioner(&f).is_ready(&cpu, &environment));
 }

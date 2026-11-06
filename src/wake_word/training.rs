@@ -183,7 +183,7 @@ fn provision_system(
     use crate::engine::torch::provision::{CudaSource, Provisioner, UvSource};
     let provisioner = Provisioner {
         layout: Layout::new(models_root),
-        capability,
+        capability: Some(capability),
         uv: UvSource::from_env(),
         cuda: CudaSource::default(),
     };

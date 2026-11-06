@@ -25,7 +25,7 @@ use tracing::{info, warn, Instrument as _};
 
 use crate::config::SharedConfig;
 use crate::engine::Engine;
-use crate::http::ApiClient;
+use crate::http::{ApiClient, JobOutput};
 use crate::job_run::JobRun;
 use crate::runtime::{
     is_permanent_failure, prompt_for, push_log_with_observers, set_session_state, truncate_prompt,
@@ -1048,6 +1048,29 @@ async fn run_offered_job(
     run.finish(outcome);
 }
 
+/// How a result reaches the studio: binary outputs through the multipart `/complete` route, JSON
+/// ones in a `completeJson` frame.
+#[derive(Debug, PartialEq)]
+enum Delivery {
+    Upload(JobOutput),
+    Json(serde_json::Value),
+}
+
+fn delivery_of(result: TaskResult, prompt: &str) -> Delivery {
+    match result {
+        TaskResult::Image { bytes, ext }
+        | TaskResult::AudioTts { bytes, ext }
+        | TaskResult::Video { bytes, ext }
+        | TaskResult::Mesh { bytes, ext } => Delivery::Upload(JobOutput::new(ext, prompt, bytes)),
+        // The conversion report rides as `generationMeta` (the studio's model-conversion spec).
+        TaskResult::ModelConvert { bytes, ext, report } => Delivery::Upload(JobOutput {
+            generation_meta: Some(report.to_string()),
+            ..JobOutput::new(ext, prompt, bytes)
+        }),
+        TaskResult::Llm { json } | TaskResult::AudioStt { json } => Delivery::Json(json),
+    }
+}
+
 /// Deliver a successful engine result to the studio and return the
 /// outcome to record.  Binary outputs travel the multipart HTTP
 /// `/complete` route (R2 doesn't fit in WS frames); JSON outputs
@@ -1059,26 +1082,20 @@ async fn deliver_result(
     result: TaskResult,
     full_prompt: &str,
 ) -> JobOutcome {
-    match result {
-        TaskResult::Image { bytes, ext }
-        | TaskResult::AudioTts { bytes, ext }
-        | TaskResult::Video { bytes, ext }
-        | TaskResult::Mesh { bytes, ext } => {
+    match delivery_of(result, full_prompt) {
+        Delivery::Upload(output) => {
             let upload_result = tokio::task::spawn_blocking({
                 let api_base_url = ctx.api_base_url.clone();
                 let job_id = job_id.to_string();
                 let auth_token = ctx.auth_token.clone();
                 let worker_id = ctx.worker_id.clone();
-                let prompt = full_prompt.to_string();
                 move || -> Result<()> {
                     let api = ApiClient::new(api_base_url)?;
                     api.complete_with_retry(
                         &worker_id,
                         &auth_token,
                         &job_id,
-                        &ext,
-                        &prompt,
-                        bytes,
+                        &output,
                         UPLOAD_RETRIES,
                         UPLOAD_RETRY_PAUSE,
                     )
@@ -1138,7 +1155,7 @@ async fn deliver_result(
                 }
             }
         }
-        TaskResult::Llm { json } | TaskResult::AudioStt { json } => {
+        Delivery::Json(json) => {
             // Mirror the binary path: branch on the send result so a
             // dropped `completeJson` frame is recorded as a failure
             // (never a false-positive `Completed`) and a successful
@@ -1563,6 +1580,40 @@ mod tests {
     }
 
     // (worker-reservation exclusivity now lives in `job_gate::tests`.)
+
+    #[test]
+    fn a_converted_model_uploads_with_its_report_as_generation_meta() {
+        let report = serde_json::json!({ "kind": "model_convert", "bytes": 3 });
+        let result = TaskResult::ModelConvert {
+            bytes: vec![1, 2, 3],
+            ext: "onnx".into(),
+            report: report.clone(),
+        };
+        let Delivery::Upload(output) = delivery_of(result, "hf:o/r@sha m.tflite") else {
+            panic!("a converted model is uploaded");
+        };
+        assert_eq!(output.ext, "onnx");
+        assert_eq!(output.bytes, [1, 2, 3]);
+        assert_eq!(output.prompt, "hf:o/r@sha m.tflite");
+        let meta: serde_json::Value =
+            serde_json::from_str(output.generation_meta.as_deref().unwrap()).unwrap();
+        assert_eq!(meta, report);
+    }
+
+    #[test]
+    fn other_results_carry_no_generation_meta() {
+        let mesh = TaskResult::Mesh {
+            bytes: vec![1],
+            ext: "glb".into(),
+        };
+        assert_eq!(
+            delivery_of(mesh, ""),
+            Delivery::Upload(JobOutput::new("glb", "", vec![1]))
+        );
+        let json = serde_json::json!({ "text": "hi" });
+        let stt = TaskResult::AudioStt { json: json.clone() };
+        assert_eq!(delivery_of(stt, "p"), Delivery::Json(json));
+    }
 
     #[test]
     fn a_heartbeat_is_recorded_for_the_worker_page_ok_or_failed() {

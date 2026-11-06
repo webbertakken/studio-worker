@@ -46,6 +46,8 @@ top-level [`README.md`](../README.md).  For active plans, see
   llama.cpp abort ends one job, not the daemon; structured output and vision.
 - [torch engine](engines/torch.md) — PyTorch models with custom CUDA extensions in a child process
   per job: image to 3D (`mesh`) with Pixal3D, TRELLIS.2 and Hunyuan3D 2.1.
+- [convert engine](engines/convert.md): `model_convert`, a published classifier converted to ONNX
+  with tf2onnx on the CPU and scored on a held-out gate set (Doodle Games' guesser).
 - [vision engine](engines/vision.md): animal detection (MegaDetector, YOLO) and species
   classification on ONNX Runtime, CUDA when present; `/vision/*` on the local API.
 - [Wake word training](engines/wake-word.md): train a microWakeWord model (ESPHome's format) for

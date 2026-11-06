@@ -21,10 +21,13 @@ pub enum TaskKind {
     Vision,
     /// Training a wake word model from a phrase (see `docs/engines/wake-word.md`).  Local only.
     WakeWord,
+    /// Converting a published classifier to ONNX and scoring it on a gate set (see
+    /// `docs/engines/convert.md`).
+    ModelConvert,
 }
 
 impl TaskKind {
-    pub const ALL: [TaskKind; 8] = [
+    pub const ALL: [TaskKind; 9] = [
         TaskKind::Image,
         TaskKind::Llm,
         TaskKind::AudioStt,
@@ -33,16 +36,18 @@ impl TaskKind {
         TaskKind::Mesh,
         TaskKind::Vision,
         TaskKind::WakeWord,
+        TaskKind::ModelConvert,
     ];
 
     /// The kinds the studio offers as jobs: every kind but the local-only ones.
-    pub const STUDIO: [TaskKind; 6] = [
+    pub const STUDIO: [TaskKind; 7] = [
         TaskKind::Image,
         TaskKind::Llm,
         TaskKind::AudioStt,
         TaskKind::AudioTts,
         TaskKind::Video,
         TaskKind::Mesh,
+        TaskKind::ModelConvert,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -55,6 +60,7 @@ impl TaskKind {
             TaskKind::Mesh => "mesh",
             TaskKind::Vision => "vision",
             TaskKind::WakeWord => "wake_word",
+            TaskKind::ModelConvert => "model_convert",
         }
     }
 }
@@ -273,6 +279,57 @@ fn default_mesh_ext() -> String {
     "glb".into()
 }
 
+/// A published classifier converted to ONNX and scored on a gate set (`docs/engines/convert.md`;
+/// the studio's `docs/specs/015-studio/model-conversion.md`).  Every string is checked by the
+/// `convert` engine, so an unknown value fails the job rather than the offer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelConvertParams {
+    /// `hf:<repo>@<revision>`, the revision a full commit sha.
+    pub source: String,
+    /// The model file in the source, e.g. `quickdraw_model_int8.tflite`.
+    pub file: String,
+    /// The labels file in the source, one class per line in output order.
+    #[serde(default = "default_convert_labels")]
+    pub labels: String,
+    /// `tf2onnx`.
+    pub converter: String,
+    #[serde(default = "default_convert_opset")]
+    pub opset: u32,
+    pub gate_set: GateSetParams,
+    /// How a raw drawing becomes the model's input: `quickdraw-issue-19`.
+    pub recipe: String,
+    /// `inkOnDark` and/or `darkOnLight`.
+    #[serde(default = "default_convert_polarities")]
+    pub polarities: Vec<String>,
+    /// Gate drawings returned with their raster, across distinct labels.
+    #[serde(default = "default_convert_references")]
+    pub reference_count: u32,
+}
+
+/// The held-out drawings a conversion is scored on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateSetParams {
+    /// `quickdraw-raw`.
+    pub dataset: String,
+    pub drawings_per_word: u32,
+    pub seed: u64,
+}
+
+fn default_convert_labels() -> String {
+    "labels.txt".into()
+}
+fn default_convert_opset() -> u32 {
+    13
+}
+fn default_convert_polarities() -> Vec<String> {
+    vec!["inkOnDark".into(), "darkOnLight".into()]
+}
+fn default_convert_references() -> u32 {
+    20
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Task {
@@ -282,6 +339,7 @@ pub enum Task {
     AudioTts(AudioTtsParams),
     Video(VideoParams),
     Mesh(MeshParams),
+    ModelConvert(ModelConvertParams),
 }
 
 impl Task {
@@ -293,6 +351,7 @@ impl Task {
             Task::AudioTts(_) => TaskKind::AudioTts,
             Task::Video(_) => TaskKind::Video,
             Task::Mesh(_) => TaskKind::Mesh,
+            Task::ModelConvert(_) => TaskKind::ModelConvert,
         }
     }
 }
@@ -315,6 +374,13 @@ pub enum TaskResult {
     Video { bytes: Vec<u8>, ext: String },
     /// Binary 3D model (glb).
     Mesh { bytes: Vec<u8>, ext: String },
+    /// A converted model (`onnx`) and its conversion report, which the multipart `/complete`
+    /// upload carries as `generationMeta`.
+    ModelConvert {
+        bytes: Vec<u8>,
+        ext: String,
+        report: serde_json::Value,
+    },
 }
 
 impl TaskResult {
@@ -326,6 +392,7 @@ impl TaskResult {
             TaskResult::AudioTts { .. } => TaskKind::AudioTts,
             TaskResult::Video { .. } => TaskKind::Video,
             TaskResult::Mesh { .. } => TaskKind::Mesh,
+            TaskResult::ModelConvert { .. } => TaskKind::ModelConvert,
         }
     }
 }
@@ -481,17 +548,20 @@ pub enum ModelEngine {
     OnnxVision,
     /// PyTorch models in a child process per job (`engine::torch`): image to 3D.
     Torch,
+    /// Model conversion to ONNX in a child process per job (`engine::convert`), on the CPU.
+    Convert,
     Synthetic,
 }
 
 impl ModelEngine {
-    pub const ALL: [ModelEngine; 7] = [
+    pub const ALL: [ModelEngine; 8] = [
         ModelEngine::SdCpp,
         ModelEngine::LlamaCpp,
         ModelEngine::Onnx,
         ModelEngine::Parakeet,
         ModelEngine::OnnxVision,
         ModelEngine::Torch,
+        ModelEngine::Convert,
         ModelEngine::Synthetic,
     ];
 
@@ -505,6 +575,7 @@ impl ModelEngine {
             ModelEngine::Parakeet => "parakeet",
             ModelEngine::OnnxVision => "onnx-vision",
             ModelEngine::Torch => "torch",
+            ModelEngine::Convert => "convert",
             ModelEngine::Synthetic => "synthetic",
         }
     }

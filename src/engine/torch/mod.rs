@@ -191,7 +191,7 @@ impl TorchEngine {
         );
         let provisioner = Provisioner {
             layout: self.layout.clone(),
-            capability,
+            capability: Some(capability),
             uv: self.uv.clone(),
             cuda: self.cuda.clone(),
         };

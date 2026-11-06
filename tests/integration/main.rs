@@ -25,6 +25,7 @@ mod local_api_voice_samples;
 mod local_api_wake_word;
 mod multi_modal;
 mod real_candle_image;
+mod real_convert;
 mod real_llama;
 mod real_torch_mesh;
 mod real_vision;

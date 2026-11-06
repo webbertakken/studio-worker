@@ -297,6 +297,14 @@ fn task_result_kind_matches_for_every_variant() {
             },
             TaskKind::Mesh,
         ),
+        (
+            TaskResult::ModelConvert {
+                bytes: vec![1],
+                ext: "onnx".into(),
+                report: serde_json::json!({}),
+            },
+            TaskKind::ModelConvert,
+        ),
     ];
     for (r, expected) in cases {
         assert_eq!(r.kind(), expected);
@@ -311,6 +319,13 @@ fn task_kind_as_str_round_trips_with_serde() {
     assert_eq!(TaskKind::AudioTts.as_str(), "audio_tts");
     assert_eq!(TaskKind::Video.as_str(), "video");
     assert_eq!(TaskKind::Mesh.as_str(), "mesh");
+    assert_eq!(TaskKind::ModelConvert.as_str(), "model_convert");
+    assert_eq!(
+        serde_json::to_value(TaskKind::ModelConvert).unwrap(),
+        "model_convert"
+    );
+    assert!(TaskKind::ALL.contains(&TaskKind::ModelConvert));
+    assert!(TaskKind::STUDIO.contains(&TaskKind::ModelConvert));
 }
 
 #[test]
@@ -394,4 +409,72 @@ fn job_claim_with_full_task_and_model_source_round_trips() {
     assert_eq!(claim.task.kind(), TaskKind::Image);
     let res = synth_engine().dispatch(&claim.model, claim.task).unwrap();
     assert_eq!(res.kind(), TaskKind::Image);
+}
+
+/// The studio's `model_convert` task (its model-conversion spec), as the offer carries it.
+fn spec_model_convert_task() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "model_convert",
+        "source": "hf:zarqankhn/quickdraw-345-tflite@f978d83cfc41fa3c76435a4c96417e055220c735",
+        "file": "quickdraw_model_int8.tflite",
+        "labels": "labels.txt",
+        "converter": "tf2onnx",
+        "opset": 13,
+        "gateSet": { "dataset": "quickdraw-raw", "drawingsPerWord": 100, "seed": 3577 },
+        "recipe": "quickdraw-issue-19",
+        "polarities": ["inkOnDark", "darkOnLight"],
+        "referenceCount": 20,
+    })
+}
+
+#[test]
+fn model_convert_params_read_the_studios_wire_shape() {
+    let task: Task = serde_json::from_value(spec_model_convert_task()).unwrap();
+    let Task::ModelConvert(p) = &task else {
+        panic!("expected model_convert")
+    };
+    assert_eq!(p.file, "quickdraw_model_int8.tflite");
+    assert_eq!(p.gate_set.drawings_per_word, 100);
+    assert_eq!(p.gate_set.seed, 3577);
+    assert_eq!(p.polarities, ["inkOnDark", "darkOnLight"]);
+    assert_eq!(p.reference_count, 20);
+    assert_eq!(task.kind(), TaskKind::ModelConvert);
+    assert_eq!(
+        serde_json::to_value(&task).unwrap(),
+        spec_model_convert_task()
+    );
+}
+
+#[test]
+fn model_convert_params_default_what_the_cli_defaults() {
+    let mut wire = spec_model_convert_task();
+    for field in ["labels", "opset", "polarities", "referenceCount"] {
+        wire.as_object_mut().unwrap().remove(field);
+    }
+    let Task::ModelConvert(p) = serde_json::from_value(wire).unwrap() else {
+        panic!("expected model_convert")
+    };
+    assert_eq!(p.labels, "labels.txt");
+    assert_eq!(p.opset, 13);
+    assert_eq!(p.polarities, ["inkOnDark", "darkOnLight"]);
+    assert_eq!(p.reference_count, 20);
+}
+
+#[test]
+fn synthetic_model_convert_answers_an_onnx_and_its_report() {
+    let engine = synth_engine();
+    assert!(engine
+        .capabilities()
+        .supports(TaskKind::ModelConvert, "synthetic-convert"));
+    let task: Task = serde_json::from_value(spec_model_convert_task()).unwrap();
+    let TaskResult::ModelConvert { bytes, ext, report } =
+        engine.dispatch("synthetic-convert", task).unwrap()
+    else {
+        panic!("expected a converted model")
+    };
+    assert_eq!(ext, "onnx");
+    assert_eq!(report["kind"], "model_convert");
+    assert_eq!(report["bytes"], bytes.len());
+    assert_eq!(report["gate"]["drawings"], 34_500);
+    assert_eq!(report["references"].as_array().unwrap().len(), 20);
 }

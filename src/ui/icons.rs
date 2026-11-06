@@ -54,6 +54,7 @@ impl Icon {
             TaskKind::Mesh => Icon::Cube,
             TaskKind::Vision => Icon::Eye,
             TaskKind::WakeWord => Icon::Waveform,
+            TaskKind::ModelConvert => Icon::Models,
         }
     }
 }
