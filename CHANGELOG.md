@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.36](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.35...studio-worker-v0.4.36) (2026-11-06)
+
+
+### Features
+
+* model_convert, ONNX conversion with a gate ([#274](https://github.com/webbertakken/studio-worker/issues/274)) ([fcf25f2](https://github.com/webbertakken/studio-worker/commit/fcf25f273472ad79c2842acfd51fca8d458168db))
+
+
+### Bug Fixes
+
+* **deps:** move off the yanked async-executor 1.14.0 ([#276](https://github.com/webbertakken/studio-worker/issues/276)) ([403c8f0](https://github.com/webbertakken/studio-worker/commit/403c8f06394ffe2836dc6e191e916eeafdbeb460))
+
 ## [0.4.35](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.34...studio-worker-v0.4.35) (2026-10-28)
 
 
