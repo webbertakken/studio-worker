@@ -309,6 +309,10 @@ local-artifacts-jobs = ["./build-cuda"]
 # Re-apply it after `dist init` / `dist generate` (see docs/operations/release.md).
 allow-dirty = ["ci"]
 
+# GitHub retired the macos-14 image cargo-dist 0.30.4 picks for Apple silicon by default.
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # System build deps cargo-dist installs on the release runners.
 # llama-cpp-2 builds llama.cpp via cmake + a C/C++ toolchain.
 [workspace.metadata.dist.dependencies.apt]
