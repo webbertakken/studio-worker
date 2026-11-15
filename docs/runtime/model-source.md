@@ -78,6 +78,8 @@ correct ([warm models](model-lifecycle.md#warm-models)).
 | `diffusion-model` | `--diffusion-model` | |
 | `text-encoder`    | `--llm`              | |
 | `text-encoder-vision` | `--llm_vision`   | the vision projector (`mmproj`): the model reads images ([vision](../engines/llama.md#vision)) |
+| `text-encoder-clip-l` | `--clip_l` (FLUX.1's CLIP-L encoder) | |
+| `text-encoder-t5xxl`  | `--t5xxl` (FLUX.1's T5-XXL encoder) | |
 | `vae`             | `--vae`              | |
 | `lora`            | `--lora-model-dir`   | |
 | `model`           | `--model` (single-file packaging) | the weights |

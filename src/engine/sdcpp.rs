@@ -240,17 +240,7 @@ impl SdCppEngine {
             return Err(e);
         }
         let files = self.ensure_files(model, source)?;
-        // A `diffusion-model` file is the standalone diffusion weights (sd-cli `--diffusion-model`,
-        // used with split vae/clip); a `model` file is a full checkpoint (sd-cli `-m`/`--model`).
-        // Prefer the explicit diffusion-model role; fall back to a full checkpoint.
-        let diffusion_only = file_for_role(&files, ModelFileRole::DiffusionModel);
-        let full_checkpoint = diffusion_only.is_none();
-        let diffusion_model = diffusion_only
-            .or_else(|| file_for_role(&files, ModelFileRole::Model))
-            .ok_or_else(|| anyhow!("modelSource has no diffusion-model / model file"))?;
-        let vae = file_for_role(&files, ModelFileRole::Vae);
-        let text_encoder = file_for_role(&files, ModelFileRole::TextEncoder);
-        let text_encoder_vision = file_for_role(&files, ModelFileRole::TextEncoderVision);
+        let model_files = ImageModelFiles::from_files(&files)?;
         // LoRA files are applied through sd-cli's `--lora-model-dir` + prompt tags, not as
         // standalone model paths; collect them in source order for the arg builder.
         let loras: Vec<&Path> = files
@@ -264,13 +254,7 @@ impl SdCppEngine {
         if let Some(keep_warm) = warm_keep(&params, source, !loras.is_empty()) {
             match sd_server::sibling_sd_server(&sd_cli) {
                 Some(sd_server_bin) => {
-                    let mut load_args = model_file_args(
-                        diffusion_model,
-                        vae,
-                        text_encoder,
-                        text_encoder_vision,
-                        full_checkpoint,
-                    );
+                    let mut load_args = model_file_args(&model_files);
                     load_args.extend(model_flag_args(source));
                     let start_args = warm_start_args(&load_args, source);
                     let key = sd_server::WarmKey {
@@ -398,15 +382,11 @@ impl SdCppEngine {
         let args = build_sdcli_args(
             &params,
             source,
-            diffusion_model,
-            vae,
-            text_encoder,
-            text_encoder_vision,
+            &model_files,
             &out_path,
             init_img_path.as_deref(),
             mask_path.as_deref(),
             ref_img_path.as_deref(),
-            full_checkpoint,
             &loras,
         );
         let mut cmd = crate::process::command(&sd_cli);
@@ -544,6 +524,60 @@ fn file_for_role(files: &[(ModelFileRole, PathBuf)], role: ModelFileRole) -> Opt
         .map(|(_, p)| p.as_path())
 }
 
+/// An image model's files, by the flag sd-cli loads each with
+/// ([model source](../../docs/runtime/model-source.md)).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ImageModelFiles<'a> {
+    /// The diffusion weights (`--diffusion-model`), or a full checkpoint (`--model`).
+    diffusion_model: &'a Path,
+    /// Whether `diffusion_model` is a full checkpoint.
+    full_checkpoint: bool,
+    vae: Option<&'a Path>,
+    /// The LLM text encoder (`--llm`).
+    text_encoder: Option<&'a Path>,
+    /// The LLM text encoder's vision tower (`--llm_vision`).
+    text_encoder_vision: Option<&'a Path>,
+    /// FLUX.1's CLIP-L text encoder (`--clip_l`).
+    clip_l: Option<&'a Path>,
+    /// FLUX.1's T5-XXL text encoder (`--t5xxl`).
+    t5xxl: Option<&'a Path>,
+}
+
+impl<'a> ImageModelFiles<'a> {
+    /// Standalone diffusion weights and nothing else.
+    #[cfg(test)]
+    fn of(diffusion_model: &'a Path) -> Self {
+        Self {
+            diffusion_model,
+            full_checkpoint: false,
+            vae: None,
+            text_encoder: None,
+            text_encoder_vision: None,
+            clip_l: None,
+            t5xxl: None,
+        }
+    }
+
+    /// A model's downloaded files by role.  A `diffusion-model` file is the standalone diffusion
+    /// weights, used with split vae and encoders; a `model` file is a full checkpoint.  The
+    /// explicit diffusion-model role wins.
+    fn from_files(files: &'a [(ModelFileRole, PathBuf)]) -> Result<Self> {
+        let diffusion_only = file_for_role(files, ModelFileRole::DiffusionModel);
+        let diffusion_model = diffusion_only
+            .or_else(|| file_for_role(files, ModelFileRole::Model))
+            .ok_or_else(|| anyhow!("modelSource has no diffusion-model / model file"))?;
+        Ok(Self {
+            diffusion_model,
+            full_checkpoint: diffusion_only.is_none(),
+            vae: file_for_role(files, ModelFileRole::Vae),
+            text_encoder: file_for_role(files, ModelFileRole::TextEncoder),
+            text_encoder_vision: file_for_role(files, ModelFileRole::TextEncoderVision),
+            clip_l: file_for_role(files, ModelFileRole::TextEncoderClipL),
+            t5xxl: file_for_role(files, ModelFileRole::TextEncoderT5xxl),
+        })
+    }
+}
+
 /// The LoRA prompt-tag stem for a resolved file: its file name without the
 /// `.safetensors` / `.ckpt` / `.gguf` extension.  `None` for a name sd-cli
 /// cannot address as a LoRA.
@@ -617,33 +651,23 @@ struct ResolvedImageArgs {
 /// the caller resolves files / out-path / init-image-path, this
 /// function only assembles the flag list so it can be asserted in
 /// unit tests without spawning the binary.
-// Eight model-path + i2i components; grouping them adds indirection without
+// The i2i paths are each optional and independent; grouping them adds indirection without
 // improving readability (mirrors the `#[allow]` already used in ws::session).
 #[allow(clippy::too_many_arguments)]
 fn build_sdcli_args(
     params: &ImageParams,
     source: &ModelSource,
-    diffusion_model: &Path,
-    vae: Option<&Path>,
-    text_encoder: Option<&Path>,
-    text_encoder_vision: Option<&Path>,
+    files: &ImageModelFiles,
     out_path: &Path,
     init_img_path: Option<&Path>,
     mask_path: Option<&Path>,
     ref_img_path: Option<&Path>,
-    full_checkpoint: bool,
     loras: &[&Path],
 ) -> Vec<OsString> {
     let resolved = resolve_image_args(params, source);
     let mut args: Vec<OsString> = Vec::with_capacity(32);
 
-    args.extend(model_file_args(
-        diffusion_model,
-        vae,
-        text_encoder,
-        text_encoder_vision,
-        full_checkpoint,
-    ));
+    args.extend(model_file_args(files));
     // LoRA pass-through: every LoRA of a model shares its cache directory, so
     // one `--lora-model-dir` suffices; each file is named by a
     // `<lora:stem:weight>` prompt tag appended to the positive prompt.  A file
@@ -726,36 +750,30 @@ fn build_sdcli_args(
 }
 
 /// The model's files, as `sd-cli` and `sd-server` load them.  Load time: part of the warm key.
-fn model_file_args(
-    diffusion_model: &Path,
-    vae: Option<&Path>,
-    text_encoder: Option<&Path>,
-    text_encoder_vision: Option<&Path>,
-    full_checkpoint: bool,
-) -> Vec<OsString> {
-    let mut args: Vec<OsString> = Vec::with_capacity(8);
+fn model_file_args(files: &ImageModelFiles) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::with_capacity(12);
     // A full checkpoint loads via `-m`/`--model`; standalone diffusion weights via
     // `--diffusion-model` (alongside split vae/clip files).
     args.push(
-        if full_checkpoint {
+        if files.full_checkpoint {
             "--model"
         } else {
             "--diffusion-model"
         }
         .into(),
     );
-    args.push(diffusion_model.into());
-    if let Some(p) = vae {
-        args.push("--vae".into());
-        args.push(p.into());
-    }
-    if let Some(p) = text_encoder {
-        args.push("--llm".into());
-        args.push(p.into());
-    }
-    if let Some(p) = text_encoder_vision {
-        args.push("--llm_vision".into());
-        args.push(p.into());
+    args.push(files.diffusion_model.into());
+    for (flag, path) in [
+        ("--vae", files.vae),
+        ("--llm", files.text_encoder),
+        ("--llm_vision", files.text_encoder_vision),
+        ("--clip_l", files.clip_l),
+        ("--t5xxl", files.t5xxl),
+    ] {
+        if let Some(path) = path {
+            args.push(flag.into());
+            args.push(path.into());
+        }
     }
     args
 }
@@ -967,6 +985,61 @@ mod tests {
     }
 
     #[test]
+    fn flux1_roles_read_their_wire_names_and_load_with_clip_l_and_t5xxl() {
+        // docs/runtime/model-source.md: `text-encoder-clip-l` is `--clip_l`, `text-encoder-t5xxl`
+        // is `--t5xxl`.
+        let roles: Vec<ModelFileRole> =
+            serde_json::from_str(r#"["text-encoder-clip-l", "text-encoder-t5xxl"]"#).unwrap();
+        assert_eq!(
+            roles,
+            vec![
+                ModelFileRole::TextEncoderClipL,
+                ModelFileRole::TextEncoderT5xxl
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelFileRole::TextEncoderT5xxl).unwrap(),
+            "\"text-encoder-t5xxl\""
+        );
+        let files = vec![
+            (ModelFileRole::TextEncoderT5xxl, PathBuf::from("/t5.gguf")),
+            (ModelFileRole::DiffusionModel, PathBuf::from("/flux1.gguf")),
+            (
+                ModelFileRole::TextEncoderClipL,
+                PathBuf::from("/clip_l.safetensors"),
+            ),
+            (ModelFileRole::Vae, PathBuf::from("/ae.safetensors")),
+        ];
+        let model_files = ImageModelFiles::from_files(&files).unwrap();
+        assert_eq!(model_files.clip_l, Some(Path::new("/clip_l.safetensors")));
+        assert_eq!(model_files.t5xxl, Some(Path::new("/t5.gguf")));
+        assert!(!model_files.full_checkpoint);
+        assert_eq!(
+            args_to_strings(&model_file_args(&model_files)),
+            [
+                "--diffusion-model",
+                "/flux1.gguf",
+                "--vae",
+                "/ae.safetensors",
+                "--clip_l",
+                "/clip_l.safetensors",
+                "--t5xxl",
+                "/t5.gguf",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_files_fall_back_to_a_full_checkpoint_and_need_one_of_the_two() {
+        let files = vec![(ModelFileRole::Model, PathBuf::from("/sdxl.safetensors"))];
+        let model_files = ImageModelFiles::from_files(&files).unwrap();
+        assert!(model_files.full_checkpoint);
+        assert_eq!(model_files.diffusion_model, Path::new("/sdxl.safetensors"));
+        let none = vec![(ModelFileRole::Vae, PathBuf::from("/vae.safetensors"))];
+        assert!(ImageModelFiles::from_files(&none).is_err());
+    }
+
+    #[test]
     fn file_for_role_picks_matching_file() {
         let files = vec![
             (ModelFileRole::DiffusionModel, PathBuf::from("/d.gguf")),
@@ -1086,13 +1159,11 @@ mod tests {
     #[test]
     fn warm_start_args_are_the_load_args_then_the_model_defaults() {
         let source = warm_source(Some(300));
-        let mut load = model_file_args(
-            Path::new("/flux.gguf"),
-            Some(Path::new("/vae.safetensors")),
-            Some(Path::new("/qwen3.gguf")),
-            None,
-            false,
-        );
+        let mut load = model_file_args(&ImageModelFiles {
+            vae: Some(Path::new("/vae.safetensors")),
+            text_encoder: Some(Path::new("/qwen3.gguf")),
+            ..ImageModelFiles::of(Path::new("/flux.gguf"))
+        });
         load.extend(model_flag_args(&source));
         let args = args_to_strings(&warm_start_args(&load, &source));
         assert_eq!(&args[..load.len()], &args_to_strings(&load)[..]);
@@ -1117,20 +1188,16 @@ mod tests {
     fn the_sd_cli_argv_is_the_file_args_then_the_job_then_the_flag_args() {
         let source = warm_source(Some(300));
         let params = plain_params();
-        let files = model_file_args(Path::new("/flux.gguf"), None, None, None, false);
+        let files = model_file_args(&ImageModelFiles::of(Path::new("/flux.gguf")));
         let flags = model_flag_args(&source);
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/flux.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/flux.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         assert_eq!(&args[..files.len()], &files[..]);
@@ -1148,15 +1215,11 @@ mod tests {
         let argv = args_to_strings(&build_sdcli_args(
             &params,
             &source,
-            Path::new("/flux.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/flux.gguf")),
             Path::new("/tmp/out.jpg"),
             None,
             None,
             None,
-            false,
             &[],
         ));
         assert_eq!(
@@ -1209,15 +1272,15 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            Some(Path::new("/v.safetensors")),
-            Some(Path::new("/llm.gguf")),
-            None,
+            &ImageModelFiles {
+                vae: Some(Path::new("/v.safetensors")),
+                text_encoder: Some(Path::new("/llm.gguf")),
+                ..ImageModelFiles::of(Path::new("/d.gguf"))
+            },
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1250,15 +1313,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1279,15 +1338,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1305,15 +1360,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1334,15 +1385,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
             Some(Path::new("/tmp/mask.png")),
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1361,15 +1408,15 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/checkpoint.safetensors"),
-            Some(Path::new("/v.safetensors")),
-            None,
-            None,
+            &ImageModelFiles {
+                vae: Some(Path::new("/v.safetensors")),
+                full_checkpoint: true,
+                ..ImageModelFiles::of(Path::new("/checkpoint.safetensors"))
+            },
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            true,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1392,15 +1439,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             Some(Path::new("/tmp/init.webp")),
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1418,15 +1461,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1444,15 +1483,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1470,15 +1505,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1496,15 +1527,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1541,15 +1568,16 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/qwen.gguf"),
-            Some(Path::new("/vae.safetensors")),
-            Some(Path::new("/llm.gguf")),
-            Some(Path::new("/mmproj.gguf")),
+            &ImageModelFiles {
+                vae: Some(Path::new("/vae.safetensors")),
+                text_encoder: Some(Path::new("/llm.gguf")),
+                text_encoder_vision: Some(Path::new("/mmproj.gguf")),
+                ..ImageModelFiles::of(Path::new("/qwen.gguf"))
+            },
             Path::new("/tmp/out.webp"),
             None,
             Some(Path::new("/tmp/mask.png")),
             Some(Path::new("/tmp/ref.webp")),
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1583,15 +1611,16 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/qwen21.gguf"),
-            Some(Path::new("/vae.safetensors")),
-            Some(Path::new("/llm.gguf")),
-            Some(Path::new("/mmproj.gguf")),
+            &ImageModelFiles {
+                vae: Some(Path::new("/vae.safetensors")),
+                text_encoder: Some(Path::new("/llm.gguf")),
+                text_encoder_vision: Some(Path::new("/mmproj.gguf")),
+                ..ImageModelFiles::of(Path::new("/qwen21.gguf"))
+            },
             Path::new("/tmp/out.webp"),
             None,
             None,
             Some(Path::new("/tmp/ref.webp")),
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1612,15 +1641,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1645,15 +1670,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &loras,
         );
         let s = args_to_strings(&args);
@@ -1675,15 +1696,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &loras,
         );
         let s = args_to_strings(&args);
@@ -1706,15 +1723,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &loras,
         );
         let s = args_to_strings(&args);
@@ -1734,15 +1747,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &[],
         );
         let s = args_to_strings(&args);
@@ -1766,15 +1775,11 @@ mod tests {
         let args = build_sdcli_args(
             &params,
             &source,
-            Path::new("/d.gguf"),
-            None,
-            None,
-            None,
+            &ImageModelFiles::of(Path::new("/d.gguf")),
             Path::new("/tmp/out.webp"),
             None,
             None,
             None,
-            false,
             &loras,
         );
         let s = args_to_strings(&args);
