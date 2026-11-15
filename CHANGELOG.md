@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.38](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.37...studio-worker-v0.4.38) (2026-11-15)
+
+
+### Features
+
+* warm image models on sd-server ([#281](https://github.com/webbertakken/studio-worker/issues/281)) ([423b915](https://github.com/webbertakken/studio-worker/commit/423b9151f58ae84ccea32a8baa5e9e9aeda44ec9))
+
 ## [0.4.37](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.36...studio-worker-v0.4.37) (2026-11-06)
 
 
