@@ -526,6 +526,10 @@ pub enum ModelFileRole {
     /// Qwen2.5-VL ViT). Maps to `sd-cli --llm_vision`; required by
     /// instruction-edit models that condition on the reference image.
     TextEncoderVision,
+    /// FLUX.1's CLIP-L text encoder.  Maps to `sd-cli --clip_l`.
+    TextEncoderClipL,
+    /// FLUX.1's T5-XXL text encoder.  Maps to `sd-cli --t5xxl`.
+    TextEncoderT5xxl,
     Vae,
     Lora,
     Model,

@@ -145,7 +145,8 @@ The legacy `with_builtin(models_root)` returned a hardcoded
    missing, stream-download from `file.url` (atomic via `.part` +
    rename).  Cached after first download.
 2. **Resolve roles**: pick out the diffusion-model + vae +
-   text-encoder paths.  A `model` role is also accepted as the
+   text-encoder paths (FLUX.1 brings its two encoders as `text-encoder-clip-l`
+   and `text-encoder-t5xxl`).  A `model` role is also accepted as the
    diffusion file (single-file packagings like Flux).
 3. **Build `sd-cli` argv**:
 
@@ -155,6 +156,8 @@ The legacy `with_builtin(models_root)` returned a hardcoded
      --vae             <local vae file>          # if present
      --llm             <local text encoder>      # if present
      --llm_vision      <local vision tower>      # text-encoder-vision role, if present
+     --clip_l          <local CLIP-L encoder>    # text-encoder-clip-l role (FLUX.1), if present
+     --t5xxl           <local T5-XXL encoder>    # text-encoder-t5xxl role (FLUX.1), if present
      -p                <prompt from the task>
      -r                <reference image>         # instruction edits (refImageUrl)
      --mask            <mask>                    # if the task carries one
