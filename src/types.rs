@@ -630,6 +630,10 @@ pub struct ModelCliDefaults {
     /// the card with other tenants (pairs with `offload_to_cpu`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_vram_gib: Option<f32>,
+    /// Seconds an image model stays loaded in a warm `sd-server` after a job
+    /// (docs/runtime/model-source.md#keep-warm); absent or 0 runs `sd-cli` per job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_warm_seconds: Option<u32>,
     /// Blend weight for the model's LoRA files, appended to each
     /// `<lora:name:weight>` prompt tag; defaults to 1.0 when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -792,6 +796,26 @@ pub struct GithubReleaseAsset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_defaults_read_keep_warm_seconds_and_leave_it_out_when_absent() {
+        let warm: ModelCliDefaults = serde_json::from_value(serde_json::json!({
+            "cfgScale": 1.0, "steps": 4, "width": 512, "height": 512, "keepWarmSeconds": 300
+        }))
+        .unwrap();
+        assert_eq!(warm.keep_warm_seconds, Some(300));
+        assert_eq!(serde_json::to_value(&warm).unwrap()["keepWarmSeconds"], 300);
+
+        let cold: ModelCliDefaults = serde_json::from_value(serde_json::json!({
+            "cfgScale": 1.0, "steps": 4, "width": 512, "height": 512
+        }))
+        .unwrap();
+        assert_eq!(cold.keep_warm_seconds, None);
+        assert!(serde_json::to_value(&cold)
+            .unwrap()
+            .get("keepWarmSeconds")
+            .is_none());
+    }
 
     fn synthetic_model_source_json() -> serde_json::Value {
         serde_json::json!({

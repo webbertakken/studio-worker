@@ -32,7 +32,7 @@
 //! to synthetic for any kind it doesn't have a real backend for.
 
 use crate::engine::download::{self, TempFileGuard};
-use crate::engine::sd_provision;
+use crate::engine::{sd_provision, sd_server};
 use crate::engine::{Engine, EngineCapabilities};
 use crate::types::{ImageParams, ModelFileRole, ModelSource, Task, TaskKind, TaskResult};
 use anyhow::{anyhow, bail, Context, Result};
@@ -258,6 +258,58 @@ impl SdCppEngine {
             .filter(|(role, _)| *role == ModelFileRole::Lora)
             .map(|(_, path)| path.as_path())
             .collect();
+
+        // A warm-eligible job runs on the warm server; any failure there runs it on sd-cli
+        // (docs/engines/sdcpp.md#warm-server).
+        if let Some(keep_warm) = warm_keep(&params, source, !loras.is_empty()) {
+            match sd_server::sibling_sd_server(&sd_cli) {
+                Some(sd_server_bin) => {
+                    let mut load_args = model_file_args(
+                        diffusion_model,
+                        vae,
+                        text_encoder,
+                        text_encoder_vision,
+                        full_checkpoint,
+                    );
+                    load_args.extend(model_flag_args(source));
+                    let start_args = warm_start_args(&load_args, source);
+                    let key = sd_server::WarmKey {
+                        model: model.to_string(),
+                        load_args,
+                    };
+                    let request = warm_request(&params, source);
+                    match sd_server::warm_servers().generate(
+                        &sd_server_bin,
+                        key,
+                        &start_args,
+                        keep_warm,
+                        &request,
+                    ) {
+                        Ok(bytes) => {
+                            return Ok(TaskResult::Image {
+                                bytes,
+                                ext: normalize_output_ext(&params.ext),
+                            })
+                        }
+                        Err(error) => warn!(
+                            target: "studio_worker::engine::sd_server",
+                            op = "fallback",
+                            model,
+                            error = %format!("{error:#}"),
+                            "warm server failed; running the job on sd-cli"
+                        ),
+                    }
+                }
+                None => warn!(
+                    target: "studio_worker::engine::sd_server",
+                    op = "fallback",
+                    model,
+                    sd_cli = %sd_cli.display(),
+                    error = "no sd-server beside sd-cli",
+                    "model asks to stay warm but sd-server is missing; running the job on sd-cli"
+                ),
+            }
+        }
 
         let out_dir = std::env::temp_dir().join("studio-worker-sdcpp");
         std::fs::create_dir_all(&out_dir)
@@ -585,29 +637,13 @@ fn build_sdcli_args(
     let resolved = resolve_image_args(params, source);
     let mut args: Vec<OsString> = Vec::with_capacity(32);
 
-    // A full checkpoint loads via `-m`/`--model`; standalone diffusion weights via
-    // `--diffusion-model` (alongside split vae/clip files).
-    args.push(
-        if full_checkpoint {
-            "--model"
-        } else {
-            "--diffusion-model"
-        }
-        .into(),
-    );
-    args.push(diffusion_model.into());
-    if let Some(p) = vae {
-        args.push("--vae".into());
-        args.push(p.into());
-    }
-    if let Some(p) = text_encoder {
-        args.push("--llm".into());
-        args.push(p.into());
-    }
-    if let Some(p) = text_encoder_vision {
-        args.push("--llm_vision".into());
-        args.push(p.into());
-    }
+    args.extend(model_file_args(
+        diffusion_model,
+        vae,
+        text_encoder,
+        text_encoder_vision,
+        full_checkpoint,
+    ));
     // LoRA pass-through: every LoRA of a model shares its cache directory, so
     // one `--lora-model-dir` suffices; each file is named by a
     // `<lora:stem:weight>` prompt tag appended to the positive prompt.  A file
@@ -685,6 +721,49 @@ fn build_sdcli_args(
         args.push("--sampling-method".into());
         args.push(method.into());
     }
+    args.extend(model_flag_args(source));
+    args
+}
+
+/// The model's files, as `sd-cli` and `sd-server` load them.  Load time: part of the warm key.
+fn model_file_args(
+    diffusion_model: &Path,
+    vae: Option<&Path>,
+    text_encoder: Option<&Path>,
+    text_encoder_vision: Option<&Path>,
+    full_checkpoint: bool,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::with_capacity(8);
+    // A full checkpoint loads via `-m`/`--model`; standalone diffusion weights via
+    // `--diffusion-model` (alongside split vae/clip files).
+    args.push(
+        if full_checkpoint {
+            "--model"
+        } else {
+            "--diffusion-model"
+        }
+        .into(),
+    );
+    args.push(diffusion_model.into());
+    if let Some(p) = vae {
+        args.push("--vae".into());
+        args.push(p.into());
+    }
+    if let Some(p) = text_encoder {
+        args.push("--llm".into());
+        args.push(p.into());
+    }
+    if let Some(p) = text_encoder_vision {
+        args.push("--llm_vision".into());
+        args.push(p.into());
+    }
+    args
+}
+
+/// The model-level flags from the registry, and the flags safe on every box.  Load time: part
+/// of the warm key.
+fn model_flag_args(source: &ModelSource) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::with_capacity(10);
     // Flow / instruction-edit model flags (model-level constants from the registry). Only emitted
     // when the model declares them, so SDXL-style models are unaffected.
     if let Some(shift) = source.cli_defaults.flow_shift {
@@ -710,6 +789,75 @@ fn build_sdcli_args(
     args
 }
 
+/// What a warm server is started with beyond its port: the load-time arguments, then the model's
+/// defaults (each request sets its own values on top).
+fn warm_start_args(load_args: &[OsString], source: &ModelSource) -> Vec<OsString> {
+    let defaults = resolve_image_args(&ImageParams::default(), source);
+    let mut args = load_args.to_vec();
+    args.push("--cfg-scale".into());
+    args.push(defaults.cfg_scale.to_string().into());
+    args.push("--steps".into());
+    args.push(defaults.steps.to_string().into());
+    args.push("-W".into());
+    args.push(defaults.width.to_string().into());
+    args.push("-H".into());
+    args.push(defaults.height.to_string().into());
+    if let Some(method) = defaults.sampling_method {
+        args.push("--sampling-method".into());
+        args.push(method.into());
+    }
+    args
+}
+
+/// How long a job's model may stay warm, when the job may run on a warm server
+/// (docs/engines/sdcpp.md#warm-server): the model sets `keepWarmSeconds`, the job has no init
+/// image, no reference image, no mask and no LoRA, and its format is one `sd-server` encodes.
+fn warm_keep(
+    params: &ImageParams,
+    source: &ModelSource,
+    has_loras: bool,
+) -> Option<std::time::Duration> {
+    let seconds = source.cli_defaults.keep_warm_seconds.filter(|s| *s > 0)?;
+    let has_image = |url: &Option<String>| url.as_deref().is_some_and(|u| !u.is_empty());
+    if has_image(&params.init_image_url)
+        || has_image(&params.ref_image_url)
+        || has_image(&params.mask_url)
+        || has_loras
+        || warm_output_format(&normalize_output_ext(&params.ext)).is_none()
+    {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(u64::from(seconds)))
+}
+
+/// `sd-server`'s name for an output extension; `None` for one it does not encode.
+fn warm_output_format(ext: &str) -> Option<&'static str> {
+    match ext {
+        "png" => Some("png"),
+        "jpg" => Some("jpeg"),
+        "webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+/// One job's warm request, resolved exactly as `build_sdcli_args` resolves it for `sd-cli`.
+fn warm_request(params: &ImageParams, source: &ModelSource) -> sd_server::WarmRequest {
+    let resolved = resolve_image_args(params, source);
+    sd_server::WarmRequest {
+        prompt: params.prompt.clone(),
+        negative_prompt: params.negative_prompt.clone().filter(|n| !n.is_empty()),
+        width: resolved.width,
+        height: resolved.height,
+        steps: resolved.steps,
+        cfg_scale: resolved.cfg_scale,
+        sampling_method: resolved.sampling_method,
+        seed: params.seed,
+        output_format: warm_output_format(&normalize_output_ext(&params.ext))
+            .unwrap_or("webp")
+            .to_string(),
+    }
+}
+
 /// Point the per-job `Command`'s dynamic linker at the shared library
 /// that ships next to an auto-provisioned `sd-cli` (Linux / macOS).
 /// No-op on Windows (sibling DLLs resolve automatically) and when the
@@ -717,7 +865,7 @@ fn build_sdcli_args(
 /// installs manage their own load path).  Prepends to any inherited
 /// value so a pre-set `LD_LIBRARY_PATH` isn't clobbered.
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn apply_library_path(cmd: &mut Command, sd_cli: &Path) {
+pub(crate) fn apply_library_path(cmd: &mut Command, sd_cli: &Path) {
     let Some((var, dir)) = sd_provision::library_path_env(sd_cli) else {
         return;
     };
@@ -881,6 +1029,157 @@ mod tests {
     // The legacy `dispatch_requires_model_source` test is gone: the
     // trait signature now takes `&ModelSource` so the compiler enforces
     // it at every call site.  No runtime fallback to police.
+
+    // -----------------------------------------------------------------
+    // Warm server (docs/engines/sdcpp.md#warm-server)
+    // -----------------------------------------------------------------
+
+    fn warm_source(seconds: Option<u32>) -> ModelSource {
+        let mut source = fake_source(vec![]);
+        source.cli_defaults.keep_warm_seconds = seconds;
+        source.cli_defaults.mmap = Some(true);
+        source
+    }
+
+    fn plain_params() -> ImageParams {
+        ImageParams {
+            prompt: "a lighthouse".into(),
+            ext: "webp".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn warm_keep_needs_keep_warm_seconds_above_zero() {
+        let params = plain_params();
+        assert_eq!(
+            warm_keep(&params, &warm_source(Some(300)), false),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(warm_keep(&params, &warm_source(Some(0)), false), None);
+        assert_eq!(warm_keep(&params, &warm_source(None), false), None);
+    }
+
+    #[test]
+    fn warm_keep_refuses_images_masks_loras_and_formats_sd_server_cannot_encode() {
+        let source = warm_source(Some(300));
+        let with = |edit: fn(&mut ImageParams)| {
+            let mut params = plain_params();
+            edit(&mut params);
+            warm_keep(&params, &source, false)
+        };
+        assert_eq!(
+            with(|p| p.init_image_url = Some("https://x/i.webp".into())),
+            None
+        );
+        assert_eq!(
+            with(|p| p.ref_image_url = Some("https://x/r.webp".into())),
+            None
+        );
+        assert_eq!(with(|p| p.mask_url = Some("https://x/m.png".into())), None);
+        assert_eq!(with(|p| p.ext = "bmp".into()), None);
+        assert!(with(|p| p.init_image_url = Some(String::new())).is_some());
+        assert!(with(|p| p.ext = "jpg".into()).is_some());
+        assert_eq!(warm_keep(&plain_params(), &source, true), None);
+    }
+
+    #[test]
+    fn warm_start_args_are_the_load_args_then_the_model_defaults() {
+        let source = warm_source(Some(300));
+        let mut load = model_file_args(
+            Path::new("/flux.gguf"),
+            Some(Path::new("/vae.safetensors")),
+            Some(Path::new("/qwen3.gguf")),
+            None,
+            false,
+        );
+        load.extend(model_flag_args(&source));
+        let args = args_to_strings(&warm_start_args(&load, &source));
+        assert_eq!(&args[..load.len()], &args_to_strings(&load)[..]);
+        assert_eq!(
+            args[idx_after(&args, "--diffusion-model").unwrap()],
+            "/flux.gguf"
+        );
+        assert_eq!(args[idx_after(&args, "--llm").unwrap()], "/qwen3.gguf");
+        assert!(args.contains(&"--mmap".to_string()));
+        assert!(args.contains(&"--diffusion-fa".to_string()));
+        assert_eq!(args[idx_after(&args, "--steps").unwrap()], "8");
+        assert_eq!(args[idx_after(&args, "-W").unwrap()], "1024");
+        assert_eq!(
+            args[idx_after(&args, "--sampling-method").unwrap()],
+            "euler"
+        );
+        assert!(!args.contains(&"-p".to_string()));
+        assert!(!args.contains(&"-o".to_string()));
+    }
+
+    #[test]
+    fn the_sd_cli_argv_is_the_file_args_then_the_job_then_the_flag_args() {
+        let source = warm_source(Some(300));
+        let params = plain_params();
+        let files = model_file_args(Path::new("/flux.gguf"), None, None, None, false);
+        let flags = model_flag_args(&source);
+        let args = build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/flux.gguf"),
+            None,
+            None,
+            None,
+            Path::new("/tmp/out.webp"),
+            None,
+            None,
+            None,
+            false,
+            &[],
+        );
+        assert_eq!(&args[..files.len()], &files[..]);
+        assert_eq!(&args[args.len() - flags.len()..], &flags[..]);
+    }
+
+    #[test]
+    fn a_warm_request_resolves_like_sd_cli() {
+        let source = warm_source(Some(300));
+        let mut params = plain_params();
+        params.seed = Some(42);
+        params.negative_prompt = Some(String::new());
+        params.ext = "jpg".into();
+        let request = warm_request(&params, &source);
+        let argv = args_to_strings(&build_sdcli_args(
+            &params,
+            &source,
+            Path::new("/flux.gguf"),
+            None,
+            None,
+            None,
+            Path::new("/tmp/out.jpg"),
+            None,
+            None,
+            None,
+            false,
+            &[],
+        ));
+        assert_eq!(
+            request.steps.to_string(),
+            argv[idx_after(&argv, "--steps").unwrap()]
+        );
+        assert_eq!(
+            request.width.to_string(),
+            argv[idx_after(&argv, "-W").unwrap()]
+        );
+        assert_eq!(
+            request.height.to_string(),
+            argv[idx_after(&argv, "-H").unwrap()]
+        );
+        assert_eq!(
+            request.cfg_scale.to_string(),
+            argv[idx_after(&argv, "--cfg-scale").unwrap()]
+        );
+        assert_eq!(request.seed, Some(42));
+        assert_eq!(request.negative_prompt, None);
+        assert_eq!(request.output_format, "jpeg");
+        assert_eq!(request.prompt, "a lighthouse");
+    }
 
     // -----------------------------------------------------------------
     // Pure arg-builder tests — lock down the sd-cli invocation contract

@@ -136,6 +136,11 @@ impl DaemonControl {
             changed = was != paused,
             "pause toggled through the local api"
         );
+        if paused {
+            // A paused worker gives its warm image model's memory back
+            // (docs/runtime/model-lifecycle.md#warm-models).
+            crate::engine::sd_server::evict_started("paused");
+        }
         paused
     }
 

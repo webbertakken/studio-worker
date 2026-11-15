@@ -155,6 +155,9 @@ pub fn ensure_file_for_model(
         );
         return Ok(legacy);
     }
+    if let Some(reused) = reuse_from_another_model(models_root, &subdir, &target, file)? {
+        return Ok(reused);
+    }
     preflight_disk_space(&subdir, filename, file.approx_bytes)?;
     download_file_verified(file.url.as_str(), &target, file.sha256.as_deref()).with_context(
         || {
@@ -166,6 +169,72 @@ pub fn ensure_file_for_model(
         },
     )?;
     Ok(target)
+}
+
+/// The same file (same name, same declared size) another model already downloaded, under
+/// another folder of `models_root`.
+fn same_file_elsewhere(models_root: &Path, own_dir: &Path, file: &ModelFile) -> Option<PathBuf> {
+    let size = file.approx_bytes?;
+    let mut folders: Vec<PathBuf> = std::fs::read_dir(models_root)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir() && path != own_dir)
+        .collect();
+    folders.sort();
+    folders.into_iter().find_map(|folder| {
+        let candidate = folder.join(&file.filename);
+        let found = std::fs::metadata(&candidate).ok()?;
+        (found.is_file() && found.len() == size).then_some(candidate)
+    })
+}
+
+/// Hard-link (or copy, when linking fails) a file another model already downloaded into this
+/// model's folder, then verify it like a download (docs/runtime/model-source.md).  `None` when
+/// there is none, or it does not verify (it is removed and the caller downloads).
+fn reuse_from_another_model(
+    models_root: &Path,
+    own_dir: &Path,
+    target: &Path,
+    file: &ModelFile,
+) -> Result<Option<PathBuf>> {
+    let Some(found) = same_file_elsewhere(models_root, own_dir, file) else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(own_dir)
+        .with_context(|| format!("creating model folder {}", own_dir.display()))?;
+    let how = if std::fs::hard_link(&found, target).is_ok() {
+        "link"
+    } else {
+        std::fs::copy(&found, target)
+            .with_context(|| format!("copying {} -> {}", found.display(), target.display()))?;
+        "copy"
+    };
+    if let Some(expected) = file.sha256.as_deref() {
+        let digest = sha256_of(&mut std::fs::File::open(target)?)
+            .with_context(|| format!("hashing {}", target.display()))?;
+        let actual_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        if let Err(error) = verify_sha256(&actual_hex, Some(expected)) {
+            remove_temp_file(target);
+            warn!(
+                target: TRACE_TARGET,
+                op = "reuse",
+                from = %found.display(),
+                error = %error,
+                "an identical-looking file of another model does not verify; downloading instead"
+            );
+            return Ok(None);
+        }
+    }
+    info!(
+        target: TRACE_TARGET,
+        op = "reuse",
+        from = %found.display(),
+        to = %target.display(),
+        how,
+        verified = file.sha256.is_some(),
+        "reused another model's identical file"
+    );
+    Ok(Some(target.to_path_buf()))
 }
 
 /// Resolve `filename` to a path inside `dir`, refusing anything that
@@ -978,6 +1047,62 @@ mod tests {
             approx_bytes: bytes,
             sha256: None,
         }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        sha256_of(&mut &bytes[..])
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn a_model_reuses_another_models_identical_file_without_downloading() {
+        let root = tempdir().unwrap();
+        let other = model_dir(root.path(), "flux2-klein-4b-removal");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("qwen3.gguf"), b"weights").unwrap();
+        let mut file = model_file("qwen3.gguf", Some(7));
+        file.sha256 = Some(sha256_hex(b"weights"));
+        // The URL is unreachable: only reuse can succeed.
+        let path = ensure_file_for_model(root.path(), "flux2-klein-4b", &file).unwrap();
+        assert_eq!(
+            path,
+            model_dir(root.path(), "flux2-klein-4b").join("qwen3.gguf")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"weights");
+    }
+
+    #[test]
+    fn a_file_of_another_size_is_not_reused() {
+        let root = tempdir().unwrap();
+        let other = model_dir(root.path(), "other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("qwen3.gguf"), b"weights").unwrap();
+        let file = model_file("qwen3.gguf", Some(8));
+        let own = model_dir(root.path(), "mine");
+        assert_eq!(same_file_elsewhere(root.path(), &own, &file), None);
+        let without_size = model_file("qwen3.gguf", None);
+        assert_eq!(same_file_elsewhere(root.path(), &own, &without_size), None);
+    }
+
+    #[test]
+    fn a_reused_file_that_does_not_verify_is_removed_and_not_used() {
+        let root = tempdir().unwrap();
+        let other = model_dir(root.path(), "other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("qwen3.gguf"), b"weights").unwrap();
+        let mut file = model_file("qwen3.gguf", Some(7));
+        file.sha256 = Some(sha256_hex(b"WEIGHTS"));
+        let own = model_dir(root.path(), "mine");
+        let target = own.join("qwen3.gguf");
+        assert_eq!(
+            reuse_from_another_model(root.path(), &own, &target, &file).unwrap(),
+            None
+        );
+        assert!(!target.exists());
+        assert!(other.join("qwen3.gguf").is_file());
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use crate::admission::{self, FreeMemory, MemoryNeed, MemoryProbe, Refused};
 use crate::catalog::{Catalog, CatalogModel};
+use crate::engine::sd_server::{StartedWarm, WarmHold};
 use crate::lifecycle::{Command, Lifecycle, ModelState};
 use crate::residency::Residency;
 use chrono::{DateTime, Utc};
@@ -159,6 +160,7 @@ struct Inner {
     entries: Mutex<HashMap<String, Entry>>,
     changed: Condvar,
     subscribers: Mutex<Vec<mpsc::Sender<ModelStatus>>>,
+    warm: Arc<dyn WarmHold>,
 }
 
 /// Cheap to clone; every clone is the same host.
@@ -183,8 +185,18 @@ impl ModelHost {
                 entries: Mutex::new(HashMap::new()),
                 changed: Condvar::new(),
                 subscribers: Mutex::new(Vec::new()),
+                warm: Arc::new(StartedWarm),
             }),
         }
+    }
+
+    /// For tests: another warm server than the process-wide one.  Call it before cloning.
+    #[cfg(test)]
+    pub fn with_warm(mut self, warm: Arc<dyn WarmHold>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_warm before the host is shared")
+            .warm = warm;
+        self
     }
 
     /// Status of one catalogue model.
@@ -230,6 +242,18 @@ impl ModelHost {
     /// swaps a resident out.  Memory that cannot be measured (no probe, no total) admits it, as
     /// before admission: a worker without a readable device must not turn every job away.
     pub fn admit_transient(&self, model: &str, need: MemoryNeed) -> Result<(), admission::Refused> {
+        // The warm model's memory is already in use for it; anything else gets the warm
+        // server's memory back first (docs/runtime/model-lifecycle.md#warm-models).
+        if self.inner.warm.holds(model) {
+            tracing::info!(
+                target: TRACE_TARGET,
+                op = "admit",
+                model,
+                "warm model: transient job admitted without a memory check"
+            );
+            return Ok(());
+        }
+        self.inner.warm.evict("admission");
         let needed_gib = need.device_gib;
         let free = admission::free_now(self.inner.probe.as_ref(), self.loaded_gib());
         let device = if free == admission::FreeMemory::Unknown {
@@ -342,6 +366,7 @@ impl ModelHost {
             None => Vec::new(),
         };
         if needs_load {
+            self.inner.warm.evict("load");
             let freed: f32 = catalog
                 .iter()
                 .filter(|m| swap_out.contains(&m.id))
@@ -1186,6 +1211,96 @@ mod tests {
         f.host
             .admit_transient("mistral-small", MemoryNeed::device(14.0))
             .unwrap();
+    }
+
+    /// A warm server stand-in: holds `model` until evicted, counting evictions.
+    struct FakeWarm {
+        model: Mutex<Option<String>>,
+        evictions: Mutex<Vec<String>>,
+    }
+
+    impl FakeWarm {
+        fn holding(model: &str) -> Arc<Self> {
+            Arc::new(Self {
+                model: Mutex::new(Some(model.to_string())),
+                evictions: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl WarmHold for FakeWarm {
+        fn holds(&self, model: &str) -> bool {
+            self.model.lock().as_deref() == Some(model)
+        }
+        fn evict(&self, reason: &str) -> bool {
+            self.evictions.lock().push(reason.to_string());
+            self.model.lock().take().is_some()
+        }
+    }
+
+    /// A probe with no room on the device at all.
+    struct FullProbe;
+
+    impl crate::admission::MemoryProbe for FullProbe {
+        fn free_gib(&self) -> Option<f32> {
+            Some(0.1)
+        }
+        fn total_gib(&self) -> Option<f32> {
+            Some(24.0)
+        }
+        fn host_available_gib(&self) -> Option<f32> {
+            None
+        }
+    }
+
+    fn host_with_warm(warm: Arc<FakeWarm>) -> (ModelHost, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ModelHost::new(
+            Arc::new(Mutex::new(Catalog::default())),
+            FakeRuntime::open(),
+            Arc::new(FullProbe),
+            Residency::load_for_serving(Some(dir.path().join("residency.json"))),
+        )
+        .with_warm(warm);
+        (host, dir)
+    }
+
+    #[test]
+    fn the_warm_model_is_admitted_without_a_memory_check() {
+        let warm = FakeWarm::holding("flux2-klein-4b");
+        let (host, _dir) = host_with_warm(Arc::clone(&warm));
+        host.admit_transient("flux2-klein-4b", MemoryNeed::device(10.0))
+            .unwrap();
+        assert!(warm.evictions.lock().is_empty());
+        assert!(warm.holds("flux2-klein-4b"));
+    }
+
+    #[test]
+    fn another_transient_job_evicts_the_warm_model_before_admission() {
+        let warm = FakeWarm::holding("flux2-klein-4b");
+        let (host, _dir) = host_with_warm(Arc::clone(&warm));
+        // The full device still refuses it: eviction comes first, admission is unchanged.
+        assert!(host
+            .admit_transient("qwen-image-2512", MemoryNeed::device(12.0))
+            .is_err());
+        assert_eq!(*warm.evictions.lock(), vec!["admission".to_string()]);
+        assert!(!warm.holds("flux2-klein-4b"));
+    }
+
+    #[test]
+    fn a_load_evicts_the_warm_model_first() {
+        let warm = FakeWarm::holding("flux2-klein-4b");
+        let dir = tempfile::tempdir().unwrap();
+        let host = ModelHost::new(
+            Arc::new(Mutex::new(Catalog::default())),
+            FakeRuntime::open(),
+            Arc::new(HostProbe(None)),
+            Residency::load_for_serving(Some(dir.path().join("residency.json"))),
+        )
+        .with_warm(Arc::clone(&warm) as Arc<dyn WarmHold>);
+        host.inner.catalog.lock().upsert(model("a", 3.0, None));
+        host.load("a").unwrap();
+        assert_eq!(*warm.evictions.lock(), vec!["load".to_string()]);
     }
 
     /// A probe with room on the device and `host` GiB of host memory available.

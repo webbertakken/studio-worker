@@ -98,8 +98,13 @@ pub struct Tracker {
 
 impl Tracker {
     /// Apply one sample to `slot`, logging a change of presence, a probe that
-    /// starts failing (or fails differently) and a probe that recovers.
-    pub fn record(&mut self, slot: &PresenceSlot, sample: Result<Duration, ProbeError>) {
+    /// starts failing (or fails differently) and a probe that recovers.  The
+    /// presence it changed to, when it changed.
+    pub fn record(
+        &mut self,
+        slot: &PresenceSlot,
+        sample: Result<Duration, ProbeError>,
+    ) -> Option<UserPresence> {
         match sample {
             Ok(idle) => {
                 if let Some(error) = self.last_error.take() {
@@ -112,15 +117,17 @@ impl Tracker {
                 }
                 let now = classify(idle);
                 let before = slot.lock().replace(now);
-                if before != Some(now) {
-                    tracing::info!(
-                        target: TRACE_TARGET,
-                        op = "presence",
-                        presence = now.as_str(),
-                        idle_secs = idle.as_secs(),
-                        "user presence changed"
-                    );
+                if before == Some(now) {
+                    return None;
                 }
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    op = "presence",
+                    presence = now.as_str(),
+                    idle_secs = idle.as_secs(),
+                    "user presence changed"
+                );
+                Some(now)
             }
             Err(error) => {
                 let before = slot.lock().take();
@@ -134,20 +141,27 @@ impl Tracker {
                     );
                     self.last_error = Some(error);
                 }
+                None
             }
         }
     }
 }
 
-/// Sample the presence into `slot` until `stop` is set.
-pub fn spawn_monitor(slot: PresenceSlot, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+/// Sample the presence into `slot` until `stop` is set, telling `on_change` each change.
+pub fn spawn_monitor(
+    slot: PresenceSlot,
+    stop: Arc<AtomicBool>,
+    on_change: impl Fn(UserPresence) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tracker = Tracker::default();
         let mut tick = tokio::time::interval(SAMPLE_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         while !stop.load(Ordering::SeqCst) {
             tick.tick().await;
-            tracker.record(&slot, idle_time().await);
+            if let Some(presence) = tracker.record(&slot, idle_time().await) {
+                on_change(presence);
+            }
         }
     })
 }
@@ -333,6 +347,22 @@ mod tests {
     }
 
     #[test]
+    fn the_tracker_answers_each_change_once() {
+        let slot = PresenceSlot::default();
+        let mut tracker = Tracker::default();
+        assert_eq!(
+            tracker.record(&slot, Ok(Duration::from_secs(1))),
+            Some(UserPresence::Active)
+        );
+        assert_eq!(tracker.record(&slot, Ok(Duration::from_secs(2))), None);
+        assert_eq!(
+            tracker.record(&slot, Ok(Duration::from_secs(300))),
+            Some(UserPresence::Idle)
+        );
+        assert_eq!(tracker.record(&slot, Err(ProbeError::Unsupported)), None);
+    }
+
+    #[test]
     fn the_tracker_logs_changes_only() {
         let slot = PresenceSlot::default();
         let in_capture = slot.clone();
@@ -385,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn the_monitor_stops_when_asked() {
         let stop = Arc::new(AtomicBool::new(true));
-        let handle = spawn_monitor(PresenceSlot::default(), stop);
+        let handle = spawn_monitor(PresenceSlot::default(), stop, |_| {});
         tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("monitor stops")
