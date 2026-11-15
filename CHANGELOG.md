@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.39](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.38...studio-worker-v0.4.39) (2026-11-15)
+
+
+### Features
+
+* **sdcpp:** FLUX.1 clip_l and t5xxl file roles ([#285](https://github.com/webbertakken/studio-worker/issues/285)) ([8a2b3bd](https://github.com/webbertakken/studio-worker/commit/8a2b3bd311bd491fb6a8b495173c08f9c59dc274))
+
 ## [0.4.38](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.37...studio-worker-v0.4.38) (2026-11-15)
 
 
