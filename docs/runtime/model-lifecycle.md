@@ -15,6 +15,10 @@ answers, and it can **unload** them on request to give the memory back.
 | lane | the serving path of one loaded model; requests to it queue on its lane |
 | admission | the check that a load or transient job fits in free device memory |
 | exclusive group | catalogue models of which at most one may be loaded at a time |
+| warm model | an image model a transient job left loaded in an `sd-server` child, for its `keepWarmSeconds` |
+| warm server | that `sd-server` child, listening on loopback; at most one per worker |
+| warm key | what must be equal to reuse a warm server: the model id, its files and its load-time flags |
+| eviction | stopping the warm server before its time, to give its memory to something else |
 
 ## States
 
@@ -109,6 +113,24 @@ Every catalogue model has exactly one state. Only the worker changes it.
   must also fit in the host memory available: see
   [memory ceiling](memory-ceiling.md#admission-of-host-memory).
 - A load that is refused changes nothing and says why; there is no silent fallback to CPU.
+
+## Warm models
+
+A transient image job whose model sets `keepWarmSeconds` (see
+[model source](model-source.md#keep-warm)) leaves its model loaded in a warm server, so the next
+job for the same model skips the load ([sd-cpp warm server](../engines/sdcpp.md#warm-server)).
+
+- A warm model is neither loaded (it has no lane and no lifecycle state) nor gone: it holds device
+  memory until it expires, is replaced or is evicted.
+- Admission: a transient job for the warm model is admitted without a memory check, because its
+  memory is already in use for it. Any other transient job or load evicts the warm server first,
+  then is admitted as below against the memory that frees.
+- Expiry: the warm server stops `keepWarmSeconds` after its last job (checked every 5 s).
+- Eviction: also when the operator pauses the worker, when `onlyWhenIdle` is on and the person
+  becomes active, and when the daemon stops. A warm server never outlives the daemon: on Linux the
+  kernel stops it with the daemon (`PR_SET_PDEATHSIG`); elsewhere the daemon stops it on exit.
+- A warm failure (start, ready, generate) logs a warning, evicts, and runs the job on `sd-cli`:
+  a job never fails because of the warm path.
 
 ## Local API
 

@@ -117,6 +117,7 @@ pub mod onnx_provision;
 #[cfg(feature = "stt-stream")]
 pub mod parakeet;
 pub mod sd_provision;
+pub mod sd_server;
 pub mod sdcpp;
 pub mod torch;
 #[cfg(feature = "tts")]

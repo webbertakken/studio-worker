@@ -612,8 +612,18 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     let busy = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let observers = WorkerObservers::with_global_worker_log();
-    let presence_monitor =
-        crate::presence::spawn_monitor(observers.user_presence.clone(), control.stop.clone());
+    let presence_cfg = control.cfg.clone();
+    let presence_monitor = crate::presence::spawn_monitor(
+        observers.user_presence.clone(),
+        control.stop.clone(),
+        move |presence| {
+            // Only when idle: the person came back, so the warm image model's memory goes back
+            // to them (docs/runtime/model-lifecycle.md#warm-models).
+            if crate::presence::holds_back(presence_cfg.lock().only_when_idle, Some(presence)) {
+                crate::engine::sd_server::evict_started("presence");
+            }
+        },
+    );
     // A tray UI that vanished (crashed, killed, lost with its session bus) comes back.
     #[cfg(feature = "ui")]
     crate::tray_watchdog::spawn(control.clone());
@@ -639,6 +649,7 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
         let _ = handle.join();
     }
     presence_monitor.abort();
+    crate::engine::sd_server::evict_started("shutdown");
     outcome
 }
 

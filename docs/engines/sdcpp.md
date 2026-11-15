@@ -221,11 +221,29 @@ Flux VAE (335MB) on an RTX 4090 via the Vulkan build:
 - Multipart upload to R2: 2-3s
 - **End-to-end per job: ~10-15s steady-state**
 
-Each `sd-cli` invocation pays the model-load cost.  That's the
-biggest single optimisation we haven't done — keeping an
-`sd-server` subprocess alive and routing every job through HTTP
-would amortise load to once per worker boot.  Not done yet because
-the current rate is already inside the operator's tolerance window.
+Each `sd-cli` invocation pays the model-load cost; a model that sets `keepWarmSeconds` pays it
+once per warm server instead (below).
+
+## Warm server
+
+A job is warm-eligible when its model's `keepWarmSeconds` is above 0, it has no init image, no
+reference image, no mask and no LoRA, and `sd-server` stands beside the resolved `sd-cli` (the
+pinned release ships both). A warm-eligible job runs on the warm server; any other runs `sd-cli`.
+
+- Start: `sd-server --listen-ip 127.0.0.1 --listen-port <port>` with the load-time arguments
+  `sd-cli` would get (model files, `--diffusion-fa`, `--mmap`, `--offload-to-cpu`, `--max-vram`,
+  `--model-args`, `--flow-shift`) and the model's defaults (`--cfg-scale`, `--steps`, `-W`, `-H`,
+  `--sampling-method`). The port is a free loopback port; a failed start retries once on another.
+- Ready: `GET /v1/models` every 250 ms until `200`; the child exiting (its last stderr lines are
+  the error) or 180 s passing fails the start.
+- Generate: `POST /v1/images/generations` with the prompt, `n` 1, `size`, `output_format` and the
+  per-job values in `<sd_cpp_extra_args>` (seed, negative prompt, steps, sampler, `txt_cfg`), resolved
+  exactly as for `sd-cli`; the answer's `data[0].b64_json` is the picture. 300 s at most.
+- One warm server at most; a job with another warm key (model, files, load flags) replaces it.
+- Admission, expiry and eviction: [warm models](../runtime/model-lifecycle.md#warm-models).
+- Logs: target `studio_worker::engine::sd_server`, `op` = `start` (model, port, elapsed_ms),
+  `reuse`, `generate` (elapsed_ms, bytes), `evict` (reason, held_s), `expire` (idle_s),
+  `fallback` (error); the server's own stderr lines at `debug`.
 
 ## Failure modes specific to this engine
 

@@ -55,6 +55,17 @@ worker-local (the studio does not send them today):
 | `contextSize` | context window in tokens (default 8192, capped at the model's training size) |
 | `chatTemplateKwargs` | variables for the model's chat template, e.g. `{"enable_thinking": false}` |
 
+### Keep warm
+
+Image models (`engine: "sd-cpp"`) read one more `cliDefaults` field, optional:
+
+| Field | Meaning |
+|---|---|
+| `keepWarmSeconds` | seconds an `sd-server` keeps the model loaded after a job; absent or 0 runs `sd-cli` per job |
+
+A worker that does not know the field ignores it and runs each job on `sd-cli`, slower but
+correct ([warm models](model-lifecycle.md#warm-models)).
+
 - TS source of truth: `apps/studio/src/shared/types/worker.ts`
   (`WorkerModelSource` + `WorkerModelFile` + `WorkerModelCliDefaults`).
 - Rust mirror: [`src/types.rs`](../../src/types.rs) (`ModelSource`,
