@@ -22,7 +22,8 @@ top-level [`README.md`](../README.md).  For active plans, see
 - [Daemon and tray UI](runtime/daemon-and-tray.md) — the headless daemon hosts every
   model and job; the always-on tray UI is its client over the local API: per-job logs,
   thumbnails, model lifecycle, display wait.
-- [Model lifecycle](runtime/model-lifecycle.md) — loaded models, residency, admission.
+- [Model lifecycle](runtime/model-lifecycle.md) — loaded models, residency, admission, and warm image
+  models (`keepWarmSeconds`): an `sd-server` kept between jobs, evicted for anything else.
 - [Memory ceiling](runtime/memory-ceiling.md) — on Linux the worker runs in a capped systemd
   user scope; admission checks host memory for jobs that offload their weights.
 - [Local API](local-api.md) — loopback HTTP API: generation, catalogue, lifecycle,
@@ -41,7 +42,8 @@ top-level [`README.md`](../README.md).  For active plans, see
 
 - [sd-cpp engine](engines/sdcpp.md) — real image inference via
   `stable-diffusion.cpp` as a subprocess.  Auto-provisions `sd-cli`
-  and downloads model weights on demand, cached in `cfg.models_root`.
+  and downloads model weights on demand, cached in `cfg.models_root`; a warm server answers
+  repeat pictures in about a second, and FLUX.1 brings its CLIP-L and T5-XXL encoders as file roles.
 - [llama engine](engines/llama.md) — chat models (llama.cpp) in a llama process per model, so a
   llama.cpp abort ends one job, not the daemon; structured output and vision.
 - [torch engine](engines/torch.md) — PyTorch models with custom CUDA extensions in a child process
