@@ -240,6 +240,10 @@ pictures with six different prompts through the local API (wall time per request
 - The warm server holds about 7.4 GB of device memory between pictures.
 - A prompt the server has just encoded is cached: repeating one is not a fair measure.
 
+In production (0.4.38, the same card, 37 studio pictures on 15 November 2026): the server is ready
+in 0.8 s, its first picture takes 10.8 s, every next one 0.92 to 1.35 s (median 0.99 s). The
+binary upload after each picture then takes about 1.2 s, more than the picture itself.
+
 ## Warm server
 
 A job is warm-eligible when its model's `keepWarmSeconds` is above 0, it has no init image, no
