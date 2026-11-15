@@ -30,7 +30,7 @@ use serde_json::json;
 use studio_worker::config::{self, Config};
 use studio_worker::presence::UserPresence;
 use studio_worker::runtime::WorkerObservers;
-use studio_worker::types::LogEntry;
+use studio_worker::types::{LogEntry, TaskKind};
 use studio_worker::ws::session::{spawn_ws_session, SessionSchedule};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -321,12 +321,14 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
     let logs = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
     let busy = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
+    let observers = WorkerObservers::default();
 
     let session_handle = tokio::spawn({
         let shared = shared.clone();
         let stop = stop.clone();
         let logs = logs.clone();
         let busy = busy.clone();
+        let observers = observers.clone();
         let paused = paused.clone();
         async move {
             spawn_ws_session(
@@ -335,7 +337,7 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
                 logs,
                 busy,
                 paused,
-                WorkerObservers::default(),
+                observers,
                 SessionSchedule::fast_for_tests(),
             )
             .await
@@ -365,6 +367,13 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
     // returned Ok then every frame in the script reached the worker and
     // every expected reply (accept + completeJson per offer) flowed back.
     let _ = logs;
+
+    // Both delivered studio jobs count towards the worker's contribution.
+    let tally = observers.job_tally.snapshot();
+    let one_each: studio_worker::job_tally::KindCounts =
+        [(TaskKind::Llm, 1), (TaskKind::AudioStt, 1)].into();
+    assert_eq!(tally.total, one_each);
+    assert_eq!(tally.today, one_each);
 }
 
 #[tokio::test]

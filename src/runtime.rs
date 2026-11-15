@@ -222,6 +222,9 @@ pub struct WorkerObservers {
     /// An update waits for the running job to end: the WS session turns new offers away as
     /// `busy` until it is cleared (`UpdateDrain`).
     pub update_pending: Arc<AtomicBool>,
+    /// Studio jobs completed today and in total, per kind; the daemon loads
+    /// it from `job-tally.json` at start.
+    pub job_tally: crate::job_tally::SharedTally,
 }
 
 /// Entries of `recent_logs` newer than sequence number `after`, and the
@@ -612,6 +615,11 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     let busy = Arc::new(AtomicBool::new(false));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let observers = WorkerObservers::with_global_worker_log();
+    observers
+        .job_tally
+        .replace(crate::job_tally::JobTally::load_for_serving(
+            config::job_tally_path_for(&control.config_path),
+        ));
     let presence_cfg = control.cfg.clone();
     let presence_monitor = crate::presence::spawn_monitor(
         observers.user_presence.clone(),

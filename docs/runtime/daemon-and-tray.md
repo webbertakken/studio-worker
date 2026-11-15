@@ -133,6 +133,23 @@ Every job, whatever its source, is visible while it runs and after it ends.
 - A thumbnail that cannot be made is logged (`op="thumbnail"`) in the job's log and the job
   itself is unaffected.
 
+### Contribution
+
+The daemon counts what the worker gives the studio, so whoever hosts it can see it.
+
+- It counts **completed studio jobs**, per kind. Failed jobs, and local, lane and stream jobs,
+  give the studio nothing and are not counted. A studio job counts when its result was
+  delivered (`JobRun::finish` with `Completed`).
+- **Today** is the daemon's local calendar day; it starts over at local midnight. **Total**
+  counts from the day counting began (`since`), across restarts and updates.
+- The tally persists in `<config dir>/job-tally.json`, written atomically on every count.
+  A corrupt file (or an unknown version) is quarantined beside it as
+  `job-tally.json.corrupt-<ts>` and counting starts from zero; an unreadable one is left alone
+  and the daemon counts in memory only. A failed save is a warning; the count is kept in memory.
+- Each count logs `op="tally"` "studio job counted" with the kind and the running sums, inside
+  the job's span, so it also lands in the job log.
+- `GET /daemon/status` carries it as `tally` (`today`, `total`, `since`).
+
 ## Install
 
 Every install method ends with the tray UI running:
@@ -420,6 +437,11 @@ their size whatever the state, so nothing moves when a job starts or ends.
 The worker's identity and health on one page (formerly Status and About):
 
 - a hero card with the state (`Idle`, `Running`, `Paused`) and **Pause / Resume**;
+- **Contribution to the studio** ([contribution](#contribution)): jobs today (in brass) and in
+  total as large figures, then one row per kind done (`Images`, `Text`, `Transcriptions`,
+  `Speech`, `Videos`, `3D models`, `Model conversions`) with its glyph, today and total, in a
+  fixed order; counts with thousands separators; `Counting since <date>` and a thank-you.
+  Before the first job it says that every studio job will count there;
 - registration: `Initialising`, `Waiting for approval` (with the request id and a copy
   button), `Registration rejected` (with the reason and **Reset registration**), or
   registered (the worker id, copyable);
@@ -506,5 +528,6 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `tray` | `studio_worker::ui::tray` | the Linux tray icon service started, ended, or re-registered |
 | `log_trim` | `studio_worker::log_trim` | `daemon.log` / `ui.log` trimmed, or the trim failed |
 | `presence` | `studio_worker::presence` | the user presence changed, or the idle time could not be read |
+| `tally` / `load` / `save` | `studio_worker::job_tally` | a studio job counted; the tally file recovered or could not be saved |
 | `start` / `restart` / `process_died` / `stop` / `cancel` / `output` | `studio_worker::llama_process` | a [llama process](../engines/llama.md#llama-process) started, ended, or wrote outside its protocol |
 | `memory_ceiling` | `studio_worker::memory_ceiling` | the ceiling in effect at start, the scope's limits set, the launcher unusable |

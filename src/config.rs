@@ -243,6 +243,12 @@ pub fn residency_path_for(config_path: &Path) -> Option<PathBuf> {
     config_path.parent().map(|dir| dir.join("residency.json"))
 }
 
+/// Path to the job tally (`job-tally.json`), next to the active config
+/// file, for the same isolation reason as [`catalog_path_for`].
+pub fn job_tally_path_for(config_path: &Path) -> Option<PathBuf> {
+    config_path.parent().map(|dir| dir.join("job-tally.json"))
+}
+
 /// Path to the local API discovery file (`local-api.json`), next to
 /// the active config file.  Written on every successful bind so local
 /// clients can find the URL + bearer token without parsing logs;

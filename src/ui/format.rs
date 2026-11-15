@@ -41,6 +41,19 @@ pub fn format_age(now: DateTime<Utc>, when: DateTime<Utc>) -> String {
     format!("{hours}h {rem_min:02}m ago")
 }
 
+/// A count with thousands separated: `7`, `1,284`, `12,000,001`.
+pub fn format_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The heading of a day of jobs: `Today`, `Yesterday`, `Mon 21 Sep`, or
 /// `21 Sep 2025` for another year.
 pub fn day_label(day: NaiveDate, today: NaiveDate) -> String {
@@ -79,6 +92,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_separate_their_thousands() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(1_284), "1,284");
+        assert_eq!(format_count(123_456), "123,456");
+        assert_eq!(format_count(12_000_001), "12,000,001");
+    }
 
     #[test]
     fn durations_cover_every_range() {

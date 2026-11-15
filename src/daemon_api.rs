@@ -236,6 +236,10 @@ pub struct DaemonStatus {
     pub local_jobs: Vec<JobWire>,
     /// Sequence number of the newest worker log entry.
     pub logs_seq: u64,
+    /// Studio jobs completed today and in total, per kind.  Defaults to
+    /// empty when an older daemon answers.
+    #[serde(default)]
+    pub tally: crate::job_tally::TallySnapshot,
 }
 
 /// `GET /daemon/logs?after=<seq>`.

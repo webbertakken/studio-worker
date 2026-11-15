@@ -12,6 +12,7 @@
 pub mod actions;
 pub mod app;
 pub mod chrome;
+pub mod contribution;
 pub mod exit_log;
 pub mod format;
 pub mod icons;

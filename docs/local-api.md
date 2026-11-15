@@ -117,7 +117,12 @@ carries a credential:
   "activeJobs": [ /* running jobs */ ],
   "recentJobs": [ /* finished studio jobs, newest first, up to 50 */ ],
   "localJobs":  [ /* finished local jobs, newest first, up to 50 */ ],
-  "logsSeq": 1234                            // newest worker log entry
+  "logsSeq": 1234,                           // newest worker log entry
+  "tally": {                                 // completed studio jobs, per kind
+    "today": { "image": 12, "llm": 3 },      // on the daemon's local day
+    "total": { "image": 1204, "llm": 80 },
+    "since": "2026-05-12"                    // the day counting began; null before
+  }
 }
 ```
 

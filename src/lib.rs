@@ -37,6 +37,7 @@ pub mod http;
 pub mod job_gate;
 pub mod job_log;
 pub mod job_run;
+pub mod job_tally;
 pub mod legacy_service;
 pub mod lifecycle;
 pub mod llama_process;
