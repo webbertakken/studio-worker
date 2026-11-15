@@ -224,6 +224,22 @@ Flux VAE (335MB) on an RTX 4090 via the Vulkan build:
 Each `sd-cli` invocation pays the model-load cost; a model that sets `keepWarmSeconds` pays it
 once per warm server instead (below).
 
+FLUX.2 klein 4B (Q8_0, Qwen3-4B Q8_0 encoder) at 512×512, 4 steps, RTX 4090, Vulkan build, six
+pictures with six different prompts through the local API (wall time per request), measured on
+15 November 2026:
+
+| Path | First picture | Next five |
+| --- | --- | --- |
+| `sd-cli` per job | 15.1 s | 6.7 to 7.5 s |
+| warm server | 19.7 s | 1.12 to 1.19 s |
+
+- A warm picture is about 1 s inside `sd-server`: text encoding 0.06 s, sampling 0.71 s, decoding
+  0.20 s; the rest is the WebP, base64 and HTTP round trip.
+- The first warm picture pays the lazy weight load (Qwen3-4B 4.2 s, FLUX 2.6 s) and the first-use
+  GPU pipeline build (sampling 5.5 s, decoding 5.8 s instead of 0.7 s and 0.2 s).
+- The warm server holds about 7.4 GB of device memory between pictures.
+- A prompt the server has just encoded is cached: repeating one is not a fair measure.
+
 ## Warm server
 
 A job is warm-eligible when its model's `keepWarmSeconds` is above 0, it has no init image, no

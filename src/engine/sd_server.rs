@@ -30,7 +30,7 @@ pub const WARM_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const READY_POLL: Duration = Duration::from_millis(250);
 /// How often an idle warm server is checked for expiry; 1 to 30 s.
 const IDLE_CHECK: Duration = Duration::from_secs(5);
-/// Stderr lines kept for the error of a server that dies while starting.
+/// Output lines kept for the error of a server that dies while starting.
 const STDERR_TAIL_LINES: usize = 20;
 
 /// What must be equal to reuse a warm server: the model id, its files and its load-time flags.
@@ -548,7 +548,7 @@ fn spawn_child(program: &Path, args: &[OsString]) -> std::io::Result<std::proces
     command
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::engine::sdcpp::apply_library_path(&mut command, program);
     #[cfg(target_os = "linux")]
@@ -591,28 +591,42 @@ impl ServerLauncher for ProcessLauncher {
             .map_err(|_| anyhow!("the warm image spawner thread did not answer"))?
             .with_context(|| format!("starting {}", sd_server.display()))?;
         let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        // sd-server logs its loading and timings on stdout and its errors on stderr; both are
+        // kept at `debug` and in the tail an error quotes.
+        if let Some(stdout) = child.stdout.take() {
+            read_lines("warm-image-stdout", stdout, Arc::clone(&tail))?;
+        }
         if let Some(stderr) = child.stderr.take() {
-            let tail = Arc::clone(&tail);
-            std::thread::Builder::new()
-                .name("warm-image-stderr".into())
-                .spawn(move || {
-                    use std::io::BufRead;
-                    for line in std::io::BufReader::new(stderr)
-                        .lines()
-                        .map_while(Result::ok)
-                    {
-                        debug!(target: TRACE_TARGET, op = "server", line = %line, "sd-server");
-                        let mut tail = tail.lock();
-                        if tail.len() == STDERR_TAIL_LINES {
-                            tail.pop_front();
-                        }
-                        tail.push_back(line);
-                    }
-                })
-                .context("spawning the sd-server stderr reader")?;
+            read_lines("warm-image-stderr", stderr, Arc::clone(&tail))?;
         }
         Ok(Box::new(ChildServer { child, tail }))
     }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn read_lines(
+    name: &str,
+    stream: impl std::io::Read + Send + 'static,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) -> Result<()> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stream)
+                .lines()
+                .map_while(Result::ok)
+            {
+                debug!(target: TRACE_TARGET, op = "server", line = %line, "sd-server");
+                let mut tail = tail.lock();
+                if tail.len() == STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        })
+        .context("spawning an sd-server output reader")?;
+    Ok(())
 }
 
 struct ChildServer {
