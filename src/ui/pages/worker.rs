@@ -1,5 +1,5 @@
-//! Worker: the worker's state, registration, studio link, hardware, local
-//! API and version on one page (formerly the Status and About tabs).
+//! Worker: the worker's state, its contribution to the studio, registration,
+//! studio link, hardware, local API and version on one page.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::runtime::{self, GpuRuntimeStatus, HeartbeatOutcome, HeartbeatStatus, SessionState};
 use crate::{update, AGENT_VERSION, RELEASE_NAME};
 
+use super::super::contribution::{self, ContributionView};
 use super::super::format::{format_age, format_duration};
 use super::super::icons::{self, Icon};
 use super::super::pulse::{format_gb, Activity};
@@ -130,6 +131,7 @@ pub struct WorkerFacts {
     pub vram_threshold_gb: f32,
     pub held_gb: f32,
     pub local_api_url: Option<String>,
+    pub contribution: ContributionView,
 }
 
 /// Everything [`WorkerFacts`] is built from.
@@ -143,6 +145,7 @@ pub struct FactsInputs<'a> {
     pub vram_total_gb: f32,
     pub held_gb: f32,
     pub local_api_url: Option<String>,
+    pub tally: &'a crate::job_tally::TallySnapshot,
 }
 
 impl WorkerFacts {
@@ -158,6 +161,7 @@ impl WorkerFacts {
             vram_threshold_gb: i.cfg.vram_threshold_gb,
             held_gb: i.held_gb,
             local_api_url: i.local_api_url,
+            contribution: ContributionView::build(i.tally),
         }
     }
 }
@@ -319,7 +323,7 @@ pub fn render(ui: &mut egui::Ui, cx: WorkerContext<'_>) -> Option<WorkerAction> 
     widgets::page_title(
         ui,
         "Worker",
-        "This machine's worker: its state, its place in the studio, its hardware and version.",
+        "This machine's worker: its state, what it gives the studio, its hardware and version.",
     );
     let mut action = None;
     if let Some(offline) = cx.offline {
@@ -328,6 +332,8 @@ pub fn render(ui: &mut egui::Ui, cx: WorkerContext<'_>) -> Option<WorkerAction> 
     }
     if let Some(facts) = cx.facts {
         action = hero(ui, cx.activity, cx.paused, cx.glow);
+        ui.add_space(12.0);
+        contribution::card(ui, &facts.contribution);
         ui.add_space(12.0);
         if let Some(a) = registration_card(ui, facts) {
             action = Some(a);
@@ -771,6 +777,11 @@ mod tests {
             vram_total_gb: 24.0,
             held_gb: 1.5,
             local_api_url: Some("http://127.0.0.1:4787".into()),
+            tally: &crate::job_tally::TallySnapshot {
+                today: [(crate::types::TaskKind::Image, 2)].into(),
+                total: [(crate::types::TaskKind::Image, 9)].into(),
+                since: chrono::NaiveDate::from_ymd_opt(2026, 5, 1),
+            },
         })
     }
 
@@ -784,6 +795,7 @@ mod tests {
         assert_eq!(f.gpu, Some((false, "install libvulkan1".into())));
         assert_eq!(f.vram_threshold_gb, 12.0);
         assert_eq!(f.held_gb, 1.5);
+        assert_eq!((f.contribution.today, f.contribution.total), (2, 9));
     }
 
     #[test]

@@ -487,6 +487,7 @@ impl App {
         let replica = &self.deps.replica;
         let status = replica.status.lock().clone();
         let facts = offline.is_none().then(|| {
+            let tally = status.as_ref().map(|s| s.tally.clone()).unwrap_or_default();
             let cfg = replica.cfg.lock();
             let registration = replica.registration.lock().clone();
             let session = replica.observers.session_state.lock().clone();
@@ -502,6 +503,7 @@ impl App {
                 vram_total_gb: status.as_ref().map_or(0.0, |s| s.vram_total_gb),
                 held_gb: pulse.gpu.map_or(0.0, |g| g.held_gb),
                 local_api_url: replica.observers.local_api_url.lock().clone(),
+                tally: &tally,
             })
         });
         let about = worker_page::AboutView::build(

@@ -123,6 +123,7 @@ impl DaemonControl {
             recent_jobs: finished(&observers.recent_jobs),
             local_jobs: finished(&observers.local_jobs),
             logs_seq: observers.recent_logs_seq.load(Ordering::SeqCst),
+            tally: observers.job_tally.snapshot(),
         }
     }
 
@@ -280,9 +281,13 @@ mod tests {
             source: JobSource::Local,
         });
         observers.thumbnails.insert("img-1", vec![1, 2, 3]);
+        observers.job_tally.record(TaskKind::Video);
         control.set_paused(true);
 
         let status = control.status(&observers, true);
+
+        assert_eq!(status.tally.total.get(&TaskKind::Video), Some(&1));
+        assert_eq!(status.tally.today.get(&TaskKind::Video), Some(&1));
 
         assert!(status.paused && status.busy && status.registered);
         assert_eq!(status.worker_id.as_deref(), Some("w-1"));
@@ -293,6 +298,11 @@ mod tests {
         assert!(!json.contains("secret-token"), "{json}");
         let back: DaemonStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back, status);
+
+        let mut older_daemon = serde_json::to_value(&status).unwrap();
+        older_daemon.as_object_mut().unwrap().remove("tally");
+        let back: DaemonStatus = serde_json::from_value(older_daemon).unwrap();
+        assert_eq!(back.tally, crate::job_tally::TallySnapshot::default());
     }
 
     #[test]

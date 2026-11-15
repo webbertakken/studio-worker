@@ -80,7 +80,8 @@ impl JobRun {
     }
 
     /// Log the job's end, take it off the running list and record it in its
-    /// ring (studio jobs in the recent ring, the rest in the local ring).
+    /// ring (studio jobs in the recent ring, the rest in the local ring).  A
+    /// completed studio job also counts in the job tally.
     pub fn finish(self, outcome: JobOutcome) -> RecentJob {
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
         self.span.in_scope(|| match &outcome {
@@ -110,6 +111,10 @@ impl JobRun {
             finished_at: Utc::now(),
             source: self.job.source,
         };
+        if self.job.source == JobSource::Studio && recent.outcome == JobOutcome::Completed {
+            let _in_job = self.span.enter();
+            self.observers.job_tally.record(self.job.kind);
+        }
         match self.job.source {
             JobSource::Studio => record_recent_job(&self.observers, recent.clone()),
             _ => record_local_job(&self.observers, recent.clone()),
@@ -212,6 +217,29 @@ mod tests {
         });
         assert_eq!(observers.recent_jobs.lock()[0].job_id, "studio-1");
         assert!(observers.local_jobs.lock().is_empty());
+    }
+
+    #[test]
+    fn only_completed_studio_jobs_count_in_the_tally() {
+        let observers = WorkerObservers::default();
+        JobRun::begin(&observers, job("studio-ok", JobSource::Studio))
+            .finish(JobOutcome::Completed);
+        JobRun::begin(&observers, job("studio-bad", JobSource::Studio)).finish(
+            JobOutcome::Failed {
+                reason: "boom".into(),
+            },
+        );
+        for source in [JobSource::Local, JobSource::Lane, JobSource::Stream] {
+            JobRun::begin(&observers, job("local", source)).finish(JobOutcome::Completed);
+        }
+        drop(JobRun::begin(
+            &observers,
+            job("studio-dropped", JobSource::Studio),
+        ));
+        let tally = observers.job_tally.snapshot();
+        assert_eq!(tally.total.get(&TaskKind::Image), Some(&1));
+        assert_eq!(tally.today.get(&TaskKind::Image), Some(&1));
+        assert_eq!(crate::job_tally::sum(&tally.total), 1);
     }
 
     #[test]
