@@ -31,6 +31,7 @@ fn caps() -> WorkerCapabilities {
         task_kinds: vec![TaskKind::Image],
         supported_models_per_kind: models_per_kind,
         model_engines: vec![],
+        machine_id: None,
     }
 }
 

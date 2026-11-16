@@ -142,6 +142,12 @@ The daemon counts what the worker gives the studio, so whoever hosts it can see 
   delivered (`JobRun::finish` with `Completed`).
 - **Today** is the daemon's local calendar day; it starts over at local midnight. **Total**
   counts from the day counting began (`since`), across restarts and updates.
+- **The studio's figure is the base of the total.** Its `welcome` carries what it counted for
+  this machine across reinstalls ([machine id](machine-id.md)); the daemon adopts it (`op="tally"`
+  "studio contribution adopted"), and the total is that figure plus the jobs completed since, and
+  `since` the studio's first day. A kind the worker does not know is left out, with a warning. A
+  studio that sends none (an older one, or a failed read) leaves the local count standing, logged.
+  Today stays the daemon's own count.
 - The tally persists in `<config dir>/job-tally.json`, written atomically on every count.
   A corrupt file (or an unknown version) is quarantined beside it as
   `job-tally.json.corrupt-<ts>` and counting starts from zero; an unreadable one is left alone
@@ -527,6 +533,7 @@ selects a job once it shows up, for screenshots and headless inspection.
 | `tray_start` | `studio_worker::setup` | a tray UI started by `setup` or the watchdog has exited |
 | `tray` | `studio_worker::ui::tray` | the Linux tray icon service started, ended, or re-registered |
 | `log_trim` | `studio_worker::log_trim` | `daemon.log` / `ui.log` trimmed, or the trim failed |
+| `machine_id` | `studio_worker::machine_id` | the machine id was derived, or could not be read |
 | `presence` | `studio_worker::presence` | the user presence changed, or the idle time could not be read |
 | `tally` / `load` / `save` | `studio_worker::job_tally` | a studio job counted; the tally file recovered or could not be saved |
 | `start` / `restart` / `process_died` / `stop` / `cancel` / `output` | `studio_worker::llama_process` | a [llama process](../engines/llama.md#llama-process) started, ended, or wrote outside its protocol |

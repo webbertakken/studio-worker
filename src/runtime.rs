@@ -1578,6 +1578,7 @@ pub fn build_capabilities_with(
         task_kinds,
         supported_models_per_kind,
         model_engines: engine.model_engines(),
+        machine_id: crate::machine_id::machine_id(),
     }
 }
 

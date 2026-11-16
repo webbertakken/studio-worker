@@ -2,6 +2,10 @@
 //! completed today and in total, per job kind (see
 //! `docs/runtime/daemon-and-tray.md#contribution`).
 //!
+//! Once the studio has said what it counted for this machine (`welcome`), its figure is the
+//! total and only the jobs done since are added here: the studio keeps the history across
+//! reinstalls (see `docs/runtime/machine-id.md`).
+//!
 //! Persisted in `job-tally.json` beside the config so the total survives
 //! restarts and updates.  Same recovery rules as residency: a corrupt file
 //! is quarantined and counting starts afresh, an unreadable one disables
@@ -44,6 +48,31 @@ struct TallyFile {
     day: Option<NaiveDate>,
     today: KindCounts,
     total: KindCounts,
+    /// What the studio counted for this machine, as last told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    studio: Option<StudioBaseline>,
+    /// Jobs completed since the studio last told.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    since_studio: KindCounts,
+}
+
+/// The studio's count for this machine, kept as the base of the total.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StudioBaseline {
+    total: KindCounts,
+    since: Option<NaiveDate>,
+}
+
+/// What `welcome` carries: the studio's count for this worker and every worker on its machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StudioContribution {
+    /// Jobs per kind, keyed by the studio's kind names.
+    #[serde(default)]
+    pub total: BTreeMap<String, u64>,
+    /// The earliest (UTC) day counted.
+    #[serde(default)]
+    pub since: Option<NaiveDate>,
 }
 
 /// The tally plus the file it persists to (`None`: memory only).
@@ -99,6 +128,9 @@ impl JobTally {
         file.since.get_or_insert(day);
         *file.today.entry(kind).or_default() += 1;
         *file.total.entry(kind).or_default() += 1;
+        if file.studio.is_some() {
+            *file.since_studio.entry(kind).or_default() += 1;
+        }
         let (today, total) = (sum(&file.today), sum(&file.total));
         tracing::info!(
             target: TRACE_TARGET,
@@ -108,6 +140,41 @@ impl JobTally {
             total,
             "studio job counted"
         );
+        self.persist();
+    }
+
+    /// Take the studio's count for this machine as the base of the total; the jobs counted here
+    /// before are in it.  Kinds this worker does not know are left out, and logged.
+    pub fn adopt_studio(&mut self, contribution: &StudioContribution) {
+        let mut total = KindCounts::new();
+        for (name, &jobs) in &contribution.total {
+            match serde_json::from_value::<TaskKind>(serde_json::Value::String(name.clone())) {
+                Ok(kind) => *total.entry(kind).or_default() += jobs,
+                Err(_) => tracing::warn!(
+                    target: TRACE_TARGET,
+                    op = "tally",
+                    kind = %name,
+                    jobs,
+                    "the studio counted a job kind this worker does not know; left out"
+                ),
+            }
+        }
+        tracing::info!(
+            target: TRACE_TARGET,
+            op = "tally",
+            total = sum(&total),
+            since = ?contribution.since,
+            "studio contribution adopted"
+        );
+        self.file.studio = Some(StudioBaseline {
+            total,
+            since: contribution.since,
+        });
+        self.file.since_studio.clear();
+        self.persist();
+    }
+
+    fn persist(&self) {
         if let Some(path) = &self.path {
             if let Err(err) = save(path, &self.file) {
                 tracing::warn!(
@@ -131,8 +198,11 @@ impl JobTally {
             } else {
                 KindCounts::new()
             },
-            total: file.total.clone(),
-            since: file.since,
+            total: match &file.studio {
+                Some(studio) => add(&studio.total, &file.since_studio),
+                None => file.total.clone(),
+            },
+            since: file.studio.as_ref().and_then(|s| s.since).or(file.since),
         }
     }
 
@@ -140,6 +210,15 @@ impl JobTally {
     pub fn persistence(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+}
+
+/// `a` and `b` added per kind.
+fn add(a: &KindCounts, b: &KindCounts) -> KindCounts {
+    let mut out = a.clone();
+    for (kind, jobs) in b {
+        *out.entry(*kind).or_default() += jobs;
+    }
+    out
 }
 
 /// The sum of every kind's count.
@@ -160,6 +239,11 @@ impl SharedTally {
     /// Count one completed studio job of `kind` today.
     pub fn record(&self, kind: TaskKind) {
         self.0.lock().record(kind, local_today());
+    }
+
+    /// Take the studio's count for this machine as the base of the total.
+    pub fn adopt_studio(&self, contribution: &StudioContribution) {
+        self.0.lock().adopt_studio(contribution);
     }
 
     /// The tally as seen today.
@@ -410,6 +494,88 @@ mod tests {
         assert_eq!(snap.since, Some(chrono::Local::now().date_naive()));
         shared.replace(JobTally::default());
         assert_eq!(shared.snapshot(), TallySnapshot::default());
+    }
+
+    fn studio(total: &[(&str, u64)], since: Option<NaiveDate>) -> StudioContribution {
+        StudioContribution {
+            total: total.iter().map(|(k, n)| (k.to_string(), *n)).collect(),
+            since,
+        }
+    }
+
+    #[test]
+    fn the_studio_figure_becomes_the_total_and_later_jobs_add_to_it() {
+        let mut tally = JobTally::default();
+        tally.record(TaskKind::Image, day(9));
+        tally.adopt_studio(&studio(&[("image", 120), ("llm", 4)], Some(day(1))));
+        tally.record(TaskKind::Image, day(9));
+        let snap = tally.snapshot(day(9));
+        assert_eq!(
+            snap.total,
+            counts(&[(TaskKind::Image, 121), (TaskKind::Llm, 4)]),
+            "the first image is in the studio's 120; the second is added"
+        );
+        assert_eq!(
+            snap.since,
+            Some(day(1)),
+            "the studio's history starts earlier"
+        );
+        assert_eq!(
+            snap.today,
+            counts(&[(TaskKind::Image, 2)]),
+            "today stays this worker's own count"
+        );
+    }
+
+    #[test]
+    fn a_later_studio_figure_replaces_the_earlier_one() {
+        let mut tally = JobTally::default();
+        tally.adopt_studio(&studio(&[("image", 10)], Some(day(1))));
+        tally.record(TaskKind::Image, day(2));
+        tally.adopt_studio(&studio(&[("image", 11)], Some(day(1))));
+        assert_eq!(
+            tally.snapshot(day(2)).total,
+            counts(&[(TaskKind::Image, 11)])
+        );
+    }
+
+    #[test]
+    fn an_empty_studio_figure_keeps_the_local_start_day() {
+        let mut tally = JobTally::default();
+        tally.record(TaskKind::Llm, day(3));
+        tally.adopt_studio(&studio(&[], None));
+        let snap = tally.snapshot(day(3));
+        assert!(snap.total.is_empty());
+        assert_eq!(snap.since, Some(day(3)));
+    }
+
+    #[test]
+    fn a_kind_this_worker_does_not_know_is_left_out_and_logged() {
+        let logs = capture(|| {
+            let mut tally = JobTally::default();
+            tally.adopt_studio(&studio(&[("image", 2), ("hologram", 5)], Some(day(1))));
+            assert_eq!(
+                tally.snapshot(day(1)).total,
+                counts(&[(TaskKind::Image, 2)])
+            );
+        });
+        assert!(logs.contains("does not know"), "{logs}");
+        assert!(logs.contains("hologram"), "{logs}");
+        assert!(logs.contains("studio contribution adopted"), "{logs}");
+    }
+
+    #[test]
+    fn the_studio_figure_persists() {
+        let (_d, path) = tmp();
+        let mut tally = JobTally::load_for_serving(Some(path.clone()));
+        tally.adopt_studio(&studio(&[("video", 3)], Some(day(2))));
+        tally.record(TaskKind::Video, day(4));
+        let again = JobTally::load_for_serving(Some(path));
+        assert_eq!(again.snapshot(day(4)), tally.snapshot(day(4)));
+        assert_eq!(
+            again.snapshot(day(4)).total,
+            counts(&[(TaskKind::Video, 4)])
+        );
     }
 
     #[test]

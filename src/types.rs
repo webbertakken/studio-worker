@@ -447,6 +447,9 @@ pub struct WorkerCapabilities {
     /// only to a worker that names its `modelSource.engine` here.
     #[serde(rename = "modelEngines", default)]
     pub model_engines: Vec<ModelEngine>,
+    /// This computer, the same across reinstalls (`crate::machine_id`); absent when unknown.
+    #[serde(rename = "machineId", default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

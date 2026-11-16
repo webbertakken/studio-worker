@@ -28,6 +28,7 @@ fn caps() -> WorkerCapabilities {
         task_kinds: vec![],
         supported_models_per_kind: Default::default(),
         model_engines: vec![],
+        machine_id: None,
     }
 }
 

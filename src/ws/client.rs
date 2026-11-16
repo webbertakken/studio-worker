@@ -883,6 +883,7 @@ mod tests {
             task_kinds: vec![],
             supported_models_per_kind: Default::default(),
             model_engines: vec![],
+            machine_id: None,
         };
         assert_eq!(
             frame_label(&WorkerInbound::Hello(crate::ws::types::HelloFrame {
