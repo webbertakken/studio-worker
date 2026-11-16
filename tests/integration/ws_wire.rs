@@ -26,6 +26,7 @@ fn capabilities() -> WorkerCapabilities {
         task_kinds: vec![],
         supported_models_per_kind: Default::default(),
         model_engines: vec![],
+        machine_id: None,
     }
 }
 
@@ -361,9 +362,11 @@ fn outbound_welcome_round_trips() {
         WorkerOutbound::Welcome {
             ref worker_id,
             ref server_time,
+            ref contribution,
         } => {
             assert_eq!(worker_id, "w-1");
             assert_eq!(server_time, "2026-05-25T12:00:00Z");
+            assert_eq!(*contribution, None, "an older studio sends none");
         }
         ref other => panic!("expected Welcome, got {other:?}"),
     }
@@ -647,5 +650,40 @@ fn hello_names_the_model_engines_in_the_studio_spelling() {
     assert_eq!(
         back.model_engines,
         vec![ModelEngine::SdCpp, ModelEngine::LlamaCpp]
+    );
+}
+
+#[test]
+fn outbound_welcome_carries_the_studio_contribution() {
+    let json = json!({
+        "type": "welcome",
+        "workerId": "w-1",
+        "serverTime": "2026-05-25T12:00:00Z",
+        "contribution": { "total": { "image": 1204, "llm": 80 }, "since": "2026-05-12" },
+    });
+    let parsed: WorkerOutbound = serde_json::from_value(json.clone()).unwrap();
+    let WorkerOutbound::Welcome { contribution, .. } = &parsed else {
+        panic!("expected Welcome, got {parsed:?}");
+    };
+    let contribution = contribution.as_ref().expect("contribution");
+    assert_eq!(contribution.total["image"], 1204);
+    assert_eq!(
+        contribution.since,
+        chrono::NaiveDate::from_ymd_opt(2026, 5, 12)
+    );
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+}
+
+#[test]
+fn capabilities_carry_the_machine_id_only_when_known() {
+    let mut caps = capabilities();
+    assert!(serde_json::to_value(&caps)
+        .unwrap()
+        .get("machineId")
+        .is_none());
+    caps.machine_id = Some("0123456789abcdef0123456789abcdef".into());
+    assert_eq!(
+        serde_json::to_value(&caps).unwrap()["machineId"],
+        "0123456789abcdef0123456789abcdef"
     );
 }

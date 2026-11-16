@@ -331,7 +331,9 @@ async fn wait_for_welcome(
             SessionEvent::Frame(WorkerOutbound::Welcome {
                 worker_id: wid,
                 server_time,
+                contribution,
             }) => {
+                adopt_contribution(observers, contribution.as_ref());
                 push_log_with_observers(
                     logs,
                     Some(observers),
@@ -643,7 +645,9 @@ async fn run_dispatch_loop(
                 WorkerOutbound::Welcome {
                     worker_id: wid,
                     server_time,
+                    contribution,
                 } => {
+                    adopt_contribution(&ctx.observers, contribution.as_ref());
                     push_log_with_observers(
                         &ctx.logs,
                         Some(&ctx.observers),
@@ -1424,6 +1428,22 @@ fn reconnect_breadcrumb(error: Option<&anyhow::Error>, attempt: u32, backoff: Du
 /// welcome.
 fn welcome_breadcrumb(worker_id: &str, server_time: &str) -> String {
     format!("server welcomed {worker_id} server_time={server_time}")
+}
+
+/// Take the studio's count for this machine as the base of the job tally; an older studio, or one
+/// that could not read it, sends none and the local count stands (logged).
+fn adopt_contribution(
+    observers: &WorkerObservers,
+    contribution: Option<&crate::job_tally::StudioContribution>,
+) {
+    match contribution {
+        Some(contribution) => observers.job_tally.adopt_studio(contribution),
+        None => tracing::info!(
+            target: "studio_worker::job_tally",
+            op = "tally",
+            "the studio sent no contribution; the local count stands"
+        ),
+    }
 }
 
 /// Operator-facing breadcrumb summarising an incoming job offer.

@@ -64,12 +64,20 @@ async fn spawn_studio_ws() -> (SocketAddr, tokio::task::JoinHandle<Result<()>>) 
             .map_err(|_| anyhow::anyhow!("hello not text"))?;
         let hello_json: serde_json::Value = serde_json::from_str(&hello)?;
         assert_eq!(hello_json["type"], "hello");
+        // The machine id, when the OS has one, is 32 hex characters (docs/runtime/machine-id.md).
+        if let Some(id) = hello_json["capabilities"]["machineId"].as_str() {
+            assert!(
+                id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()),
+                "{id}"
+            );
+        }
 
-        // 2. welcome.
+        // 2. welcome, with what the studio counted for this machine.
         ws.send(Message::Text(
-            serde_json::to_string(
-                &json!({"type":"welcome","workerId":"w-test","serverTime":"now"}),
-            )?
+            serde_json::to_string(&json!({
+                "type": "welcome", "workerId": "w-test", "serverTime": "now",
+                "contribution": { "total": { "image": 5, "llm": 2 }, "since": "2026-05-01" },
+            }))?
             .into(),
         ))
         .await?;
@@ -368,12 +376,20 @@ async fn ws_session_walks_through_two_json_offers_and_then_disconnects() {
     // every expected reply (accept + completeJson per offer) flowed back.
     let _ = logs;
 
-    // Both delivered studio jobs count towards the worker's contribution.
+    // The studio's count is the base of the total; both delivered jobs add to it, and today counts
+    // only this worker's own.
     let tally = observers.job_tally.snapshot();
-    let one_each: studio_worker::job_tally::KindCounts =
+    let total: studio_worker::job_tally::KindCounts = [
+        (TaskKind::Image, 5),
+        (TaskKind::Llm, 3),
+        (TaskKind::AudioStt, 1),
+    ]
+    .into();
+    let today: studio_worker::job_tally::KindCounts =
         [(TaskKind::Llm, 1), (TaskKind::AudioStt, 1)].into();
-    assert_eq!(tally.total, one_each);
-    assert_eq!(tally.today, one_each);
+    assert_eq!(tally.total, total);
+    assert_eq!(tally.today, today);
+    assert_eq!(tally.since, chrono::NaiveDate::from_ymd_opt(2026, 5, 1));
 }
 
 #[tokio::test]

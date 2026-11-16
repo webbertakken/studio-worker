@@ -136,6 +136,10 @@ pub enum WorkerOutbound {
     Welcome {
         worker_id: String,
         server_time: String,
+        /// What the studio counted for this worker's machine; absent from an older studio, or
+        /// when it could not read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contribution: Option<crate::job_tally::StudioContribution>,
     },
     Offer {
         // Boxed to keep the WorkerOutbound enum compact — JobOfferClaim

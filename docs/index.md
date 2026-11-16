@@ -24,6 +24,8 @@ top-level [`README.md`](../README.md).  For active plans, see
   thumbnails, model lifecycle, display wait.
 - [Model lifecycle](runtime/model-lifecycle.md) — loaded models, residency, admission, and warm image
   models (`keepWarmSeconds`): an `sd-server` kept between jobs, evicted for anything else.
+- [Machine id](runtime/machine-id.md) — the hashed OS machine identifier that lets the studio
+  recognise a reinstall and keep its contribution together.
 - [Memory ceiling](runtime/memory-ceiling.md) — on Linux the worker runs in a capped systemd
   user scope; admission checks host memory for jobs that offload their weights.
 - [Local API](local-api.md) — loopback HTTP API: generation, catalogue, lifecycle,
