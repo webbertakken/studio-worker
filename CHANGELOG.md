@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.40](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.39...studio-worker-v0.4.40) (2026-11-22)
+
+
+### Features
+
+* machine id and studio contribution ([#289](https://github.com/webbertakken/studio-worker/issues/289)) ([0039b94](https://github.com/webbertakken/studio-worker/commit/0039b94dc625f28d62722e96f66ad85f19a12c23))
+* show jobs done today and in total ([#287](https://github.com/webbertakken/studio-worker/issues/287)) ([afeafe8](https://github.com/webbertakken/studio-worker/commit/afeafe840c1540d4d48f4d0b4cf6946bc624ffd3))
+* **vision:** assess picture clarity with CLIP-IQA+ ([#294](https://github.com/webbertakken/studio-worker/issues/294)) ([29ceb86](https://github.com/webbertakken/studio-worker/commit/29ceb86ba6c039c21cd0bfd00d860ca9670d3ff1))
+
 ## [0.4.39](https://github.com/webbertakken/studio-worker/compare/studio-worker-v0.4.38...studio-worker-v0.4.39) (2026-11-15)
 
 
