@@ -61,4 +61,13 @@ ignore = [
     "RUSTSEC-2026-0367", # zip 8          — extract() keeps SUID/SGID (candle)
     "RUSTSEC-2026-0368", # zip 8          — extract() symlink targets (candle)
     "RUSTSEC-2026-0369", # zip 8          — extract() chmod via symlink (candle)
+    # chrono is declared unmaintained (no patched version; the advisory
+    # suggests jiff or time), and humantime with it because it wraps
+    # chrono.  chrono is ours (timestamps in job records, logs and the UI)
+    # and hf-hub's xet stack's (xet-runtime, xet-data, xet-client);
+    # humantime is xet-runtime's only.  Neither is a vulnerability.
+    # Drop chrono when we and the xet crates move off it; humantime when
+    # xet-runtime does.
+    "RUSTSEC-2026-0543", # chrono         — unmaintained (ours + hf-hub xet)
+    "RUSTSEC-2026-0542", # humantime      — unmaintained (hf-hub xet)
 ]
