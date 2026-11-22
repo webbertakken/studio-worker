@@ -73,10 +73,23 @@ pub fn load(models_root: &Path, model: &CatalogModel) -> Result<OnnxVision> {
     // `config.json` are common to many models.
     let dir = download::model_dir(models_root, &model.id);
     let file = |role: ModelFileRole| model.source.files.iter().find(|f| f.role == role);
-    let weights = file(ModelFileRole::Model)
-        .ok_or_else(|| anyhow!("model {} has no `model` file (the .onnx)", model.id))?;
-    let weights = download::ensure_file_reusing(&dir, models_root, weights)
-        .with_context(|| format!("downloading the weights of {}", model.id))?;
+    // Every `model` file lands beside the graph: an export over 2 GiB, or one saved with
+    // external data, keeps its weights in a `.onnx.data` file ONNX Runtime reads from there.
+    let mut weights = None;
+    for part in model
+        .source
+        .files
+        .iter()
+        .filter(|f| f.role == ModelFileRole::Model)
+    {
+        let path = download::ensure_file_reusing(&dir, models_root, part)
+            .with_context(|| format!("downloading {} of {}", part.filename, model.id))?;
+        if weights.is_none() && super::is_graph(&part.filename) {
+            weights = Some(path);
+        }
+    }
+    let weights =
+        weights.ok_or_else(|| anyhow!("model {} has no `model` file ending .onnx", model.id))?;
     let labels = match file(ModelFileRole::Labels) {
         Some(labels) => {
             let path = download::ensure_file_reusing(&dir, models_root, labels)
@@ -163,17 +176,20 @@ fn check_io(session: &Session, spec: &VisionSpec) -> Result<(String, String)> {
             );
         }
     }
-    if spec.task == crate::types::VisionTask::Classify {
-        if let Some(shape) = output.dtype().tensor_shape() {
-            if !super::scores_fit(shape, spec.labels.len()) {
-                bail!(
-                    "model {} output {} has shape {:?}; its labels name {} classes",
-                    spec.model,
-                    output.name(),
-                    &shape[..],
-                    spec.labels.len()
-                );
-            }
+    let scores = match spec.task {
+        crate::types::VisionTask::Detect => None,
+        crate::types::VisionTask::Classify => Some(spec.labels.len()),
+        crate::types::VisionTask::Assess => Some(1),
+    };
+    if let (Some(scores), Some(shape)) = (scores, output.dtype().tensor_shape()) {
+        if !super::scores_fit(shape, scores) {
+            bail!(
+                "model {} output {} has shape {:?}; a {} model answers {scores} score(s)",
+                spec.model,
+                output.name(),
+                &shape[..],
+                spec.task.as_str()
+            );
         }
     }
     Ok((input.name().to_string(), output.name().to_string()))

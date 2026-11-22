@@ -1,5 +1,5 @@
-//! Vision on the local API: detection, classification, and the two together (animals found,
-//! then each one classified).  See `docs/engines/vision.md`.
+//! Vision on the local API: detection, classification, the two together (animals found, then
+//! each one classified), and assessment (how clear a picture is).  See `docs/engines/vision.md`.
 //!
 //! A loaded model answers on its lane, warm, beside other jobs.  A model that is not loaded
 //! runs as a transient job: it takes the job gate, is admitted next to the loaded models,
@@ -98,6 +98,18 @@ pub struct ClassifyAnswer {
     pub device: &'static str,
     pub picture: PictureSize,
     pub predictions: Vec<Prediction>,
+    pub elapsed_ms: u64,
+}
+
+/// The answer of `POST /vision/assess`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssessAnswer {
+    pub model: String,
+    pub device: &'static str,
+    pub picture: PictureSize,
+    /// The model's quality score, in its own range; higher is better.
+    pub score: f32,
     pub elapsed_ms: u64,
 }
 
@@ -323,6 +335,36 @@ pub fn classify(
     Ok(answer)
 }
 
+/// How clear an assess model finds `picture`.
+pub fn assess(
+    ctx: &VisionContext<'_>,
+    model: Option<&str>,
+    picture: &RgbImage,
+) -> Result<AssessAnswer, VisionError> {
+    let started = Instant::now();
+    let model = resolve(ctx.catalog, model, VisionTask::Assess)?;
+    let (device, score) = on_model(ctx, model, picture, "assess", &mut None, |m| {
+        Ok((m.device(), vision::assess(m, picture)?))
+    })?;
+    let answer = AssessAnswer {
+        model: model.id.clone(),
+        device,
+        picture: PictureSize::of(picture),
+        score,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    };
+    tracing::info!(
+        target: TRACE_TARGET,
+        op = "assess",
+        model = %answer.model,
+        device,
+        score = answer.score,
+        elapsed_ms = answer.elapsed_ms,
+        "picture assessed"
+    );
+    Ok(answer)
+}
+
 /// The animals a detector finds in `picture`, each classified on its own crop.  A picture
 /// without animals never runs the classifier.
 pub fn species(
@@ -517,6 +559,21 @@ mod tests {
         assert_eq!(job.outcome, JobOutcome::Completed);
         assert!(f.observers.thumbnails.contains(&job.job_id));
         assert!(!f.gate.is_busy(), "the gate is free again");
+    }
+
+    #[test]
+    fn an_assessment_answers_the_models_score_as_a_local_job() {
+        let f = Fixture::new(catalog());
+        let answer = assess(&f.ctx(), None, &picture()).unwrap();
+        assert_eq!(answer.model, "iqa");
+        assert_eq!(answer.score, 0.75);
+        assert_eq!(answer.device, "cpu");
+        let job = f.observers.local_jobs.lock()[0].clone();
+        assert_eq!(job.prompt, "assess 64x64");
+        assert_eq!(job.outcome, JobOutcome::Completed);
+        let json = serde_json::to_value(&answer).unwrap();
+        assert_eq!(json["score"], 0.75);
+        assert!(json.get("elapsedMs").is_some());
     }
 
     #[test]

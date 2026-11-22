@@ -1,8 +1,8 @@
-//! Vision inference: detection (is there an animal, and where) and classification (which
-//! species).  See `docs/engines/vision.md`.
+//! Vision inference: detection (is there an animal, and where), classification (which
+//! species) and assessment (how clear the picture is).  See `docs/engines/vision.md`.
 //!
 //! A vision model is a catalogue model of kind `vision` on the `onnx-vision` engine; its
-//! `cliDefaults.vision` says whether it detects or classifies, and how.  The pre- and
+//! `cliDefaults.vision` says whether it detects, classifies or assesses, and how.  The pre- and
 //! post-processing here are pure and run over any [`VisionModel`]; only [`onnx`] (feature
 //! `vision`) touches ONNX Runtime.
 
@@ -101,7 +101,15 @@ impl VisionSpec {
                 model.id
             );
         }
-        let labels = if !defaults.labels.is_empty() {
+        let labels = if defaults.task == VisionTask::Assess {
+            if !defaults.labels.is_empty() || labels_file.is_some() {
+                bail!(
+                    "model {}: an assess model answers one score and takes no labels",
+                    model.id
+                );
+            }
+            Vec::new()
+        } else if !defaults.labels.is_empty() {
             defaults.labels.iter().map(Label::plain).collect()
         } else if let Some(text) = labels_file {
             labels::parse(text).with_context(|| format!("reading the labels of {}", model.id))?
@@ -146,7 +154,7 @@ impl VisionSpec {
             probabilities: defaults.probabilities.unwrap_or(false),
             min_confidence: defaults.min_confidence.unwrap_or(match defaults.task {
                 VisionTask::Detect => DEFAULT_MIN_CONFIDENCE,
-                VisionTask::Classify => 0.0,
+                VisionTask::Classify | VisionTask::Assess => 0.0,
             }),
             iou: defaults.iou.unwrap_or(DEFAULT_IOU),
             top_k: defaults.top_k.unwrap_or(DEFAULT_TOP_K).clamp(1, MAX_TOP_K),
@@ -171,6 +179,12 @@ pub fn scores_fit(output: &[i64], labels: usize) -> bool {
     output
         .last()
         .is_some_and(|last| *last < 0 || *last as usize == labels)
+}
+
+/// Whether a `model` file is the network's graph rather than its external weights
+/// (`.onnx.data`), which ONNX Runtime finds beside the graph.
+pub fn is_graph(filename: &str) -> bool {
+    filename.ends_with(".onnx")
 }
 
 /// A vision network in memory.
@@ -330,6 +344,25 @@ pub fn classify(
         .collect())
 }
 
+/// How good `picture` looks to an assess model: its one score, in the model's own range (higher is
+/// better).  The picture is cropped to the input's aspect around its centre and scaled down with
+/// antialiasing, so the network judges the picture's own sharpness, not resampling artefacts.
+pub fn assess(model: &dyn VisionModel, picture: &RgbImage) -> Result<f32> {
+    let spec = model.spec();
+    require(spec, VisionTask::Assess)?;
+    let input = preprocess::covered(picture, spec.width, spec.height, spec.mean, spec.std);
+    let raw = model.run(spec.arrange(input))?;
+    match raw.data[..] {
+        [score] if score.is_finite() => Ok(score),
+        _ => bail!(
+            "assess output holds {:?} (shape {:?}); model {} must answer one finite score",
+            &raw.data[..raw.data.len().min(4)],
+            raw.shape,
+            spec.model
+        ),
+    }
+}
+
 /// Decode a PNG, JPEG or WebP picture to RGB, turned upright as its EXIF orientation says
 /// (camera pictures are often stored on their side).
 pub fn decode_picture(bytes: &[u8]) -> Result<RgbImage> {
@@ -399,6 +432,63 @@ mod tests {
         d.animal_labels = Some(vec!["aminal".into()]);
         let err = VisionSpec::from_model(&vision_model("md", 8, d), None).unwrap_err();
         assert!(err.to_string().contains("\"aminal\""), "{err}");
+    }
+
+    #[test]
+    fn an_assess_spec_takes_no_labels() {
+        let model = vision_model("iqa", 8, defaults(VisionTask::Assess, &[]));
+        let spec = VisionSpec::from_model(&model, None).unwrap();
+        assert!(spec.labels.is_empty());
+        assert_eq!(spec.min_confidence, 0.0);
+        let err = VisionSpec::from_model(&model, Some("sharp\nblurry")).unwrap_err();
+        assert!(err.to_string().contains("takes no labels"), "{err}");
+        let labelled = vision_model("iqa", 8, defaults(VisionTask::Assess, &["good"]));
+        assert!(VisionSpec::from_model(&labelled, None).is_err());
+    }
+
+    fn assessor(output: Vec<f32>) -> Canned {
+        let mut d = defaults(VisionTask::Assess, &[]);
+        d.mean = Some([0.5; 3]);
+        d.std = Some([0.25; 3]);
+        let spec = VisionSpec::from_model(&vision_model("iqa", 4, d), None).unwrap();
+        let shape = [1, output.len() as i64];
+        Canned::new(spec, &shape, output)
+    }
+
+    #[test]
+    fn an_assessment_answers_the_one_score_of_a_normalised_picture() {
+        let model = assessor(vec![0.62]);
+        let white = RgbImage::from_pixel(16, 8, image::Rgb([255, 255, 255]));
+        assert_eq!(assess(&model, &white).unwrap(), 0.62);
+        let seen = model.seen.lock().clone().unwrap();
+        assert_eq!(seen.len(), 3 * 4 * 4);
+        // White normalised with mean 0.5, std 0.25.
+        assert!(seen.iter().all(|v| (v - 2.0).abs() < 1e-6), "{seen:?}");
+    }
+
+    #[test]
+    fn an_assessment_refuses_anything_but_one_finite_score() {
+        let err = assess(&assessor(vec![0.1, 0.2]), &RgbImage::new(4, 4)).unwrap_err();
+        assert!(err.to_string().contains("one finite score"), "{err}");
+        assert!(assess(&assessor(vec![f32::NAN]), &RgbImage::new(4, 4)).is_err());
+        assert!(assess(&assessor(vec![]), &RgbImage::new(4, 4)).is_err());
+    }
+
+    #[test]
+    fn only_an_assess_model_assesses() {
+        let classifier = Canned::new(classifier_spec(false), &[1, 3], vec![0.0; 3]);
+        let err = assess(&classifier, &RgbImage::new(4, 4)).unwrap_err();
+        assert!(
+            err.to_string().contains("is a classify model, not assess"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_graph_is_the_onnx_file_not_its_external_weights() {
+        assert!(is_graph("clipiqa_model.onnx"));
+        assert!(!is_graph("clipiqa_model.onnx.data"));
+        assert!(!is_graph("config.json"));
     }
 
     #[test]

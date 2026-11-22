@@ -1,4 +1,5 @@
-//! `POST /vision/detect`, `/vision/classify` and `/vision/species`: a picture in, JSON out.
+//! `POST /vision/detect`, `/vision/classify`, `/vision/species` and `/vision/assess`: a picture
+//! in, JSON out.
 //!
 //! The picture and its options arrive in any of the forms [`super::picture`] reads.
 
@@ -17,6 +18,7 @@ pub(super) enum Route {
     Detect,
     Classify,
     Species,
+    Assess,
 }
 
 impl Route {
@@ -25,6 +27,7 @@ impl Route {
             "/vision/detect" => Some(Self::Detect),
             "/vision/classify" => Some(Self::Classify),
             "/vision/species" => Some(Self::Species),
+            "/vision/assess" => Some(Self::Assess),
             _ => None,
         }
     }
@@ -35,6 +38,7 @@ impl Route {
             Route::Detect => &["model", "minConfidence", "iou"],
             Route::Classify => &["model", "minConfidence", "topK"],
             Route::Species => &["detector", "classifier", "minConfidence", "iou", "topK"],
+            Route::Assess => &["model"],
         }
     }
 }
@@ -133,6 +137,7 @@ impl LocalApi {
             Route::Detect => detect_options(o).map(|d| (d, ClassifyOptions::default())),
             Route::Classify => classify_options(o, true).map(|c| (DetectOptions::default(), c)),
             Route::Species => detect_options(o).and_then(|d| Ok((d, classify_options(o, false)?))),
+            Route::Assess => Ok((DetectOptions::default(), ClassifyOptions::default())),
         };
         let (detect_options, classify_options) = match options {
             Ok(options) => options,
@@ -160,6 +165,7 @@ impl LocalApi {
                 &classify_options,
             )
             .map(serde_json::to_value),
+            Route::Assess => local_vision::assess(&ctx, model, &picture).map(serde_json::to_value),
         };
         match answer {
             Ok(Ok(json)) => respond_json(request, 200, &json),
@@ -202,6 +208,7 @@ mod tests {
         assert_eq!(Route::of("/vision/detect"), Some(Route::Detect));
         assert_eq!(Route::of("/vision/classify"), Some(Route::Classify));
         assert_eq!(Route::of("/vision/species"), Some(Route::Species));
+        assert_eq!(Route::of("/vision/assess"), Some(Route::Assess));
         assert_eq!(Route::of("/vision/other"), None);
     }
 

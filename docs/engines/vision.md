@@ -1,6 +1,6 @@
-# Vision engine: animal detection and species classification
+# Vision engine: animal detection, species classification and clarity
 
-The worker answers two questions about a picture, on its own GPU when it has one:
+The worker answers three questions about a picture, on its own GPU when it has one:
 
 - **Is there an animal, and where?** A detector (MegaDetector, or any YOLO export) returns boxes
   with a class and a confidence; a picture without an animal is blank, so camera trap blanks
@@ -8,6 +8,9 @@ The worker answers two questions about a picture, on its own GPU when it has one
 - **Which species?** A classifier (SpeciesNet over 2 498 camera trap species, the 525-species bird
   EfficientNet, or any ImageNet-style export) ranks its classes with confidences, and their
   taxonomy when its labels carry one (SpeciesNet's do).
+- **How clear is it?** An assessor (CLIP-IQA+, or any no-reference quality export with one
+  output) scores the whole picture: mist, blur and noise score low, so the clearest of many
+  pictures of the same thing can be chosen.
 
 Together (`POST /vision/species`) the detector finds the animals and the classifier ranks each
 one on its own crop, so a small bird in a wide camera trap frame is classified on the bird, not
@@ -28,6 +31,7 @@ the `vision` kind to it.
 | vision model | a catalogue model of kind `vision` on engine `onnx-vision`, with `cliDefaults.vision` |
 | detector | a vision model with `task: detect`: YOLO-style boxes |
 | classifier | a vision model with `task: classify`: one score per class |
+| assessor | a vision model with `task: assess`: one quality score for the picture, higher is better |
 | labels | the class names by output index: inline, or the model's `labels` file |
 | animal class | a detector class listed in `animalLabels` (every class when absent) |
 | blank | a picture in which the detector finds no animal class at or above the threshold |
@@ -41,6 +45,7 @@ Seeded in the catalogue; their files download on first use, pinned by revision a
 | `megadetector-v5a` | detect | 1280² letterbox | `animal`, `person`, `vehicle` | 562 MB | MIT ([CameraTraps v5.0](https://github.com/microsoft/CameraTraps/releases/tag/v5.0), ONNX by [malyvsen](https://huggingface.co/malyvsen/megadetector-v5a-onnx)) |
 | `speciesnet-v4a` | classify | 480² channels last, an animal's crop | 2 498 camera trap species, with taxonomy | 224 MB | Apache-2.0 ([SpeciesNet](https://github.com/google/cameratrapai) v4.0.1a always-crop, ONNX by [daslearning](https://huggingface.co/daslearning/Google-SpeciesNet-ONNX), labels from [the 4.0.1a release](https://huggingface.co/earthtoolsmaker/speciesnet)) |
 | `bird-species-efficientnet-b2` | classify | 260² | 525 bird species | 34 MB | MIT ([chriamue/bird-species-classifier](https://huggingface.co/chriamue/bird-species-classifier)) |
+| `clipiqa-plus` | assess | 224², CLIP normalisation | one score, 0..1 | 153 MB | weights non-commercial ([IQA-PyTorch](https://github.com/chaofengc/IQA-PyTorch), NTU S-Lab License 1.0), ONNX export Apache-2.0 ([86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)) |
 
 Any other model is added like every catalogue model (`POST /models` or `models.json`):
 
@@ -68,8 +73,8 @@ Any other model is added like every catalogue model (`POST /models` or `models.j
 
 | Key | Meaning | Default |
 | --- | --- | --- |
-| `task` | `detect` or `classify` | required |
-| `labels` | class names by output index | the `labels` file |
+| `task` | `detect`, `classify` or `assess` | required |
+| `labels` | class names by output index; an assessor takes none | the `labels` file |
 | `animalLabels` | detector classes that are animals | every class |
 | `mean`, `std` | per-channel RGB normalisation after scaling to 0..1 | 0 and 1 |
 | `probabilities` | the classifier already outputs probabilities | false: logits, softmaxed |
@@ -81,8 +86,12 @@ Any other model is added like every catalogue model (`POST /models` or `models.j
 
 `cliDefaults.width` and `height` are the network's input size.  A load refuses a model whose
 input is not one f32 tensor of that shape (a dynamic dimension fits any size), a classifier whose
-output does not hold one score per label, a detector whose animal labels are not among its
-labels, and labels that skip an index.
+output does not hold one score per label, an assessor whose output is not one score, a detector
+whose animal labels are not among its labels, and labels that skip an index.
+
+Every `model` file downloads beside the others; the first ending `.onnx` is the graph.  An
+export saved with external data (CLIP-IQA+, any graph over 2 GiB) lists its `.onnx.data` file
+as a second `model` file, and ONNX Runtime reads it from beside the graph.
 
 ### Labels files
 
@@ -112,6 +121,11 @@ size, as is the weights file: names like `config.json` are common to many models
 
 **Classify:** the picture stretched to the input, normalised with `mean` and `std`, the output
 softmaxed (unless `probabilities`), the `topK` classes at or above `minConfidence`.
+
+**Assess:** the picture cropped around its centre to the input's aspect, scaled to the input
+with an antialiased bicubic filter (a quality network judges sharpness, so the input must carry
+no aliasing a plain bilinear shrink adds), normalised with `mean` and `std`; the one output is
+the score.  An output that is not one finite number fails the request.
 
 **Species:** detect; each animal box (at most 20, strongest first) widened by the classifier's
 `cropMargin` and cropped; each crop classified.  SpeciesNet's always-crop model is trained on the
@@ -144,13 +158,14 @@ with a thumbnail of the picture; `species` records the detector and the classifi
 
 ## Local API
 
-All three routes take the picture the same three ways; see [local API](../local-api.md#vision).
+All four routes take the picture the same three ways; see [local API](../local-api.md#vision).
 
 | Route | Options | Answers |
 | --- | --- | --- |
 | `POST /vision/detect` | `model`, `minConfidence`, `iou` | `{model, device, picture, animalPresent, detections, elapsedMs}` |
 | `POST /vision/classify` | `model`, `minConfidence`, `topK` | `{model, device, picture, predictions, elapsedMs}` |
 | `POST /vision/species` | `detector`, `classifier`, `minConfidence` (detector), `iou`, `topK` | `{detector, classifier, picture, animalPresent, detections (each animal with species), elapsedMs}` |
+| `POST /vision/assess` | `model` | `{model, device, picture, score, elapsedMs}` |
 
 ## Observability
 
@@ -159,7 +174,7 @@ All three routes take the picture the same three ways; see [local API](../local-
 | `load` | `studio_worker::engine::vision` | a vision model loaded: task, device, flavour, input and output names, label count, time |
 | `transient` | `studio_worker::lifecycle` | a model loaded for one job, or failed to |
 | `admit` | `studio_worker::lifecycle` | a transient job admitted or refused |
-| `detect` / `classify` / `species` | `studio_worker::vision` | a request answered: model, device, counts, time |
+| `detect` / `classify` / `species` / `assess` | `studio_worker::vision` | a request answered: model, device, counts or score, time |
 | `vision` | `studio_worker::local_api` | a request refused, with its status, code and reason |
 | `job` | `studio_worker::job` | each vision job started and finished |
 
@@ -170,3 +185,8 @@ the expected class and MegaDetector box of each): every MegaDetector box lands w
 of the frame of the reference box, and SpeciesNet on the reference crops names every expected
 class (elephants, also greyscale, CMYK, truncated and EXIF-rotated; black bear, cattle, dog,
 ocelot, human, three blanks) at 98.7 % to 99.9 %.
+
+CLIP-IQA+ on 13 garden camera trap frames of birds, each labelled by eye clear (7) or misty or
+blurred (6), ranks every clear frame above every unclear one (42 of 42 pairs; 0.68 to 0.81
+against 0.50 to 0.66).  `real_vision::clipiqa_ranks_clear_pictures_above_misty_and_blurred_ones`
+checks it on any such folder (`VISION_CLARITY_DIR`).
