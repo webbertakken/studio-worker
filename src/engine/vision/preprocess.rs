@@ -61,10 +61,40 @@ pub fn normalised(
     mean: [f32; 3],
     std: [f32; 3],
 ) -> Vec<f32> {
-    let resized = resize_bilinear(image, width, height);
-    let plane = (width * height) as usize;
+    planar(&resize_bilinear(image, width, height), mean, std)
+}
+
+/// The picture cropped around its centre to the aspect of `width` x `height`, scaled to it with
+/// an antialiased bicubic (Catmull-Rom) filter, then normalised as [`normalised`]: the assess
+/// models' input.  Quality networks judge sharpness and noise, so their input keeps the picture's
+/// proportions and carries no aliasing a plain bilinear shrink would add.
+pub fn covered(
+    image: &RgbImage,
+    width: u32,
+    height: u32,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> Vec<f32> {
+    let (w, h) = image.dimensions();
+    let scale = (width as f32 / w as f32).max(height as f32 / h as f32);
+    let crop_w = ((width as f32 / scale).round() as u32).clamp(1, w);
+    let crop_h = ((height as f32 / scale).round() as u32).clamp(1, h);
+    let centred =
+        image::imageops::crop_imm(image, (w - crop_w) / 2, (h - crop_h) / 2, crop_w, crop_h);
+    let resized = image::imageops::resize(
+        &*centred,
+        width,
+        height,
+        image::imageops::FilterType::CatmullRom,
+    );
+    planar(&resized, mean, std)
+}
+
+/// A picture already at the input size as planar `(v / 255 - mean) / std` per channel.
+fn planar(image: &RgbImage, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
+    let plane = (image.width() * image.height()) as usize;
     let mut input = vec![0.0; 3 * plane];
-    for (i, pixel) in resized.pixels().enumerate() {
+    for (i, pixel) in image.pixels().enumerate() {
         for c in 0..3 {
             input[c * plane + i] = (pixel.0[c] as f32 / 255.0 - mean[c]) / std[c];
         }
@@ -148,6 +178,31 @@ mod tests {
 
     fn solid(w: u32, h: u32, rgb: [u8; 3]) -> RgbImage {
         RgbImage::from_pixel(w, h, image::Rgb(rgb))
+    }
+
+    #[test]
+    fn a_covered_picture_keeps_its_centre_at_the_inputs_aspect() {
+        // A 6x2 picture, blue | red | blue in thirds, covering a 2x2 input keeps the red middle.
+        let mut picture = solid(6, 2, [0, 0, 255]);
+        for x in 2..4 {
+            for y in 0..2 {
+                picture.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            }
+        }
+        let input = covered(&picture, 2, 2, [0.0; 3], [1.0; 3]);
+        assert_eq!(input, [[1.0; 4], [0.0; 4], [0.0; 4]].concat());
+    }
+
+    #[test]
+    fn a_covered_picture_is_shrunk_with_antialiasing() {
+        // One-pixel black and white stripes shrunk 4x average to grey; a bilinear shrink without
+        // antialiasing would land on whole stripes.
+        let mut stripes = RgbImage::new(32, 32);
+        for (x, _, pixel) in stripes.enumerate_pixels_mut() {
+            *pixel = image::Rgb([if x % 2 == 0 { 255 } else { 0 }; 3]);
+        }
+        let input = covered(&stripes, 8, 8, [0.0; 3], [1.0; 3]);
+        assert!(input.iter().all(|v| (0.3..0.7).contains(v)), "{input:?}");
     }
 
     #[test]

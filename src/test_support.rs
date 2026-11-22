@@ -486,7 +486,7 @@ impl crate::host::LoadedModel for CannedVision {
 
 /// Loads [`vision_catalog`]'s models as canned networks: the detector finds an animal at
 /// (15..25, 15..25) and a person at (45..55, 45..55) of a 64 x 64 input; the classifier
-/// answers `robin`.
+/// answers `robin`; the assessor scores 0.75.
 pub struct FakeVisionRuntime;
 
 impl crate::host::ModelRuntime for FakeVisionRuntime {
@@ -507,12 +507,13 @@ impl crate::host::ModelRuntime for FakeVisionRuntime {
             crate::types::VisionTask::Classify => {
                 CannedVision::new(spec, &[1, 3], vec![0.0, 4.0, 1.0])
             }
+            crate::types::VisionTask::Assess => CannedVision::new(spec, &[1, 1], vec![0.75]),
         }))
     }
 }
 
-/// A detector `md` (animal, person; 64 x 64) and a classifier `birds` (blackbird, robin, wren),
-/// for [`FakeVisionRuntime`].
+/// A detector `md` (animal, person; 64 x 64), a classifier `birds` (blackbird, robin, wren)
+/// and an assessor `iqa` (8 x 8), for [`FakeVisionRuntime`].
 pub fn vision_catalog() -> crate::catalog::Catalog {
     use crate::types::VisionTask;
     let mut detector = vision_defaults(VisionTask::Detect, &["animal", "person"]);
@@ -525,6 +526,7 @@ pub fn vision_catalog() -> crate::catalog::Catalog {
                 8,
                 vision_defaults(VisionTask::Classify, &["blackbird", "robin", "wren"]),
             ),
+            vision_model("iqa", 8, vision_defaults(VisionTask::Assess, &[])),
         ],
         ..Default::default()
     }

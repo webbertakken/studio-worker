@@ -87,6 +87,7 @@ impl Catalog {
                 megadetector_v5a(),
                 speciesnet_v4a(),
                 bird_species(),
+                clipiqa_plus(),
             ],
             dismissed_seeds: Vec::new(),
         }
@@ -384,6 +385,66 @@ fn speciesnet_v4a() -> CatalogModel {
                     top_k: Some(5),
                     channels_last: Some(true),
                     crop_margin: Some(0.0),
+                }),
+                ..Default::default()
+            },
+        },
+        enabled: true,
+        origin: "local".into(),
+        exclusive_group: None,
+    }
+}
+
+/// CLIP-IQA+ (IQA-PyTorch, trained on KonIQ-10k): how clear a picture looks, 0..1, higher is
+/// clearer.  CLIP's ResNet-50 with learned quality prompts; it scores mist, blur and noise low.
+/// ONNX export by 86Cao of IQA-PyTorch's weights, verified against PyTorch to 2e-6; its graph
+/// keeps its weights in an external `.onnx.data` file.  The graph starts at CLIP's first
+/// convolution, so the input takes CLIP's normalisation.  Weights licensed non-commercial
+/// (NTU S-Lab License 1.0); the export Apache-2.0.
+fn clipiqa_plus() -> CatalogModel {
+    const REPO: &str = "86Cao/IQA-ONNX-Models";
+    const REVISION: &str = "2e32ab1ad40c592da9d199f4c7fb8a2383bbae94";
+    CatalogModel {
+        id: "clipiqa-plus".into(),
+        display_name: "CLIP-IQA+ (picture clarity)".into(),
+        kind: TaskKind::Vision,
+        vram_gb_estimate: 0.6,
+        description: Some(
+            "Scores how clear a picture looks: mist, blur and noise score low".into(),
+        ),
+        source: ModelSource {
+            engine: ModelEngine::OnnxVision,
+            files: vec![
+                hf_file(
+                    REPO,
+                    REVISION,
+                    "clipiqa_model.onnx",
+                    409_923,
+                    "4f959db3c321a652ef45915aeade0eb05284a8145cc933dd9feaae4e633cac37",
+                ),
+                hf_file(
+                    REPO,
+                    REVISION,
+                    "clipiqa_model.onnx.data",
+                    152_764_416,
+                    "8c6b5a074405e85cda90155975588a3c4bc500d858ad994423380115610c19b6",
+                ),
+            ],
+            cli_defaults: ModelCliDefaults {
+                width: 224,
+                height: 224,
+                vision: Some(VisionDefaults {
+                    task: VisionTask::Assess,
+                    labels: vec![],
+                    animal_labels: None,
+                    mean: Some([0.481_454_66, 0.457_827_5, 0.408_210_73]),
+                    std: Some([0.268_629_54, 0.261_302_6, 0.275_777_1]),
+                    probabilities: None,
+                    min_confidence: None,
+                    iou: None,
+                    top_k: None,
+                    channels_last: None,
+                    crop_margin: None,
                 }),
                 ..Default::default()
             },
@@ -708,8 +769,29 @@ mod tests {
                 "megadetector-v5a",
                 "speciesnet-v4a",
                 "bird-species-efficientnet-b2",
+                "clipiqa-plus",
             ]
         );
+    }
+
+    #[test]
+    fn the_clarity_seed_assesses_with_clip_normalisation_and_external_weights() {
+        use crate::engine::vision::{is_graph, VisionSpec};
+        let assessor = Catalog::seed().get("clipiqa-plus").cloned().unwrap();
+        let spec = VisionSpec::from_model(&assessor, None).unwrap();
+        assert_eq!(spec.task, VisionTask::Assess);
+        assert_eq!(spec.input_shape(), [1, 3, 224, 224]);
+        assert!(spec.labels.is_empty());
+        assert_eq!(spec.mean[0], 0.481_454_66);
+        let graphs: Vec<&str> = assessor
+            .source
+            .files
+            .iter()
+            .filter(|f| f.role == ModelFileRole::Model && is_graph(&f.filename))
+            .map(|f| f.filename.as_str())
+            .collect();
+        assert_eq!(graphs, ["clipiqa_model.onnx"]);
+        assert_eq!(assessor.source.files.len(), 2);
     }
 
     #[test]

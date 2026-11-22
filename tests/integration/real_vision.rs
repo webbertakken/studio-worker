@@ -85,3 +85,48 @@ fn the_bird_classifier_names_the_species() {
     let total: f32 = ranked.iter().map(|p| p.confidence).sum();
     assert!(total <= 1.0 + 1e-4, "softmaxed: {total}");
 }
+
+/// `VISION_CLARITY_DIR` holds pictures named `clear-*` and `unclear-*` (misty, blurred): CLIP-IQA+
+/// ranks a clear one above an unclear one in at least nine pairs out of ten.
+#[test]
+fn clipiqa_ranks_clear_pictures_above_misty_and_blurred_ones() {
+    if std::env::var_os("RUN_REAL_ENGINE_TESTS").is_none() {
+        eprintln!("[real_vision] skipped: set RUN_REAL_ENGINE_TESTS=1 and VISION_CLARITY_DIR");
+        return;
+    }
+    let dir = PathBuf::from(std::env::var("VISION_CLARITY_DIR").expect("VISION_CLARITY_DIR"));
+    let loaded = load("clipiqa-plus");
+    let assessor = loaded.as_vision().expect("a vision model");
+    let (mut clear, mut unclear) = (Vec::new(), Vec::new());
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("the clarity dir")
+        .flatten()
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let bytes = std::fs::read(entry.path()).expect("a picture");
+        let score = vision::assess(
+            assessor,
+            &vision::decode_picture(&bytes).expect("a picture"),
+        )
+        .expect("a score");
+        eprintln!("[real_vision] {} {name}: {score:.3}", assessor.device());
+        if name.starts_with("clear-") {
+            clear.push(score);
+        } else if name.starts_with("unclear-") {
+            unclear.push(score);
+        }
+    }
+    assert!(
+        !clear.is_empty() && !unclear.is_empty(),
+        "both kinds of picture"
+    );
+    let pairs = clear.len() * unclear.len();
+    let won = clear
+        .iter()
+        .flat_map(|c| unclear.iter().filter(move |u| c > u))
+        .count();
+    eprintln!("[real_vision] clear above unclear in {won} of {pairs} pairs");
+    assert!(won * 10 >= pairs * 9, "{won} of {pairs}");
+}

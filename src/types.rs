@@ -674,6 +674,8 @@ pub enum VisionTask {
     Detect,
     /// One confidence per class for the whole picture.
     Classify,
+    /// One quality score for the whole picture (no-reference image quality assessment).
+    Assess,
 }
 
 impl VisionTask {
@@ -681,6 +683,7 @@ impl VisionTask {
         match self {
             VisionTask::Detect => "detect",
             VisionTask::Classify => "classify",
+            VisionTask::Assess => "assess",
         }
     }
 }

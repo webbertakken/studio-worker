@@ -40,6 +40,7 @@ itself a client of this API (see [daemon control](#daemon-control)).
 | POST   | `/vision/detect` | yes | a picture (raw, multipart or JSON) + `model?`, `minConfidence?`, `iou?` | animals, people, vehicles: boxes and `animalPresent` ([vision](#vision)) |
 | POST   | `/vision/classify` | yes | a picture + `model?`, `minConfidence?`, `topK?` | ranked classes with confidence and taxonomy |
 | POST   | `/vision/species` | yes | a picture + `detector?`, `classifier?`, `minConfidence?`, `iou?`, `topK?` | each detection; each animal with its ranked species |
+| POST   | `/vision/assess` | yes | a picture + `model?` | how clear the picture is: one `score`, higher is clearer |
 | GET    | `/models`       | yes  | —                                          | catalog as JSON array, each entry with `state`, `resident`, `since`, `loadable`, `images` (+ `error` when failed) |
 | GET    | `/models/:id/state` | yes | —                                        | `{id, state, resident, since, error?}` |
 | POST   | `/models/:id/load`  | yes | —                                        | `202` loading / `200` loaded; marks it resident |
@@ -484,7 +485,7 @@ LLMs on the CPU.
 
 ### Vision
 
-Animal detection and species classification; models, pipeline and GPU use in
+Animal detection, species classification and picture clarity; models, pipeline and GPU use in
 [vision](engines/vision.md).  Each route takes one picture (PNG, JPEG or WebP, at most 25 MiB)
 in any of three ways:
 
@@ -518,6 +519,11 @@ curl -s "$URL/vision/species" -H "$AUTH" -H 'content-type: application/json' \
   -d "{\"image\":\"$(base64 -w0 trap.jpg)\",\"topK\":3}"
 # {"detector":"megadetector-v5a","classifier":"bird-species-efficientnet-b2",
 #  "animalPresent":true,"detections":[{"label":"animal",…,"species":[{"label":…}]}],…}
+
+# How clear is it?  Mist, blur and noise score low.
+curl -s "$URL/vision/assess" -H "$AUTH" -H 'content-type: image/jpeg' --data-binary @bird.jpg
+# {"model":"clipiqa-plus","device":"cuda","picture":{"width":1536,"height":864},
+#  "score":0.79,"elapsedMs":40}
 ```
 
 `animalPresent: false` means the picture is blank (no animal class at or above the threshold);
@@ -569,7 +575,7 @@ model registry: each entry carries the same `ModelSource` (engine + files +
 Z-Image-Turbo (image), Qwen3.5 0.8B and 2B (LLMs, reasoning off, 32K context; the 2B
 needs about 3 GB of VRAM at 32K),
 Nemotron 3.5 streaming and Parakeet EOU (streaming speech, one loaded at a time),
-MegaDetector v5a, SpeciesNet v4.0.1a and a 525-species bird classifier ([vision](engines/vision.md))
+MegaDetector v5a, SpeciesNet v4.0.1a, a 525-species bird classifier and CLIP-IQA+ ([vision](engines/vision.md))
 — seeds a catalogue lacks are added at startup, except ones the operator deleted
 (`dismissedSeeds`) — and the files are downloaded on demand into
 `models_root` (`~/models`) the first time a model is used — exactly as a
